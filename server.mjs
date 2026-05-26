@@ -49,7 +49,7 @@ const MOCK_ORDERS = [
     customer: { id: 'gid://shopify/Customer/101', displayName: 'Acme Pet Supply', email: 'buyer@acme.com' },
     displayFinancialStatus: 'PENDING', displayFulfillmentStatus: 'UNFULFILLED',
     totalPriceSet: { presentmentMoney: { amount: '450.00', currencyCode: 'USD' } },
-    tags: ['b2b-portal'], note: '',
+    sourceName: 'web', tags: ['b2b-portal'], note: '',
     lineItems: { edges: [
       { node: { id: 'li1', title: 'Elite Collar', quantity: 5, variant: { id: 'v301', sku: 'EC-001-S-NV', price: '36.00', inventoryQuantity: 24 },
           discountedUnitPriceSet: { presentmentMoney: { amount: '18.00', currencyCode: 'USD' } },
@@ -71,7 +71,7 @@ const MOCK_ORDERS = [
     customer: { id: 'gid://shopify/Customer/102', displayName: 'Happy Paws Boutique', email: 'orders@happypaws.com' },
     displayFinancialStatus: 'PENDING', displayFulfillmentStatus: 'UNFULFILLED',
     totalPriceSet: { presentmentMoney: { amount: '285.50', currencyCode: 'USD' } },
-    tags: ['b2b-portal'], note: 'Ship by Friday',
+    sourceName: 'web', tags: ['b2b-portal'], note: 'Ship by Friday',
     lineItems: { edges: [
       { node: { id: 'li3', title: 'Simplicity Collar', quantity: 10, variant: { id: 'v303', sku: 'SC-002-M-RD', price: '22.00', inventoryQuantity: 7 },
           discountedUnitPriceSet: { presentmentMoney: { amount: '11.00', currencyCode: 'USD' } },
@@ -89,7 +89,7 @@ const MOCK_ORDERS = [
     customer: { id: 'gid://shopify/Customer/103', displayName: 'Doggo Depot', email: 'wholesale@doggo.com' },
     displayFinancialStatus: 'PAID', displayFulfillmentStatus: 'FULFILLED',
     totalPriceSet: { presentmentMoney: { amount: '1200.00', currencyCode: 'USD' } },
-    tags: ['b2b-portal'], note: '',
+    sourceName: 'web', tags: ['b2b-portal'], note: '',
     lineItems: { edges: [
       { node: { id: 'li4', title: 'Elite Collar Bundle XL', quantity: 20, variant: { id: 'v304', sku: 'ECB-010-XL', price: '60.00', inventoryQuantity: 8 },
           discountedUnitPriceSet: { presentmentMoney: { amount: '60.00', currencyCode: 'USD' } },
@@ -108,7 +108,7 @@ const MOCK_ORDERS = [
     customer: { id: 'gid://shopify/Customer/104', displayName: 'Pet Paradise', email: 'buy@petparadise.com' },
     displayFinancialStatus: 'PAID', displayFulfillmentStatus: 'PARTIALLY_FULFILLED',
     totalPriceSet: { presentmentMoney: { amount: '675.00', currencyCode: 'USD' } },
-    tags: ['b2b-portal'], note: 'Partial ship OK',
+    sourceName: 'web', tags: ['b2b-portal'], note: 'Partial ship OK',
     lineItems: { edges: [
       { node: { id: 'li5', title: 'Everyday Collar', quantity: 15, variant: { id: 'v305', sku: 'EC-003-L-BK', price: '30.00', inventoryQuantity: 12 },
           discountedUnitPriceSet: { presentmentMoney: { amount: '30.00', currencyCode: 'USD' } },
@@ -124,6 +124,45 @@ const MOCK_ORDERS = [
     billingAddress:  { firstName: 'Maria', lastName: 'Garcia', address1: '321 Palm Dr', address2: 'Suite 4', city: 'Miami', province: 'FL', zip: '33101', country: 'US' },
     fulfillments: [{ status: 'SUCCESS', trackingInfo: [{ number: 'TRACK456', url: null, company: 'FedEx' }], createdAt: '2026-05-22T09:00:00Z' }],
     transactions: [{ id: 'tx3', status: 'SUCCESS', kind: 'SALE', gateway: 'manual', createdAt: '2026-05-21T17:00:00Z', amountSet: { presentmentMoney: { amount: '675.00', currencyCode: 'USD' } } }],
+  },
+  // SparkLayer wholesale order (historical — pre-portal)
+  {
+    id: 'gid://shopify/Order/1005', name: '#1005', processedAt: '2026-05-18T11:00:00Z',
+    customer: { id: 'gid://shopify/Customer/103', displayName: 'Doggo Depot', email: 'wholesale@doggo.com' },
+    displayFinancialStatus: 'PAID', displayFulfillmentStatus: 'FULFILLED',
+    totalPriceSet: { presentmentMoney: { amount: '540.00', currencyCode: 'USD' } },
+    sourceName: 'web', tags: ['sparklayer', 'b2b'], note: 'SparkLayer historical order',
+    lineItems: { edges: [
+      { node: { id: 'li7', title: 'Elite Collar', quantity: 9, variant: { id: 'v301', sku: 'EC-001-S-NV', price: '36.00', inventoryQuantity: 24 },
+          discountedUnitPriceSet: { presentmentMoney: { amount: '18.00', currencyCode: 'USD' } },
+          originalUnitPriceSet:   { presentmentMoney: { amount: '36.00', currencyCode: 'USD' } } } },
+    ]},
+    subtotalPriceSet:      { presentmentMoney: { amount: '540.00', currencyCode: 'USD' } },
+    totalShippingPriceSet: { presentmentMoney: { amount: '0.00', currencyCode: 'USD' } },
+    totalTaxSet:           { presentmentMoney: { amount: '0.00', currencyCode: 'USD' } },
+    shippingAddress: { firstName: 'Bob', lastName: 'Brown', address1: '789 Oak St', address2: '', city: 'Austin', province: 'TX', zip: '78701', country: 'US' },
+    billingAddress:  { firstName: 'Bob', lastName: 'Brown', address1: '789 Oak St', address2: '', city: 'Austin', province: 'TX', zip: '78701', country: 'US' },
+    fulfillments: [{ status: 'SUCCESS', trackingInfo: [{ number: 'SPKL001', url: null, company: 'UPS' }], createdAt: '2026-05-19T09:00:00Z' }],
+    transactions: [{ id: 'tx4', status: 'SUCCESS', kind: 'SALE', gateway: 'manual', createdAt: '2026-05-18T11:30:00Z', amountSet: { presentmentMoney: { amount: '540.00', currencyCode: 'USD' } } }],
+  },
+  // POS order (from dog show / in-person sale)
+  {
+    id: 'gid://shopify/Order/1006', name: '#1006', processedAt: '2026-05-15T14:30:00Z',
+    customer: { id: 'gid://shopify/Customer/101', displayName: 'Acme Pet Supply', email: 'buyer@acme.com' },
+    displayFinancialStatus: 'PAID', displayFulfillmentStatus: 'FULFILLED',
+    totalPriceSet: { presentmentMoney: { amount: '220.00', currencyCode: 'USD' } },
+    sourceName: 'pos', tags: [], note: 'In-person at dog show',
+    lineItems: { edges: [
+      { node: { id: 'li8', title: 'Luxe Leash', quantity: 4, variant: { id: 'v302', sku: 'LL-005', price: '55.00', inventoryQuantity: 5 },
+          discountedUnitPriceSet: { presentmentMoney: { amount: '55.00', currencyCode: 'USD' } },
+          originalUnitPriceSet:   { presentmentMoney: { amount: '55.00', currencyCode: 'USD' } } } },
+    ]},
+    subtotalPriceSet:      { presentmentMoney: { amount: '220.00', currencyCode: 'USD' } },
+    totalShippingPriceSet: { presentmentMoney: { amount: '0.00', currencyCode: 'USD' } },
+    totalTaxSet:           { presentmentMoney: { amount: '0.00', currencyCode: 'USD' } },
+    shippingAddress: null, billingAddress: null,
+    fulfillments: [{ status: 'SUCCESS', trackingInfo: [], createdAt: '2026-05-15T14:30:00Z' }],
+    transactions: [{ id: 'tx5', status: 'SUCCESS', kind: 'SALE', gateway: 'pos', createdAt: '2026-05-15T14:30:00Z', amountSet: { presentmentMoney: { amount: '220.00', currencyCode: 'USD' } } }],
   },
 ];
 
@@ -193,6 +232,17 @@ const MOCK_CUSTOMERS = [
     numberOfOrders: 5,
     defaultAddress: null,
     addresses: [],
+    metafields: { edges: [] },
+  },
+  // SparkLayer legacy customer (not yet b2b-tagged)
+  {
+    id: 'gid://shopify/Customer/106', displayName: 'Top Dog Boutique',
+    email: 'buying@topdogboutique.com', phone: '+1-555-0106',
+    tags: ['sparklayer', 'sparklayer-customer'],
+    amountSpent: { amount: '3100.00', currencyCode: 'USD' },
+    numberOfOrders: 11,
+    defaultAddress: { id: 'addr6', firstName: 'Dave', lastName: 'Lee', address1: '100 Elm St', city: 'Portland', province: 'OR', zip: '97201', country: 'US' },
+    addresses: [{ id: 'addr6', firstName: 'Dave', lastName: 'Lee', address1: '100 Elm St', city: 'Portland', province: 'OR', zip: '97201', country: 'US' }],
     metafields: { edges: [] },
   },
 ];
@@ -676,6 +726,19 @@ function renderDashboard(session, data) {
 }
 
 // ── Orders list ───────────────────────────────────────────────────────────────
+function deriveOrderSource(order) {
+  const tags = order.tags || [];
+  const sn   = order.sourceName || '';
+  if (tags.some(t => (t || '').toLowerCase().startsWith('sparklayer'))) return 'sparklayer';
+  if (sn === 'pos') return 'pos';
+  if (sn === 'draft_order') return 'manual';
+  if (tags.includes('b2b-portal')) return 'b2b-portal';
+  return 'online';
+}
+
+const ORDER_SOURCE_LABELS = { 'b2b-portal': 'B2B', sparklayer: 'SparkLayer', pos: 'POS', manual: 'Manual', online: 'Online' };
+const ORDER_SOURCE_COLORS = { 'b2b-portal': 'lime', sparklayer: 'blue', pos: 'orange', manual: 'gray', online: 'muted' };
+
 const FINANCIAL_STATUS_FILTER = {
   pending: ['PENDING','AUTHORIZED'],
   paid:    ['PAID','PARTIALLY_PAID'],
@@ -690,6 +753,10 @@ async function getOrdersData(filters) {
       const ov = mockOrderOverrides.get(shopifyNumericId(o.id)) || {};
       return { ...o, ...ov };
     });
+    if (filters.source === 'b2b-portal') orders = orders.filter(o => (o.tags||[]).includes('b2b-portal'));
+    if (filters.source === 'sparklayer')  orders = orders.filter(o => (o.tags||[]).some(t => t.toLowerCase().startsWith('sparklayer')));
+    if (filters.source === 'pos')         orders = orders.filter(o => (o.sourceName||'') === 'pos');
+    if (filters.source === 'manual')      orders = orders.filter(o => (o.sourceName||'') === 'draft_order');
     if (filters.q) {
       const q = filters.q.toLowerCase();
       orders = orders.filter(o =>
@@ -714,7 +781,11 @@ async function getOrdersData(filters) {
   }
 
   try {
-    let qParts = ['tag:b2b-portal'];
+    const qParts = [];  // Phase 9: no default filter — show all orders
+    if (filters.source === 'b2b-portal') qParts.push('tag:b2b-portal');
+    if (filters.source === 'sparklayer')  qParts.push('tag:sparklayer*');
+    if (filters.source === 'pos')         qParts.push('source_name:pos');
+    if (filters.source === 'manual')      qParts.push('source_name:draft_order');
     if (filters.q) qParts.push(filters.q);
     if (filters.date) {
       const days = { '7d': 7, '30d': 30, '90d': 90 }[filters.date];
@@ -735,7 +806,7 @@ async function getOrdersData(filters) {
             customer{id displayName email}
             displayFinancialStatus displayFulfillmentStatus
             totalPriceSet{presentmentMoney{amount currencyCode}}
-            note tags
+            sourceName note tags
             lineItems(first:3){edges{node{title quantity variant{sku}}}}
           }}
           pageInfo{hasNextPage endCursor}
@@ -763,6 +834,9 @@ function renderOrdersList(session, data, filters) {
     const fstatus = (o.displayFulfillmentStatus || '').toLowerCase().replace(/_/g, '-');
     const lineItemSummary = (o.lineItems?.edges || []).slice(0, 3)
       .map(e => `${e.node.title} ×${e.node.quantity}`).join(', ');
+    const src = deriveOrderSource(o);
+    const srcLabel = ORDER_SOURCE_LABELS[src] || src;
+    const srcColor = ORDER_SOURCE_COLORS[src] || 'muted';
     return `<tr>
       <td class="col-check"><input type="checkbox" name="ids" value="${h(numId)}"></td>
       <td><a href="/orders/${h(numId)}" class="order-link">${h(o.name)}</a></td>
@@ -770,6 +844,7 @@ function renderOrdersList(session, data, filters) {
       <td class="text-muted">${fmtDate(o.processedAt)}</td>
       <td class="text-muted small-text">${h(lineItemSummary)}</td>
       <td class="text-right mono">${fmtMoney(o.totalPriceSet?.presentmentMoney?.amount)}</td>
+      <td><span class="badge badge-src-${h(srcColor)}" title="${h(src)}">${h(srcLabel)}</span></td>
       <td><span class="badge badge-${h(status)}">${h(o.displayFinancialStatus)}</span></td>
       <td><span class="badge badge-ff-${h(fstatus)}">${h(o.displayFulfillmentStatus)}</span></td>
       <td><a href="/orders/${h(numId)}" class="table-action">View →</a></td>
@@ -777,11 +852,12 @@ function renderOrdersList(session, data, filters) {
   }).join('');
 
   const emptyRow = orders.length === 0
-    ? `<tr><td colspan="9" class="empty-state">No orders found${filters.q || filters.status || filters.date ? ' — try clearing filters' : ''}</td></tr>`
+    ? `<tr><td colspan="10" class="empty-state">No orders found${filters.q || filters.source || filters.status || filters.date ? ' — try clearing filters' : ''}</td></tr>`
     : '';
 
   const currentParams = new URLSearchParams();
   if (filters.q)      currentParams.set('q', filters.q);
+  if (filters.source) currentParams.set('source', filters.source);
   if (filters.status) currentParams.set('status', filters.status);
   if (filters.date)   currentParams.set('date', filters.date);
 
@@ -790,6 +866,20 @@ function renderOrdersList(session, data, filters) {
 
   const flash = filters.success === 'marked_paid' ? `<div class="alert alert-success">Order(s) marked as paid.</div>` : '';
 
+  const sourceChips = [
+    { value: '',           label: 'All' },
+    { value: 'b2b-portal', label: 'B2B portal' },
+    { value: 'sparklayer', label: 'SparkLayer' },
+    { value: 'pos',        label: 'POS' },
+    { value: 'manual',     label: 'Manual / draft' },
+  ].map(c => {
+    const p = new URLSearchParams(currentParams);
+    if (c.value) p.set('source', c.value); else p.delete('source');
+    p.delete('after');
+    const active = (filters.source || '') === c.value;
+    return `<a href="/orders?${p}" class="filter-chip${active ? ' filter-chip-active' : ''}">${h(c.label)}</a>`;
+  }).join('');
+
   return layout({ title: 'Orders', session, activePath: '/orders', content: `
     <div class="page-header-row">
       <h1>Orders</h1>
@@ -797,8 +887,10 @@ function renderOrdersList(session, data, filters) {
     </div>
     ${flash}
     ${error ? `<div class="alert alert-warning">Shopify unavailable: ${h(error)}</div>` : ''}
+    <div class="filter-chips">${sourceChips}</div>
     <form class="filter-bar" method="GET" action="/orders">
-      <input type="search" name="q" value="${h(filters.q||'')}" placeholder="Order #, customer, SKU…" class="filter-input">
+      ${filters.source ? `<input type="hidden" name="source" value="${h(filters.source)}">` : ''}
+      <input type="search" name="q" value="${h(filters.q||'')}" placeholder="Order #, customer, SKU…" class="filter-input search-input">
       <select name="status" class="filter-select">
         <option value="">All statuses</option>
         <option value="open"    ${filters.status==='open'?'selected':''}>Open (unpaid)</option>
@@ -825,7 +917,7 @@ function renderOrdersList(session, data, filters) {
           <thead><tr>
             <th class="col-check"><input type="checkbox" id="select-all"></th>
             <th>Order</th><th>Customer</th><th>Date</th><th>Items</th>
-            <th class="text-right">Amount</th><th>Payment</th><th>Fulfillment</th><th></th>
+            <th class="text-right">Amount</th><th>Source</th><th>Payment</th><th>Fulfillment</th><th></th>
           </tr></thead>
           <tbody>${rows}${emptyRow}</tbody>
         </table>
@@ -1038,6 +1130,10 @@ function renderOrderDetail(session, order, flash) {
 async function getCustomersData(filters) {
   if (MOCK) {
     let customers = [...MOCK_CUSTOMERS];
+    if (filters.segment === 'b2b')         customers = customers.filter(c => (c.tags||[]).includes('b2b'));
+    if (filters.segment === 'sparklayer')  customers = customers.filter(c => (c.tags||[]).some(t => t.toLowerCase().startsWith('sparklayer')));
+    if (filters.segment === 'has_orders')  customers = customers.filter(c => (c.numberOfOrders||0) > 0);
+    if (filters.segment === 'no_orders')   customers = customers.filter(c => (c.numberOfOrders||0) === 0);
     if (filters.q) {
       const q = filters.q.toLowerCase();
       customers = customers.filter(c =>
@@ -1047,14 +1143,18 @@ async function getCustomersData(filters) {
       );
     }
     if (filters.tag) {
-      customers = customers.filter(c => c.tags.includes(filters.tag));
+      customers = customers.filter(c => (c.tags||[]).includes(filters.tag));
     }
     return { customers, hasNextPage: false, total: customers.length };
   }
   try {
-    const qParts = ['tag:b2b'];
+    const qParts = [];  // Phase 9: no default filter — show all customers
+    if (filters.segment === 'b2b')        qParts.push('tag:b2b');
+    if (filters.segment === 'sparklayer') qParts.push('tag:sparklayer*');
+    if (filters.segment === 'has_orders') qParts.push('orders_count:>0');
+    if (filters.segment === 'no_orders')  qParts.push('orders_count:0');
     if (filters.q) qParts.push(filters.q);
-    if (filters.tag && filters.tag !== 'b2b') qParts.push(`tag:${filters.tag}`);
+    if (filters.tag && !filters.segment)  qParts.push(`tag:${filters.tag}`);
     const result = await shopifyFetch(`
       query($q:String!,$first:Int!,$after:String){
         customers(first:$first,query:$q,after:$after,sortKey:AMOUNT_SPENT,reverse:true){
@@ -1080,6 +1180,17 @@ async function getCustomersData(filters) {
   }
 }
 
+function tagChip(t) {
+  const tl = (t || '').toLowerCase();
+  let cls = 'tag-chip-default';
+  if (tl === 'b2b') cls = 'tag-chip-b2b';
+  else if (tl.startsWith('sparklayer')) cls = 'tag-chip-sparklayer';
+  else if (tl === 'b2b-admin') cls = 'tag-chip-admin';
+  else if (tl.startsWith('b2b-tier:gold')) cls = 'tag-chip-gold';
+  else if (tl.startsWith('b2b-tier:')) cls = 'tag-chip-tier';
+  return `<span class="tag-chip ${cls}">${h(t)}</span>`;
+}
+
 function renderCustomersList(session, data, filters) {
   const { customers, hasNextPage, endCursor, error } = data;
 
@@ -1088,10 +1199,13 @@ function renderCustomersList(session, data, filters) {
     const dropship = c.metafields?.edges?.find(e => e.node.key === 'dropship_enabled')?.node?.value === 'true';
     const addr     = c.defaultAddress;
     const location = addr ? `${addr.city || ''}${addr.province ? ', '+addr.province : ''}` : '—';
+    const visibleTags = (c.tags || []).slice(0, 3);
+    const moreTags    = (c.tags || []).length - visibleTags.length;
+    const tagBadges   = visibleTags.map(tagChip).join('') + (moreTags > 0 ? `<span class="tag-chip tag-chip-more" title="${h((c.tags||[]).join(', '))}">+${moreTags}</span>` : '');
     return `<tr>
       <td><a href="/customers/${h(numId)}" class="link-strong">${h(c.displayName)}</a><br><small>${h(c.email)}</small></td>
       <td class="text-muted">${h(location)}</td>
-      <td><div class="tags-mini">${(c.tags||[]).map(t=>`<span class="tag tag-sm">${h(t)}</span>`).join(' ')}</div></td>
+      <td><div class="tags-mini">${tagBadges}</div></td>
       <td class="text-right mono">${fmtMoney(c.amountSpent?.amount, c.amountSpent?.currencyCode)}</td>
       <td class="text-right">${c.numberOfOrders || 0}</td>
       <td>${dropship ? '<span class="badge badge-dropship">Dropship</span>' : ''}</td>
@@ -1104,16 +1218,33 @@ function renderCustomersList(session, data, filters) {
     : '';
 
   const currentParams = new URLSearchParams();
-  if (filters.q)   currentParams.set('q', filters.q);
-  if (filters.tag) currentParams.set('tag', filters.tag);
+  if (filters.q)       currentParams.set('q', filters.q);
+  if (filters.segment) currentParams.set('segment', filters.segment);
+  if (filters.tag)     currentParams.set('tag', filters.tag);
   const nextParams = new URLSearchParams(currentParams);
   if (endCursor) nextParams.set('after', endCursor);
+
+  const segmentChips = [
+    { value: '',           label: 'All' },
+    { value: 'b2b',        label: 'B2B-tagged' },
+    { value: 'sparklayer', label: 'SparkLayer' },
+    { value: 'has_orders', label: 'Has orders' },
+    { value: 'no_orders',  label: 'No orders' },
+  ].map(c => {
+    const p = new URLSearchParams(currentParams);
+    if (c.value) p.set('segment', c.value); else p.delete('segment');
+    p.delete('after');
+    const active = (filters.segment || '') === c.value;
+    return `<a href="/customers?${p}" class="filter-chip${active ? ' filter-chip-active' : ''}">${h(c.label)}</a>`;
+  }).join('');
 
   return layout({ title: 'Customers', session, activePath: '/customers', content: `
     <div class="page-header-row"><h1>Customers</h1></div>
     ${error ? `<div class="alert alert-warning">Shopify unavailable: ${h(error)}</div>` : ''}
+    <div class="filter-chips">${segmentChips}</div>
     <form class="filter-bar" method="GET" action="/customers">
-      <input type="search" name="q" value="${h(filters.q||'')}" placeholder="Name, email, phone…" class="filter-input">
+      ${filters.segment ? `<input type="hidden" name="segment" value="${h(filters.segment)}">` : ''}
+      <input type="search" name="q" value="${h(filters.q||'')}" placeholder="Name, email, phone…" class="filter-input search-input">
       <select name="tag" class="filter-select">
         <option value="">All tags</option>
         <option value="b2b-tier:gold"   ${filters.tag==='b2b-tier:gold'?'selected':''}>Gold tier</option>
@@ -1173,16 +1304,19 @@ async function getCustomerRecentOrders(customerId) {
         edges{node{id name processedAt displayFinancialStatus displayFulfillmentStatus
           totalPriceSet{presentmentMoney{amount currencyCode}}
         }}}}`,
-      { q: `tag:b2b-portal customer_id:${customerId}` });
+      { q: `customer_id:${customerId}` });
     return result.data?.orders?.edges?.map(e => e.node) || [];
   } catch { return []; }
 }
 
+// Phase 10: 4 per-customer fields — discount_pct, dropship_enabled, dropship_margin_pct, allow_order_on_invoice
+// min_order_usd and payment_terms are GLOBAL settings only (not per-customer).
 async function getB2bConfig(numericId) {
   const defaults = {
-    discount_pct:  parseInt(getSetting('b2b_discount_pct') ?? '50', 10),
-    min_order_usd: parseInt(getSetting('order_minimum')    ?? '0',  10),
-    payment_terms: getSetting('payment_terms')             ?? 'Net 30',
+    discount_pct:            parseInt(getSetting('b2b_discount_pct') ?? '50', 10),
+    dropship_enabled:        false,
+    dropship_margin_pct:     30,
+    allow_order_on_invoice:  true,
   };
 
   if (MOCK) {
@@ -1190,30 +1324,32 @@ async function getB2bConfig(numericId) {
     const gid = shopifyCustomerGid(numericId);
     const cust = MOCK_CUSTOMERS.find(c => c.id === gid);
     const mfs  = cust?.metafields?.edges?.map(e => e.node) || [];
-    // Start from metafields in mock data, then apply in-memory overrides on top
     const fromMf = {};
     const dpStr   = mfs.find(m => m.key === 'discount_pct')?.value;
-    const moStr   = mfs.find(m => m.key === 'min_order_usd')?.value;
-    const ptStr   = mfs.find(m => m.key === 'payment_terms')?.value;
-    if (dpStr !== undefined) fromMf.discount_pct  = parseInt(dpStr, 10);
-    if (moStr !== undefined) fromMf.min_order_usd = parseInt(moStr, 10);
-    if (ptStr !== undefined) fromMf.payment_terms  = ptStr;
+    const deStr   = mfs.find(m => m.key === 'dropship_enabled')?.value;
+    const dmStr   = mfs.find(m => m.key === 'dropship_margin_pct')?.value;
+    const aoiStr  = mfs.find(m => m.key === 'allow_order_on_invoice')?.value;
+    if (dpStr  !== undefined) fromMf.discount_pct           = parseInt(dpStr, 10);
+    if (deStr  !== undefined) fromMf.dropship_enabled       = deStr === 'true';
+    if (dmStr  !== undefined) fromMf.dropship_margin_pct    = parseInt(dmStr, 10);
+    if (aoiStr !== undefined) fromMf.allow_order_on_invoice = aoiStr !== 'false';
 
     const overrides = { ...fromMf, ...inMemory };
-    // Null entries in inMemory mean "cleared"
     for (const k of Object.keys(inMemory)) {
       if (inMemory[k] === null) delete overrides[k];
     }
     return {
       effective: {
-        discount_pct:  overrides.discount_pct  ?? defaults.discount_pct,
-        min_order_usd: overrides.min_order_usd ?? defaults.min_order_usd,
-        payment_terms: overrides.payment_terms ?? defaults.payment_terms,
+        discount_pct:            overrides.discount_pct           ?? defaults.discount_pct,
+        dropship_enabled:        overrides.dropship_enabled       ?? defaults.dropship_enabled,
+        dropship_margin_pct:     overrides.dropship_margin_pct    ?? defaults.dropship_margin_pct,
+        allow_order_on_invoice:  overrides.allow_order_on_invoice ?? defaults.allow_order_on_invoice,
       },
       overrides: {
-        discount_pct:  overrides.discount_pct  ?? null,
-        min_order_usd: overrides.min_order_usd ?? null,
-        payment_terms: overrides.payment_terms ?? null,
+        discount_pct:            overrides.discount_pct           ?? null,
+        dropship_enabled:        overrides.dropship_enabled       ?? null,
+        dropship_margin_pct:     overrides.dropship_margin_pct    ?? null,
+        allow_order_on_invoice:  overrides.allow_order_on_invoice ?? null,
       },
       defaults,
     };
@@ -1227,18 +1363,21 @@ async function getB2bConfig(numericId) {
     const mfs = result.data?.customer?.metafields?.edges?.map(e => e.node) || [];
     const getVal = k => mfs.find(m => m.key === k)?.value ?? null;
     const dpStr  = getVal('discount_pct');
-    const moStr  = getVal('min_order_usd');
-    const ptStr  = getVal('payment_terms');
+    const deStr  = getVal('dropship_enabled');
+    const dmStr  = getVal('dropship_margin_pct');
+    const aoiStr = getVal('allow_order_on_invoice');
     const overrides = {
-      discount_pct:  dpStr !== null ? parseInt(dpStr, 10)  : null,
-      min_order_usd: moStr !== null ? parseInt(moStr, 10)  : null,
-      payment_terms: ptStr !== null ? ptStr                : null,
+      discount_pct:            dpStr  !== null ? parseInt(dpStr, 10)   : null,
+      dropship_enabled:        deStr  !== null ? deStr === 'true'       : null,
+      dropship_margin_pct:     dmStr  !== null ? parseInt(dmStr, 10)   : null,
+      allow_order_on_invoice:  aoiStr !== null ? aoiStr !== 'false'    : null,
     };
     return {
       effective: {
-        discount_pct:  overrides.discount_pct  ?? defaults.discount_pct,
-        min_order_usd: overrides.min_order_usd ?? defaults.min_order_usd,
-        payment_terms: overrides.payment_terms ?? defaults.payment_terms,
+        discount_pct:            overrides.discount_pct           ?? defaults.discount_pct,
+        dropship_enabled:        overrides.dropship_enabled       ?? defaults.dropship_enabled,
+        dropship_margin_pct:     overrides.dropship_margin_pct    ?? defaults.dropship_margin_pct,
+        allow_order_on_invoice:  overrides.allow_order_on_invoice ?? defaults.allow_order_on_invoice,
       },
       overrides,
       defaults,
@@ -1247,19 +1386,25 @@ async function getB2bConfig(numericId) {
     console.error('getB2bConfig error:', err.message);
     return {
       effective: defaults,
-      overrides: { discount_pct: null, min_order_usd: null, payment_terms: null },
+      overrides: { discount_pct: null, dropship_enabled: null, dropship_margin_pct: null, allow_order_on_invoice: null },
       defaults,
     };
   }
 }
 
-async function applyB2bConfigUpdate(numericId, { discount_pct, min_order_usd, payment_terms }) {
+async function applyB2bConfigUpdate(numericId, body) {
+  const { discount_pct, dropship_enabled, dropship_margin_pct, allow_order_on_invoice } = body;
   const gid = shopifyCustomerGid(numericId);
   if (MOCK) {
     const cur = { ...(mockB2bConfigOverrides.get(numericId) || {}) };
-    if (discount_pct  !== undefined) { cur.discount_pct  = (discount_pct  === null || discount_pct  === '') ? null : parseInt(discount_pct,  10); }
-    if (min_order_usd !== undefined) { cur.min_order_usd = (min_order_usd === null || min_order_usd === '') ? null : parseInt(min_order_usd, 10); }
-    if (payment_terms !== undefined) { cur.payment_terms = (payment_terms === null || payment_terms === '') ? null : String(payment_terms); }
+    if (discount_pct !== undefined)
+      cur.discount_pct = (discount_pct === null || discount_pct === '') ? null : parseInt(discount_pct, 10);
+    if (dropship_enabled !== undefined)
+      cur.dropship_enabled = (dropship_enabled === null || dropship_enabled === '') ? null : (dropship_enabled === true || dropship_enabled === 'true' || dropship_enabled === 'on');
+    if (dropship_margin_pct !== undefined)
+      cur.dropship_margin_pct = (dropship_margin_pct === null || dropship_margin_pct === '') ? null : parseInt(dropship_margin_pct, 10);
+    if (allow_order_on_invoice !== undefined)
+      cur.allow_order_on_invoice = (allow_order_on_invoice === null || allow_order_on_invoice === '') ? null : (allow_order_on_invoice === true || allow_order_on_invoice === 'true' || allow_order_on_invoice === 'on');
     mockB2bConfigOverrides.set(numericId, cur);
     return;
   }
@@ -1267,17 +1412,20 @@ async function applyB2bConfigUpdate(numericId, { discount_pct, min_order_usd, pa
   const sets    = [];
   const delKeys = [];
   const fieldDefs = [
-    { key: 'discount_pct',  val: discount_pct,  type: 'number_integer' },
-    { key: 'min_order_usd', val: min_order_usd, type: 'number_integer' },
-    { key: 'payment_terms', val: payment_terms, type: 'single_line_text_field' },
+    { key: 'discount_pct',           val: discount_pct,           type: 'number_integer' },
+    { key: 'dropship_enabled',       val: dropship_enabled,       type: 'boolean' },
+    { key: 'dropship_margin_pct',    val: dropship_margin_pct,    type: 'number_integer' },
+    { key: 'allow_order_on_invoice', val: allow_order_on_invoice, type: 'boolean' },
   ];
   for (const f of fieldDefs) {
     if (f.val === undefined) continue;
     if (f.val === null || f.val === '') {
       delKeys.push(f.key);
+    } else if (f.type === 'boolean') {
+      const bval = f.val === true || f.val === 'true' || f.val === 'on';
+      sets.push({ ownerId: gid, namespace: 'b2b', key: f.key, value: String(bval), type: 'boolean' });
     } else {
-      const valStr = f.type === 'number_integer' ? String(parseInt(f.val, 10)) : String(f.val).slice(0, 100);
-      sets.push({ ownerId: gid, namespace: 'b2b', key: f.key, value: valStr, type: f.type });
+      sets.push({ ownerId: gid, namespace: 'b2b', key: f.key, value: String(parseInt(f.val, 10)), type: 'number_integer' });
     }
   }
   if (sets.length) {
@@ -1289,21 +1437,15 @@ async function applyB2bConfigUpdate(numericId, { discount_pct, min_order_usd, pa
   }
 }
 
-function renderCustomerDetail(session, customer, recentOrders, notes, dropshipCache, b2bConfig, flash) {
+function renderCustomerDetail(session, customer, recentOrders, notes, _dropshipCache, b2bConfig, flash) {
   const numId      = shopifyNumericId(customer.id);
-  const metafields = customer.metafields?.edges?.map(e => e.node) || [];
-  const dropshipEnabled = dropshipCache?.enabled
-    ? dropshipCache.enabled === 1
-    : metafields.find(m => m.key === 'dropship_enabled')?.value === 'true';
-  const dropshipMargin  = dropshipCache?.margin_pct
-    ?? parseInt(metafields.find(m => m.key === 'dropship_margin_pct')?.value || '0', 10);
 
   const flashHtml = flash === 'notes_saved'
     ? `<div class="alert alert-success">Notes saved.</div>`
-    : flash === 'dropship_saved'
-    ? `<div class="alert alert-success">Dropship config updated.</div>`
+    : flash === 'dropship_saved' || flash === 'b2b_settings_saved'
+    ? `<div class="alert alert-success">B2B customer settings saved.</div>`
     : flash === 'b2b_config_saved'
-    ? `<div class="alert alert-success">B2B pricing config saved.</div>`
+    ? `<div class="alert alert-success">B2B customer settings saved.</div>`
     : flash === 'tags_added'
     ? `<div class="alert alert-success">Tags updated.</div>`
     : '';
@@ -1355,46 +1497,65 @@ function renderCustomerDetail(session, customer, recentOrders, notes, dropshipCa
             <div style="margin-top:0.5rem"><button type="submit" class="btn btn-secondary btn-sm">Save Notes</button></div>
           </form>
         </div>
-        <div class="card">
-          <div class="card-header"><h2>Dropship Config</h2></div>
-          <form method="POST" action="/customers/${h(numId)}/dropship">
-            <label class="toggle-row">
-              <span>Dropship enabled</span>
-              <input type="checkbox" name="enabled" class="toggle" ${dropshipEnabled?'checked':''} onchange="this.form.submit()">
-            </label>
-            <div class="form-row" style="margin-top:0.75rem">
-              <label for="margin_pct">Margin %</label>
-              <input type="number" id="margin_pct" name="margin_pct" value="${h(String(dropshipMargin))}" min="0" max="100" step="1" class="input input-sm" style="width:80px">
-            </div>
-            <div style="margin-top:0.5rem"><button type="submit" class="btn btn-secondary btn-sm">Save Dropship Config</button></div>
-          </form>
-        </div>
-        <div class="card" id="b2b-pricing-card">
-          <div class="card-header"><h2>B2B Pricing &amp; Terms</h2></div>
-          <p class="text-muted small-text" style="margin-bottom:0.75rem">Store defaults: ${h(String(b2bConfig.defaults.discount_pct))}% discount · $${h(String(b2bConfig.defaults.min_order_usd))} min order · ${h(b2bConfig.defaults.payment_terms)}. Leave blank to use default.</p>
-          <form method="POST" action="/customers/${h(numId)}/b2b-config">
-            <div class="form-row" style="margin-bottom:0.5rem;align-items:center">
-              <label style="min-width:120px">Discount %</label>
-              <div style="display:flex;align-items:center;gap:0.5rem">
-                <input type="number" name="discount_pct" value="${b2bConfig.overrides.discount_pct !== null ? h(String(b2bConfig.overrides.discount_pct)) : ''}" min="0" max="100" step="1" class="input input-sm" style="width:80px" placeholder="${h(String(b2bConfig.defaults.discount_pct))}">
-                <span class="badge ${b2bConfig.overrides.discount_pct !== null ? 'badge-warning' : 'badge-muted'}">${b2bConfig.overrides.discount_pct !== null ? 'override: ' + h(String(b2bConfig.effective.discount_pct)) + '%' : 'default'}</span>
+        <div class="card" id="b2b-settings-card">
+          <div class="card-header"><h2>B2B Customer Settings</h2></div>
+          <form method="POST" action="/customers/${h(numId)}/b2b-config" id="b2b-settings-form">
+            <div class="b2b-settings-grid">
+              <div class="b2b-field-row">
+                <div>
+                  <div class="b2b-field-label">Discount %</div>
+                  <div class="b2b-field-help">What percent off MSRP this customer pays. Default ${h(String(b2bConfig.defaults.discount_pct))}% comes from store settings.</div>
+                </div>
+                <div class="b2b-field-control">
+                  <input type="number" name="discount_pct" id="discount_pct"
+                    value="${b2bConfig.overrides.discount_pct !== null ? h(String(b2bConfig.overrides.discount_pct)) : ''}"
+                    min="0" max="95" step="1" class="input input-sm" style="width:80px"
+                    placeholder="${h(String(b2bConfig.defaults.discount_pct))}">
+                  <span class="badge ${b2bConfig.overrides.discount_pct !== null ? 'badge-warning' : 'badge-muted'}">
+                    ${b2bConfig.overrides.discount_pct !== null ? 'override: ' + h(String(b2bConfig.effective.discount_pct)) + '%' : 'default applied'}
+                  </span>
+                  ${b2bConfig.overrides.discount_pct !== null ? `<button type="submit" name="discount_pct" value="" class="btn btn-ghost btn-xs">Reset</button>` : ''}
+                </div>
+              </div>
+              <div class="b2b-field-row">
+                <div>
+                  <div class="b2b-field-label">Drop-ship allowed</div>
+                  <div class="b2b-field-help">If on, this customer can ship orders directly to their end customer. Useful for resellers who don't carry inventory.</div>
+                </div>
+                <div class="b2b-field-control">
+                  <label class="toggle-label">
+                    <input type="checkbox" name="dropship_enabled" id="dropship_enabled" class="toggle"
+                      ${b2bConfig.effective.dropship_enabled ? 'checked' : ''}
+                      onchange="document.getElementById('dropship_margin_pct').disabled=!this.checked">
+                  </label>
+                </div>
+              </div>
+              <div class="b2b-field-row">
+                <div>
+                  <div class="b2b-field-label">Drop-ship discount %</div>
+                  <div class="b2b-field-help">Discount on drop-ship orders only (separate from standard discount). Typical 25–35%.</div>
+                </div>
+                <div class="b2b-field-control">
+                  <input type="number" name="dropship_margin_pct" id="dropship_margin_pct"
+                    value="${h(String(b2bConfig.effective.dropship_margin_pct ?? 30))}"
+                    min="0" max="95" step="1" class="input input-sm" style="width:80px"
+                    ${!b2bConfig.effective.dropship_enabled ? 'disabled' : ''}>
+                </div>
+              </div>
+              <div class="b2b-field-row">
+                <div>
+                  <div class="b2b-field-label">Allow order on invoice</div>
+                  <div class="b2b-field-help">If on, customer can place orders without upfront payment — we invoice them. If off, must pay at checkout.</div>
+                </div>
+                <div class="b2b-field-control">
+                  <label class="toggle-label">
+                    <input type="checkbox" name="allow_order_on_invoice" id="allow_order_on_invoice" class="toggle"
+                      ${b2bConfig.effective.allow_order_on_invoice !== false ? 'checked' : ''}>
+                  </label>
+                </div>
               </div>
             </div>
-            <div class="form-row" style="margin-bottom:0.5rem;align-items:center">
-              <label style="min-width:120px">Min order ($)</label>
-              <div style="display:flex;align-items:center;gap:0.5rem">
-                <input type="number" name="min_order_usd" value="${b2bConfig.overrides.min_order_usd !== null ? h(String(b2bConfig.overrides.min_order_usd)) : ''}" min="0" step="1" class="input input-sm" style="width:100px" placeholder="${h(String(b2bConfig.defaults.min_order_usd))}">
-                <span class="badge ${b2bConfig.overrides.min_order_usd !== null ? 'badge-warning' : 'badge-muted'}">${b2bConfig.overrides.min_order_usd !== null ? 'override: $' + h(String(b2bConfig.effective.min_order_usd)) : 'default'}</span>
-              </div>
-            </div>
-            <div class="form-row" style="margin-bottom:0.5rem;align-items:center">
-              <label style="min-width:120px">Payment terms</label>
-              <div style="display:flex;align-items:center;gap:0.5rem">
-                <input type="text" name="payment_terms" value="${h(b2bConfig.overrides.payment_terms ?? '')}" class="input input-sm" style="width:160px" placeholder="${h(b2bConfig.defaults.payment_terms)}">
-                <span class="badge ${b2bConfig.overrides.payment_terms !== null ? 'badge-warning' : 'badge-muted'}">${b2bConfig.overrides.payment_terms !== null ? 'override' : 'default'}</span>
-              </div>
-            </div>
-            <div style="margin-top:0.5rem"><button type="submit" class="btn btn-secondary btn-sm">Save B2B Config</button></div>
+            <div style="margin-top:1rem"><button type="submit" class="btn btn-primary btn-sm">Save changes</button></div>
           </form>
         </div>
       </div>
@@ -1432,12 +1593,6 @@ function renderCustomerDetail(session, customer, recentOrders, notes, dropshipCa
             if(btn && form){ btn.addEventListener('click',function(){ form.hidden=false; form.querySelector('input').focus(); }); }
           })();
           </script>
-        </div>
-        <div class="card">
-          <div class="card-header"><h2>Metafields (b2b)</h2></div>
-          ${metafields.length > 0
-            ? `<table class="mini-table"><tbody>${metafields.map(m=>`<tr><td class="mono">${h(m.key)}</td><td>${h(m.value)}</td></tr>`).join('')}</tbody></table>`
-            : '<p class="text-muted small-text">No b2b metafields</p>'}
         </div>
       </div>
     </div>
@@ -1877,7 +2032,7 @@ app.get('/', requireAuth, async (req, res) => {
 // ── Orders ──
 // MUST define /orders/new and /orders/bulk BEFORE /orders/:id
 app.get('/orders', requireAuth, async (req, res) => {
-  const filters = { q: req.query.q || '', status: req.query.status || '', date: req.query.date || '', after: req.query.after || '', success: req.query.success || '' };
+  const filters = { q: req.query.q || '', source: req.query.source || '', status: req.query.status || '', date: req.query.date || '', after: req.query.after || '', success: req.query.success || '' };
   const data = await getOrdersData(filters);
   res.send(renderOrdersList(req.adminSession, data, filters));
 });
@@ -2067,7 +2222,7 @@ app.get('/customers/export.csv', requireAuth, async (req, res) => {
 
 // ── Customers ──
 app.get('/customers', requireAuth, async (req, res) => {
-  const filters = { q: req.query.q || '', tag: req.query.tag || '', after: req.query.after || '' };
+  const filters = { q: req.query.q || '', segment: req.query.segment || '', tag: req.query.tag || '', after: req.query.after || '' };
   const data = await getCustomersData(filters);
   res.send(renderCustomersList(req.adminSession, data, filters));
 });
@@ -2142,15 +2297,21 @@ app.post('/customers/:id/dropship', requireAuth, async (req, res) => {
   res.redirect(`/customers/${req.params.id}?success=dropship_saved`);
 });
 
-// ── Phase 7: B2B config overrides ─────────────────────────────────────────────
+// ── Phase 7/10: B2B config (unified: discount + dropship + allow_order_on_invoice) ──
 
 app.post('/customers/:id/b2b-config', requireAuth, async (req, res) => {
   const numId = req.params.id;
+  // Checkboxes: if absent from form body, checkbox was unchecked → explicitly set false
+  const body = {
+    ...req.body,
+    dropship_enabled:       'dropship_enabled'       in req.body ? req.body.dropship_enabled       : 'false',
+    allow_order_on_invoice: 'allow_order_on_invoice' in req.body ? req.body.allow_order_on_invoice : 'false',
+  };
   const before = await getB2bConfig(numId);
-  await applyB2bConfigUpdate(numId, req.body);
+  await applyB2bConfigUpdate(numId, body);
   const after = await getB2bConfig(numId);
   auditLog(req.adminSession.email, 'customer:b2b-config', shopifyCustomerGid(numId), before.overrides, after.overrides);
-  res.redirect(`/customers/${numId}?success=b2b_config_saved`);
+  res.redirect(`/customers/${numId}?success=b2b_settings_saved`);
 });
 
 app.get('/api/admin/customers/:id/b2b-config', requireAuth, async (req, res) => {

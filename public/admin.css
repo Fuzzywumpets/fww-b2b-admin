@@ -1114,3 +1114,58 @@ kbd {
   .exports-layout { grid-template-columns: 1fr; }
   .tab { padding: 0.4rem 0.75rem; font-size: 0.8rem; }
 }
+
+/* ── Phase 9: Filter chips + source badges + tag chips ── */
+.filter-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.375rem;
+  margin-bottom: 0.75rem;
+}
+.filter-chip {
+  display: inline-block;
+  padding: 0.25rem 0.75rem;
+  border: 1px solid var(--gray-200);
+  border-radius: 9999px;
+  font-size: 0.8rem;
+  font-weight: 500;
+  color: var(--gray-600);
+  background: #fff;
+  text-decoration: none;
+  transition: background 0.1s, border-color 0.1s;
+}
+.filter-chip:hover { background: var(--gray-50); border-color: var(--gray-400); }
+.filter-chip-active { background: var(--curtain-blue); color: #fff; border-color: var(--curtain-blue); }
+.filter-chip-active:hover { background: #1a6f96; }
+
+/* Source badges on order rows */
+.badge-src-lime     { background: #d4edaa; color: #3a5200; }
+.badge-src-blue     { background: #d9e8ff; color: #0c4478; }
+.badge-src-orange   { background: #fde8cc; color: #7a3800; }
+.badge-src-gray     { background: var(--gray-100); color: var(--gray-600); }
+.badge-src-muted    { background: var(--gray-50);  color: var(--gray-400); }
+
+/* Colored tag chips on customer rows */
+.tag-chip-b2b         { background: #d4edaa; color: #3a5200; }
+.tag-chip-sparklayer  { background: #d9e8ff; color: #0c4478; }
+.tag-chip-admin       { background: #e8d9ff; color: #4a0c78; }
+.tag-chip-gold        { background: #fef3c7; color: #92400e; }
+.tag-chip-tier        { background: #e0f2fe; color: #075985; }
+.tag-chip-default     { background: var(--gray-100); color: var(--gray-600); }
+.tag-chip-more        { background: transparent; color: var(--gray-400); border: 1px solid var(--gray-200); cursor: default; }
+
+/* Phase 10: Unified B2B Customer Settings section */
+.b2b-settings-grid { display: grid; gap: 0.75rem; }
+.b2b-field-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: start;
+  gap: 0.75rem;
+  padding: 0.625rem 0;
+  border-bottom: 1px solid var(--gray-100);
+}
+.b2b-field-row:last-child { border-bottom: none; }
+.b2b-field-label { font-weight: 600; font-size: 0.875rem; }
+.b2b-field-help  { font-size: 0.75rem; color: var(--gray-500); margin-top: 0.25rem; max-width: 340px; }
+.b2b-field-control { display: flex; align-items: center; gap: 0.5rem; }
+.b2b-field-control input[disabled] { opacity: 0.4; cursor: not-allowed; }

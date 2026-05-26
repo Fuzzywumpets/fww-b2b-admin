@@ -185,7 +185,7 @@ await test('/customers shows customer list with search', async (page, ctx) => {
   assert.ok(html.includes('Lifetime Spend'), 'Missing column');
 });
 
-await test('/customers/101 shows customer detail with notes and dropship form', async (page, ctx) => {
+await test('/customers/101 shows customer detail with notes and B2B settings form', async (page, ctx) => {
   const sid = await seedSession();
   await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
 
@@ -194,8 +194,8 @@ await test('/customers/101 shows customer detail with notes and dropship form', 
   const html = await page.content();
   assert.ok(html.includes('Acme Pet Supply'), 'Missing customer name');
   assert.ok(html.includes('Internal Notes'), 'Missing notes section');
-  assert.ok(html.includes('Dropship Config'), 'Missing dropship section');
-  assert.ok(html.includes('margin_pct'), 'Missing margin_pct input');
+  assert.ok(html.includes('Drop-ship'), 'Missing dropship section');
+  assert.ok(html.includes('dropship_margin_pct'), 'Missing dropship_margin_pct input');
 });
 
 await test('/customers/101 note save persists and shows success banner', async (page, ctx) => {
@@ -476,26 +476,25 @@ await testMobile('/exports renders without overflow at 390px', async (page, ctx)
   assert.ok(scrollWidth <= clientWidth + 4, `Overflow on /exports at 390px: scrollW=${scrollWidth} clientW=${clientWidth}`);
 });
 
-// ── Phase 7: B2B config overrides UI ─────────────────────────────────────────
-console.log('\nUI tests — Phase 7: B2B config overrides:');
+// ── Phase 7/10: B2B Customer Settings UI ──────────────────────────────────────
+console.log('\nUI tests — Phase 7/10: B2B Customer Settings:');
 
-await test('/customers/:id shows B2B pricing & terms section', async (page, ctx) => {
+await test('/customers/:id shows unified B2B Customer Settings section', async (page, ctx) => {
   const sid = await seedSession();
   await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
   await page.goto(`${BASE}/customers/101`);
-  await page.waitForSelector('#b2b-pricing-card');
+  await page.waitForSelector('#b2b-settings-card');
   const html = await page.content();
-  assert.ok(html.includes('B2B Pricing'), 'Missing B2B Pricing heading');
+  assert.ok(html.includes('B2B Customer Settings'), 'Missing B2B Customer Settings heading');
   assert.ok(html.includes('Discount %'), 'Missing discount field');
-  assert.ok(html.includes('Min order'), 'Missing min order field');
-  assert.ok(html.includes('Payment terms'), 'Missing payment terms field');
+  assert.ok(html.includes('allow_order_on_invoice'), 'Missing allow_order_on_invoice field');
 });
 
 await test('customer B2B config shows override badge for customer 101', async (page, ctx) => {
   const sid = await seedSession();
   await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
   await page.goto(`${BASE}/customers/101`);
-  await page.waitForSelector('#b2b-pricing-card');
+  await page.waitForSelector('#b2b-settings-card');
   const html = await page.content();
   assert.ok(html.includes('override'), 'Should show override badge for customer 101 discount_pct=60');
 });
@@ -504,12 +503,12 @@ await test('customer B2B config save form redirects with success', async (page, 
   const sid = await seedSession();
   await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
   await page.goto(`${BASE}/customers/103`);
-  await page.waitForSelector('#b2b-pricing-card');
+  await page.waitForSelector('#b2b-settings-form');
   await page.fill('input[name="discount_pct"]', '55');
-  await page.click('#b2b-pricing-card button[type="submit"]');
-  await page.waitForURL(/b2b_config_saved/);
+  await page.click('#b2b-settings-form button[type="submit"]');
+  await page.waitForURL(/b2b_settings_saved|b2b_config_saved/);
   const html = await page.content();
-  assert.ok(html.includes('B2B pricing config saved'), 'Missing success flash');
+  assert.ok(html.includes('B2B customer settings saved'), 'Missing success flash');
 });
 
 // ── Phase 8: 10 templates + 6 checkboxes UI ──────────────────────────────────

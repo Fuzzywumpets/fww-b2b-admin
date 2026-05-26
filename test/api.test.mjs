@@ -258,7 +258,7 @@ await test('GET /customers/101 returns customer detail', async () => {
   assert.ok(html.includes('Acme Pet Supply'), 'Missing customer name');
   assert.ok(html.includes('buyer@acme.com'), 'Missing customer email');
   assert.ok(html.includes('Internal Notes'), 'Missing notes section');
-  assert.ok(html.includes('Dropship'), 'Missing dropship section');
+  assert.ok(html.includes('Drop-ship') || html.includes('B2B Customer Settings'), 'Missing B2B settings section');
 });
 
 await test('GET /customers/9999 returns 404 for non-existent customer', async () => {
@@ -901,8 +901,8 @@ await test('CSV escape handles commas, quotes, and newlines', async () => {
   assert.ok(text.startsWith('product_title'), 'CSV should start with header');
 });
 
-// ── Phase 7: B2B config overrides ─────────────────────────────────────────────
-console.log('\nAPI tests — Phase 7: B2B config overrides:');
+// ── Phase 7/10: B2B config overrides (4 fields) ───────────────────────────────
+console.log('\nAPI tests — Phase 7/10: B2B config overrides:');
 
 await test('GET /api/admin/customers/:id/b2b-config returns effective/overrides/defaults', async () => {
   const cookie = await seedSession();
@@ -914,22 +914,35 @@ await test('GET /api/admin/customers/:id/b2b-config returns effective/overrides/
   assert.ok('overrides' in data, 'Missing overrides');
   assert.ok('defaults' in data, 'Missing defaults');
   assert.ok('discount_pct' in data.effective, 'Missing discount_pct in effective');
+  assert.ok('allow_order_on_invoice' in data.effective, 'Missing allow_order_on_invoice in effective');
   assert.equal(data.overrides.discount_pct, 60, 'Customer 101 should have discount_pct override=60');
 });
 
-await test('PUT /api/admin/customers/:id/b2b-config sets override', async () => {
+await test('PUT /api/admin/customers/:id/b2b-config sets discount_pct override', async () => {
   const cookie = await seedSession();
   const res = await fetch(`${BASE}/api/admin/customers/103/b2b-config`, {
     method: 'PUT',
     headers: { Cookie: cookie, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ discount_pct: 55, payment_terms: 'NET 60' }),
+    body: JSON.stringify({ discount_pct: 55 }),
   });
   assert.equal(res.status, 200);
   const data = await res.json();
   assert.ok(data.ok, 'Should return ok');
   assert.equal(data.overrides.discount_pct, 55, 'Should have discount_pct override');
-  assert.equal(data.overrides.payment_terms, 'NET 60', 'Should have payment_terms override');
   assert.equal(data.effective.discount_pct, 55, 'Effective should reflect override');
+});
+
+await test('PUT /api/admin/customers/:id/b2b-config sets allow_order_on_invoice', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/api/admin/customers/105/b2b-config`, {
+    method: 'PUT',
+    headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ allow_order_on_invoice: false }),
+  });
+  assert.equal(res.status, 200);
+  const data = await res.json();
+  assert.ok(data.ok, 'Should return ok');
+  assert.equal(data.effective.allow_order_on_invoice, false, 'Effective should reflect override');
 });
 
 await test('PUT /api/admin/customers/:id/b2b-config clears override with null', async () => {
@@ -949,7 +962,6 @@ await test('PUT /api/admin/customers/:id/b2b-config clears override with null', 
   assert.equal(res.status, 200);
   const data = await res.json();
   assert.equal(data.overrides.discount_pct, null, 'Override should be cleared');
-  // Effective should fall back to default (50)
   assert.equal(data.effective.discount_pct, data.defaults.discount_pct, 'Effective should equal default when override cleared');
 });
 
@@ -958,21 +970,21 @@ await test('POST /customers/:id/b2b-config form saves override and redirects', a
   const res = await fetch(`${BASE}/customers/103/b2b-config`, {
     method: 'POST',
     headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({ discount_pct: '65', min_order_usd: '200', payment_terms: 'NET 45' }).toString(),
+    body: new URLSearchParams({ discount_pct: '65', dropship_margin_pct: '25' }).toString(),
     redirect: 'manual',
   });
   assert.equal(res.status, 302, 'Should redirect after save');
-  assert.ok(res.headers.get('location')?.includes('b2b_config_saved'), 'Should redirect with success param');
+  assert.ok(res.headers.get('location')?.includes('b2b_settings_saved') || res.headers.get('location')?.includes('b2b_config_saved'), 'Should redirect with success param');
 });
 
-await test('GET /customers/:id shows B2B pricing section', async () => {
+await test('GET /customers/:id shows B2B Customer Settings section', async () => {
   const cookie = await seedSession();
   const res = await fetch(`${BASE}/customers/101`, { headers: { Cookie: cookie } });
   assert.equal(res.status, 200);
   const html = await res.text();
-  assert.ok(html.includes('B2B Pricing') || html.includes('b2b-pricing'), 'Missing B2B pricing section');
+  assert.ok(html.includes('B2B Customer Settings'), 'Missing B2B Customer Settings section');
   assert.ok(html.includes('Discount %'), 'Missing discount field');
-  assert.ok(html.includes('Payment terms'), 'Missing payment terms field');
+  assert.ok(html.includes('allow_order_on_invoice'), 'Missing allow_order_on_invoice field');
 });
 
 await test('B2B config audit log is written on update', async () => {
@@ -983,8 +995,68 @@ await test('B2B config audit log is written on update', async () => {
     body: JSON.stringify({ discount_pct: 40 }),
   });
   const auditRes = await fetch(`${BASE}/audit?format=json`, { headers: { Cookie: cookie } });
-  // Audit page exists (200); we can't easily read JSON but we can verify the endpoint works
   assert.ok(auditRes.status === 200 || auditRes.status === 404, 'Audit endpoint should be accessible');
+});
+
+// ── Phase 9: Broadened orders/customers scope ──────────────────────────────────
+console.log('\nAPI tests — Phase 9: Broadened orders/customers scope:');
+
+await test('GET /orders shows all orders by default (not just b2b-portal)', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/orders`, { headers: { Cookie: cookie } });
+  const html = await res.text();
+  assert.ok(html.includes('#1001'), 'Missing b2b-portal order #1001');
+  assert.ok(html.includes('#1005'), 'Missing SparkLayer order #1005');
+  assert.ok(html.includes('#1006'), 'Missing POS order #1006');
+  assert.ok(html.includes('filter-chip'), 'Missing source filter chips');
+});
+
+await test('GET /orders?source=b2b-portal filters to b2b-portal only', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/orders?source=b2b-portal`, { headers: { Cookie: cookie } });
+  const html = await res.text();
+  assert.ok(html.includes('#1001'), 'Should include b2b-portal order');
+  assert.ok(!html.includes('#1006') || html.includes('No orders found'), 'Should not include POS order');
+});
+
+await test('GET /orders?source=sparklayer filters to sparklayer only', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/orders?source=sparklayer`, { headers: { Cookie: cookie } });
+  const html = await res.text();
+  assert.ok(html.includes('#1005'), 'Should include SparkLayer order');
+  assert.ok(!html.includes('#1006') || html.includes('No orders found'), 'Should not include POS order');
+});
+
+await test('GET /orders?source=pos filters to POS only', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/orders?source=pos`, { headers: { Cookie: cookie } });
+  const html = await res.text();
+  assert.ok(html.includes('#1006'), 'Should include POS order');
+  assert.ok(!html.includes('#1001') || html.includes('No orders found'), 'Should not include b2b-portal order');
+});
+
+await test('GET /customers shows all customers by default (not just b2b-tagged)', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/customers`, { headers: { Cookie: cookie } });
+  const html = await res.text();
+  assert.ok(html.includes('Acme Pet Supply'), 'Missing b2b customer');
+  assert.ok(html.includes('Top Dog Boutique'), 'Missing SparkLayer customer');
+  assert.ok(html.includes('filter-chip'), 'Missing segment filter chips');
+});
+
+await test('GET /customers?segment=b2b filters to b2b-tagged only', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/customers?segment=b2b`, { headers: { Cookie: cookie } });
+  const html = await res.text();
+  assert.ok(html.includes('Acme Pet Supply'), 'Should include b2b customer');
+  assert.ok(!html.includes('Top Dog Boutique') || html.includes('No customers found'), 'Should not include non-b2b customer');
+});
+
+await test('GET /customers?segment=sparklayer filters to SparkLayer customers', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/customers?segment=sparklayer`, { headers: { Cookie: cookie } });
+  const html = await res.text();
+  assert.ok(html.includes('Top Dog Boutique'), 'Should include SparkLayer customer');
 });
 
 // ── Phase 8: 10 templates + 6-checkbox fields ─────────────────────────────────
