@@ -298,6 +298,11 @@ body {
 .badge-partially_paid { background: #FEE2E2; color: #991B1B; }
 .badge-refunded   { background: var(--gray-100); color: var(--gray-500); }
 .badge-voided     { background: var(--gray-100); color: var(--gray-500); }
+.badge-draft      { background: #FEF3C7; color: #92400E; font-size: 10px; }
+.badge-archived   { background: var(--gray-200); color: var(--gray-500); font-size: 10px; }
+.row-archived td  { opacity: 0.5; }
+.chip-count       { font-size: 11px; color: var(--gray-400); }
+.top-customer-star { color: #D97706; font-size: 13px; margin-right: 2px; }
 
 /* ── Stock indicators ── */
 .qty-zero     { color: var(--red); font-weight: 700; }

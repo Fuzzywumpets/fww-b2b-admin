@@ -540,6 +540,64 @@ await test('/labels shows 6-field checkboxes with correct defaults', async (page
   assert.ok(!skuChecked, 'SKU checkbox should be unchecked by default');
 });
 
+// ── Phase 19E: Catalog status filter ────────────────────────────────────────
+console.log('\nUI tests — Phase 19E: Catalog status filter:');
+
+await test('/catalog shows status filter chips', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/catalog`);
+  await page.waitForSelector('#catalog-status-chips');
+  const html = await page.content();
+  assert.ok(html.includes('Active'), 'Active chip missing');
+  assert.ok(html.includes('Draft'),  'Draft chip missing');
+  assert.ok(html.includes('Archived'), 'Archived chip missing');
+  assert.ok(html.includes('filter-chip-active'), 'No active chip highlighted');
+});
+
+await test('/catalog default shows Active products only (no archived row)', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/catalog`);
+  await page.waitForSelector('.data-table');
+  const html = await page.content();
+  assert.ok(html.includes('Elite Collar'), 'Active product missing');
+  assert.ok(!html.includes('row-archived'), 'Archived row should not appear in default (active) view');
+});
+
+await test('/catalog?status=all shows ARCHIVED badge on archived product row', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/catalog?status=all`);
+  await page.waitForSelector('.data-table');
+  const html = await page.content();
+  assert.ok(html.includes('badge-archived') || html.includes('ARCHIVED'), 'ARCHIVED badge missing in all view');
+  assert.ok(html.includes('row-archived'), 'row-archived class missing on archived row');
+});
+
+// ── Phase 20: Priority customers ─────────────────────────────────────────────
+console.log('\nUI tests — Phase 20: Priority customers:');
+
+await test('/customers shows sort dropdown', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/customers`);
+  await page.waitForSelector('.data-table');
+  const sortSelect = await page.$('select[name="sort"]');
+  assert.ok(sortSelect, 'Sort dropdown missing');
+  const html = await page.content();
+  assert.ok(html.includes('lifetime_spend_desc') || html.includes('Lifetime spend'), 'Sort option missing');
+});
+
+await test('/customers shows star badge on top-spend customer', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/customers`);
+  await page.waitForSelector('.data-table');
+  const html = await page.content();
+  assert.ok(html.includes('top-customer-star'), 'Top customer star badge missing');
+});
+
 await browser.close();
 
 console.log(`\n  ${passed} passed, ${failed} failed`);

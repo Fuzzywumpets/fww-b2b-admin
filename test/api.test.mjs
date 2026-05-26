@@ -1286,5 +1286,109 @@ await test('GET /tax-exempt → no auth → redirect to /login', async () => {
   assert.ok(res.headers.get('location')?.includes('/login'));
 });
 
+// ── Phase 19E: Catalog status filter ────────────────────────────────────────
+console.log('\nAPI tests — Phase 19E: Catalog status filter:');
+
+await test('GET /catalog (no query) → shows only Active products by default', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/catalog`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  // Active products should appear; draft/archived should NOT
+  assert.ok(html.includes('Elite Collar'), 'Active product missing');
+  assert.ok(!html.includes('Legacy Slip Lead'), 'Archived product should not appear in default view');
+  assert.ok(!html.includes('Everyday Bandana (Draft)'), 'Draft product should not appear in default view');
+});
+
+await test('GET /catalog?status=all → shows all products including draft and archived', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/catalog?status=all`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  assert.ok(html.includes('Elite Collar'), 'Active product missing in all view');
+  assert.ok(html.includes('Legacy Slip Lead'), 'Archived product missing in all view');
+  assert.ok(html.includes('Everyday Bandana'), 'Draft product missing in all view');
+});
+
+await test('GET /catalog?status=draft → shows only draft products', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/catalog?status=draft`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  assert.ok(html.includes('Everyday Bandana'), 'Draft product should appear in draft view');
+  assert.ok(!html.includes('Elite Collar'), 'Active product should not appear in draft view');
+});
+
+await test('GET /catalog?status=archived → shows only archived products', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/catalog?status=archived`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  assert.ok(html.includes('Legacy Slip Lead'), 'Archived product should appear in archived view');
+  assert.ok(!html.includes('Elite Collar'), 'Active product should not appear in archived view');
+});
+
+await test('GET /catalog → status chips render with counts', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/catalog`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  assert.ok(html.includes('catalog-status-chips'), 'Status chips container missing');
+  assert.ok(html.includes('filter-chip'), 'Filter chips missing');
+});
+
+// ── Phase 20: Priority customers ─────────────────────────────────────────────
+console.log('\nAPI tests — Phase 20: Priority customers:');
+
+await test('GET /customers → sorted by lifetime spend desc by default', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/customers`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  // Top spender (Acme Pet Supply $4520) should appear before lower spenders
+  const acmePos = html.indexOf('Acme Pet Supply');
+  const pawCentralPos = html.indexOf('Paw Central');
+  assert.ok(acmePos !== -1, 'Acme Pet Supply should be in list');
+  assert.ok(pawCentralPos !== -1, 'Paw Central should be in list');
+  assert.ok(acmePos < pawCentralPos, 'Acme (higher spend) should appear before Paw Central (lower spend)');
+});
+
+await test('GET /customers → sort dropdown renders', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/customers`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  assert.ok(html.includes('name="sort"'), 'Sort dropdown missing');
+  assert.ok(html.includes('Lifetime spend'), 'Sort option missing');
+});
+
+await test('GET /customers → star badges appear on top customers', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/customers`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  assert.ok(html.includes('top-customer-star'), 'Top customer star badge missing');
+});
+
+await test('GET /customers?sort=name_asc → sorted alphabetically', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/customers?sort=name_asc`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  // Acme Pet Supply comes before Paw Central alphabetically
+  const acmePos = html.indexOf('Acme Pet Supply');
+  const pawCentralPos = html.indexOf('Paw Central');
+  assert.ok(acmePos < pawCentralPos, 'Name sort: Acme should appear before Paw Central');
+});
+
+await test('GET / (dashboard) → top customers widget shows spend + order count', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  assert.ok(html.includes('Top Customers'), 'Top Customers widget missing');
+  assert.ok(html.includes('top-customer-star'), 'Star badge missing in dashboard widget');
+});
+
 console.log(`\n  ${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);

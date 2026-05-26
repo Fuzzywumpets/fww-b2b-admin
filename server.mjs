@@ -360,7 +360,7 @@ const MOCK_PRODUCTS = [
 // Phase 3 mock data ─────────────────────────────────────────────────────────
 const MOCK_CATALOG_PRODUCTS = [
   { id: 'gid://shopify/Product/201', title: 'Elite Collar', handle: 'elite-collar',
-    vendor: 'Fuzzywumpets', tags: ['Style_Elite', 'b2b'], publishedOnB2B: true,
+    vendor: 'Fuzzywumpets', tags: ['Style_Elite', 'b2b'], publishedOnB2B: true, status: 'active',
     variants: { edges: [
       { node: { id: 'gid://shopify/ProductVariant/301', sku: 'EC-001-S-NV', title: 'Small / Navy', inventoryQuantity: 24 } },
       { node: { id: 'gid://shopify/ProductVariant/302', sku: 'EC-001-M-NV', title: 'Medium / Navy', inventoryQuantity: 12 } },
@@ -368,36 +368,48 @@ const MOCK_CATALOG_PRODUCTS = [
     ]}
   },
   { id: 'gid://shopify/Product/202', title: 'Luxe Leash', handle: 'luxe-leash',
-    vendor: 'Fuzzywumpets', tags: ['Style_Luxe', 'b2b'], publishedOnB2B: true,
+    vendor: 'Fuzzywumpets', tags: ['Style_Luxe', 'b2b'], publishedOnB2B: true, status: 'active',
     variants: { edges: [
       { node: { id: 'gid://shopify/ProductVariant/303', sku: 'LL-005', title: 'Default Title', inventoryQuantity: 5 } },
     ]}
   },
   { id: 'gid://shopify/Product/203', title: 'Simplicity Collar', handle: 'simplicity-collar',
-    vendor: 'Fuzzywumpets', tags: ['Style_Simplicity', 'b2b'], publishedOnB2B: true,
+    vendor: 'Fuzzywumpets', tags: ['Style_Simplicity', 'b2b'], publishedOnB2B: true, status: 'active',
     variants: { edges: [
       { node: { id: 'gid://shopify/ProductVariant/304', sku: 'SC-002-M-RD', title: 'Medium / Red', inventoryQuantity: 7 } },
       { node: { id: 'gid://shopify/ProductVariant/305', sku: 'SC-002-L-RD', title: 'Large / Red', inventoryQuantity: 18 } },
     ]}
   },
   { id: 'gid://shopify/Product/204', title: 'Everyday Collar Bundle', handle: 'everyday-collar-bundle',
-    vendor: 'Fuzzywumpets', tags: ['Style_Everyday', 'b2b'], publishedOnB2B: true,
+    vendor: 'Fuzzywumpets', tags: ['Style_Everyday', 'b2b'], publishedOnB2B: true, status: 'active',
     variants: { edges: [
       { node: { id: 'gid://shopify/ProductVariant/306', sku: 'ECB-010-XL', title: 'XL', inventoryQuantity: 8 } },
     ]}
   },
   { id: 'gid://shopify/Product/205', title: 'Everyday Collar Starter', handle: 'everyday-collar-starter',
-    vendor: 'Fuzzywumpets', tags: ['Style_Everyday'], publishedOnB2B: false,
+    vendor: 'Fuzzywumpets', tags: ['Style_Everyday'], publishedOnB2B: false, status: 'active',
     variants: { edges: [
       { node: { id: 'gid://shopify/ProductVariant/308', sku: 'EC-STR-S', title: 'Small', inventoryQuantity: 45 } },
       { node: { id: 'gid://shopify/ProductVariant/309', sku: 'EC-STR-M', title: 'Medium', inventoryQuantity: 32 } },
     ]}
   },
   { id: 'gid://shopify/Product/206', title: 'Elite Harness', handle: 'elite-harness',
-    vendor: 'Fuzzywumpets', tags: ['Style_Elite', 'b2b'], publishedOnB2B: true,
+    vendor: 'Fuzzywumpets', tags: ['Style_Elite', 'b2b'], publishedOnB2B: true, status: 'active',
     variants: { edges: [
       { node: { id: 'gid://shopify/ProductVariant/310', sku: 'EH-001-S', title: 'Small', inventoryQuantity: 3 } },
       { node: { id: 'gid://shopify/ProductVariant/311', sku: 'EH-001-M', title: 'Medium', inventoryQuantity: 9 } },
+    ]}
+  },
+  { id: 'gid://shopify/Product/207', title: 'Everyday Bandana (Draft)', handle: 'everyday-bandana-draft',
+    vendor: 'Fuzzywumpets', tags: ['Style_Everyday'], publishedOnB2B: false, status: 'draft',
+    variants: { edges: [
+      { node: { id: 'gid://shopify/ProductVariant/312', sku: 'EB-DFT-S', title: 'Small', inventoryQuantity: 0 } },
+    ]}
+  },
+  { id: 'gid://shopify/Product/208', title: 'Legacy Slip Lead (Archived)', handle: 'legacy-slip-lead',
+    vendor: 'Fuzzywumpets', tags: ['Style_Simplicity'], publishedOnB2B: false, status: 'archived',
+    variants: { edges: [
+      { node: { id: 'gid://shopify/ProductVariant/313', sku: 'LSL-OLD-OS', title: 'One Size', inventoryQuantity: 0 } },
     ]}
   },
 ];
@@ -673,10 +685,10 @@ async function getDashboardData() {
       openOrdersCount: 2,
       openOrders: MOCK_ORDERS.filter(o => ['PENDING','AUTHORIZED'].includes(o.displayFinancialStatus)).slice(0, 5),
       weekOrdersCount: 3,
-      topCustomers: MOCK_CUSTOMERS.slice(0, 5).map(c => ({
-        id: c.id, name: c.displayName, email: c.email,
-        spend: parseFloat(c.amountSpent.amount),
-      })),
+      topCustomers: [...MOCK_CUSTOMERS]
+        .sort((a, b) => parseFloat(b.amountSpent?.amount || 0) - parseFloat(a.amountSpent?.amount || 0))
+        .slice(0, 5)
+        .map(c => ({ id: c.id, name: c.displayName, email: c.email, spend: parseFloat(c.amountSpent.amount), orders: c.numberOfOrders })),
       lowStockItems: [
         { productId: 'gid://shopify/Product/201', productTitle: 'Elite Collar', variantTitle: 'Large / Navy', sku: 'EC-001-L-NV', qty: 0 },
         { productId: 'gid://shopify/Product/202', productTitle: 'Luxe Leash', variantTitle: 'Default Title', sku: 'LL-005', qty: 5 },
@@ -740,10 +752,11 @@ function renderDashboard(session, data) {
     : '<p class="empty-state">No open orders</p>';
 
   const topCustomersTable = data.topCustomers?.length > 0
-    ? `<table class="mini-table"><thead><tr><th>Customer</th><th>Spend</th></tr></thead><tbody>
-      ${data.topCustomers.map(c => `<tr>
-        <td><a href="/customers/${shopifyNumericId(c.id)}">${h(c.name)}</a><br><small>${h(c.email)}</small></td>
-        <td>${fmtMoney(c.spend)}</td>
+    ? `<table class="mini-table"><thead><tr><th>Customer</th><th class="text-right">Spend</th><th class="text-right">Orders</th></tr></thead><tbody>
+      ${data.topCustomers.map((c, i) => `<tr>
+        <td><span class="top-customer-star" title="Top customer">★</span> <a href="/customers/${shopifyNumericId(c.id)}">${h(c.name)}</a><br><small class="text-muted">${h(c.email)}</small></td>
+        <td class="text-right mono">${fmtMoney(c.spend)}</td>
+        <td class="text-right"><a href="/orders?customer=${shopifyNumericId(c.id)}" class="link">${c.orders ?? '—'}</a></td>
       </tr>`).join('')}</tbody></table>`
     : '<p class="empty-state">No customer data</p>';
 
@@ -1267,6 +1280,15 @@ async function getCustomersData(filters) {
     if (filters.tag) {
       customers = customers.filter(c => (c.tags||[]).includes(filters.tag));
     }
+    // Sort: default = lifetime spend desc (Phase 20)
+    const sort = filters.sort || 'lifetime_spend_desc';
+    if (sort === 'lifetime_spend_desc') {
+      customers.sort((a, b) => parseFloat(b.amountSpent?.amount || 0) - parseFloat(a.amountSpent?.amount || 0));
+    } else if (sort === 'name_asc') {
+      customers.sort((a, b) => a.displayName.localeCompare(b.displayName));
+    } else if (sort === 'orders_desc') {
+      customers.sort((a, b) => (b.numberOfOrders || 0) - (a.numberOfOrders || 0));
+    }
     return { customers, hasNextPage: false, total: customers.length };
   }
   try {
@@ -1316,7 +1338,9 @@ function tagChip(t) {
 function renderCustomersList(session, data, filters) {
   const { customers, hasNextPage, endCursor, error } = data;
 
-  const rows = customers.map(c => {
+  // top-10 by spend get a star badge (Phase 20) — rank = index in list when sorted by spend
+  const TOP_CUSTOMER_THRESHOLD = 10;
+  const rows = customers.map((c, idx) => {
     const numId = shopifyNumericId(c.id);
     const dropship = c.metafields?.edges?.find(e => e.node.key === 'dropship_enabled')?.node?.value === 'true';
     const addr     = c.defaultAddress;
@@ -1324,12 +1348,14 @@ function renderCustomersList(session, data, filters) {
     const visibleTags = (c.tags || []).slice(0, 3);
     const moreTags    = (c.tags || []).length - visibleTags.length;
     const tagBadges   = visibleTags.map(tagChip).join('') + (moreTags > 0 ? `<span class="tag-chip tag-chip-more" title="${h((c.tags||[]).join(', '))}">+${moreTags}</span>` : '');
+    const isTop = (filters.sort || 'lifetime_spend_desc') === 'lifetime_spend_desc' && idx < TOP_CUSTOMER_THRESHOLD;
+    const starBadge = isTop ? `<span class="top-customer-star" title="Top customer by lifetime spend">★</span>` : '';
     return `<tr>
-      <td><a href="/customers/${h(numId)}" class="link-strong">${h(c.displayName)}</a><br><small>${h(c.email)}</small></td>
+      <td><a href="/customers/${h(numId)}" class="link-strong">${h(c.displayName)}</a>${starBadge}<br><small>${h(c.email)}</small></td>
       <td class="text-muted">${h(location)}</td>
       <td><div class="tags-mini">${tagBadges}</div></td>
       <td class="text-right mono">${fmtMoney(c.amountSpent?.amount, c.amountSpent?.currencyCode)}</td>
-      <td class="text-right">${c.numberOfOrders || 0}</td>
+      <td class="text-right"><a href="/orders?customer=${h(numId)}" class="link">${c.numberOfOrders || 0}</a></td>
       <td>${dropship ? '<span class="badge badge-dropship">Dropship</span>' : ''}</td>
       <td><a href="/customers/${h(numId)}" class="table-action">View →</a></td>
     </tr>`;
@@ -1343,6 +1369,7 @@ function renderCustomersList(session, data, filters) {
   if (filters.q)       currentParams.set('q', filters.q);
   if (filters.segment) currentParams.set('segment', filters.segment);
   if (filters.tag)     currentParams.set('tag', filters.tag);
+  if (filters.sort)    currentParams.set('sort', filters.sort);
   const nextParams = new URLSearchParams(currentParams);
   if (endCursor) nextParams.set('after', endCursor);
 
@@ -1360,6 +1387,13 @@ function renderCustomersList(session, data, filters) {
     return `<a href="/customers?${p}" class="filter-chip${active ? ' filter-chip-active' : ''}">${h(c.label)}</a>`;
   }).join('');
 
+  const sortOptions = [
+    { value: 'lifetime_spend_desc', label: 'Lifetime spend ↓' },
+    { value: 'orders_desc',         label: 'Order count ↓' },
+    { value: 'name_asc',            label: 'Name A–Z' },
+  ];
+  const currentSort = filters.sort || 'lifetime_spend_desc';
+
   return layout({ title: 'Customers', session, activePath: '/customers', content: `
     <div class="page-header-row"><h1>Customers</h1></div>
     ${error ? `<div class="alert alert-warning">Shopify unavailable: ${h(error)}</div>` : ''}
@@ -1372,6 +1406,9 @@ function renderCustomersList(session, data, filters) {
         <option value="b2b-tier:gold"   ${filters.tag==='b2b-tier:gold'?'selected':''}>Gold tier</option>
         <option value="b2b-tier:silver" ${filters.tag==='b2b-tier:silver'?'selected':''}>Silver tier</option>
         <option value="b2b-dropship"    ${filters.tag==='b2b-dropship'?'selected':''}>Dropship</option>
+      </select>
+      <select name="sort" class="filter-select" onchange="this.form.submit()">
+        ${sortOptions.map(o => `<option value="${h(o.value)}"${currentSort===o.value?' selected':''}>${h(o.label)}</option>`).join('')}
       </select>
       <button type="submit" class="btn btn-secondary">Filter</button>
       <a href="/customers" class="btn btn-ghost">Clear</a>
@@ -2442,7 +2479,7 @@ app.get('/customers/export.csv', requireAuth, async (req, res) => {
 
 // ── Customers ──
 app.get('/customers', requireAuth, async (req, res) => {
-  const filters = { q: req.query.q || '', segment: req.query.segment || '', tag: req.query.tag || '', after: req.query.after || '' };
+  const filters = { q: req.query.q || '', segment: req.query.segment || '', tag: req.query.tag || '', after: req.query.after || '', sort: req.query.sort || '' };
   const data = await getCustomersData(filters);
   res.send(renderCustomersList(req.adminSession, data, filters));
 });
@@ -2660,31 +2697,39 @@ function renderSparkline(values, opts = {}) {
 
 // ── Catalog ───────────────────────────────────────────────────────────────────
 
-async function getCatalogData({ vendor, style, stock, b2b, page = 1 }) {
+async function getCatalogData({ vendor, style, stock, b2b, status = 'active', page = 1 }) {
   if (MOCK) {
-    let prods = MOCK_CATALOG_PRODUCTS.map(p => {
+    const allProds = MOCK_CATALOG_PRODUCTS.map(p => {
       const ov = mockCatalogOverrides.get(shopifyNumericId(p.id)) || {};
       return { ...p, publishedOnB2B: ov.publishedOnB2B !== undefined ? ov.publishedOnB2B : p.publishedOnB2B };
     });
+    const statusCounts = {
+      active:   allProds.filter(p => (p.status || 'active') === 'active').length,
+      draft:    allProds.filter(p => p.status === 'draft').length,
+      archived: allProds.filter(p => p.status === 'archived').length,
+      all:      allProds.length,
+    };
+    let prods = status === 'all' ? allProds : allProds.filter(p => (p.status || 'active') === status);
     if (vendor)      prods = prods.filter(p => p.vendor === vendor);
     if (style)       prods = prods.filter(p => (p.tags || []).includes(`Style_${style}`));
     if (b2b === '1') prods = prods.filter(p => p.publishedOnB2B);
     if (b2b === '0') prods = prods.filter(p => !p.publishedOnB2B);
     if (stock === 'low')  prods = prods.filter(p => { const t = (p.variants?.edges||[]).reduce((s,e) => s+(e.node.inventoryQuantity||0),0); return t > 0 && t < 10; });
     if (stock === 'out')  prods = prods.filter(p => { const t = (p.variants?.edges||[]).reduce((s,e) => s+(e.node.inventoryQuantity||0),0); return t === 0; });
-    const vendors = [...new Set(MOCK_CATALOG_PRODUCTS.map(p => p.vendor))];
-    const styles  = [...new Set(MOCK_CATALOG_PRODUCTS.flatMap(p => (p.tags||[]).filter(t=>t.startsWith('Style_')).map(t=>t.slice(6))))];
-    return { products: prods, vendors, styles, total: prods.length, hasNextPage: false };
+    const vendors = [...new Set(allProds.map(p => p.vendor))];
+    const styles  = [...new Set(allProds.flatMap(p => (p.tags||[]).filter(t=>t.startsWith('Style_')).map(t=>t.slice(6))))];
+    return { products: prods, vendors, styles, total: prods.length, hasNextPage: false, statusCounts };
   }
 
   try {
-    let qParts = ['product_type:*'];
-    if (vendor) qParts.push(`vendor:"${vendor}"`);
+    const qParts = [];
+    if (vendor)           qParts.push(`vendor:"${vendor}"`);
+    if (status !== 'all') qParts.push(`status:${status}`);
     const result = await shopifyFetch(`
       query($q:String!,$after:String){
         products(first:50,query:$q,after:$after,sortKey:TITLE){
           edges{node{
-            id title handle vendor tags
+            id title handle vendor tags status
             publishedOnPublication(publicationId:"${B2B_PUB_ID}")
             variants(first:15){edges{node{sku title inventoryQuantity}}}
           }}
@@ -2702,17 +2747,40 @@ async function getCatalogData({ vendor, style, stock, b2b, page = 1 }) {
     if (stock === 'out')  prods = prods.filter(p => { const t=(p.variants?.edges||[]).reduce((s,e)=>s+(e.node.inventoryQuantity||0),0); return t===0; });
     const allVendors = [...new Set(result.data?.products?.edges?.map(e => e.node.vendor).filter(Boolean) || [])];
     const allStyles  = [...new Set((result.data?.products?.edges||[]).flatMap(e => (e.node.tags||[]).filter(t=>t.startsWith('Style_')).map(t=>t.slice(6))))];
-    return { products: prods, vendors: allVendors, styles: allStyles, total: prods.length, hasNextPage: result.data?.products?.pageInfo?.hasNextPage };
+    return { products: prods, vendors: allVendors, styles: allStyles, total: prods.length, hasNextPage: result.data?.products?.pageInfo?.hasNextPage, statusCounts: null };
   } catch (err) {
     console.error('getCatalogData error:', err.message);
-    return { products: [], vendors: [], styles: [], total: 0, hasNextPage: false, error: err.message };
+    return { products: [], vendors: [], styles: [], total: 0, hasNextPage: false, error: err.message, statusCounts: null };
   }
 }
 
 function renderCatalog(session, data, filters) {
-  const { products, vendors, styles, error } = data;
+  const { products, vendors, styles, error, statusCounts } = data;
+
+  // Status filter chips (Phase 19E) — Active is the default
+  const statusChips = [
+    { value: 'active',   label: 'Active' },
+    { value: 'draft',    label: 'Draft' },
+    { value: 'archived', label: 'Archived' },
+    { value: 'all',      label: 'All' },
+  ].map(c => {
+    const active = (filters.status || 'active') === c.value;
+    const count  = statusCounts ? statusCounts[c.value] : null;
+    const badge  = count != null ? ` <span class="chip-count">(${count})</span>` : '';
+    const params = new URLSearchParams();
+    if (c.value !== 'active') params.set('status', c.value);
+    if (filters.vendor) params.set('vendor', filters.vendor);
+    if (filters.style)  params.set('style',  filters.style);
+    if (filters.stock)  params.set('stock',  filters.stock);
+    if (filters.b2b)    params.set('b2b',    filters.b2b);
+    const href = params.toString() ? `/catalog?${params}` : '/catalog';
+    return `<a href="${href}" class="filter-chip${active ? ' filter-chip-active' : ''}">${h(c.label)}${badge}</a>`;
+  }).join('');
+
   const filterBar = `
+    <div class="filter-chips" id="catalog-status-chips">${statusChips}</div>
     <form method="GET" action="/catalog" class="filter-bar">
+      ${filters.status && filters.status !== 'active' ? `<input type="hidden" name="status" value="${h(filters.status)}">` : ''}
       <select name="vendor" onchange="this.form.submit()">
         <option value="">All vendors</option>
         ${(vendors||[]).map(v => `<option value="${h(v)}"${filters.vendor===v?' selected':''}>${h(v)}</option>`).join('')}
@@ -2753,9 +2821,16 @@ function renderCatalog(session, data, filters) {
     const b2bBadge = p.publishedOnB2B
       ? `<span class="badge badge-paid">B2B ✓</span>`
       : `<span class="badge badge-pending">Not on B2B</span>`;
-    return `<tr data-id="${h(numId)}">
+    const pStatus = (p.status || 'active').toLowerCase();
+    const statusBadge = pStatus === 'draft'
+      ? ` <span class="badge badge-draft">DRAFT</span>`
+      : pStatus === 'archived'
+        ? ` <span class="badge badge-archived">ARCHIVED</span>`
+        : '';
+    const rowClass = pStatus === 'archived' ? ' class="row-archived"' : '';
+    return `<tr data-id="${h(numId)}"${rowClass}>
       <td><input type="checkbox" name="ids" value="${h(numId)}" class="row-check" onchange="updateBulkBar()"></td>
-      <td><a href="/catalog/${h(numId)}" class="link-primary">${h(p.title)}</a></td>
+      <td><a href="/catalog/${h(numId)}" class="link-primary">${h(p.title)}</a>${statusBadge}</td>
       <td class="text-muted">${h(p.vendor||'—')}</td>
       <td>${style ? `<span class="tag-chip">${h(style)}</span>` : '—'}</td>
       <td class="mono text-sm">${variants.map(e => h(e.node.sku||'—')).join('<br>')}</td>
@@ -2819,6 +2894,7 @@ app.get('/catalog', requireAuth, async (req, res) => {
     style:  req.query.style  || '',
     stock:  req.query.stock  || '',
     b2b:    req.query.b2b    || '',
+    status: req.query.status || 'active',
   };
   const data = await getCatalogData(filters);
   res.send(renderCatalog(req.adminSession, data, filters));
