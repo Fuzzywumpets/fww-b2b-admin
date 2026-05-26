@@ -369,3 +369,126 @@ After picking an order or products, show an editable table of items:
 - alexa can toggle "Show retail price" and see the PDF change
 - alexa can switch detail level (product vs product+variant) and see the labels change
 - 15+ tests added for the engine + UI, all green
+
+## Phase 6 — Product CSV + Image Exports (build after Phase 5; can be parallel)
+
+Two related operator features for getting Shopify product data + media OUT of Shopify in formats
+alexa can hand to vendors, photographers, accountants, marketing, etc.
+
+### Routes
+
+- **`/exports`** — landing page with two cards: "CSV export" and "Image export"
+- **`/exports/csv`** — product picker + column selector → CSV download
+- **`/exports/images`** — product picker + image option toggle → ZIP download
+
+Reuse the same product-picker component built for Phase 5 (`/labels`). Source of truth = the B2B
+publication by default (publication 199709720811), with a filter toggle to expand to "all active
+products". Multi-select, search by title/handle/SKU, paginated.
+
+### CSV export — `/exports/csv`
+
+Default columns (all enabled, user can uncheck before generating):
+
+- `product_handle`, `product_title`, `vendor`, `product_type`, `style` (derived from `Style_*` tag),
+  `tags` (pipe-joined)
+- `variant_id` (numeric Shopify id), `variant_title`, `sku`, `barcode` (UPC), `price` (MSRP),
+  `b2b_price` (MSRP × 0.5), `compare_at_price`, `inventory_qty`, `inventory_policy`
+- `created_at`, `updated_at`
+
+One row per VARIANT (product info repeats for products with multiple variants). Use streaming
+CSV response (don't buffer 5000 rows in memory):
+
+```js
+res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+res.setHeader('Content-Disposition', `attachment; filename="fww-products-${ts}.csv"`);
+res.write(headerRow);
+for await (const variantRow of streamVariants(productIds, columns)) {
+  res.write(csvLine(variantRow));
+}
+res.end();
+```
+
+No new deps needed — implement CSV escape inline (`s => /[",\n\r]/.test(s) ? '"' + String(s).replace(/"/g,'""') + '"' : String(s)`).
+
+### Image export — `/exports/images`
+
+Two modes (radio):
+- **Main photo only** — one image per product: `{handle}.jpg`
+- **Main + all gallery images** — every product image: `{handle}_01.jpg`, `{handle}_02.jpg`, ...
+
+Output: single ZIP archive. Use the `archiver` npm package (new dep) which streams to the
+response. Don't buffer in memory:
+
+```js
+import archiver from 'archiver';
+const zip = archiver('zip', { zlib: { level: 6 } });
+res.setHeader('Content-Type', 'application/zip');
+res.setHeader('Content-Disposition', `attachment; filename="fww-images-${ts}.zip"`);
+zip.pipe(res);
+for (const p of products) {
+  for (const [i, img] of imagesForProduct(p, mode).entries()) {
+    // Fetch from Shopify CDN, pipe directly into zip entry
+    const r = await fetch(img.url);
+    const buf = Buffer.from(await r.arrayBuffer());
+    const name = mode === 'main-only'
+      ? `${p.handle}${path.extname(new URL(img.url).pathname) || '.jpg'}`
+      : `${p.handle}_${String(i+1).padStart(2,'0')}${path.extname(new URL(img.url).pathname) || '.jpg'}`;
+    zip.append(buf, { name });
+  }
+}
+zip.finalize();
+```
+
+Shopify Admin GraphQL for fetching all images per product:
+
+```graphql
+query($ids: [ID!]!) {
+  nodes(ids: $ids) {
+    ... on Product {
+      id handle title
+      featuredImage { url altText }
+      images(first: 30) { edges { node { url altText } } }
+    }
+  }
+}
+```
+
+Use `featuredImage.url` for main-only, all `images.edges[].node.url` for main+gallery.
+
+### Image source URLs
+
+Shopify CDN URLs come from the GraphQL response unmodified. They include the original
+upload's extension (jpg, png, etc.). If the original was uploaded as PNG, the ZIP entry should
+keep .png. Default to `.jpg` if extension can't be parsed.
+
+You can request specific transforms by appending `?width=` to the URL but for these exports
+**use the original** (no transform) — alexa may want full-resolution for print/photography.
+
+### UI patterns
+
+Mirror the `/labels` page style (two-flow tabs work here too if you want, but a simple form
+that toggles "CSV vs Images" mode also works). Show a count of selected products and an estimated
+file size warning ("~5 MB" for CSVs over 1000 rows, "~250 MB for image ZIPs over 500 images") so
+alexa knows what's coming.
+
+### Persistence + audit
+
+- Save user's last-used columns + image mode in `admin_settings` SQLite table (same table as
+  Phase 5's label preferences).
+- Log every export to `export_batches` SQLite (id, email, ts, type='csv'|'images', product_count,
+  row_or_image_count, bytes_out_approx). Optional but useful for "what did I download last week?".
+
+### Tests
+
+- API: GET /exports/csv?ids=mock1,mock2&cols=handle,title,sku → returns CSV with right header + N data rows
+- API: GET /exports/images?ids=mock1&mode=main-only → returns Zip with N entries
+- API: GET /exports/images?ids=mock1&mode=gallery → returns Zip with > N entries
+- Engine unit: CSV escape handles commas/quotes/newlines in product titles
+- UI: navigate /exports → both cards visible → click "CSV export" → form renders → submit → download starts
+- UI: navigate /exports/images → toggle main-only ↔ gallery shows different "estimated images: X" count
+
+### Acceptance for Phase 6
+
+- alexa can select 50 products on /exports/csv, uncheck "compare_at_price" and "tags", click Download → gets a CSV with 200 rows (variants) and the right columns
+- alexa can select 10 products on /exports/images, choose "Main + all gallery", click Download → gets a ZIP with subfolders or flat-named files for ~40 images
+- Tests pass, including stream-based ones (don't load full ZIP into memory in tests; just assert headers + entry count via the archiver event)
