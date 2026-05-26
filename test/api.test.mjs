@@ -353,5 +353,238 @@ await test('GET /api/products/search requires auth', async () => {
   assert.equal(res.status, 401);
 });
 
+console.log('\nAPI tests — Phase 3: Catalog:');
+
+await test('GET /catalog returns 200 with product table', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/catalog`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  assert.ok(html.includes('Catalog'), 'Missing page title');
+  assert.ok(html.includes('Elite Collar'), 'Missing product');
+  assert.ok(html.includes('B2B Status'), 'Missing B2B Status column');
+});
+
+await test('GET /catalog without auth redirects to login', async () => {
+  const res = await fetch(`${BASE}/catalog`, { redirect: 'manual' });
+  assert.equal(res.status, 302);
+  assert.ok(res.headers.get('location')?.includes('/login'));
+});
+
+await test('GET /catalog?b2b=1 filters to B2B-published products', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/catalog?b2b=1`, { headers: { Cookie: cookie } });
+  const html = await res.text();
+  assert.ok(html.includes('Elite Collar'), 'Should show B2B products');
+  assert.ok(!html.includes('Everyday Collar Starter'), 'Should not show non-B2B products');
+});
+
+await test('GET /catalog?stock=low shows only low-stock products', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/catalog?stock=low`, { headers: { Cookie: cookie } });
+  const html = await res.text();
+  assert.ok(html.includes('Catalog'), 'Missing page');
+  assert.ok(!html.includes('Everyday Collar Starter'), 'High-stock product should be filtered out');
+});
+
+await test('POST /catalog/:id/publish redirects back to /catalog', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/catalog/205/publish`, {
+    method: 'POST',
+    headers: { Cookie: cookie },
+    redirect: 'manual',
+  });
+  assert.equal(res.status, 302);
+  assert.ok(res.headers.get('location')?.includes('/catalog'));
+});
+
+await test('POST /catalog/:id/unpublish redirects back to /catalog', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/catalog/201/unpublish`, {
+    method: 'POST',
+    headers: { Cookie: cookie },
+    redirect: 'manual',
+  });
+  assert.equal(res.status, 302);
+  assert.ok(res.headers.get('location')?.includes('/catalog'));
+});
+
+await test('POST /catalog/bulk with publish action redirects', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/catalog/bulk`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: 'ids=205&ids=204&action=publish',
+    redirect: 'manual',
+  });
+  assert.equal(res.status, 302);
+  assert.ok(res.headers.get('location')?.includes('/catalog'));
+});
+
+await test('POST /catalog/bulk requires auth', async () => {
+  const res = await fetch(`${BASE}/catalog/bulk`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: 'ids=201&action=unpublish',
+    redirect: 'manual',
+  });
+  assert.equal(res.status, 302);
+  assert.ok(res.headers.get('location')?.includes('/login'));
+});
+
+console.log('\nAPI tests — Phase 3: Reports:');
+
+await test('GET /reports returns 200 with charts and tables', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/reports`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  assert.ok(html.includes('Reports'), 'Missing page title');
+  assert.ok(html.includes('Monthly Revenue'), 'Missing monthly chart');
+  assert.ok(html.includes('Sales by Customer'), 'Missing customer table');
+  assert.ok(html.includes('Sales by Product'), 'Missing product table');
+  assert.ok(html.includes('<svg'), 'Missing SVG chart');
+});
+
+await test('GET /reports/csv/monthly returns CSV file', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/reports/csv/monthly`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  assert.ok(res.headers.get('content-type')?.includes('text/csv'), 'Missing CSV content-type');
+  assert.ok(res.headers.get('content-disposition')?.includes('attachment'), 'Missing attachment header');
+  const text = await res.text();
+  assert.ok(text.includes('month'), 'Missing CSV header');
+  assert.ok(text.includes('revenue'), 'Missing revenue column');
+  const rows = text.trim().split('\n');
+  assert.ok(rows.length >= 13, `Expected 13+ rows (header + 12 months), got ${rows.length}`);
+});
+
+await test('GET /reports/csv/customers returns CSV with customer data', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/reports/csv/customers`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const text = await res.text();
+  assert.ok(text.includes('name'), 'Missing name column');
+  assert.ok(text.includes('Acme Pet Supply'), 'Missing customer data');
+});
+
+await test('GET /reports/csv/products returns CSV with product data', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/reports/csv/products`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const text = await res.text();
+  assert.ok(text.includes('title'), 'Missing title column');
+  assert.ok(text.includes('revenue'), 'Missing revenue column');
+});
+
+await test('GET /reports requires auth', async () => {
+  const res = await fetch(`${BASE}/reports`, { redirect: 'manual' });
+  assert.equal(res.status, 302);
+  assert.ok(res.headers.get('location')?.includes('/login'));
+});
+
+console.log('\nAPI tests — Phase 3: Settings:');
+
+await test('GET /settings returns 200 with config form', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/settings`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  assert.ok(html.includes('Settings'), 'Missing page title');
+  assert.ok(html.includes('b2b_discount_pct'), 'Missing discount field');
+  assert.ok(html.includes('order_minimum'), 'Missing order minimum field');
+  assert.ok(html.includes('payment_terms'), 'Missing payment terms field');
+  assert.ok(html.includes('Admin Allowlist'), 'Missing allowlist section');
+});
+
+await test('POST /settings saves config and redirects with flash', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/settings`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: 'b2b_discount_pct=40&order_minimum=100&payment_terms=Net+15',
+    redirect: 'manual',
+  });
+  assert.equal(res.status, 302);
+  assert.ok(res.headers.get('location')?.includes('/settings'), 'Should redirect to /settings');
+  assert.ok(res.headers.get('location')?.includes('flash=ok'), 'Should have success flash');
+});
+
+await test('GET /settings shows saved values after POST', async () => {
+  const cookie = await seedSession();
+  // First save a value
+  await fetch(`${BASE}/settings`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: 'b2b_discount_pct=45&order_minimum=50&payment_terms=Net+45',
+  });
+  // Then check the GET (not redirect so we re-fetch the page)
+  const res = await fetch(`${BASE}/settings`, { headers: { Cookie: cookie } });
+  const html = await res.text();
+  assert.ok(html.includes('45'), 'Saved value should appear in form');
+});
+
+await test('POST /settings/allowlist/add with invalid email returns error redirect', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/settings/allowlist/add`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: 'email=not-an-email',
+    redirect: 'manual',
+  });
+  assert.equal(res.status, 302);
+  assert.ok(res.headers.get('location')?.includes('flash=err'), 'Should have error flash');
+});
+
+await test('POST /settings/allowlist/add with valid email in mock mode redirects ok', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/settings/allowlist/add`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: 'email=newadmin@fuzzywumpets.com',
+    redirect: 'manual',
+  });
+  assert.equal(res.status, 302);
+  assert.ok(res.headers.get('location')?.includes('/settings'), 'Should redirect to /settings');
+});
+
+console.log('\nAPI tests — Phase 3: Migrate:');
+
+await test('GET /migrate returns 200 with SparkLayer candidates', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/migrate`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  assert.ok(html.includes('SparkLayer Migration'), 'Missing page title');
+  assert.ok(html.includes('SparkLayer'), 'Missing SparkLayer content');
+});
+
+await test('GET /migrate shows pending and already-migrated counts', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/migrate`, { headers: { Cookie: cookie } });
+  const html = await res.text();
+  assert.ok(html.includes('Pending Migration') || html.includes('customers'), 'Missing migration stats');
+});
+
+await test('POST /migrate/run tags pending customers and redirects', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/migrate/run`, {
+    method: 'POST',
+    headers: { Cookie: cookie },
+    redirect: 'manual',
+  });
+  assert.equal(res.status, 302);
+  assert.ok(res.headers.get('location')?.includes('/migrate'), 'Should redirect to /migrate');
+});
+
+await test('GET /audit returns 200 with log table', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/audit`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  assert.ok(html.includes('Audit Log'), 'Missing page title');
+  assert.ok(html.includes('Action'), 'Missing Action column');
+});
+
 console.log(`\n  ${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);

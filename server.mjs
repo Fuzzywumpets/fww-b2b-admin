@@ -7,9 +7,11 @@ import express from 'express';
 import crypto from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { spawnSync } from 'node:child_process';
 import {
   createSession, getSession, deleteSession, auditLog,
   getCustomerNotes, setCustomerNotes, getDropshipCache, setDropshipCache,
+  getSetting, setSetting, getGlobalSettings, getAuditLog, getAuditLogCount,
 } from './db.mjs';
 import { generateInvoicePdf } from './pdf.mjs';
 
@@ -210,6 +212,90 @@ const MOCK_PRODUCTS = [
     ]}
   },
 ];
+
+// Phase 3 mock data ─────────────────────────────────────────────────────────
+const MOCK_CATALOG_PRODUCTS = [
+  { id: 'gid://shopify/Product/201', title: 'Elite Collar', handle: 'elite-collar',
+    vendor: 'Fuzzywumpets', tags: ['Style_Elite', 'b2b'], publishedOnB2B: true,
+    variants: { edges: [
+      { node: { id: 'gid://shopify/ProductVariant/301', sku: 'EC-001-S-NV', title: 'Small / Navy', inventoryQuantity: 24 } },
+      { node: { id: 'gid://shopify/ProductVariant/302', sku: 'EC-001-M-NV', title: 'Medium / Navy', inventoryQuantity: 12 } },
+      { node: { id: 'gid://shopify/ProductVariant/307', sku: 'EC-001-L-NV', title: 'Large / Navy', inventoryQuantity: 0 } },
+    ]}
+  },
+  { id: 'gid://shopify/Product/202', title: 'Luxe Leash', handle: 'luxe-leash',
+    vendor: 'Fuzzywumpets', tags: ['Style_Luxe', 'b2b'], publishedOnB2B: true,
+    variants: { edges: [
+      { node: { id: 'gid://shopify/ProductVariant/303', sku: 'LL-005', title: 'Default Title', inventoryQuantity: 5 } },
+    ]}
+  },
+  { id: 'gid://shopify/Product/203', title: 'Simplicity Collar', handle: 'simplicity-collar',
+    vendor: 'Fuzzywumpets', tags: ['Style_Simplicity', 'b2b'], publishedOnB2B: true,
+    variants: { edges: [
+      { node: { id: 'gid://shopify/ProductVariant/304', sku: 'SC-002-M-RD', title: 'Medium / Red', inventoryQuantity: 7 } },
+      { node: { id: 'gid://shopify/ProductVariant/305', sku: 'SC-002-L-RD', title: 'Large / Red', inventoryQuantity: 18 } },
+    ]}
+  },
+  { id: 'gid://shopify/Product/204', title: 'Everyday Collar Bundle', handle: 'everyday-collar-bundle',
+    vendor: 'Fuzzywumpets', tags: ['Style_Everyday', 'b2b'], publishedOnB2B: true,
+    variants: { edges: [
+      { node: { id: 'gid://shopify/ProductVariant/306', sku: 'ECB-010-XL', title: 'XL', inventoryQuantity: 8 } },
+    ]}
+  },
+  { id: 'gid://shopify/Product/205', title: 'Everyday Collar Starter', handle: 'everyday-collar-starter',
+    vendor: 'Fuzzywumpets', tags: ['Style_Everyday'], publishedOnB2B: false,
+    variants: { edges: [
+      { node: { id: 'gid://shopify/ProductVariant/308', sku: 'EC-STR-S', title: 'Small', inventoryQuantity: 45 } },
+      { node: { id: 'gid://shopify/ProductVariant/309', sku: 'EC-STR-M', title: 'Medium', inventoryQuantity: 32 } },
+    ]}
+  },
+  { id: 'gid://shopify/Product/206', title: 'Elite Harness', handle: 'elite-harness',
+    vendor: 'Fuzzywumpets', tags: ['Style_Elite', 'b2b'], publishedOnB2B: true,
+    variants: { edges: [
+      { node: { id: 'gid://shopify/ProductVariant/310', sku: 'EH-001-S', title: 'Small', inventoryQuantity: 3 } },
+      { node: { id: 'gid://shopify/ProductVariant/311', sku: 'EH-001-M', title: 'Medium', inventoryQuantity: 9 } },
+    ]}
+  },
+];
+const mockCatalogOverrides = new Map();
+
+const MOCK_MONTHLY_REVENUE = [
+  { month: '2025-06', revenue: 4250.00, orders: 8 },
+  { month: '2025-07', revenue: 5100.50, orders: 10 },
+  { month: '2025-08', revenue: 6800.00, orders: 13 },
+  { month: '2025-09', revenue: 5950.00, orders: 11 },
+  { month: '2025-10', revenue: 7200.00, orders: 14 },
+  { month: '2025-11', revenue: 8400.00, orders: 17 },
+  { month: '2025-12', revenue: 9100.00, orders: 19 },
+  { month: '2026-01', revenue: 6200.00, orders: 12 },
+  { month: '2026-02', revenue: 7100.00, orders: 14 },
+  { month: '2026-03', revenue: 8800.00, orders: 18 },
+  { month: '2026-04', revenue: 7500.00, orders: 15 },
+  { month: '2026-05', revenue: 4650.00, orders: 9 },
+];
+
+const MOCK_CUSTOMER_REVENUE = [
+  { id: '101', name: 'Acme Pet Supply',    email: 'buyer@acme.com',         revenue: 14520, orders: 23, aov: 631 },
+  { id: '102', name: 'Happy Paws Boutique', email: 'orders@happypaws.com',  revenue: 8890,  orders: 15, aov: 593 },
+  { id: '103', name: 'Doggo Depot',         email: 'wholesale@doggo.com',   revenue: 5850,  orders: 9,  aov: 650 },
+  { id: '104', name: 'Pet Paradise',        email: 'buy@petparadise.com',   revenue: 4200,  orders: 7,  aov: 600 },
+  { id: '105', name: 'Paw Central',         email: 'orders@pawcentral.com', revenue: 2890,  orders: 5,  aov: 578 },
+];
+
+const MOCK_PRODUCT_REVENUE = [
+  { id: '201', title: 'Elite Collar',           sku: 'EC-001-*', revenue: 8640,  units: 240 },
+  { id: '202', title: 'Luxe Leash',             sku: 'LL-005',   revenue: 6375,  units: 85  },
+  { id: '203', title: 'Simplicity Collar',      sku: 'SC-002-*', revenue: 4400,  units: 200 },
+  { id: '204', title: 'Everyday Collar Bundle', sku: 'ECB-010',  revenue: 3600,  units: 60  },
+  { id: '206', title: 'Elite Harness',          sku: 'EH-001-*', revenue: 2200,  units: 55  },
+];
+
+const MOCK_SPARKLAYER_CUSTOMERS = [
+  { id: 'gid://shopify/Customer/201', displayName: 'SparkLayer Test Store', email: 'sl@retailer.com',     tags: ['sparklayer-customer'] },
+  { id: 'gid://shopify/Customer/202', displayName: 'Old Portal Boutique',   email: 'old@boutique.com',    tags: ['sparklayer-account', 'b2b-portal-v1'] },
+  { id: 'gid://shopify/Customer/203', displayName: 'Migrated Early',        email: 'migrated@store.com',  tags: ['sparklayer-customer', 'b2b'] },
+];
+const mockSparkLayerMigrated = new Set(['203']); // id 203 already has b2b
 
 // ── Cookie helpers ────────────────────────────────────────────────────────────
 function getCookie(req, name) {
@@ -1753,10 +1839,733 @@ app.get('/api/products/search', requireAuth, async (req, res) => {
   })));
 });
 
-// Stubs for Phase 3
-for (const [p, label] of [['/catalog','Catalog'],['/reports','Reports'],['/settings','Settings']]) {
-  app.get(p, requireAuth, (req, res) => res.send(renderComingSoon(req.adminSession, label, p)));
+// ── Phase 3 helpers ───────────────────────────────────────────────────────────
+
+function getStyleFromTags(tags) {
+  const t = (tags || []).find(t => t.startsWith('Style_'));
+  return t ? t.slice(6) : null;
 }
+
+function csvLine(cells) {
+  return cells.map(c => {
+    const s = c == null ? '' : String(c);
+    return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  }).join(',') + '\n';
+}
+
+function renderBarChart(data, opts = {}) {
+  const { width = 580, height = 110, fill = '#9BBC0E', labelField = 'label', valueField = 'value' } = opts;
+  if (!data.length) return `<svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg"></svg>`;
+  const max = Math.max(...data.map(d => d[valueField]));
+  const barW = Math.max(4, Math.floor((width - 8) / data.length) - 2);
+  const bars = data.map((d, i) => {
+    const bh = max > 0 ? Math.max(2, Math.round((d[valueField] / max) * (height - 24))) : 2;
+    const x = 4 + i * (barW + 2);
+    const y = height - 18 - bh;
+    const lbl = data.length <= 12 ? `<text x="${x + barW / 2}" y="${height - 3}" text-anchor="middle" font-size="9" fill="#6B7280" font-family="sans-serif">${h(String(d[labelField]))}</text>` : '';
+    return `<rect x="${x}" y="${y}" width="${barW}" height="${bh}" fill="${fill}" rx="1"><title>${h(String(d[labelField]))}: ${h(String(d[valueField]))}</title></rect>${lbl}`;
+  }).join('');
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${height}" width="${width}" height="${height}" style="max-width:100%;display:block">${bars}</svg>`;
+}
+
+function renderSparkline(values, opts = {}) {
+  const { width = 80, height = 24, fill = '#9BBC0E' } = opts;
+  if (!values.length) return '';
+  const max = Math.max(...values, 1);
+  const pts = values.map((v, i) => {
+    const x = Math.round((i / (values.length - 1 || 1)) * (width - 2)) + 1;
+    const y = height - 2 - Math.round((v / max) * (height - 4));
+    return `${x},${y}`;
+  }).join(' ');
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" style="vertical-align:middle"><polyline points="${pts}" fill="none" stroke="${fill}" stroke-width="1.5"/></svg>`;
+}
+
+// ── Catalog ───────────────────────────────────────────────────────────────────
+
+async function getCatalogData({ vendor, style, stock, b2b, page = 1 }) {
+  if (MOCK) {
+    let prods = MOCK_CATALOG_PRODUCTS.map(p => {
+      const ov = mockCatalogOverrides.get(shopifyNumericId(p.id)) || {};
+      return { ...p, publishedOnB2B: ov.publishedOnB2B !== undefined ? ov.publishedOnB2B : p.publishedOnB2B };
+    });
+    if (vendor)      prods = prods.filter(p => p.vendor === vendor);
+    if (style)       prods = prods.filter(p => (p.tags || []).includes(`Style_${style}`));
+    if (b2b === '1') prods = prods.filter(p => p.publishedOnB2B);
+    if (b2b === '0') prods = prods.filter(p => !p.publishedOnB2B);
+    if (stock === 'low')  prods = prods.filter(p => { const t = (p.variants?.edges||[]).reduce((s,e) => s+(e.node.inventoryQuantity||0),0); return t > 0 && t < 10; });
+    if (stock === 'out')  prods = prods.filter(p => { const t = (p.variants?.edges||[]).reduce((s,e) => s+(e.node.inventoryQuantity||0),0); return t === 0; });
+    const vendors = [...new Set(MOCK_CATALOG_PRODUCTS.map(p => p.vendor))];
+    const styles  = [...new Set(MOCK_CATALOG_PRODUCTS.flatMap(p => (p.tags||[]).filter(t=>t.startsWith('Style_')).map(t=>t.slice(6))))];
+    return { products: prods, vendors, styles, total: prods.length, hasNextPage: false };
+  }
+
+  try {
+    let qParts = ['product_type:*'];
+    if (vendor) qParts.push(`vendor:"${vendor}"`);
+    const result = await shopifyFetch(`
+      query($q:String!,$after:String){
+        products(first:50,query:$q,after:$after,sortKey:TITLE){
+          edges{node{
+            id title handle vendor tags
+            publishedOnPublication(publicationId:"${B2B_PUB_ID}")
+            variants(first:15){edges{node{sku title inventoryQuantity}}}
+          }}
+          pageInfo{hasNextPage endCursor}
+        }
+      }`, { q: qParts.join(' '), after: null });
+    let prods = (result.data?.products?.edges || []).map(e => ({
+      ...e.node,
+      publishedOnB2B: e.node.publishedOnPublication,
+    }));
+    if (style)       prods = prods.filter(p => (p.tags||[]).includes(`Style_${style}`));
+    if (b2b === '1') prods = prods.filter(p => p.publishedOnB2B);
+    if (b2b === '0') prods = prods.filter(p => !p.publishedOnB2B);
+    if (stock === 'low')  prods = prods.filter(p => { const t=(p.variants?.edges||[]).reduce((s,e)=>s+(e.node.inventoryQuantity||0),0); return t>0&&t<10; });
+    if (stock === 'out')  prods = prods.filter(p => { const t=(p.variants?.edges||[]).reduce((s,e)=>s+(e.node.inventoryQuantity||0),0); return t===0; });
+    const allVendors = [...new Set(result.data?.products?.edges?.map(e => e.node.vendor).filter(Boolean) || [])];
+    const allStyles  = [...new Set((result.data?.products?.edges||[]).flatMap(e => (e.node.tags||[]).filter(t=>t.startsWith('Style_')).map(t=>t.slice(6))))];
+    return { products: prods, vendors: allVendors, styles: allStyles, total: prods.length, hasNextPage: result.data?.products?.pageInfo?.hasNextPage };
+  } catch (err) {
+    console.error('getCatalogData error:', err.message);
+    return { products: [], vendors: [], styles: [], total: 0, hasNextPage: false, error: err.message };
+  }
+}
+
+function renderCatalog(session, data, filters) {
+  const { products, vendors, styles, error } = data;
+  const filterBar = `
+    <form method="GET" action="/catalog" class="filter-bar">
+      <select name="vendor" onchange="this.form.submit()">
+        <option value="">All vendors</option>
+        ${(vendors||[]).map(v => `<option value="${h(v)}"${filters.vendor===v?' selected':''}>${h(v)}</option>`).join('')}
+      </select>
+      <select name="style" onchange="this.form.submit()">
+        <option value="">All styles</option>
+        ${(styles||[]).map(s => `<option value="${h(s)}"${filters.style===s?' selected':''}>${h(s)}</option>`).join('')}
+      </select>
+      <select name="stock" onchange="this.form.submit()">
+        <option value="">All stock</option>
+        <option value="low"${filters.stock==='low'?' selected':''}>Low stock (&lt;10)</option>
+        <option value="out"${filters.stock==='out'?' selected':''}>Out of stock</option>
+      </select>
+      <select name="b2b" onchange="this.form.submit()">
+        <option value="">All B2B status</option>
+        <option value="1"${filters.b2b==='1'?' selected':''}>On B2B publication</option>
+        <option value="0"${filters.b2b==='0'?' selected':''}>Not on B2B</option>
+      </select>
+      <button type="submit" class="btn btn-secondary btn-sm">Filter</button>
+      <a href="/catalog" class="btn btn-ghost btn-sm">Reset</a>
+    </form>`;
+
+  const bulkBar = `
+    <form method="POST" action="/catalog/bulk" id="catalog-bulk-form">
+      <div class="bulk-bar" id="bulk-bar" style="display:none">
+        <span id="bulk-count">0</span> selected
+        <button type="submit" name="action" value="publish" class="btn btn-primary btn-sm">Publish to B2B</button>
+        <button type="submit" name="action" value="unpublish" class="btn btn-secondary btn-sm">Remove from B2B</button>
+        <button type="button" onclick="clearSelection()" class="btn btn-ghost btn-sm">Clear</button>
+      </div>`;
+
+  const rows = products.map(p => {
+    const style = getStyleFromTags(p.tags);
+    const variants = (p.variants?.edges || []);
+    const totalQty = variants.reduce((s, e) => s + (e.node.inventoryQuantity || 0), 0);
+    const numId = shopifyNumericId(p.id);
+    const qtyClass = totalQty === 0 ? 'qty-zero' : totalQty < 10 ? 'qty-critical' : '';
+    const b2bBadge = p.publishedOnB2B
+      ? `<span class="badge badge-paid">B2B ✓</span>`
+      : `<span class="badge badge-pending">Not on B2B</span>`;
+    return `<tr data-id="${h(numId)}">
+      <td><input type="checkbox" name="ids" value="${h(numId)}" class="row-check" onchange="updateBulkBar()"></td>
+      <td><a href="/catalog/${h(numId)}" class="link-primary">${h(p.title)}</a></td>
+      <td class="text-muted">${h(p.vendor||'—')}</td>
+      <td>${style ? `<span class="tag-chip">${h(style)}</span>` : '—'}</td>
+      <td class="mono text-sm">${variants.map(e => h(e.node.sku||'—')).join('<br>')}</td>
+      <td class="${qtyClass}">${totalQty}</td>
+      <td>${b2bBadge}</td>
+      <td>
+        ${p.publishedOnB2B
+          ? `<form method="POST" action="/catalog/${h(numId)}/unpublish" style="display:inline"><button class="btn btn-ghost btn-sm" onclick="return confirm('Remove from B2B publication?')">Remove</button></form>`
+          : `<form method="POST" action="/catalog/${h(numId)}/publish" style="display:inline"><button class="btn btn-primary btn-sm">Add to B2B</button></form>`
+        }
+      </td>
+    </tr>`;
+  }).join('');
+
+  const table = products.length ? `
+    <div class="table-wrap">
+    <table class="data-table" id="catalog-table">
+      <thead><tr>
+        <th style="width:32px"><input type="checkbox" id="select-all" onchange="selectAll(this)"></th>
+        <th>Product</th><th>Vendor</th><th>Style</th><th>SKUs</th>
+        <th title="Total inventory across variants">Qty</th>
+        <th>B2B Status</th><th>Actions</th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+    </div>` : `<p class="empty-state">No products match the current filters.</p>`;
+
+  return layout({ title: 'Catalog', session, activePath: '/catalog', content: `
+    <div class="page-header">
+      <h1>Catalog</h1>
+      <span class="text-muted">${products.length} products</span>
+    </div>
+    ${error ? `<div class="alert alert-warning">Shopify data unavailable: ${h(error)}</div>` : ''}
+    ${filterBar}
+    ${bulkBar}
+    ${table}
+    </form>
+    <script>
+    function updateBulkBar(){
+      const checked=document.querySelectorAll('.row-check:checked');
+      const bar=document.getElementById('bulk-bar');
+      document.getElementById('bulk-count').textContent=checked.length;
+      bar.style.display=checked.length?'flex':'none';
+    }
+    function selectAll(cb){
+      document.querySelectorAll('.row-check').forEach(c=>{c.checked=cb.checked;});
+      updateBulkBar();
+    }
+    function clearSelection(){
+      document.querySelectorAll('.row-check').forEach(c=>{c.checked=false;});
+      document.getElementById('select-all').checked=false;
+      updateBulkBar();
+    }
+    </script>
+  ` });
+}
+
+app.get('/catalog', requireAuth, async (req, res) => {
+  const filters = {
+    vendor: req.query.vendor || '',
+    style:  req.query.style  || '',
+    stock:  req.query.stock  || '',
+    b2b:    req.query.b2b    || '',
+  };
+  const data = await getCatalogData(filters);
+  res.send(renderCatalog(req.adminSession, data, filters));
+});
+
+app.get('/catalog/:id', requireAuth, async (req, res) => {
+  // Redirect to catalog with product highlighted — full detail view is a Phase 4 enhancement
+  res.redirect(`/catalog?highlight=${encodeURIComponent(req.params.id)}`);
+});
+
+app.post('/catalog/:id/publish', requireAuth, async (req, res) => {
+  const numId = req.params.id;
+  const gid = `gid://shopify/Product/${numId}`;
+  if (MOCK) {
+    mockCatalogOverrides.set(numId, { publishedOnB2B: true });
+  } else {
+    try {
+      await shopifyFetch(`mutation pub($id:ID!,$input:[PublicationInput!]!){publishablePublish(id:$id,input:$input){userErrors{field message}}}`,
+        { id: gid, input: [{ publicationId: B2B_PUB_ID }] });
+    } catch (err) {
+      console.error('publish error:', err.message);
+    }
+  }
+  auditLog(req.adminSession.email, 'catalog:publish', gid, false, true);
+  res.redirect('/catalog');
+});
+
+app.post('/catalog/:id/unpublish', requireAuth, async (req, res) => {
+  const numId = req.params.id;
+  const gid = `gid://shopify/Product/${numId}`;
+  if (MOCK) {
+    mockCatalogOverrides.set(numId, { publishedOnB2B: false });
+  } else {
+    try {
+      await shopifyFetch(`mutation unpub($id:ID!,$input:[PublicationInput!]!){publishableUnpublish(id:$id,input:$input){userErrors{field message}}}`,
+        { id: gid, input: [{ publicationId: B2B_PUB_ID }] });
+    } catch (err) {
+      console.error('unpublish error:', err.message);
+    }
+  }
+  auditLog(req.adminSession.email, 'catalog:unpublish', gid, true, false);
+  res.redirect('/catalog');
+});
+
+app.post('/catalog/bulk', requireAuth, async (req, res) => {
+  const ids    = [req.body.ids || []].flat().filter(Boolean);
+  const action = req.body.action === 'publish' ? 'publish' : 'unpublish';
+  for (const numId of ids) {
+    const gid = `gid://shopify/Product/${numId}`;
+    if (MOCK) {
+      mockCatalogOverrides.set(numId, { publishedOnB2B: action === 'publish' });
+    } else {
+      try {
+        if (action === 'publish') {
+          await shopifyFetch(`mutation pub($id:ID!,$input:[PublicationInput!]!){publishablePublish(id:$id,input:$input){userErrors{field message}}}`,
+            { id: gid, input: [{ publicationId: B2B_PUB_ID }] });
+        } else {
+          await shopifyFetch(`mutation unpub($id:ID!,$input:[PublicationInput!]!){publishableUnpublish(id:$id,input:$input){userErrors{field message}}}`,
+            { id: gid, input: [{ publicationId: B2B_PUB_ID }] });
+        }
+      } catch (err) { console.error(`bulk ${action} ${numId}:`, err.message); }
+    }
+    auditLog(req.adminSession.email, `catalog:bulk:${action}`, gid, null, null);
+  }
+  res.redirect('/catalog');
+});
+
+// ── Reports ───────────────────────────────────────────────────────────────────
+
+async function getReportsData() {
+  if (MOCK) {
+    return {
+      monthly:    MOCK_MONTHLY_REVENUE,
+      customers:  MOCK_CUSTOMER_REVENUE,
+      products:   MOCK_PRODUCT_REVENUE,
+      totalRevenue: MOCK_MONTHLY_REVENUE.reduce((s, d) => s + d.revenue, 0),
+      totalOrders:  MOCK_MONTHLY_REVENUE.reduce((s, d) => s + d.orders, 0),
+      aov: Math.round(MOCK_MONTHLY_REVENUE.reduce((s,d)=>s+d.revenue,0) / MOCK_MONTHLY_REVENUE.reduce((s,d)=>s+d.orders,0)),
+    };
+  }
+  try {
+    const cutoff = new Date(Date.now() - 365 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+    const allOrders = [];
+    let after = null;
+    let pageCount = 0;
+    while (pageCount < 10) {
+      const result = await shopifyFetch(`
+        query($q:String!,$first:Int!,$after:String){
+          orders(first:$first,query:$q,after:$after,sortKey:PROCESSED_AT,reverse:true){
+            edges{cursor node{
+              id processedAt
+              customer{id displayName email}
+              totalPriceSet{presentmentMoney{amount}}
+              lineItems(first:50){edges{node{
+                title quantity
+                variant{sku}
+                discountedUnitPriceSet{presentmentMoney{amount}}
+              }}}
+            }}
+            pageInfo{hasNextPage endCursor}
+          }
+        }`, { q: `tag:b2b-portal created_at:>${cutoff}`, first: 250, after });
+      const edges = result.data?.orders?.edges || [];
+      allOrders.push(...edges.map(e => e.node));
+      if (!result.data?.orders?.pageInfo?.hasNextPage) break;
+      after = result.data?.orders?.pageInfo?.endCursor;
+      pageCount++;
+    }
+
+    // Aggregate monthly
+    const monthMap = new Map();
+    for (let i = 11; i >= 0; i--) {
+      const d = new Date(); d.setDate(1); d.setMonth(d.getMonth() - i);
+      const key = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`;
+      monthMap.set(key, { month: key, revenue: 0, orders: 0 });
+    }
+    const customerMap = new Map();
+    const productMap  = new Map();
+    for (const o of allOrders) {
+      const m = (o.processedAt || '').slice(0, 7);
+      if (monthMap.has(m)) {
+        const d = monthMap.get(m);
+        d.revenue += parseFloat(o.totalPriceSet?.presentmentMoney?.amount || 0);
+        d.orders++;
+      }
+      if (o.customer) {
+        const { id, displayName, email } = o.customer;
+        const amt = parseFloat(o.totalPriceSet?.presentmentMoney?.amount || 0);
+        if (!customerMap.has(id)) customerMap.set(id, { id: shopifyNumericId(id), name: displayName, email, revenue: 0, orders: 0 });
+        const c = customerMap.get(id); c.revenue += amt; c.orders++;
+      }
+      for (const li of (o.lineItems?.edges || [])) {
+        const { title, quantity, variant, discountedUnitPriceSet: dp } = li.node;
+        const sku = variant?.sku || '';
+        const rev = parseFloat(dp?.presentmentMoney?.amount || 0) * quantity;
+        const key = sku || title;
+        if (!productMap.has(key)) productMap.set(key, { title, sku, revenue: 0, units: 0 });
+        const p = productMap.get(key); p.revenue += rev; p.units += quantity;
+      }
+    }
+    const monthly   = [...monthMap.values()];
+    const customers = [...customerMap.values()].sort((a,b)=>b.revenue-a.revenue).slice(0,20).map(c => ({ ...c, aov: c.orders ? Math.round(c.revenue/c.orders) : 0 }));
+    const products  = [...productMap.values()].sort((a,b)=>b.revenue-a.revenue).slice(0,50);
+    const totalRevenue = monthly.reduce((s,d)=>s+d.revenue,0);
+    const totalOrders  = monthly.reduce((s,d)=>s+d.orders,0);
+    return { monthly, customers, products, totalRevenue, totalOrders, aov: totalOrders ? Math.round(totalRevenue/totalOrders) : 0 };
+  } catch (err) {
+    console.error('getReportsData error:', err.message);
+    return { monthly: [], customers: [], products: [], totalRevenue: 0, totalOrders: 0, aov: 0, error: err.message };
+  }
+}
+
+function renderReports(session, data) {
+  const { monthly, customers, products, totalRevenue, totalOrders, aov, error } = data;
+
+  const chartData = monthly.map(d => ({ label: d.month.slice(5), value: d.revenue }));
+  const chart = renderBarChart(chartData, { width: 580, height: 110 });
+
+  const customerRows = (customers||[]).map((c, i) => {
+    const spark = renderSparkline([c.revenue], { width: 64, height: 20 });
+    return `<tr>
+      <td class="text-muted">${i+1}</td>
+      <td><a href="/customers/${h(c.id)}">${h(c.name)}</a><br><small class="text-muted">${h(c.email)}</small></td>
+      <td>${fmtMoney(c.revenue)}</td>
+      <td>${c.orders}</td>
+      <td>${fmtMoney(c.aov)}</td>
+      <td>${spark}</td>
+    </tr>`;
+  }).join('');
+
+  const productRows = (products||[]).map((p, i) => `<tr>
+    <td class="text-muted">${i+1}</td>
+    <td>${h(p.title)}</td>
+    <td class="mono text-sm">${h(p.sku||'—')}</td>
+    <td>${fmtMoney(p.revenue)}</td>
+    <td>${p.units}</td>
+    <td>${p.units ? fmtMoney(p.revenue / p.units) : '—'}</td>
+  </tr>`).join('');
+
+  return layout({ title: 'Reports', session, activePath: '/reports', content: `
+    <div class="page-header">
+      <h1>Reports</h1>
+      <span class="text-muted">Last 12 months</span>
+    </div>
+    ${error ? `<div class="alert alert-warning">Shopify data unavailable: ${h(error)}</div>` : ''}
+    <div class="report-stats">
+      <div class="stat-card"><div class="stat-value">${fmtMoney(totalRevenue)}</div><div class="stat-label">Total Revenue</div></div>
+      <div class="stat-card"><div class="stat-value">${totalOrders}</div><div class="stat-label">Total Orders</div></div>
+      <div class="stat-card"><div class="stat-value">${fmtMoney(aov)}</div><div class="stat-label">Avg Order Value</div></div>
+    </div>
+
+    <div class="report-section">
+      <div class="report-section-header">
+        <h2>Monthly Revenue (last 12 months)</h2>
+        <a href="/reports/csv/monthly" class="btn btn-ghost btn-sm">↓ CSV</a>
+      </div>
+      <div class="chart-container">${chart}</div>
+      <table class="data-table data-table-sm">
+        <thead><tr><th>Month</th><th>Revenue</th><th>Orders</th><th>AOV</th></tr></thead>
+        <tbody>
+        ${(monthly||[]).map(d => `<tr>
+          <td>${h(d.month)}</td>
+          <td>${fmtMoney(d.revenue)}</td>
+          <td>${d.orders}</td>
+          <td>${d.orders ? fmtMoney(d.revenue / d.orders) : '—'}</td>
+        </tr>`).join('')}
+        </tbody>
+      </table>
+    </div>
+
+    <div class="report-section">
+      <div class="report-section-header">
+        <h2>Sales by Customer (top ${customers?.length||0})</h2>
+        <a href="/reports/csv/customers" class="btn btn-ghost btn-sm">↓ CSV</a>
+      </div>
+      <table class="data-table data-table-sm">
+        <thead><tr><th>#</th><th>Customer</th><th>Revenue</th><th>Orders</th><th>AOV</th><th>Trend</th></tr></thead>
+        <tbody>${customerRows||'<tr><td colspan="6" class="empty-state">No data</td></tr>'}</tbody>
+      </table>
+    </div>
+
+    <div class="report-section">
+      <div class="report-section-header">
+        <h2>Sales by Product (top ${products?.length||0})</h2>
+        <a href="/reports/csv/products" class="btn btn-ghost btn-sm">↓ CSV</a>
+      </div>
+      <table class="data-table data-table-sm">
+        <thead><tr><th>#</th><th>Product</th><th>SKU</th><th>Revenue</th><th>Units</th><th>Avg Price</th></tr></thead>
+        <tbody>${productRows||'<tr><td colspan="6" class="empty-state">No data</td></tr>'}</tbody>
+      </table>
+    </div>
+  ` });
+}
+
+app.get('/reports', requireAuth, async (req, res) => {
+  const data = await getReportsData();
+  res.send(renderReports(req.adminSession, data));
+});
+
+app.get('/reports/csv/:type', requireAuth, async (req, res) => {
+  const data = await getReportsData();
+  const ts   = new Date().toISOString().slice(0, 10);
+  const type = req.params.type;
+
+  if (type === 'monthly') {
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="fww-revenue-monthly-${ts}.csv"`);
+    res.write(csvLine(['month','revenue','orders','aov']));
+    for (const d of (data.monthly||[])) {
+      res.write(csvLine([d.month, d.revenue.toFixed(2), d.orders, d.orders ? (d.revenue/d.orders).toFixed(2) : '0']));
+    }
+    return res.end();
+  }
+  if (type === 'customers') {
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="fww-revenue-customers-${ts}.csv"`);
+    res.write(csvLine(['rank','name','email','revenue','orders','aov']));
+    (data.customers||[]).forEach((c, i) => res.write(csvLine([i+1, c.name, c.email, c.revenue.toFixed(2), c.orders, c.aov])));
+    return res.end();
+  }
+  if (type === 'products') {
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="fww-revenue-products-${ts}.csv"`);
+    res.write(csvLine(['rank','title','sku','revenue','units','avg_price']));
+    (data.products||[]).forEach((p, i) => res.write(csvLine([i+1, p.title, p.sku||'', p.revenue.toFixed(2), p.units, p.units ? (p.revenue/p.units).toFixed(2) : '0'])));
+    return res.end();
+  }
+  res.status(404).send('Unknown CSV type');
+});
+
+// ── Settings ──────────────────────────────────────────────────────────────────
+
+function getSettingsData(flash) {
+  const settings = {
+    b2b_discount_pct: getSetting('b2b_discount_pct') ?? '50',
+    order_minimum:    getSetting('order_minimum')    ?? '0',
+    payment_terms:    getSetting('payment_terms')    ?? 'Net 30',
+  };
+  const allowlist = MOCK
+    ? ['alex@fuzzywumpets.com', 'alexa@fuzzywumpets.com']
+    : (process.env.B2B_ADMIN_ALLOWED_EMAILS || '').split(',').map(s => s.trim()).filter(Boolean);
+  return { settings, allowlist, flash };
+}
+
+function renderSettings(session, { settings, allowlist, flash }) {
+  const flashHtml = flash
+    ? `<div class="alert ${flash.ok ? 'alert-success' : 'alert-error'}" style="margin-bottom:1rem">${h(flash.msg)}</div>`
+    : '';
+  return layout({ title: 'Settings', session, activePath: '/settings', content: `
+    <div class="page-header"><h1>Settings</h1></div>
+    ${flashHtml}
+
+    <div class="settings-grid">
+      <section class="settings-section">
+        <h2>B2B Config</h2>
+        <form method="POST" action="/settings" class="settings-form">
+          <div class="form-row">
+            <label>B2B Discount %</label>
+            <input type="number" name="b2b_discount_pct" value="${h(settings.b2b_discount_pct)}" min="0" max="100" step="1" class="form-input" style="width:80px">
+            <small class="text-muted">Applied to all B2B orders (default 50%)</small>
+          </div>
+          <div class="form-row">
+            <label>Order Minimum ($)</label>
+            <input type="number" name="order_minimum" value="${h(settings.order_minimum)}" min="0" step="0.01" class="form-input" style="width:100px">
+            <small class="text-muted">Minimum order value for B2B checkout (0 = no minimum)</small>
+          </div>
+          <div class="form-row">
+            <label>Payment Terms</label>
+            <input type="text" name="payment_terms" value="${h(settings.payment_terms)}" maxlength="100" class="form-input" style="width:200px">
+            <small class="text-muted">Shown on invoices (e.g. "Net 30", "Due on receipt")</small>
+          </div>
+          <button type="submit" class="btn btn-primary">Save Config</button>
+        </form>
+      </section>
+
+      <section class="settings-section">
+        <h2>Admin Allowlist</h2>
+        <p class="text-muted" style="font-size:0.85rem;margin-bottom:0.75rem">Emails that may log in to this admin panel.</p>
+        <ul class="allowlist">
+          ${allowlist.map(e => `<li>${h(e)}</li>`).join('')}
+        </ul>
+        <form method="POST" action="/settings/allowlist/add" class="settings-form" style="margin-top:0.75rem;display:flex;gap:0.5rem;align-items:center">
+          <input type="email" name="email" placeholder="new@fuzzywumpets.com" class="form-input" style="width:240px" required>
+          <button type="submit" class="btn btn-secondary">+ Add</button>
+        </form>
+      </section>
+
+      <section class="settings-section settings-readonly">
+        <h2>Read-only Info</h2>
+        <dl class="info-grid">
+          <dt>B2B Publication ID</dt><dd class="mono">${h(B2B_PUB_ID)}</dd>
+          <dt>OAuth Redirect URI</dt><dd class="mono">${h(REDIRECT_URI)}</dd>
+          <dt>Environment</dt><dd>${MOCK ? '<span class="badge badge-pending">MOCK</span>' : '<span class="badge badge-paid">PRODUCTION</span>'}</dd>
+        </dl>
+      </section>
+    </div>
+  ` });
+}
+
+app.get('/settings', requireAuth, (req, res) => {
+  const flash = req.query.flash ? { ok: req.query.flash === 'ok', msg: req.query.msg || (req.query.flash === 'ok' ? 'Settings saved.' : 'Error saving settings.') } : null;
+  res.send(renderSettings(req.adminSession, getSettingsData(flash)));
+});
+
+app.post('/settings', requireAuth, (req, res) => {
+  const { b2b_discount_pct, order_minimum, payment_terms } = req.body;
+  try {
+    if (b2b_discount_pct !== undefined) setSetting('b2b_discount_pct', String(Number(b2b_discount_pct) || 50));
+    if (order_minimum    !== undefined) setSetting('order_minimum',    String(Number(order_minimum)    || 0));
+    if (payment_terms    !== undefined) setSetting('payment_terms',    String(payment_terms).slice(0, 100));
+    auditLog(req.adminSession.email, 'settings:update', null, null, { b2b_discount_pct, order_minimum, payment_terms });
+    res.redirect('/settings?flash=ok&msg=Settings+saved.');
+  } catch (err) {
+    res.redirect(`/settings?flash=err&msg=${encodeURIComponent(err.message)}`);
+  }
+});
+
+app.post('/settings/allowlist/add', requireAuth, (req, res) => {
+  const email = String(req.body.email || '').trim().toLowerCase();
+  if (!/^[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}$/.test(email)) {
+    return res.redirect('/settings?flash=err&msg=Invalid+email+address.');
+  }
+  if (MOCK) {
+    return res.redirect(`/settings?flash=ok&msg=${encodeURIComponent(`${email} added (mock mode — not persisted).`)}`);
+  }
+  try {
+    const current = (process.env.B2B_ADMIN_ALLOWED_EMAILS || '').split(',').map(s => s.trim()).filter(Boolean);
+    if (current.includes(email)) {
+      return res.redirect(`/settings?flash=ok&msg=${encodeURIComponent(`${email} is already on the allowlist.`)}`);
+    }
+    const newList = [...current, email].join(',');
+    const result = spawnSync('doppler', ['secrets', 'set', `B2B_ADMIN_ALLOWED_EMAILS=${newList}`], { encoding: 'utf8', timeout: 10000 });
+    if (result.status !== 0) throw new Error(result.stderr || 'doppler command failed');
+    process.env.B2B_ADMIN_ALLOWED_EMAILS = newList;
+    auditLog(req.adminSession.email, 'settings:allowlist:add', email, null, null);
+    res.redirect(`/settings?flash=ok&msg=${encodeURIComponent(`${email} added to allowlist.`)}`);
+  } catch (err) {
+    res.redirect(`/settings?flash=err&msg=${encodeURIComponent(err.message)}`);
+  }
+});
+
+// ── SparkLayer Migration ───────────────────────────────────────────────────────
+
+async function getMigrateData() {
+  if (MOCK) {
+    const candidates = MOCK_SPARKLAYER_CUSTOMERS.map(c => ({
+      ...c, numId: shopifyNumericId(c.id),
+      alreadyB2B: c.tags.includes('b2b') || mockSparkLayerMigrated.has(shopifyNumericId(c.id)),
+    }));
+    return { candidates, total: candidates.length, alreadyMigrated: candidates.filter(c => c.alreadyB2B).length };
+  }
+  try {
+    const result = await shopifyFetch(`
+      query($q:String!,$after:String){
+        customers(first:50,query:$q,after:$after){
+          edges{node{id displayName email tags}}
+          pageInfo{hasNextPage endCursor}
+        }
+      }`, { q: 'tag:sparklayer', after: null });
+    const candidates = (result.data?.customers?.edges || []).map(e => ({
+      ...e.node, numId: shopifyNumericId(e.node.id),
+      alreadyB2B: (e.node.tags || []).includes('b2b'),
+    }));
+    return { candidates, total: candidates.length, alreadyMigrated: candidates.filter(c => c.alreadyB2B).length };
+  } catch (err) {
+    console.error('getMigrateData error:', err.message);
+    return { candidates: [], total: 0, alreadyMigrated: 0, error: err.message };
+  }
+}
+
+function renderMigrate(session, data, flash) {
+  const { candidates, total, alreadyMigrated, error } = data;
+  const flashHtml = flash ? `<div class="alert ${flash.ok?'alert-success':'alert-error'}" style="margin-bottom:1rem">${h(flash.msg)}</div>` : '';
+  const pending = candidates.filter(c => !c.alreadyB2B);
+  const done    = candidates.filter(c => c.alreadyB2B);
+
+  const rows = candidates.map(c => `<tr class="${c.alreadyB2B ? 'row-done' : ''}">
+    <td>${c.alreadyB2B ? '✓' : '<input type="checkbox" name="ids" value="'+h(c.numId)+'" checked>'}</td>
+    <td><a href="/customers/${h(c.numId)}">${h(c.displayName)}</a></td>
+    <td>${h(c.email)}</td>
+    <td class="text-sm">${(c.tags||[]).map(t => `<span class="tag-chip">${h(t)}</span>`).join(' ')}</td>
+    <td>${c.alreadyB2B ? '<span class="badge badge-paid">Already b2b</span>' : '<span class="badge badge-pending">Needs migration</span>'}</td>
+  </tr>`).join('');
+
+  return layout({ title: 'SparkLayer Migration', session, activePath: '/migrate', content: `
+    <div class="page-header">
+      <h1>SparkLayer Migration</h1>
+      <span class="text-muted">Tag legacy SparkLayer customers with <code>b2b</code></span>
+    </div>
+    ${flashHtml}
+    ${error ? `<div class="alert alert-warning">Shopify data unavailable: ${h(error)}</div>` : ''}
+
+    <div class="report-stats" style="margin-bottom:1.5rem">
+      <div class="stat-card"><div class="stat-value">${total}</div><div class="stat-label">SparkLayer Customers Found</div></div>
+      <div class="stat-card"><div class="stat-value">${alreadyMigrated}</div><div class="stat-label">Already Have b2b Tag</div></div>
+      <div class="stat-card"><div class="stat-value">${pending.length}</div><div class="stat-label">Pending Migration</div></div>
+    </div>
+
+    ${pending.length === 0 ? `<div class="alert alert-success">All SparkLayer customers are already tagged <code>b2b</code>. Nothing to migrate.</div>` : `
+    <form method="POST" action="/migrate/run">
+      <div style="margin-bottom:1rem">
+        <strong>${pending.length} customers</strong> will receive the <code>b2b</code> tag. This is idempotent — re-running is safe.
+      </div>
+      <button type="submit" class="btn btn-primary" onclick="return confirm('Tag ${pending.length} customers with b2b? This writes to Shopify.')">
+        Run Migration (${pending.length} customers)
+      </button>
+    </form>`}
+
+    ${candidates.length ? `
+    <div class="report-section" style="margin-top:2rem">
+      <h2>All SparkLayer Customers</h2>
+      <table class="data-table data-table-sm">
+        <thead><tr><th>Select</th><th>Name</th><th>Email</th><th>Current Tags</th><th>Status</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>` : ''}
+  ` });
+}
+
+app.get('/migrate', requireAuth, async (req, res) => {
+  const flash = req.query.flash ? { ok: req.query.flash === 'ok', msg: req.query.msg || '' } : null;
+  const data = await getMigrateData();
+  res.send(renderMigrate(req.adminSession, data, flash));
+});
+
+app.post('/migrate/run', requireAuth, async (req, res) => {
+  const data = await getMigrateData();
+  const pending = data.candidates.filter(c => !c.alreadyB2B);
+  let migrated = 0;
+  let errors   = 0;
+  for (const c of pending) {
+    try {
+      if (MOCK) {
+        mockSparkLayerMigrated.add(c.numId);
+      } else {
+        await shopifyFetch(`mutation tagsAdd($id:ID!,$tags:[String!]!){tagsAdd(id:$id,tags:$tags){node{id} userErrors{field message}}}`,
+          { id: c.id, tags: ['b2b'] });
+      }
+      auditLog(req.adminSession.email, 'migrate:sparklayer:tag_b2b', c.id, JSON.stringify(c.tags), JSON.stringify([...c.tags, 'b2b']));
+      migrated++;
+    } catch (err) {
+      console.error(`migrate ${c.id}:`, err.message);
+      errors++;
+    }
+  }
+  const msg = errors
+    ? `Migrated ${migrated}, errors on ${errors}. Check logs.`
+    : `Successfully tagged ${migrated} customer${migrated!==1?'s':''} with b2b.`;
+  res.redirect(`/migrate?flash=${errors?'err':'ok'}&msg=${encodeURIComponent(msg)}`);
+});
+
+// ── Audit log ─────────────────────────────────────────────────────────────────
+
+app.get('/audit', requireAuth, (req, res) => {
+  const page  = Math.max(1, parseInt(req.query.page) || 1);
+  const limit = 100;
+  const offset = (page - 1) * limit;
+  const rows  = getAuditLog({ limit, offset });
+  const total = getAuditLogCount();
+  const pages = Math.ceil(total / limit);
+
+  const tableRows = rows.map(r => `<tr>
+    <td class="mono text-sm">${new Date(r.ts).toISOString().replace('T',' ').slice(0,19)}</td>
+    <td>${h(r.email)}</td>
+    <td class="mono">${h(r.action)}</td>
+    <td class="text-sm text-muted" style="max-width:200px;overflow:hidden;text-overflow:ellipsis">${h(r.target||'—')}</td>
+    <td class="text-sm mono" style="max-width:150px;overflow:hidden;text-overflow:ellipsis">${h(r.after_val||'')}</td>
+  </tr>`).join('');
+
+  const pagination = pages > 1 ? `<div class="pagination">
+    ${page > 1 ? `<a href="/audit?page=${page-1}" class="btn btn-ghost btn-sm">← Prev</a>` : ''}
+    <span class="text-muted">Page ${page} of ${pages} (${total} entries)</span>
+    ${page < pages ? `<a href="/audit?page=${page+1}" class="btn btn-ghost btn-sm">Next →</a>` : ''}
+  </div>` : `<p class="text-muted">${total} entries</p>`;
+
+  res.send(layout({ title: 'Audit Log', session: req.adminSession, activePath: '/audit', content: `
+    <div class="page-header"><h1>Audit Log</h1></div>
+    ${pagination}
+    <table class="data-table data-table-sm">
+      <thead><tr><th>Time (UTC)</th><th>User</th><th>Action</th><th>Target</th><th>After</th></tr></thead>
+      <tbody>${tableRows || '<tr><td colspan="5" class="empty-state">No audit entries yet.</td></tr>'}</tbody>
+    </table>
+    ${pagination}
+  ` }));
+});
 
 // Static
 app.use(express.static(path.join(__dirname, 'public')));

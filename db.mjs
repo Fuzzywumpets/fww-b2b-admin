@@ -51,6 +51,33 @@ db.exec(`
     margin_pct REAL NOT NULL DEFAULT 0,
     updated_at INTEGER NOT NULL
   );
+
+  CREATE TABLE IF NOT EXISTS admin_settings (
+    key TEXT NOT NULL,
+    value TEXT NOT NULL DEFAULT '',
+    email TEXT NOT NULL DEFAULT '__global__',
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (key, email)
+  );
+
+  CREATE TABLE IF NOT EXISTS label_batches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    email TEXT NOT NULL,
+    ts INTEGER NOT NULL,
+    template TEXT,
+    item_count INTEGER DEFAULT 0,
+    total_labels INTEGER DEFAULT 0
+  );
+
+  CREATE TABLE IF NOT EXISTS export_batches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    email TEXT NOT NULL,
+    ts INTEGER NOT NULL,
+    type TEXT NOT NULL,
+    product_count INTEGER DEFAULT 0,
+    row_or_image_count INTEGER DEFAULT 0,
+    bytes_out_approx INTEGER DEFAULT 0
+  );
 `);
 
 export default db;
@@ -113,4 +140,31 @@ export function setDropshipCache(customerId, enabled, marginPct) {
     INSERT OR REPLACE INTO dropship_config_cache (customer_id, enabled, margin_pct, updated_at)
     VALUES (?, ?, ?, ?)
   `).run(customerId, enabled ? 1 : 0, Number(marginPct) || 0, Date.now());
+}
+
+export function getSetting(key, email = '__global__') {
+  const row = db.prepare('SELECT value FROM admin_settings WHERE key = ? AND email = ?').get(key, email);
+  return row ? row.value : null;
+}
+
+export function setSetting(key, value, email = '__global__') {
+  db.prepare(`
+    INSERT OR REPLACE INTO admin_settings (key, value, email, updated_at)
+    VALUES (?, ?, ?, ?)
+  `).run(key, String(value), email, Date.now());
+}
+
+export function getGlobalSettings() {
+  const rows = db.prepare("SELECT key, value FROM admin_settings WHERE email = '__global__'").all();
+  return Object.fromEntries(rows.map(r => [r.key, r.value]));
+}
+
+export function getAuditLog({ limit = 100, offset = 0 } = {}) {
+  return db.prepare(`
+    SELECT * FROM admin_audit_log ORDER BY ts DESC LIMIT ? OFFSET ?
+  `).all(limit, offset);
+}
+
+export function getAuditLogCount() {
+  return db.prepare('SELECT COUNT(*) as n FROM admin_audit_log').get().n;
 }

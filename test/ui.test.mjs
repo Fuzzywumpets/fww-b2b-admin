@@ -255,6 +255,133 @@ await testMobile('orders list fits 390px without horizontal scroll', async (page
   assert.ok(scrollWidth <= clientWidth + 4, `Horizontal overflow on /orders: scrollWidth=${scrollWidth} clientWidth=${clientWidth}`);
 });
 
+console.log('\nUI tests — Phase 3:');
+
+await test('/catalog shows product list with B2B column', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+
+  await page.goto(`${BASE}/catalog`);
+  await page.waitForSelector('.data-table');
+  const html = await page.content();
+  assert.ok(html.includes('Catalog'), 'Missing page title');
+  assert.ok(html.includes('Elite Collar'), 'Missing product in table');
+  assert.ok(html.includes('B2B Status'), 'Missing B2B Status column header');
+  assert.ok(html.includes('B2B ✓') || html.includes('Not on B2B'), 'Missing B2B status badge');
+});
+
+await test('/catalog filter bar renders vendor + style dropdowns', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+
+  await page.goto(`${BASE}/catalog`);
+  await page.waitForSelector('.filter-bar');
+  const selects = await page.$$('.filter-bar select');
+  assert.ok(selects.length >= 3, `Expected at least 3 filter dropdowns, got ${selects.length}`);
+});
+
+await test('/catalog shows select-all checkbox and bulk bar', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+
+  await page.goto(`${BASE}/catalog`);
+  await page.waitForSelector('#select-all');
+  const checkboxes = await page.$$('.row-check');
+  assert.ok(checkboxes.length > 0, 'No row checkboxes found');
+  // Click select-all and verify bulk bar appears
+  await page.click('#select-all');
+  await page.waitForSelector('#bulk-bar', { state: 'visible' });
+  const bulkVisible = await page.isVisible('#bulk-bar');
+  assert.ok(bulkVisible, 'Bulk bar should be visible after selecting all');
+});
+
+await test('/reports shows revenue chart (SVG) and stat cards', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+
+  await page.goto(`${BASE}/reports`);
+  await page.waitForSelector('.report-stats');
+  const html = await page.content();
+  assert.ok(html.includes('Monthly Revenue'), 'Missing chart section heading');
+  assert.ok(html.includes('<svg'), 'Missing SVG bar chart');
+  const statCards = await page.$$('.stat-card');
+  assert.ok(statCards.length >= 3, `Expected 3 stat cards, got ${statCards.length}`);
+});
+
+await test('/reports has CSV download links', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+
+  await page.goto(`${BASE}/reports`);
+  await page.waitForSelector('.report-section');
+  const html = await page.content();
+  assert.ok(html.includes('/reports/csv/monthly'), 'Missing monthly CSV link');
+  assert.ok(html.includes('/reports/csv/customers'), 'Missing customers CSV link');
+  assert.ok(html.includes('/reports/csv/products'), 'Missing products CSV link');
+});
+
+await test('/settings shows config form and read-only info', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+
+  await page.goto(`${BASE}/settings`);
+  await page.waitForSelector('.settings-grid');
+  const html = await page.content();
+  assert.ok(html.includes('B2B Config'), 'Missing B2B Config section');
+  assert.ok(html.includes('Admin Allowlist'), 'Missing allowlist section');
+  assert.ok(html.includes('Read-only Info'), 'Missing read-only section');
+  const inputs = await page.$$('input[name="b2b_discount_pct"]');
+  assert.ok(inputs.length > 0, 'Missing b2b_discount_pct input');
+});
+
+await test('/settings save config shows success flash', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+
+  await page.goto(`${BASE}/settings`);
+  await page.waitForSelector('input[name="b2b_discount_pct"]');
+  await page.fill('input[name="b2b_discount_pct"]', '45');
+  await page.click('button[type="submit"]');
+  await page.waitForURL('**/settings*');
+  const html = await page.content();
+  assert.ok(html.includes('saved') || html.includes('alert-success'), 'Missing success flash after save');
+});
+
+await test('/migrate shows SparkLayer migration page with stats', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+
+  await page.goto(`${BASE}/migrate`);
+  await page.waitForSelector('.report-stats');
+  const html = await page.content();
+  assert.ok(html.includes('SparkLayer Migration'), 'Missing page title');
+  assert.ok(html.includes('SparkLayer Test Store'), 'Missing mock candidate');
+  const statCards = await page.$$('.stat-card');
+  assert.ok(statCards.length >= 3, `Expected 3 stat cards, got ${statCards.length}`);
+});
+
+await testMobile('/catalog renders without horizontal overflow at 390px', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+
+  await page.goto(`${BASE}/catalog`);
+  await page.waitForSelector('.filter-bar');
+  const scrollWidth = await page.evaluate(() => document.documentElement.scrollWidth);
+  const clientWidth = await page.evaluate(() => document.documentElement.clientWidth);
+  assert.ok(scrollWidth <= clientWidth + 4, `Horizontal overflow on /catalog: scrollWidth=${scrollWidth} clientWidth=${clientWidth}`);
+});
+
+await testMobile('/settings renders without overflow at 390px', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+
+  await page.goto(`${BASE}/settings`);
+  await page.waitForSelector('.settings-grid');
+  const scrollWidth = await page.evaluate(() => document.documentElement.scrollWidth);
+  const clientWidth = await page.evaluate(() => document.documentElement.clientWidth);
+  assert.ok(scrollWidth <= clientWidth + 4, `Horizontal overflow on /settings at 390px: scrollWidth=${scrollWidth} clientWidth=${clientWidth}`);
+});
+
 await browser.close();
 
 console.log(`\n  ${passed} passed, ${failed} failed`);
