@@ -698,3 +698,75 @@ for the template; just add a `label_fields_json` column).
 - For a thermal template: alexa downloads a one-label-per-page PDF at the exact label dimensions
 - Settings persist between visits per user
 - All tests green
+
+## Phase 9 — Show real customer + order data (broaden default scope)
+
+The admin pages currently filter very narrowly (only orders tagged `b2b-portal`, only customers
+tagged `b2b`), so they're nearly empty in production because the portal just launched. alexa
+wants to use the admin against REAL existing data — SparkLayer orders, retail orders, all
+historical customers — so she can iterate on the invoice print tool, manual order workflow,
+etc. against real volume.
+
+### `/admin/orders` — show ALL Shopify orders by default, filter by source
+
+- Change default Shopify query in `/api/admin/orders` from `tag:b2b-portal` to `""` (no filter)
+  → returns all orders, most recent first (sortKey: PROCESSED_AT, reverse: true).
+- Add **filter chips** above the orders table (UI clickable, also bind to `?source=` query):
+  - **All** (default, no filter)
+  - **B2B portal** — `tag:b2b-portal`
+  - **SparkLayer** — `tag:sparklayer*` (verify exact tag pattern by sampling a SparkLayer order
+    via shopify-bridge; document the actual signal in SCRATCH.md)
+  - **POS** — `source_name:pos`
+  - **Manual / draft** — `source_name:draft_order`
+- Per-row badge column showing source (B2B / SparkLayer / POS / Online / Manual / Other) derived
+  from order.tags + order.app + order.sourceName. One small colored chip per row.
+- Pagination stays 50/page; cursor-based against Shopify.
+- The bulk actions (mark paid, add note) MUST still work on ALL orders, not just b2b-portal ones.
+  If they previously had a "must be tagged b2b-portal" check, remove that.
+
+### `/admin/customers` — show ALL customers, highlight by tag
+
+- Change default query in `/api/admin/customers` from `tag:b2b` to `""` (all customers), sorted
+  by `total_spent` desc (highest-spend first — best signal for "who matters").
+- Add filter chips:
+  - **All** (default)
+  - **B2B-tagged** — `tag:b2b`
+  - **SparkLayer** — `tag:sparklayer*`
+  - **Has orders** — `orders_count:>0`
+  - **No orders** — `orders_count:0` (gives alexa a list of accounts to clean up or chase)
+- Per-row tag badges: green for `b2b`, blue for `sparklayer*`, gray for `b2b-admin`,
+  gold/star for `b2b-tier:gold`, etc. Show up to 3, "+N more" tooltip.
+- Lifetime spend column stays.
+
+### Invoice + PDF on ANY order
+
+- Verify `/admin/orders/:id/invoice.pdf` works for orders WITHOUT the `b2b-portal` tag. If there's
+  a tag check, remove it (alexa needs to invoice a SparkLayer order, a POS order, etc.).
+- PDF should pull the actual order's `note` field, payment terms from the customer's
+  `b2b.payment_terms` metafield (Phase 7) or fall back to default. MSRP and line items come
+  straight from order line items (NOT recomputed from customer pricing — preserve historical
+  pricing).
+- Add a "Print invoice" toolbar action visible on every order detail page.
+
+### Filter persistence
+
+Save the most-recently-used filter chip per user in `admin_settings` so reloading `/admin/orders`
+returns to the same view. Trivial change once the filter state is wired.
+
+### Tests
+
+- API: GET /api/admin/orders → 50 orders, mixed sources
+- API: GET /api/admin/orders?source=sparklayer → only orders tagged sparklayer*
+- API: GET /api/admin/orders?source=pos → only POS orders
+- API: GET /api/admin/customers → returns customers sorted by total_spent
+- API: GET /api/admin/orders/:id/invoice.pdf works on a non-b2b-portal-tagged order
+- UI: filter chips render, clicking each updates table
+- UI: source badges render per row
+
+### Acceptance
+
+- alexa opens /admin/orders → sees recent real orders from all sources (not empty)
+- alexa filters to "SparkLayer" → sees historical SparkLayer wholesale orders
+- alexa clicks any historical order → can download a PDF invoice
+- alexa opens /admin/customers → sees actual customer list, sorted by spend, with tag badges
+- alexa picks a high-spend customer with no `b2b` tag → can add the tag from customer detail page
