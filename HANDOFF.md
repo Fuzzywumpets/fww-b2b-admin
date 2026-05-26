@@ -2378,3 +2378,35 @@ This page is read-mostly; edits flow through "Edit in Shopify" until/unless we b
 - alexa can see any customer's active cart from the admin and either convert it to an order
   or email the customer a reminder
 - All tests green
+
+### 19E — Catalog tab: product status filter (admin)
+
+On `/admin/catalog` (admin tool products list), add a filter chip row at the top:
+
+```
+Status:  [ All ]  [ Active (default) ]  [ Draft ]  [ Archived ]
+         (count)  (count)               (count)    (count)
+```
+
+**Behavior:**
+- Page loads showing **Active** products by default (most common operator need)
+- Each chip shows a count badge in parens
+- Clicking a chip swaps the visible set; URL updates with `?status=active|draft|archived|all` for shareable links
+- "All" chip shows every status (matches today's behavior — currently no filter)
+- Visually distinguish status in the list:
+  - Active: no badge (default)
+  - Draft: yellow "DRAFT" badge next to title
+  - Archived: gray "ARCHIVED" badge + entire row dim
+
+**Implementation:**
+- Server: `GET /api/admin/catalog?status=active` → adds `query: "status:active"` to Shopify GraphQL `products` query (Shopify supports `status:` directly)
+- Counts: lightweight query at page load `productsCount(query: "status:active")`, same for draft + archived; total = all three
+- Frontend: chip-style toggle component (same pattern as Phase 9 order source chips)
+- Default param if none provided: `status=active`
+
+**Tests:**
+- /admin/catalog with no query → shows only Active products
+- /admin/catalog?status=draft → shows only Draft
+- /admin/catalog?status=all → shows every product regardless of status
+- Status chip counts match the filtered list size
+- Archived row visibly dimmed
