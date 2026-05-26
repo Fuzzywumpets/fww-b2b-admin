@@ -1641,3 +1641,176 @@ manage other team members but not the primary.
 - Orders placed by team members are attributed to the primary's Shopify customer but carry
   a "Placed by {member.email}" note
 - Tests green
+
+## Phase 16 — Admin order editing (modify, partial fulfill, backorder, discounts)
+
+Real-world wholesale ops needs: alexa needs to be able to change an existing order — add/remove
+items, fix prices, adjust quantities, ship some items now and backorder the rest, apply
+order-level discounts.
+
+Shopify's `orderEdit*` mutation suite supports this on ANY order (even fulfilled/paid).
+`fulfillmentCreate` (current API name) supports partial fulfillment natively.
+
+### 16A — Edit order line items
+
+**UI** on `/admin/orders/:id`:
+
+Add an "Edit order" button at the top of the page. Clicking enters **edit mode** where:
+- Each existing line item shows: title (read-only) · qty (editable input) · price (editable $)
+  · line total · **Remove** button (× icon)
+- Below line items: **Add line item** button → opens product/variant picker → picks variant +
+  qty + price → adds to the edit calculation
+- A running diff panel on the right: "Original total: $X → New total: $Y (delta: ±$Z)"
+- **Save changes** + **Discard** buttons at the bottom
+
+**Server flow** (call sequence to Shopify Admin API via shopify-bridge):
+
+1. `orderEditBegin(orderId)` → returns `calculatedOrder.id`
+2. For each removed line: `orderEditSetQuantity(calculatedOrderId, lineItemId, quantity: 0)`
+3. For each qty change: `orderEditSetQuantity(calculatedOrderId, lineItemId, quantity: newQty)`
+4. For each price change: `orderEditAddLineItemDiscount(calculatedOrderId, lineItemId,
+   discountAmount: oldPrice - newPrice, description: "Adjusted price")` —
+   (Shopify doesn't let you directly mutate line price; we apply a discount to achieve the
+   new effective unit price)
+5. For each new line: `orderEditAddVariant(calculatedOrderId, variantId, quantity, locationId)`
+   — supports a custom unit price via `orderEditAddCustomItem` if needed
+6. Preview: `orderEditCalculate(calculatedOrderId)` (refreshed live as admin edits)
+7. On Save: `orderEditCommit(calculatedOrderId, notifyCustomer: alexa-chooses,
+   staffNote: optional)`
+
+All steps audit-logged (action: `order_edit`, before: original order JSON, after: edited order JSON).
+
+### 16B — Order-level discount
+
+In edit mode, add **"Apply order discount"** button → modal:
+- Type: Percentage (%) OR Fixed amount ($)
+- Value: numeric input
+- Reason: text (required — e.g. "Loyalty discount", "Damaged packaging compensation")
+
+On submit: calls `orderEditAddLineItemDiscount` for each line proportionally (Shopify doesn't
+have a single "order-level" discount mutation post-creation; we proportion across lines), OR
+use a Cart Transform / Discount API entry. Simplest path: add a single negative-amount custom
+line item titled "Order discount: {reason}".
+
+Show the discount line clearly in the order detail. Customer's invoice (PDF) shows it as a
+discount line above the total.
+
+### 16C — Partial fulfillment
+
+**UI**: existing order detail gets a **"Fulfill items"** action button. Clicking opens modal:
+
+```
+Mark items as shipped
+─────────────────────────────────────────
+☑ Everyday Limited Slip Collar — Small × [3 of 5 remaining]
+☑ Everyday Walking Lead — Medium    × [2 of 2 remaining]
+☐ Luxe Houndstooth Martingale       × [0 of 4 remaining]
+                                       
+Carrier:   [USPS Priority ▾]
+Tracking:  [_______________]   (optional)
+☑ Email customer with tracking info
+                                       
+[ Cancel ]   [ Fulfill selected ]
+```
+
+**Server**: `fulfillmentCreate(input: { orderId, lineItems: [{id, quantity}], trackingInfo,
+notifyCustomer })`. Multiple partial fulfillments are allowed — the order can have N
+fulfillments, each shipping some of the remaining items.
+
+Customer's order detail (b2b portal) shows each fulfillment as its own row in a timeline:
+- "Shipment 1 — shipped 2026-05-27 via USPS Priority (track: ...)" — line items A, B
+- "Shipment 2 — shipped 2026-06-02 via UPS Ground (track: ...)" — line items C
+- "Pending shipment — 2 items remaining" — line item D
+
+### 16D — Backorder flag (explicit)
+
+Sometimes you fulfill MOST of an order and explicitly mark certain items as backordered with
+an expected ship date. Different from "we just haven't shipped them yet."
+
+**UI**: in the order detail, for any unfulfilled line item, **"Mark as backorder"** action →
+modal:
+- Expected ship date: date picker (optional)
+- Notify customer: checkbox (default ON)
+
+**Server**:
+- Add per-line-item metafield: `b2b.line_backorder_status = pending` + optional
+  `b2b.line_backorder_eta` (ISO date)
+- Or store in our own SQLite `backorders (id, order_id, line_item_id, eta_date, status,
+  created_at)` — simpler, no Shopify metafield write per line
+- If notify=true: email customer "Some items on your order are backordered" with the line items
+  + ETA + link to portal order detail
+
+**Customer-side** (b2b portal order detail): shows clearly:
+> ⚠ Backordered: Luxe Houndstooth Martingale (qty 4) — expected to ship around June 15
+
+When the backordered item later ships (via 16C partial fulfillment), email customer "Your
+backordered item has shipped" with tracking info.
+
+### 16E — Billing alignment with partial fulfillment
+
+The tricky one. For invoiced orders, when partial fulfillment happens, alexa wants to bill for
+ONLY the shipped items now (not the full order).
+
+**Approach: bill against fulfilled, not against order.**
+
+When admin clicks "Generate invoice" on an order with mixed fulfilled+pending lines, modal:
+- Radio: **"Invoice for fulfilled items only"** OR **"Invoice for entire order"**
+- Preview shows the line items + total being invoiced
+
+When "fulfilled only" selected:
+- PDF invoice generation filters line items to only those currently fulfilled (or marked
+  fulfilled in any shipment)
+- Total = sum of fulfilled line items + shipping (if any) + tax (if any) — does NOT include
+  unfulfilled / backordered lines
+- Invoice number gets a suffix: `#1234-A` for first partial, `#1234-B` for second, etc.
+- Save record in `partial_invoices` SQLite table (order_id, invoice_letter, total, line_items_json, sent_at)
+- On the order detail, show "Invoices issued: #1234-A ($72.50, fulfilled portion) · pending..."
+
+Later, when the backordered/remaining items ship, alexa generates another invoice (next letter)
+for that batch. Customer ends up with potentially multiple invoices per Shopify order — that's
+fine for B2B accounting.
+
+**Tax/shipping handling**: prorate based on fulfilled line subtotal vs full order subtotal,
+unless alexa wants to put all shipping on the first invoice (more common in wholesale — make
+that the default + offer a toggle).
+
+### 16F — Audit + customer-side visibility
+
+Every order edit, partial fulfillment, backorder flag, discount, and partial invoice creates
+an `admin_audit_log` entry with full before/after.
+
+The customer's order detail (b2b portal) reflects all changes in real time:
+- Edited line item shows as crossed-out → new value (with strikethrough) for a few days, then
+  just the new value
+- Order discount shows as a line "Order discount: {reason} − $X"
+- Partial fulfillments listed as timeline rows
+- Backorder badges on affected lines
+- Partial invoices each as a separate PDF download link
+
+### Tests
+
+- Edit qty: original qty 5 → set to 3, calculated total reflects 2-unit reduction
+- Remove line: line removed, total drops by line amount
+- Add line: pick variant + qty + price, total goes up
+- Price change: line gets a discount applied = old*qty - new*qty
+- Order-level percentage discount: proportional discount lines applied
+- Order-level fixed discount: single negative line item added
+- Partial fulfillment: 2 of 3 lines shipped, 1 remains pending. Customer order detail shows
+  shipment 1 with tracking + pending shipment notice
+- Backorder mark: line shows backorder badge + ETA on customer side
+- Partial invoice: invoice generated for fulfilled portion only, ${fulfilledSubtotal} total
+- Subsequent partial invoice gets next letter (A → B)
+
+### Acceptance for Phase 16
+
+- alexa can edit any existing order: add/remove lines, change qty, change price, apply
+  order-level discount. Customer sees the updated order in real time.
+- alexa can ship 2 of 5 items, customer gets shipping notification for those 2, order shows
+  "2 of 5 shipped, 3 pending".
+- alexa can explicitly mark items as backordered with an ETA; customer sees the backorder
+  status + ETA on their order detail; customer is emailed when the backordered items
+  eventually ship.
+- alexa can generate a "fulfilled-only" invoice; customer sees that invoice covering the
+  partial shipment; remaining items get their own invoice when they ship.
+- All admin actions audit-logged.
+- All tests green.
