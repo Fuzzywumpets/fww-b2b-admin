@@ -2180,3 +2180,201 @@ manually re-trigger.
   fee correctly recorded as expense; Stripe Clearing nets to zero
 - Reconciliation page shows zero discrepancies for orders that processed cleanly
 - All tests green
+
+## Phase 19 — Customer profile depth + universal navigation + persistent cart
+
+Three pieces, all about making the admin tool a real operator console and making the customer's
+cart feel like THEIR cart (not a session blip).
+
+### 19A — Customer profile: lifetime spend + date-range filter + linked orders
+
+On `/admin/customers/:id`, add a new **"Spend"** section above the existing settings card.
+
+**Layout:**
+
+```
+┌─ Spend ──────────────────────────────────────────────────┐
+│                                                          │
+│  Lifetime spend:  $42,318.50  ·  127 orders              │
+│                                                          │
+│  Show spend for:  [ Last 30 days ▾ ]                     │
+│                    ▾ Last 7 days                         │
+│                    ▾ Last 30 days  (default)             │
+│                    ▾ Last 90 days                        │
+│                    ▾ Last 12 months                      │
+│                    ▾ Year to date                        │
+│                    ▾ All time                            │
+│                    ▾ Custom range...                     │
+│                                                          │
+│  Custom range:   [ 2026-01-01 ] to [ 2026-05-26 ]        │ ← only if "Custom"
+│                                                          │
+│  In range:  $8,440.20  ·  17 orders                      │
+│                                                          │
+│  ┌─ Orders in range ────────────────────────────────┐    │
+│  │ #1234  2026-05-20  $312.50  Paid  → invoice PDF  │    │  ← rows hyperlinked
+│  │ #1233  2026-05-18  $890.00  Paid  → invoice PDF  │    │     to /admin/orders/:id
+│  │ #1232  2026-05-15  $42.50   Pending invoice      │    │
+│  │  ...                                              │    │
+│  └─────────────────────────────────────────────────┘    │
+│                                                          │
+└──────────────────────────────────────────────────────────┘
+```
+
+**Implementation:**
+
+- New endpoint `GET /api/admin/customers/:id/spend?from=ISO&to=ISO`
+  - Returns: `{ lifetimeTotal, lifetimeCount, rangeTotal, rangeCount, orders: [{id, name, createdAt, total, financialStatus, fulfillmentStatus}] }`
+  - Lifetime: SUM(total_price) WHERE customer_id = :id AND voided=false AND refunded_amount < total_price (refunds prorated)
+  - Range: same WHERE + AND createdAt BETWEEN :from AND :to
+  - Server-side computation; cache 60s per customer (invalidate on order create/edit/cancel)
+- Frontend: dropdown changes trigger refetch; custom range shows two date pickers
+- Hyperlink every order # to `/admin/orders/:id`
+- Hyperlink every "→ invoice PDF" cell to the existing PDF generation endpoint
+
+**Data source:** Shopify orders via shopify-bridge GraphQL — `customer.orders(first: 250, query: "created_at:>YYYY-MM-DD AND created_at:<YYYY-MM-DD")`. Paginate if customer has >250 orders in range.
+
+**Edge cases:**
+- Customer with 0 orders → "No spend yet" in lifetime, "No orders in range" in range section
+- Voided/cancelled orders → excluded from totals but still show in list (dim/strikethrough)
+- Refunded orders → total reduced by refund amount; show original + refund delta on hover
+
+### 19B — Universal hyperlinks across admin
+
+Every reference to an entity should be a clickable link to that entity's detail page.
+
+**Affected components (audit + fix):**
+
+1. **Orders list** (`/admin/orders`)
+   - Order # → `/admin/orders/:id` (already linked — verify)
+   - Customer name → `/admin/customers/:id`  ← FIX
+   - Source badge (POS/SparkLayer/etc) → filter the list by that source
+
+2. **Order detail** (`/admin/orders/:id`)
+   - Customer name (top of page) → `/admin/customers/:id`  ← FIX
+   - Each line item product name → `/admin/products/:id` (NEW PAGE if needed — see 19C below)  ← FIX
+   - Each line item variant title → same as above with `?variant=:id` anchor
+   - Related orders (if cross-referenced via notes) → `/admin/orders/:otherId`
+   - Invoice numbers (in audit log) → PDF download link
+
+3. **Customers list** (`/admin/customers`)
+   - Customer name → `/admin/customers/:id` (already linked — verify)
+   - Order count → `/admin/orders?customer=:id`  ← FIX
+   - Tag chips → `/admin/customers?tag=:tag`  ← FIX
+
+4. **Customer detail** (`/admin/customers/:id`)
+   - All orders listed in spend section → `/admin/orders/:id` (per 19A)
+   - Tag chips → `/admin/customers?tag=:tag`
+   - Notes timeline: any `#1234` mention auto-linked to order, `@username` to user
+
+5. **Audit log viewer** (`/admin/audit`)
+   - Actor email → `mailto:` link
+   - Resource ID (order/customer/product) → relevant detail page
+   - Action type → filter the log by that action
+
+6. **Wholesale leads (Phase 17)**
+   - Once converted, "Customer #X" → `/admin/customers/:id`
+   - Notes: same `#1234` and `@username` auto-link rules
+
+**Convention:**
+- Hyperlinks use `class="link"` with consistent styling (Marquee Blue underline on hover)
+- Open in same tab by default; cmd/ctrl-click opens new tab (standard browser behavior)
+- Long titles truncate with ellipsis + `title=` attr for full text
+
+### 19C — Product detail in admin (NEW PAGE if not already built)
+
+For 19B link targets to work, admin needs `/admin/products/:id`:
+
+- Header: product title + handle + status (Active/Draft/Archived) + vendor + product type
+- Tags as chips, each linking to `/admin/products?tag=:tag`
+- Publications: which sales channels published to (B2B / OS / SparkLayer / POS) as colored badges
+- Variants table: SKU · barcode · price · inventory per location · weight
+- "Edit in Shopify" deep-link button → opens Shopify admin product page in new tab
+- Image gallery (thumbnails)
+- Recent orders containing this product: list with date, customer link, qty, total
+
+This page is read-mostly; edits flow through "Edit in Shopify" until/unless we build a full product editor (defer).
+
+### 19D — Persistent cart (b2b portal, cross-repo)
+
+**Cross-repo change** — touches `fww-b2b-portal`. Keep `fww-b2b-admin` changes minimal here (just the admin-visible cart audit log entry per customer if relevant).
+
+**Current behavior** (assumed): cart is in localStorage on the customer's browser; clearing localStorage / changing device = cart gone.
+
+**New behavior:**
+
+1. **Server-side cart storage** — every add/remove/qty-change syncs to portal SQLite:
+   - Table `cart_events (id, customer_id, event_type, variant_id, quantity, prev_quantity, ts)` — append-only log of every change
+   - Table `cart_state (customer_id, items_json, updated_at)` — current cart snapshot
+   - On every cart mutation in the UI: POST `/api/cart/event` → server appends to `cart_events` + updates `cart_state` row
+   - On portal page load (catalog, PDP, cart): GET `/api/cart` → server returns `cart_state.items_json`; client merges with any local pending changes
+   - LocalStorage stays as a write-through cache; source of truth is server
+
+2. **No automatic clearing**:
+   - Cart contents persist forever until the customer explicitly clicks "Empty cart"
+   - Order placement does NOT clear the cart automatically — items just get marked `purchased_at = order_id`; the cart resets to empty AFTER successful order confirmation (so a failed checkout still keeps their cart intact)
+   - On `Empty cart` button click: confirm modal ("Empty your cart? You'll lose your saved items.") → POST `/api/cart/clear`
+
+3. **Exit warning when cart has items + order not placed**:
+   - `window.addEventListener('beforeunload', ...)` if `cart.items.length > 0` AND not currently on `/checkout/success`
+   - Browser shows native "Leave site? Changes you made may not be saved" prompt
+   - Triggered only when leaving the portal entirely (not on internal nav)
+
+4. **Admin visibility**:
+   - On `/admin/customers/:id`, NEW section "Active cart":
+     - If `cart_state.items_json` is non-empty:
+       ```
+       ┌─ Active cart  ·  3 items  ·  $87.50  ·  last updated 2 hours ago ─┐
+       │ • Everyday Limited Slip Collar — Small × 2 — $30.00              │  ← product links
+       │ • Everyday Walking Lead — Medium × 1 — $25.50                    │
+       │ • Luxe Houndstooth Martingale × 1 — $32.00                       │
+       │                                                                    │
+       │ [ Convert to order... ] [ Email reminder ] [ Empty their cart ]   │
+       └────────────────────────────────────────────────────────────────────┘
+       ```
+     - Else: "No active cart"
+   - "Convert to order..." → opens manual order builder pre-populated with cart items
+   - "Email reminder" → sends "you have items waiting in your cart" email (Resend)
+   - "Empty their cart" → confirm modal + admin action audit-logged
+
+5. **Cart history viewer**:
+   - Admin can click "Cart activity" on customer detail → modal/page showing last 100 cart_events with timestamps
+   - Useful for diagnosing "I added 5 of X but only see 3" type complaints
+
+**Data retention:**
+- `cart_events` is append-only forever
+- `cart_state` is single-row-per-customer, updated in place
+- No TTL, no auto-prune (matches alexa's explicit "in perpetuity" instruction)
+
+**Migration**:
+- On first deploy, no existing cart_state rows; customers will populate as they interact
+- Existing localStorage carts on customer browsers get uploaded to server on first cart mutation after deploy (one-shot sync logic in cart JS)
+
+### Tests
+
+- 19A: customer with 5 orders across 2 years → lifetime total matches sum; range filter narrows correctly
+- 19A: change date range dropdown → orders list refetches + total updates
+- 19A: custom range with from > to → frontend validation prevents fetch
+- 19B: order detail page — clicking customer name navigates to customer detail
+- 19B: customer detail — clicking tag chip navigates to filtered customers list
+- 19B: any `#1234` in note text auto-renders as link to order 1234
+- 19C: /admin/products/:id loads product with variants + tags + publication badges
+- 19D: cart event API records each add/remove/qty-change
+- 19D: cart persists across browser refresh + new device login
+- 19D: order placement does NOT clear cart until confirmation success
+- 19D: explicit "Empty cart" clears cart_state + adds audit event
+- 19D: admin sees active cart on customer detail
+- 19D: admin "Convert to order" pre-populates manual order builder
+
+### Acceptance for Phase 19
+
+- alexa can open any customer profile and see lifetime spend, date-range spend, and a list of
+  orders in that range — every order links to its detail page
+- alexa can navigate from any order to its customer, from any customer to their orders, from
+  any product line item to that product's detail page — no copy-paste of IDs required
+- A wholesale customer's cart is preserved forever across sessions / devices / logouts;
+  if they accidentally close the tab with items in it, the browser warns them; clicking
+  through doesn't lose the cart; only an explicit "Empty cart" or completed-order confirmation
+  resets it
+- alexa can see any customer's active cart from the admin and either convert it to an order
+  or email the customer a reminder
+- All tests green
