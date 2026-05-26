@@ -2712,3 +2712,186 @@ BEFORE Phase 18 in the implementation queue.
 - Merged contacts show the merge banner
 - Phase 18 invoice booking respects the resolve helper (no dup creation)
 - All tests green
+
+## Phase 22 — Admin "View portal as customer" (impersonation)
+
+alexa's directive 2026-05-26: admin needs a "View portal as ..." button on customer profiles to
+debug customer-side issues, walk customers through the cart, see exactly what they see.
+
+Cross-repo: BOTH `fww-b2b-admin` AND `fww-b2b-portal` need changes. Similar pattern to
+Phases 13/14 cross-repo wiring.
+
+### 22A — Shared impersonation secret
+
+**New Doppler secret:** `B2B_IMPERSONATION_SECRET` (random 64-char hex, used to sign + verify
+the impersonation token by both apps).
+
+If missing in Doppler, the loop should:
+1. Generate via `openssl rand -hex 32`
+2. Push to Doppler: `doppler secrets set B2B_IMPERSONATION_SECRET=<value>`
+3. Both apps read it at startup; require it (fail to boot if absent in prod)
+
+### 22B — Admin: "View portal as ..." button + token mint
+
+On `/admin/customers/:id` (admin server), add a button in the customer header card:
+
+```
+[ View portal as Mia Wagner ... ]   ← purple/lime accent to stand out
+```
+
+Click flow:
+1. Admin clicks → confirms with modal: "Open portal as Mia Wagner? You will see her catalog,
+   prices, cart, and order history. Actions you take WILL affect her account unless you stay
+   in read-only mode."
+   - Radio option: ◉ Read-only (default — browse only, cart mutations blocked) / ◯ Interactive
+     (full simulation including cart/checkout)
+   - [Cancel] [Open portal]
+2. On confirm: POST `/api/admin/customers/:id/impersonate` with `{mode: 'readonly'|'interactive'}`
+3. Admin server creates signed JWT-style token:
+   ```js
+   const payload = {
+     customer_id: id,
+     admin_email: session.email,
+     mode: 'readonly' | 'interactive',
+     issued_at: Date.now(),
+     expires_at: Date.now() + 60*60*1000,  // 1-hour TTL
+     nonce: crypto.randomBytes(16).toString('hex')
+   };
+   const token = base64url(JSON.stringify(payload)) + '.' + hmacSha256(payload, SECRET);
+   ```
+4. Audit log entry: `action=impersonation_started, admin=<email>, customer_id=<id>, mode=<mode>, expires_at=<ts>`
+5. Response: `{ url: 'https://b2b.fuzzyreporting.com/__impersonate__?token=<token>' }`
+6. Admin frontend: `window.open(url, '_blank')` — opens portal in new tab
+
+**Endpoint:** `POST /api/admin/customers/:id/impersonate` — requires admin auth, returns the
+URL. Rate limit: 10/min per admin.
+
+### 22C — Portal: token validation + impersonation session
+
+In `fww-b2b-portal/server.mjs`, add new route `GET /__impersonate__?token=<token>`:
+
+1. Parse + HMAC-verify token using `B2B_IMPERSONATION_SECRET`
+2. Check `expires_at > now()` → 401 if expired
+3. Check `customer_id` is valid + b2b-tagged via existing customer fetch path
+4. Create session record with extra flags:
+   ```js
+   session = {
+     customer_id, /* normal session fields */,
+     impersonation: {
+       active: true,
+       admin_email: payload.admin_email,
+       mode: payload.mode,  // 'readonly' | 'interactive'
+       started_at: payload.issued_at,
+       expires_at: payload.expires_at,
+       nonce: payload.nonce
+     }
+   }
+   ```
+5. Set session cookie (separate name from normal session: `b2b_impersonation_session` so it
+   doesn't collide with the customer's actual session if they're also logged in)
+6. Redirect to `/` (portal home)
+
+**Audit log on portal:** every page request during impersonation logs `impersonation_view`
+with admin_email + customer_id + path.
+
+### 22D — Portal: impersonation banner + mode enforcement
+
+On every portal page (sticky top), render banner when `session.impersonation?.active`:
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│ 👁  Viewing as Mia Wagner — started by alex@fuzzywumpets.com         │
+│     Mode: READ-ONLY  ·  Expires in 47 min  ·  [Exit impersonation]  │ ← red bg, sticky
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+Color: bright red/orange background (#dc2626 / #ea580c) so admin can't miss it. Sticky at top
+of viewport on every page.
+
+**Read-only mode enforcement** (in portal server middleware):
+- Block POST/PUT/DELETE to: `/api/cart/*`, `/api/checkout`, `/api/orders`, `/api/stock-alerts`,
+  `/api/tax-exempt`, `/api/team-members`, `/account/*` mutations
+- Allow GET on everything
+- Blocked requests return 403 with body: `{ error: 'Read-only impersonation mode' }`
+- Frontend: any "Add to cart" / "Place order" / etc. buttons get a visual disabled state +
+  tooltip "Read-only mode — switch to interactive to perform actions"
+
+**Interactive mode**:
+- All routes work normally BUT every mutation gets an extra audit log entry:
+  `impersonation_mutation` with admin_email, customer_id, route, body_summary
+- Cart mutations + order placement get an extra client-side confirm:
+  `"You are impersonating <customer>. This action will affect their cart/order. Continue?"`
+
+### 22E — Exit impersonation
+
+[Exit impersonation] button on the banner:
+- POST `/__impersonate__/exit` → destroys impersonation session cookie
+- Audit log: `impersonation_ended, admin_email, customer_id, duration_seconds`
+- Redirect to `/exited?customer=<name>` showing a brief "Impersonation ended" confirmation page
+- Optional: window.close() if opened via window.open (when admin clicked the button) — fall
+  back to redirect if not popup-spawned
+
+Auto-expiry: if `expires_at < now()` on any page load → force-exit + audit log
+`impersonation_expired`.
+
+### 22F — Admin: active impersonation indicator
+
+On admin sidebar/header, show small badge if current admin has any active impersonation
+session (queried from audit log + token TTL check). Click → list of active impersonations with
+"Force-end" button per row. Useful when admin forgets to exit.
+
+### 22G — Security guarantees
+
+- Token TTL: 1 hour max
+- Single-use nonce: nonce stored in admin DB on issue; portal records nonce on first use;
+  reusing same token after exit returns 401 (prevents replay)
+- Cannot impersonate other admins (only `b2b`-tagged Shopify customers via this path)
+- Insiders (Alexander Lass, Mason Flowers per Phase 21) → block impersonation with error
+  "Cannot impersonate insider accounts"
+- All impersonation activity audit-logged (start, every mutation, every pageview optional,
+  end) — searchable in admin audit log viewer
+- Cookies: HttpOnly, Secure, SameSite=Lax; expires when token does
+
+### 22H — UX nicety: impersonation history on customer detail
+
+On `/admin/customers/:id`, add a section "Recent impersonation sessions":
+
+```
+┌─ Impersonation history ─────────────────────────────────┐
+│ alex@fuzzywumpets.com — 2026-05-26 14:32 (READ-ONLY)    │
+│   Duration: 23 min  ·  Pages viewed: 18  ·  Actions: 0  │
+│                                                          │
+│ alex@fuzzywumpets.com — 2026-05-25 10:14 (INTERACTIVE)  │
+│   Duration: 8 min  ·  Pages viewed: 5  ·  Actions: 2 -> │
+│   [view actions]                                         │
+└──────────────────────────────────────────────────────────┘
+```
+
+Helpful audit trail for customer support — "When did we last help this customer?" answerable
+without grepping logs.
+
+### Tests
+
+- 22B: POST impersonate creates audit log + returns valid token URL
+- 22B: token signed with wrong secret → admin endpoint rejects
+- 22C: portal /__impersonate__ accepts valid token, creates impersonation session
+- 22C: portal rejects expired token (401)
+- 22C: portal rejects reused token (401 — nonce already consumed)
+- 22D: banner renders on every page during impersonation
+- 22D: read-only mode blocks POST /api/cart/event with 403
+- 22D: interactive mode allows POST /api/cart/event but logs impersonation_mutation
+- 22E: exit destroys session + redirects + audit log
+- 22G: insider customer ID → impersonation endpoint returns 403
+- 22H: impersonation history section renders on customer detail
+
+### Acceptance for Phase 22
+
+- alexa opens any B2B customer's profile in admin → clicks "View portal as ..."
+- New tab opens with the b2b portal showing exactly what the customer sees: their catalog,
+  their pricing, their cart, their order history
+- Sticky red banner shows "Viewing as <name>" with mode + expires-in + Exit button
+- Read-only mode (default): can browse but can't add to cart or place orders
+- Interactive mode: can add to cart and check out, but every action is audit-logged + admin
+  gets a confirm dialog on mutations
+- Click [Exit impersonation] → portal session ends, audit logged, back to admin
+- All tests green
