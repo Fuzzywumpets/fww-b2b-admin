@@ -1,57 +1,61 @@
 # fww-b2b-admin — overnight status
 STATE: IN_PROGRESS
-PHASE: 2 — orders + customers
-LAST_UPDATED: 2026-05-26T19:20:00Z
+PHASE: 3 — catalog + reports + settings
+LAST_UPDATED: 2026-05-26T19:37:00Z
 
 ## What shipped this session
-- **Phase 1 DONE**: Google OAuth + dashboard MVP (commit dde366c)
-  - db.mjs: SQLite schema (admin_sessions, audit_log, customer_notes, dropship_config_cache)
-  - Full Google OAuth flow: /auth/login → callback → email allowlist gate → session mint
-  - Login page: branded FWW card with Google sign-in
-  - Dashboard /: 4 widgets — open orders, this-week count, top 5 customers, low-stock B2B items
-  - Header nav with all 6 sections
-  - Mobile-responsive (390px tested)
-  - 24/24 tests green (13 API + 11 UI/Playwright)
+- **Phase 2 DONE**: Orders + Customers pages (commit 2e6812a)
+  - /orders: filterable list, bulk mark-paid, 50/page pagination
+  - /orders/:id: full detail — line items, timeline, mark-paid, note editor, PDF invoice
+  - /orders/new: manual order builder (customer + product autocomplete, submit as draft order)
+  - /customers: b2b-tagged list, sorted by spend, tag filter, search
+  - /customers/:id: profile, notes, dropship config, tags editor, recent orders
+  - pdf.mjs: pdfkit invoice with PAYMENT PENDING watermark
+  - db.mjs: new helpers for customer_notes + dropship_config_cache
+  - 52/52 tests green (35 API + 17 UI)
 
 ## What's working (URLs)
 - https://b2badmin.fuzzywumpets.com/login — login page (LIVE)
-- https://b2badmin.fuzzywumpets.com/healthz — health check (LIVE)
-- https://b2badmin.fuzzywumpets.com/ — dashboard after Google login (LIVE)
-- /orders, /customers, /catalog, /reports, /settings — stub pages (auth-gated, coming soon)
-
-## Screenshots
-- runs/screenshots/p1-login.png
-- runs/screenshots/p1-dashboard.png
+- https://b2badmin.fuzzywumpets.com/ — dashboard with real Shopify stats
+- https://b2badmin.fuzzywumpets.com/orders — orders list (LIVE)
+- https://b2badmin.fuzzywumpets.com/orders/:id — order detail + mark paid + PDF invoice (LIVE)
+- https://b2badmin.fuzzywumpets.com/orders/new — manual order form (LIVE)
+- https://b2badmin.fuzzywumpets.com/customers — customers list (LIVE)
+- https://b2badmin.fuzzywumpets.com/customers/:id — customer detail + notes + dropship (LIVE)
+- /catalog, /reports, /settings — stub pages (coming Phase 3)
 
 ## Test status
-- API: 13/13 ✓
-- UI:  11/11 ✓ (incl. mobile 390px)
+- API: 35/35 ✓
+- UI:  17/17 ✓ (incl. mobile 390px)
 
 ## Blockers / decisions alexa needs to make
-- None. Continue to Phase 2.
+- None. Continue to Phase 3.
 
-## Phase 2 — next iteration's plan
-Per HANDOFF.md §"Phase 2 — orders + customers":
+## Phase 3 — next iteration's plan
+Per HANDOFF.md §"Phase 3 — catalog + reports + settings":
 
-6. **/orders**: list all b2b-portal tagged orders; filters (status, customer, date); search;
-   bulk actions (mark paid, add note); pagination 50/page.
+11. **/catalog**: list all products on B2B publication (pub 199709720811).
+    Filters: vendor, style (from Style_* tag), in-stock. Per-product: toggle B2B
+    inclusion (publishablePublish/Unpublish). Bulk publish/unpublish. Variant inventory.
 
-7. **/orders/:id**: full order detail — line items, status timeline, mark paid action,
-   note editor, PDF invoice (pdfkit).
+12. **/migrate** (SparkLayer migrator): find customers with sparklayer-* tags or
+    metafields. Bulk-tag them `b2b`. Idempotent. Audit-logged.
 
-8. **/customers**: list b2b-tagged customers sorted by lifetime spend; filter/search.
+13. **/reports**:
+    - Sales by customer (top 20 with sparkline)
+    - Sales by product (top 50)
+    - Month-over-month revenue (last 12 months, inline SVG bar chart)
+    - AOV trend
+    - All exportable as CSV
 
-9. **/customers/:id**: profile, tags editor, lifetime spend, recent orders, internal notes
-   (customer_notes SQLite), dropship config (Shopify metafields via shopify-bridge).
+14. **/settings**: editable config (B2B discount %, order minimum, payment terms).
+    Read-only: pub ID, OAuth issuer, admin allowlist (+ add email form → Doppler).
 
-10. **/orders/new**: manual order builder — pick customer, add line items, set shipping,
-    submit as draftOrderCreate + draftOrderComplete (paymentPending: true).
-
-### Key implementation notes
-- All Shopify writes via shopify-bridge (SHOPIFY_BRIDGE_BEARER from Doppler)
-- All mutations → auditLog() call
-- Mark paid: orderMarkAsPaid mutation (see SCRATCH.md)
-- Dropship: metafieldsSet with namespace b2b, keys dropship_enabled + dropship_margin_pct
-- PDF: use pdfkit (install as dep), don't import from b2b-portal
-- Bulk actions: form POST with array of order IDs, action type
-- Pagination: cursor-based (Shopify) mapped to ?after= query param
+### Key implementation notes for Phase 3
+- B2B publication: gid://shopify/Publication/199709720811
+- publishablePublish / publishableUnpublish mutations (already in SCRATCH.md)
+- For reports: query last 12 months of b2b-portal orders, group by month/customer/product
+- Inline SVG bar chart: pure SVG, no JS charting lib — compute rects server-side
+- Settings: read Doppler secrets for display, `doppler secrets set` for writes
+  (run child_process.execSync — only for B2B_ADMIN_ALLOWED_EMAILS writes)
+- admin_settings SQLite table needed (Phase 5 also uses it): add in db.mjs

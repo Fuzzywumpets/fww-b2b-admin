@@ -217,7 +217,37 @@ fww-b2b-admin/
 - Old process (from before systemd) sat on 8794 and blocked restarts. Kill manually first.
 - `lsof -i :8794` to check. `sudo systemctl restart fww-b2b-admin.service` only works if port is free.
 
-## Phase 2 starting next iteration
+## Phase 2 complete (2026-05-26, commit 2e6812a)
+
+### Files changed
+- server.mjs — full rewrite with orders + customers routes (~1650 lines)
+- pdf.mjs — new file, pdfkit invoice generator
+- db.mjs — added getCustomerNotes/setCustomerNotes/getDropshipCache/setDropshipCache
+- public/admin.css — 250 lines of Phase 2 styles (buttons, tables, cards, etc.)
+- test/api.test.mjs — 35 tests
+- test/ui.test.mjs — 17 tests
+
+### URL / numeric ID pattern
+- Orders: /orders/1001 → numericId=1001 → GID=gid://shopify/Order/1001
+- Customers: /customers/101 → numericId=101 → GID=gid://shopify/Customer/101
+- shopifyNumericId(gid) extracts the last segment after /
+
+### Mock order mutations
+- mockOrderOverrides Map<numericId, overrides> holds in-memory state changes
+- getMockOrder(numericId) merges MOCK_ORDERS base with overrides
+- Tests can verify state changes within a single server instance
+
+### Route ordering is important
+- GET /orders/new MUST be defined before GET /orders/:id
+- POST /orders/bulk MUST be defined before POST /orders/:id/* 
+  (not actually a conflict because sub-paths differ, but good practice)
+
+### Note persistence in tests
+- customer_notes writes to :memory: SQLite in mock mode
+- Because mock server runs continuously during test suite, notes persist within the test run
+- Tests pass because seedSession() creates new session but shares the same SQLite instance
+
+## Phase 3 starting next iteration
 
 ### Draft orders mutation (manual order builder)
 ```graphql
