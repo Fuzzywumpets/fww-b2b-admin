@@ -190,6 +190,27 @@ fww-b2b-admin/
 ## Append below this line, future iterations
 ---
 
+## Phase 19A + 17 complete (2026-05-27)
+
+### Phase 19A: Customer spend section
+- `/api/admin/customers/:id/spend?from=ISO&to=ISO` — returns { lifetimeTotal, lifetimeCount, rangeTotal, rangeCount, orders[] }
+- Mock mode: filters MOCK_ORDERS by customer GID
+- Real mode: Shopify `customer(id:$id){ orders(first:250, query:"processed_at:>=YYYY-MM-DD processed_at:<=YYYY-MM-DD") }`
+- JS on page: loadSpend() fetches from API, updates #spend-range-total, #spend-range-count, #spend-orders-body
+- Preset dropdown with `from|to` values, custom range with two date inputs + Go button
+
+### Phase 17: Wholesale Leads CRM
+- Tables: leads, lead_notes, lead_status_history (all in db.mjs)
+- LEAD_STATUSES + LEAD_TRANSITIONS maps define workflow
+- Status badge colors: blue=new, warning=under_review, orange=waiting_on_*, success=approved, lime=converted, danger=rejected, muted=dormant
+- Timeline: merge notes + history by timestamp; system note added on every status change
+- Convert to customer: `customerCreate` mutation + `metafieldsSet` for b2b.discount_pct, allow_order_on_invoice, dropship_enabled
+- Leads nav item between Customers and Catalog
+
+### Next: Phase 19B (universal hyperlinks) + Phase 16 (order editing)
+
+---
+
 ## Phase 13 complete (2026-05-26)
 
 ### Portal: per-customer discount refactor

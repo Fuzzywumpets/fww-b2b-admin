@@ -1,44 +1,43 @@
 # fww-b2b-admin — overnight status
 STATE: IN_PROGRESS
-PHASE: 19E + 20 — catalog status filter + priority customers
-LAST_UPDATED: 2026-05-26T23:35:00Z
+PHASE: 19A + 17 — customer spend section + wholesale leads CRM
+LAST_UPDATED: 2026-05-27T00:30:00Z
 
 ## What shipped this session
-- Phase 19E: Catalog tab product status filter
-  — /catalog defaults to Active products only (new default)
-  — Status filter chips: Active / Draft / Archived / All with count badges
-  — DRAFT / ARCHIVED row badges + archived rows visually dimmed
-  — Two new mock catalog products: draft (#207) and archived (#208)
-  — Real mode: passes status:active/draft/archived to Shopify query
-- Phase 20: Priority customer onboarding
-  — /customers default sort changed to lifetime spend ↓ (was arbitrary)
-  — Sort dropdown: Lifetime spend ↓ / Order count ↓ / Name A–Z
-  — ★ star badges on top-10 customers by spend
-  — Order count column now links to /orders?customer=id
-  — Dashboard "Top Customers" widget shows order count column + star badges
-  — Mock customers now returned sorted by amountSpent desc
-  — docs/PRIORITY_CUSTOMERS_BASELINE.md: top-15 customers (Mia Wagner $142K+)
-  — docs/SHOPIFY_COMPANIES_RESEARCH.md: Phase 22 migration research preserved
-- Tests: 125 API + 46 UI = 171 total, all green
+- Phase 19A: Customer spend section on /customers/:id
+  — GET /api/admin/customers/:id/spend?from=ISO&to=ISO endpoint
+  — Date range dropdown: Last 7/30/90 days, 12 months, YTD, All time, Custom
+  — AJAX-powered orders list in range, lifetime + range totals
+  — Clickable order links + inline invoice PDF download
+- Phase 17: Wholesale leads CRM
+  — SQLite: leads, lead_notes, lead_status_history tables
+  — /leads — list with status filter chips + count badges, search, follow-up dates
+  — /leads/new — create form
+  — /leads/:id — detail with merged timeline (notes + status history), change-status form
+  — Status workflow: new → under_review → waiting_on_docs/tax/w9 → approved → converted
+  — /leads/:id/convert — creates Shopify customer + b2b tag + metafields
+  — Leads nav item in header (between Customers and Catalog)
+- Tests: 136 API + 51 UI = 187 total, all green
 
 ## What's working (URLs)
-- https://b2badmin.fuzzywumpets.com (all phases 1–14 + 19E + 20)
+- https://b2badmin.fuzzywumpets.com (all phases 1–14 + 17 + 19A + 19E + 20)
+- /leads — wholesale leads pipeline with status workflow
+- /leads/new — create new lead
+- /leads/:id — lead detail with timeline, status change, notes, convert to customer
+- /customers/:id — Spend section with date range + orders list
 - /catalog — status filter chips (Active default, Draft, Archived, All)
 - /customers — sorted by lifetime spend, star badges on top customers
 - /orders — all orders; order detail has visible-notes card + tax-exempt review link
 - /tax-exempt — pending tax cert review queue with approve/reject
-- /customers/:id — B2B Customer Settings + per-customer discount
 - https://b2b.fuzzyreporting.com/checkout — 3 payment methods
 - https://b2b.fuzzyreporting.com/account — stock alerts + tax cert + portal activity
-- https://b2b.fuzzyreporting.com/account/alerts — manage back-in-stock alerts
-- https://b2b.fuzzyreporting.com/orders/:id — tracking timeline + visible notes
 
 ## Test status
-- Admin API:  125/125
-- Admin UI:    46/46
+- Admin API:  136/136
+- Admin UI:    51/51
 - Portal API: 114/114 (separate repo)
 - Portal UI:   39/39 (separate repo)
-- Total: 324 green
+- Total: 340 green
 
 ## Phases completed
 - Phase 0: Research + scaffold
@@ -52,26 +51,30 @@ LAST_UPDATED: 2026-05-26T23:35:00Z
 - Phase 9+10: Broaden order/customer scope + unified B2B settings
 - Phase 13: Final payment spec (ACH + Chase stub, portal side)
 - Phase 14: Customer self-service additions (admin side: tax-exempt review, visible notes)
-- Phase 19E: Catalog tab product status filter ← NEW
-- Phase 20: Priority customer onboarding + Companies research ← NEW
+- Phase 17: Wholesale leads CRM ← NEW
+- Phase 19A: Customer spend section on /customers/:id ← NEW
+- Phase 19E: Catalog tab product status filter
+- Phase 20: Priority customer onboarding + Companies research
 
 ## Phases remaining (spec in HANDOFF.md, code not yet built)
 - Phase 15: Customer-specific catalogs (per-customer private tags) + multi-user team accounts
 - Phase 16: Admin order editing (modify lines, partial fulfill, backorder, discounts)
-- Phase 17: Wholesale leads CRM-lite pipeline
 - Phase 18: Xero accounting integration
-- Phase 19: Customer profile depth (lifetime spend section, universal hyperlinks, persistent cart)
+- Phase 19B: Universal hyperlinks across admin (audit + fix all entity cross-links)
+- Phase 19C: Product detail page /admin/products/:id
+- Phase 19D: Persistent cart (b2b portal cross-repo)
 
 ## Next iteration's plan
-Phase 19 (partial — start with 19A):
-- 19A: Customer lifetime spend section on /customers/:id
-  — GET /api/admin/customers/:id/spend?from=ISO&to=ISO
-  — Date range dropdown (Last 30 days / 90 days / 12 months / YTD / All time / Custom)
-  — Orders list with clickable links in the range
-Phase 17 (wholesale leads CRM):
-  — New leads table in admin.db
-  — /leads list + /leads/:id + /leads/new routes
-  — Status pipeline: new → under_review → approved → converted
+Phase 19B (universal hyperlinks — easiest wins first):
+  — Order list: customer name → /customers/:id link (fix)
+  — Customer list: order count → /orders?customer=id link (fix)
+  — Audit log: resource IDs → relevant detail page links
+  — Order detail: customer name → /customers/:id (fix)
+Phase 16 (admin order editing):
+  — Edit order line items (qty, price, remove/add)
+  — Order-level discount
+  — Partial fulfillment modal
+  — Backorder flagging
 
 ## Blockers / decisions alexa needs to make
 - Email (Resend): B2B_PORTAL_RESEND_API_KEY not set → emails log to console
