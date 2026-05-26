@@ -1,0 +1,14 @@
+{
+  "name": "fww-b2b-admin",
+  "version": "0.1.0",
+  "description": "Fuzzywumpets internal B2B admin/ops dashboard — separate from the customer-facing b2b portal",
+  "type": "module",
+  "main": "server.mjs",
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "./run-tests.sh"
+  },
+  "engines": { "node": ">=20" },
+  "dependencies": { "express": "^5.2.1", "better-sqlite3": "^11.5.0" },
+  "devDependencies": { "playwright": "^1.60.0" }
+}
