@@ -27,6 +27,7 @@ import {
 } from './db.mjs';
 import { generateInvoicePdf } from './pdf.mjs';
 import { renderLabelSheet, expandItems, TEMPLATES as LABEL_TEMPLATES, DEFAULT_FIELDS } from './labels.mjs';
+import { isInsider, resolveXeroContact, syncCustomerToXero, getXeroSyncStatus } from './lib/xero-customer-sync.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const MOCK  = process.env.B2B_ADMIN_MOCK === '1';
@@ -109,6 +110,13 @@ async function callPortalInternal(method, path, body) {
 // ── Xero accounting integration ───────────────────────────────────────────────
 
 function xeroMockResponse(method, xeroPath, body) {
+  if (xeroPath.includes('/ContactGroups')) {
+    return { ContactGroups: [{ ContactGroupID: 'c5afb0f1-8a59-4db8-be57-83548c361669', Name: 'B2B Customers', Contacts: [] }] };
+  }
+  if (xeroPath.includes('/Contacts') && method === 'GET' && xeroPath.includes('where=')) {
+    // Live lookup by AccountNumber — return empty in mock (so syncCustomerToXero will create)
+    return { Contacts: [] };
+  }
   if (xeroPath.includes('/Contacts')) {
     return { Contacts: [{ ContactID: 'mock-contact-xero', Name: body?.Contacts?.[0]?.Name || 'Mock Contact', EmailAddress: body?.Contacts?.[0]?.EmailAddress || '' }] };
   }
@@ -172,10 +180,16 @@ function addDays(isoString, days) {
 
 async function ensureXeroContact(customer) {
   // customer: { id (GID), displayName, email }
+  // Phase 21G: resolve from mapping / live before creating to avoid duplicates
+  const numId = shopifyNumericId(customer.id || '');
+  if (numId) {
+    const resolved = await resolveXeroContact(numId, xeroRequest, { dryRun: MOCK });
+    if (resolved) return resolved.xeroContactId;
+  }
   const name  = customer.displayName || customer.email || 'Unknown Customer';
   const email = customer.email || '';
   const res = await xeroRequest('PUT', '/api.xro/2.0/Contacts', {
-    Contacts: [{ Name: name, EmailAddress: email }],
+    Contacts: [{ Name: name, AccountNumber: numId || undefined, EmailAddress: email }],
   });
   const contact = res.body?.Contacts?.[0];
   if (!contact?.ContactID) throw new Error('Xero contact create failed: ' + JSON.stringify(res.body).slice(0, 200));
@@ -2275,6 +2289,41 @@ function renderCustomerDetail(session, customer, recentOrders, notes, _dropshipC
           })();
           </script>
         </div>
+        <!-- Phase 21D: Xero sync status card -->
+        <div class="card" id="xero-customer-card">
+          <div class="card-header"><h2>Xero</h2></div>
+          <div id="xero-customer-status">
+            <span class="text-muted small-text">Loading…</span>
+          </div>
+          <script>
+          (function(){
+            var el = document.getElementById('xero-customer-status');
+            fetch('/api/admin/customers/${h(numId)}/xero-status')
+              .then(function(r){ return r.json(); })
+              .then(function(d){
+                var html = '';
+                if(d.state === 'synced'){
+                  html = '<span style="color:var(--lime);font-weight:600">✓ Synced</span>' +
+                    ' <a href="https://go.xero.com/Contacts/View/'+encodeURIComponent(d.xeroContactId)+'" target="_blank" class="text-muted small-text" style="font-size:11px" title="'+d.xeroContactId+'">' +
+                    d.xeroContactId.slice(0,8)+'…</a>' +
+                    (d.xeroName ? '<br><span class="text-muted small-text">'+d.xeroName+'</span>' : '') +
+                    '<br><form method="POST" action="/api/admin/customers/${h(numId)}/xero-sync" style="margin-top:6px"><button class="btn btn-ghost btn-xs" type="submit">↻ Re-sync</button></form>';
+                } else if(d.state === 'merged'){
+                  html = '<span style="color:var(--lime);font-weight:600">⚭ Merged contact</span>' +
+                    '<br><span class="text-muted small-text">Invoices for this customer post to <strong>'+d.xeroName+'</strong>.</span>' +
+                    (d.primaryShopifyId ? '<br><a href="/customers/'+d.primaryShopifyId+'" class="small-text">View primary →</a>' : '');
+                } else if(d.state === 'insider'){
+                  html = '<span style="color:#999">⊘ Insider — sync not applicable</span>';
+                } else {
+                  html = '<span style="color:var(--orange)">⚠ Not synced</span>' +
+                    '<br><form method="POST" action="/api/admin/customers/${h(numId)}/xero-sync" style="margin-top:6px"><button class="btn btn-secondary btn-xs" type="submit">Sync to Xero</button></form>';
+                }
+                el.innerHTML = html;
+              })
+              .catch(function(){ el.innerHTML = '<span class="text-muted small-text">Could not load Xero status.</span>'; });
+          })();
+          </script>
+        </div>
       </div>
     </div>
   ` });
@@ -3273,6 +3322,12 @@ app.post('/customers/:id/tags/add', requireAuth, async (req, res) => {
     } catch (err) { console.error('tagsAdd error:', err.message); }
   }
   auditLog(req.adminSession.email, 'add_tag', gid, null, { tag });
+  // Phase 21C: when b2b tag is added, trigger Xero sync (non-blocking)
+  if (tag === 'b2b') {
+    syncCustomerToXero(req.params.id, { email: '' }, xeroRequest, { dryRun: MOCK })
+      .then(r => { if (r.created) auditLog(req.adminSession.email, 'xero:customer_sync', gid, null, { xeroContactId: r.xeroContactId, via: 'tag_add' }); })
+      .catch(e => console.error('[xero-sync] tag add sync failed:', e.message));
+  }
   res.redirect(`/customers/${req.params.id}?success=tags_added`);
 });
 
@@ -5463,6 +5518,18 @@ app.post('/leads/:id/convert', requireAuth, async (req, res) => {
     shopifyCustomerId = 'gid://shopify/Customer/MOCK_' + lead.id;
   }
 
+  // Phase 21C: sync new B2B customer to Xero (non-blocking)
+  const numIdForXero = shopifyCustomerId ? shopifyCustomerId.split('/').pop() : null;
+  if (numIdForXero) {
+    syncCustomerToXero(numIdForXero, {
+      email: email, firstName: name.split(' ')[0] || name,
+      lastName: name.split(' ').slice(1).join(' ') || '',
+      displayName: name,
+    }, xeroRequest, { dryRun: MOCK }).then(r => {
+      if (r.created) auditLog(req.adminSession.email, 'xero:customer_sync', shopifyCustomerId, null, { xeroContactId: r.xeroContactId, via: 'lead_convert' });
+    }).catch(e => console.error('[xero-sync] lead convert sync failed:', e.message));
+  }
+
   updateLead(lead.id, { status: 'converted', converted_at: Date.now(), shopify_customer_id: shopifyCustomerId });
   addLeadStatusHistory(lead.id, 'approved', 'converted', 'Customer created', req.adminSession.email);
   addLeadNote(lead.id, req.adminSession.email, 'Converted to Shopify customer ' + shopifyCustomerId, 'system');
@@ -5667,6 +5734,39 @@ app.post('/orders/:id/xero/sync', requireAuth, async (req, res) => {
     res.redirect(`/orders/${numId}?success=xero_synced`);
   } catch (err) {
     res.redirect(`/orders/${numId}?success=xero_failed`);
+  }
+});
+
+// ── Phase 21: Xero customer sync endpoints ────────────────────────────────────
+
+app.get('/api/admin/customers/:id/xero-status', requireAuth, async (req, res) => {
+  try {
+    const status = await getXeroSyncStatus(req.params.id, xeroRequest, { dryRun: MOCK });
+    res.json({ ...status, ok: true });
+  } catch (e) {
+    res.json({ ok: false, state: 'error', error: e.message });
+  }
+});
+
+app.post('/api/admin/customers/:id/xero-sync', requireAuth, async (req, res) => {
+  const numId = req.params.id;
+  try {
+    let customer;
+    if (MOCK) {
+      const c = MOCK_CUSTOMERS.find(c => shopifyNumericId(c.id) === numId);
+      customer = c ? { ...c, firstName: (c.displayName||'').split(' ')[0], lastName: (c.displayName||'').split(' ').slice(1).join(' ') } : null;
+    } else {
+      const r = await shopifyFetch(`query($id:ID!){customer(id:$id){id displayName email firstName lastName
+        defaultAddress{company address1 city province zip country}}}`, { id: shopifyCustomerGid(numId) });
+      customer = r.data?.customer;
+    }
+    if (!customer) return res.status(404).json({ ok: false, error: 'Customer not found' });
+    const result = await syncCustomerToXero(numId, customer, xeroRequest, { dryRun: MOCK });
+    if (result.skipped) return res.json({ ok: true, skipped: result.skipped });
+    auditLog(req.adminSession.email, 'xero:customer_sync', shopifyCustomerGid(numId), null, { xeroContactId: result.xeroContactId, created: result.created });
+    res.json({ ok: true, ...result });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
   }
 });
 

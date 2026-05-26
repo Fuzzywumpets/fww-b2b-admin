@@ -1832,5 +1832,116 @@ await test('GET /settings/xero → requires auth', async () => {
   assert.ok([301, 302].includes(res.status), 'Should redirect to login');
 });
 
+// ── Phase 21: Xero customer sync ─────────────────────────────────────────────
+
+await test('resolveXeroContact: known Shopify ID 8902606455019 → The Dog Shoppe', async () => {
+  const { resolveXeroContact } = await import('../lib/xero-customer-sync.mjs');
+  const result = await resolveXeroContact('8902606455019');
+  assert.ok(result !== null, 'Should find mapping entry');
+  assert.equal(result.xeroName, 'The Dog Shoppe', 'Should return The Dog Shoppe');
+  assert.equal(result.isMerged, false, 'Primary should not be merged');
+});
+
+await test('resolveXeroContact: merged case 6909696999659 → Pro-Mohs Canine Supply, isMerged=true', async () => {
+  const { resolveXeroContact } = await import('../lib/xero-customer-sync.mjs');
+  const result = await resolveXeroContact('6909696999659');
+  assert.ok(result !== null, 'Should find mapping entry');
+  assert.equal(result.xeroName, 'Pro-Mohs Canine Supply', 'Should return Pro-Mohs Canine Supply');
+  assert.equal(result.isMerged, true, 'Should be marked as merged');
+});
+
+await test('resolveXeroContact: insider 4742401425601 → null', async () => {
+  const { resolveXeroContact } = await import('../lib/xero-customer-sync.mjs');
+  const result = await resolveXeroContact('4742401425601');
+  assert.equal(result, null, 'Insider should return null');
+});
+
+await test('isInsider: returns true for known insider IDs', async () => {
+  const { isInsider } = await import('../lib/xero-customer-sync.mjs');
+  assert.equal(isInsider('4742401425601'), true, 'Should be insider');
+  assert.equal(isInsider('5163530813633'), true, 'Should be insider');
+  assert.equal(isInsider('5462357967041'), false, 'Pro-Mohs should not be insider');
+});
+
+await test('syncCustomerToXero: new customer → creates mock contact (idempotent)', async () => {
+  const { syncCustomerToXero } = await import('../lib/xero-customer-sync.mjs');
+  const mockXero = async (method, path, body) => {
+    if (path.includes('where=')) return { ok: true, body: { Contacts: [] } };
+    if (path.includes('/ContactGroups')) return { ok: true, body: { ContactGroups: [] } };
+    return { ok: true, body: { Contacts: [{ ContactID: 'new-xero-' + Date.now(), Name: body?.Contacts?.[0]?.Name || 'Test' }] } };
+  };
+  const result = await syncCustomerToXero('99999999', { email: 'test@example.com', displayName: 'Test Shop' }, mockXero, { dryRun: true });
+  assert.ok(result.xeroContactId, 'Should return a contactId');
+  assert.equal(result.created, true, 'Should be created=true for new customer');
+});
+
+await test('syncCustomerToXero: existing customer → returns existing (not created)', async () => {
+  const { syncCustomerToXero } = await import('../lib/xero-customer-sync.mjs');
+  const mockXero = async () => ({ ok: true, body: { Contacts: [] } });
+  // 8902606455019 is already in mapping → should return created=false
+  const result = await syncCustomerToXero('8902606455019', { email: 'test@example.com' }, mockXero, { dryRun: true });
+  assert.equal(result.created, false, 'Should be created=false for existing customer');
+  assert.equal(result.xeroName, 'The Dog Shoppe', 'Should return correct name');
+});
+
+await test('syncCustomerToXero: insider → returns skipped', async () => {
+  const { syncCustomerToXero } = await import('../lib/xero-customer-sync.mjs');
+  const mockXero = async () => ({ ok: true, body: {} });
+  const result = await syncCustomerToXero('4742401425601', { email: 'insider@test.com' }, mockXero, { dryRun: true });
+  assert.equal(result.skipped, 'insider', 'Insider should return skipped=insider');
+  assert.equal(result.xeroContactId, null, 'Insider should have null contactId');
+});
+
+await test('GET /api/admin/customers/:id/xero-status → requires auth', async () => {
+  const res = await fetch(`${BASE}/api/admin/customers/101/xero-status`, { redirect: 'manual' });
+  assert.equal(res.status, 401, 'Should return 401 for unauthenticated API request');
+});
+
+await test('GET /api/admin/customers/101/xero-status → returns status JSON', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/api/admin/customers/101/xero-status`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const json = await res.json();
+  assert.equal(json.ok, true, 'Should return ok');
+  assert.ok(['synced','not_synced','insider','merged'].includes(json.state), 'State should be valid enum value');
+});
+
+await test('POST /api/admin/customers/101/xero-sync → triggers sync', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/api/admin/customers/101/xero-sync`, {
+    method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' }, body: '{}',
+  });
+  assert.equal(res.status, 200);
+  const json = await res.json();
+  assert.equal(json.ok, true, 'Should return ok');
+});
+
+await test('GET /api/admin/customers/8902606455019/xero-status → synced (from mapping)', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/api/admin/customers/8902606455019/xero-status`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const json = await res.json();
+  assert.equal(json.ok, true);
+  assert.equal(json.state, 'synced', 'Real Shopify ID from mapping should show as synced');
+  assert.equal(json.xeroName, 'The Dog Shoppe');
+});
+
+await test('GET /api/admin/customers/4742401425601/xero-status → insider', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/api/admin/customers/4742401425601/xero-status`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const json = await res.json();
+  assert.equal(json.state, 'insider', 'Known insider should return insider state');
+});
+
+await test('GET /api/admin/customers/6909696999659/xero-status → merged', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/api/admin/customers/6909696999659/xero-status`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const json = await res.json();
+  assert.equal(json.state, 'merged', 'Merged customer should return merged state');
+  assert.equal(json.xeroName, 'Pro-Mohs Canine Supply');
+});
+
 console.log(`\n  ${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);

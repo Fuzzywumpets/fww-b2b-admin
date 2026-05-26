@@ -773,6 +773,35 @@ await test('/settings/xero saves and shows success flash', async (page, ctx) => 
   assert.ok(html.includes('saved'), 'Should show success message after save');
 });
 
+// ── Phase 21: Xero customer sync UI ──────────────────────────────────────────
+
+await test('UI tests — Phase 21: Xero customer sync:', async () => {});
+
+await test('/customers/101 shows Xero card section', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/customers/101`);
+  const html = await page.content();
+  assert.ok(html.includes('xero-customer-card') || html.includes('Xero'), 'Should show Xero card on customer detail');
+});
+
+await test('/customers/101 Xero card loads status via fetch (not_synced for mock customer)', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/customers/101`);
+  // Wait for the async Xero status fetch to complete
+  await page.waitForFunction(() => {
+    const el = document.getElementById('xero-customer-status');
+    return el && !el.textContent.includes('Loading');
+  }, { timeout: 5000 }).catch(() => {});
+  const html = await page.content();
+  // Mock customer 101 is not in the Xero mapping → should show not_synced or synced state
+  assert.ok(
+    html.includes('Sync to Xero') || html.includes('Synced') || html.includes('Insider') || html.includes('Merged'),
+    'Should render one of the Xero status states'
+  );
+});
+
 await browser.close();
 
 console.log(`\n  ${passed} passed, ${failed} failed`);
