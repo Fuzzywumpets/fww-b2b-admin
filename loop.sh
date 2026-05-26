@@ -30,9 +30,7 @@ for i in $(seq 1 $MAX_ITERS); do
   echo "=== ITER $i START $(date -u +%FT%TZ) ===" >> runs/loop.log
   git pull -q --rebase=false 2>/dev/null || true
 
-  claude -p "$(cat HANDOFF.md)
-
-$CONT" \
+  claude -p "$CONT" \
     --permission-mode bypassPermissions \
     --max-turns $MAX_TURNS \
     --output-format stream-json \
