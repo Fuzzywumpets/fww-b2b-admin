@@ -92,3 +92,25 @@ export function auditLog(email, action, target, before, after) {
     Date.now()
   );
 }
+
+export function getCustomerNotes(customerId) {
+  return db.prepare('SELECT * FROM customer_notes WHERE customer_id = ?').get(customerId) || null;
+}
+
+export function setCustomerNotes(customerId, body, email) {
+  db.prepare(`
+    INSERT OR REPLACE INTO customer_notes (customer_id, body, updated_at, updated_by)
+    VALUES (?, ?, ?, ?)
+  `).run(customerId, body, Date.now(), email);
+}
+
+export function getDropshipCache(customerId) {
+  return db.prepare('SELECT * FROM dropship_config_cache WHERE customer_id = ?').get(customerId) || null;
+}
+
+export function setDropshipCache(customerId, enabled, marginPct) {
+  db.prepare(`
+    INSERT OR REPLACE INTO dropship_config_cache (customer_id, enabled, margin_pct, updated_at)
+    VALUES (?, ?, ?, ?)
+  `).run(customerId, enabled ? 1 : 0, Number(marginPct) || 0, Date.now());
+}
