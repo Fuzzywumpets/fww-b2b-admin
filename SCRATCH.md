@@ -247,6 +247,79 @@ fww-b2b-admin/
 - Because mock server runs continuously during test suite, notes persist within the test run
 - Tests pass because seedSession() creates new session but shares the same SQLite instance
 
+## Phase 3 complete (2026-05-26, commit 3c4a747)
+
+### Files changed
+- db.mjs — added admin_settings, label_batches, export_batches tables; getSetting/setSetting/getGlobalSettings/getAuditLog helpers
+- server.mjs — full Phase 3: catalog, reports, settings, migrate, audit routes (~815 new lines)
+- public/admin.css — Phase 3 styles: bulk-bar, tag-chip, stat-card, report-section, settings-grid, form-input, pagination
+- test/api.test.mjs — 57 tests total (20 new Phase 3 tests)
+- test/ui.test.mjs — 27 tests total (10 new Phase 3 tests)
+
+### Key gotchas
+- Catalog table needs `.table-wrap` (overflow-x:auto) for mobile — without it, document.documentElement.scrollWidth overflows
+- For SparkLayer migration: query `tag:sparklayer` in real mode (Shopify tag search)
+- Settings allowlist write: use spawnSync('doppler', ['secrets', 'set', `B2B_ADMIN_ALLOWED_EMAILS=...`]) — NOT execSync with shell
+- renderBarChart/renderSparkline return inline SVG — no JS charting lib needed
+- csvLine() escapes commas/quotes/newlines correctly
+
+### GraphQL for catalog (real mode)
+```graphql
+query($q:String!,$after:String){
+  products(first:50,query:$q,after:$after,sortKey:TITLE){
+    edges{node{
+      id title handle vendor tags
+      publishedOnPublication(publicationId:"gid://shopify/Publication/199709720811")
+      variants(first:15){edges{node{sku title inventoryQuantity}}}
+    }}
+    pageInfo{hasNextPage endCursor}
+  }
+}
+```
+
+## Phase 4 starting next iteration
+
+Remaining items per HANDOFF.md:
+1. Keyboard shortcuts: global keydown handler in layout(), `g d`/`g o`/`g c` navigation, `/` focus search, `?` overlay
+2. Orders CSV export: GET /orders/export.csv
+3. Customers CSV export: GET /customers/export.csv  
+4. PWA manifest: manifest.json + <link rel="manifest"> in layout()
+5. Mobile polish: already OK for main pages; check /reports table on 390px
+
+### Keyboard shortcut implementation plan
+```js
+// In layout() extraHead:
+`<script>
+document.addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') return;
+  if (e.key === '/') { e.preventDefault(); document.querySelector('.search-input, #filter-q, input[type="search"]')?.focus(); }
+  if (e.key === '?') { toggleShortcutOverlay(); }
+  if (e.key === 'g') { window._gPressed = true; setTimeout(()=>{ window._gPressed=false; }, 1000); }
+  if (window._gPressed) {
+    if (e.key === 'd') { window.location = '/'; }
+    if (e.key === 'o') { window.location = '/orders'; }
+    if (e.key === 'c') { window.location = '/customers'; }
+    if (e.key === 'l') { window.location = '/catalog'; }
+    if (e.key === 'r') { window.location = '/reports'; }
+  }
+});
+</script>`
+```
+
+### PWA manifest
+```json
+{
+  "name": "FWW Admin",
+  "short_name": "FWWadmin",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#FFFFFF",
+  "theme_color": "#9BBC0E",
+  "icons": [{ "src": "/icon-192.png", "sizes": "192x192", "type": "image/png" }]
+}
+```
+Need to create a simple 192x192 PNG icon (lime green with "FW" text).
+
 ## Phase 3 starting next iteration
 
 ### Draft orders mutation (manual order builder)
