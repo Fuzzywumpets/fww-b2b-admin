@@ -1276,3 +1276,128 @@ auto-mark matching b2b orders paid.
 - Unmatched Zelle payments show up at `/admin/zelle/unmatched` for manual review (alexa picks
   the matching order, clicks "Reconcile to this order")
 - alexa never has to manually mark a Zelle order paid in the happy path
+
+## Phase 13 — Final payment spec (supersedes 11, 11-rev, 12)
+
+alexa's decision 2026-05-26: drop Zelle + PayPal entirely. Assume Chase Merchant Services API
+will eventually handle both invoice links and on-screen card payments. Stub those workflows
+in the UI now so the experience is in place; wire to real Chase API once it ships (deferred).
+
+### Final payment method matrix
+
+| # | Method | Provider | Fees | Status |
+|---|---|---|---|---|
+| 1 | Pay later (invoice / NET) | Internal | 0% | mostly built |
+| 2 | Bank transfer (ACH) | **Stripe today, Chase later** (swap when GA) | 0.8% capped $5 (Stripe) | build now via Stripe |
+| 3 | Card payment (Chase Pay Now modal) | Chase MS | TBD (alexa's existing merchant rate) | **STUB the UI; backend wiring deferred** |
+| 4 | Chase invoice link (admin-sent) | Chase MS | same as #3 | **STUB the admin button; backend wiring deferred** |
+
+**Dropped from earlier phases:** Zelle (any flow), PayPal Invoicing, Apple/Google Pay, Amazon
+Pay, Shop Pay. Reasons recorded in HANDOFF history; do not re-add without alexa's say-so.
+
+### Customer-side checkout `/checkout` UI
+
+Replace today's single "Place order on invoice" button with this picker:
+
+```
+┌─ Payment method ─────────────────────────────────────────┐
+│                                                          │
+│  ◯ Pay later (invoice)                                   │ ← only if allow_order_on_invoice
+│     We'll send you a NET 30 invoice. No upfront payment. │
+│                                                          │
+│  ◯ Bank transfer (ACH)                  Save 3% now      │
+│     Connect your bank, pay direct. Usually instant       │
+│     verification via Stripe's Plaid integration.         │
+│                                                          │
+│  ◯ Pay with card (Chase)                                 │
+│     Visa / Mastercard / Amex / Discover                  │
+│     (coming soon — pending Chase API enablement)         │ ← STUB
+│                                                          │
+└──────────────────────────────────────────────────────────┘
+
+[ Place order — $XXX.XX ]
+```
+
+Visibility rules per method:
+- **Invoice**: visible only if `customer.allow_order_on_invoice` is true
+- **ACH**: visible if `B2B_PORTAL_STRIPE_PK` is configured (Doppler). If not configured, hide.
+- **Card via Chase**: ALWAYS VISIBLE (as a stub) — clicking opens a placeholder modal:
+  ```
+  Card payments coming soon
+  We're finalizing our Chase merchant integration. For now, please contact
+  us at wholesale@fuzzywumpets.com to pay by credit card.
+  [ OK ]
+  ```
+  When Chase API is wired, this stub becomes the real flow.
+
+### Admin order detail — "Send Chase invoice link" button (stub)
+
+On `/admin/orders/:id`, in the actions toolbar, add a button: **"Send Chase invoice link"**.
+
+Clicking it (today, stub mode):
+- Shows a confirm dialog: "Send a Chase-hosted invoice link to {customer.email}? (Note: Chase
+  API not yet wired; this will log the intent + email a placeholder.)"
+- On confirm: writes an audit log row `action: 'chase_invoice_queued'` with order id + customer
+  email; emails alexa a "Chase invoice link requested by you for order #X — wire up Chase API
+  to send the real link." for now; returns success to UI.
+
+When Chase API is wired:
+- The button calls Chase's `POST /invoice/create` (or whatever endpoint), gets back a hosted
+  invoice URL, emails the customer the link, updates order tag to `payment:chase-invoice-sent`.
+
+### 3% prompt-pay discount (revision of 12A)
+
+Applies ONLY when payment method = **ACH (Stripe or future Chase ACH)**. Does NOT apply to:
+- Invoice/NET (you're not paying upfront, no incentive needed)
+- Card via Chase (alexa eats Chase's CC fee — no extra discount to compound)
+- Anything else
+
+Settings stay as in 12A:
+- `prompt_pay_discount_pct` (integer, default 3) in /settings
+- `prompt_pay_enabled` (boolean, default true) in /settings
+- `b2b.block_prompt_pay_discount` per-customer override (boolean, metafield)
+
+UI shows the discount line when the customer selects ACH; vanishes for other methods.
+
+### Implementation order
+
+1. **First** (~1 day): Wire the new checkout UI with 3 methods (invoice / ACH / Chase stub) +
+   prompt-pay discount logic. Mock the ACH backend (no real Stripe yet) — just create the
+   Shopify order with appropriate tags and PENDING financial status. Tests for each branch.
+2. **Second** (~2 days): Real Stripe ACH backend. Once alexa creates a Stripe account and pushes
+   pk/sk to Doppler (`B2B_PORTAL_STRIPE_PK`, `B2B_PORTAL_STRIPE_SK`), wire the Payment Element
+   restricted to `us_bank_account` only. Webhook on `payment_intent.succeeded` marks order PAID.
+3. **Third** (~30 min when Chase ships): Replace Chase stub modal with real Chase modal SDK +
+   wire `/api/admin/orders/:id/send-chase-invoice` to the real Chase invoice API. No UI changes
+   needed beyond removing the "coming soon" labels.
+
+### Doppler keys
+
+- `B2B_PORTAL_STRIPE_PK` — Stripe publishable key (write when alexa shares)
+- `B2B_PORTAL_STRIPE_SK` — Stripe secret key (same)
+- `B2B_PORTAL_STRIPE_WEBHOOK_SECRET` — for verifying webhooks
+- `B2B_PORTAL_CHASE_MERCHANT_ID` — placeholder, set when Chase API is wired
+- `B2B_PORTAL_CHASE_API_KEY` — placeholder
+
+### Tests
+
+- /checkout shows invoice option only when allow_order_on_invoice is true
+- /checkout shows ACH option only when Stripe PK is set
+- /checkout always shows the Chase stub button
+- Clicking Chase stub opens placeholder modal (no order created)
+- Picking ACH applies 3% discount to total
+- Picking invoice or Chase stub does NOT apply 3% discount
+- Submit with ACH → creates Shopify order PENDING + tag `payment:stripe-ach-pending`
+- Submit with invoice → creates Shopify order PENDING + tag `b2b-portal`
+- Admin "Send Chase invoice link" button: in stub mode, creates audit log entry + alerts alexa;
+  in wired mode (future), calls real Chase API
+- /api/admin/orders/:id/send-chase-invoice endpoint stub returns 200 with `{ status: 'stubbed' }`
+
+### Acceptance for Phase 13
+
+- Customer at /checkout sees 3 payment methods (or 2, if invoice not allowed for them)
+- Customer picks ACH → 3% off + Stripe Element renders bank-only flow → order submits
+- Customer clicks Chase stub button → sees placeholder modal explaining card support is coming
+- Admin clicks "Send Chase invoice link" on any order → audit log entry created + notification
+  to alexa
+- All tests green
