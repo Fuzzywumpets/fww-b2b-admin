@@ -1814,3 +1814,369 @@ The customer's order detail (b2b portal) reflects all changes in real time:
   partial shipment; remaining items get their own invoice when they ship.
 - All admin actions audit-logged.
 - All tests green.
+
+## Phase 17 — Wholesale leads pipeline (CRM-lite)
+
+A built-in CRM for pre-customer wholesale leads. People who've submitted an application but
+haven't been converted to a B2B customer yet. Replaces emailed-spreadsheet workflow with a
+structured pipeline view.
+
+### Data model (b2b-admin SQLite)
+
+```sql
+CREATE TABLE leads (
+  id INTEGER PRIMARY KEY,
+  email TEXT UNIQUE NOT NULL,
+  business_name TEXT,
+  contact_name TEXT,
+  phone TEXT,
+  website TEXT,
+  business_type TEXT,                 -- boutique | trainer | kennel | show-vendor | groomer | other
+  estimated_monthly_volume_usd INTEGER,
+  source TEXT,                        -- tradeshow | website-form | instagram | referral | cold-outreach | other
+  source_detail TEXT,                 -- "IKC 2026", "@petboutique referred", etc.
+  status TEXT NOT NULL DEFAULT 'new', -- see status table below
+  application_data_json TEXT,         -- raw form submission
+  application_signed_pdf_path TEXT,
+  sales_tax_state TEXT,
+  sales_tax_id TEXT,
+  sales_tax_cert_path TEXT,
+  w9_path TEXT,
+  business_license_path TEXT,
+  custom_tags TEXT,                   -- comma-separated chips: high-value, recurring-show-visitor, etc.
+  assigned_to TEXT,                   -- admin email (currently alexa); future-proof for team
+  next_followup_due DATE,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  converted_at INTEGER,
+  shopify_customer_id TEXT,           -- filled in upon conversion
+  rejected_reason TEXT
+);
+
+CREATE TABLE lead_notes (
+  id INTEGER PRIMARY KEY,
+  lead_id INTEGER REFERENCES leads(id),
+  author_email TEXT NOT NULL,
+  body TEXT NOT NULL,
+  note_type TEXT NOT NULL,            -- call | email | meeting | system | general
+  created_at INTEGER NOT NULL
+);
+
+CREATE TABLE lead_status_history (
+  id INTEGER PRIMARY KEY,
+  lead_id INTEGER REFERENCES leads(id),
+  from_status TEXT,
+  to_status TEXT NOT NULL,
+  note TEXT,
+  changed_by TEXT,
+  changed_at INTEGER NOT NULL
+);
+```
+
+### Status workflow
+
+| Status | Meaning | Allowed transitions |
+|---|---|---|
+| `new` | Just submitted, no review yet | under_review, rejected |
+| `under_review` | Sales director (alexa) actively reviewing | waiting_on_docs, waiting_on_sales_tax, waiting_on_w9, approved, rejected, dormant |
+| `waiting_on_docs` | Asked for additional documents | under_review (on receipt), dormant, rejected |
+| `waiting_on_sales_tax` | Needs resale cert before approval | under_review, dormant, rejected |
+| `waiting_on_w9` | Needs W9 (for ≥$600 contracted vendors) | under_review, dormant, rejected |
+| `approved` | Approved but not yet converted to Shopify customer | converted (terminal), rejected (rare reversal) |
+| `converted` | Shopify customer created, lead archived | (terminal) |
+| `rejected` | Not a good fit | (terminal, with reason) |
+| `dormant` | No response for 30+ days | under_review (on re-engagement), rejected |
+
+Status transitions auto-create a `lead_status_history` row + a `system` note. Optional free-text
+note on every transition for context ("Customer texted, said they'd send W9 by Friday").
+
+### Pages
+
+**`/admin/leads`** — main pipeline view, two layouts (toggle):
+
+- **List view**: filterable table — search by name/email/business, filter by status chip,
+  sort by created/updated/follow-up date. Columns: business · contact · status · last activity
+  · next follow-up. Bulk actions: change status, send canned email, export CSV.
+- **Kanban view**: vertical columns per status, lead cards draggable between columns. Card
+  shows business name, contact, last note preview, days-since-last-activity. Drop → status
+  transition (with optional note modal).
+
+Top of page: stats strip showing counts per status + "leads needing attention" (next_followup_due
+≤ today OR status unchanged for > N days where N varies by status).
+
+**`/admin/leads/:id`** — lead detail page:
+
+- Header: business name + contact + email + status badge
+- Action buttons: change status (dropdown), add note, upload doc, convert to customer
+- Two-column body:
+  - Left: profile (all fields editable), document list (with viewer), custom tag chips editor
+  - Right: timeline (chronological merged view of status changes + notes + doc uploads)
+- "Next follow-up" date picker
+
+**`/admin/leads/new`** — manual entry (in case alexa meets someone at a show before they hit
+the form)
+
+**`/admin/leads/:id/convert`** — convert-to-customer workflow:
+- Prefilled customer creation form (name, email, phone, address from application)
+- Pick discount % (default from settings), dropship config, allow_order_on_invoice
+- Submit → creates Shopify customer with `b2b` tag via shopify-bridge, sets all metafields
+  per Phase 10, marks lead `converted_at` + stores `shopify_customer_id`
+- Lead archived (stays in DB for history; appears under "Converted" filter)
+- Sends customer the welcome email with portal login instructions
+
+### Canned email templates (stored in admin_settings, editable)
+
+- `welcome` — sent on form submission ("Thanks for applying, we'll be in touch in 1-2 business days")
+- `request_docs` — when status flips to waiting_on_docs ("Please send us...")
+- `request_sales_tax` — when status flips to waiting_on_sales_tax
+- `request_w9` — when status flips to waiting_on_w9
+- `approved` — when converted ("Welcome! Log in at b2b.fuzzywumpets.com...")
+- `rejected` — when rejected (with optional custom reason)
+- `dormant_followup` — re-engagement email
+
+Each template editable in /admin/settings/email-templates with merge tags ({contact_name},
+{business_name}, etc.). "Send email" buttons on lead detail use these.
+
+### Follow-up reminders
+
+Background job (15-min cron via setInterval):
+- Find leads where `next_followup_due ≤ today` AND status is not terminal → flag as "needs
+  attention" (visible in stats strip + sortable in list view)
+- Find leads in any `waiting_on_*` status with no activity in 14 days → suggest moving to
+  dormant (banner on lead detail: "No activity in 14 days. Move to Dormant?")
+
+### Bulk actions on list view
+
+- Change status for selected (with confirm + note)
+- Send canned email to selected
+- Export selected to CSV
+- Mark "needs attention" / clear flag
+
+### Convert-to-customer side effects
+
+When a lead is converted:
+1. Shopify customer created with all the lead's profile data + `b2b` tag
+2. If sales tax cert was uploaded: write `b2b.tax_exempt=true` + `b2b.tax_exempt_state` metafields
+3. If application included a signed PDF: store it linked to the customer for future reference
+4. All lead notes copied/linked to the new customer as initial notes (so history isn't lost)
+5. Welcome email sent
+6. Audit log row
+
+### Tests
+
+- POST /api/leads creates lead with status='new'
+- Status transition logs history + creates system note
+- Upload document → file saved + path stored
+- Convert: lead.converted_at set + shopify_customer_id linked + Shopify customer created
+- Bulk status change: 5 selected → all get history rows
+- Email template rendering with merge tags
+- Follow-up overdue logic flags correct leads
+
+### Acceptance for Phase 17
+
+- alexa can see all pending wholesale leads in /admin/leads with status, last activity, next
+  follow-up at a glance
+- Can drag-drop a lead between status columns in Kanban view to update status
+- Can add timestamped notes per lead; full timeline visible
+- Can upload + view application/sales tax/W9 docs per lead
+- "Convert to customer" creates a real Shopify customer + carries all profile + tax cert
+- Email templates send via canned button presses
+- Tests green
+
+---
+
+## Phase 18 — Xero accounting integration
+
+Auto-book orders, edits, and payments into Xero. Replaces manual journal entries with
+real-time double-entry bookkeeping triggered by the portal/admin.
+
+### Why this matters
+
+Without this: every wholesale order requires alexa to manually record a journal in Xero
+(DR A/R, CR Sales), then when payment hits, manually post the payment + reconcile the fee
+deduction. At scale that's hours per week.
+
+With this: order placement = invoice issued in Xero automatically. Payment received =
+auto-allocated. Stripe payout = fee + deposit split automatically. Books stay clean.
+
+### Architecture
+
+Use the existing `fww-xero-bridge` worker (per memory `reference_fww_xero_bridge`) as the
+proxy. Bearer token in Doppler as `XERO_BRIDGE_BEARER`. Endpoints we'll call:
+
+- `POST /api.xro/2.0/Contacts` — create/upsert customer-as-Xero-contact
+- `POST /api.xro/2.0/Invoices` — create invoice on order placement
+- `POST /api.xro/2.0/Invoices/{id}` — update on order edit
+- `POST /api.xro/2.0/Payments` — record payment against invoice
+- `POST /api.xro/2.0/BankTransactions` — Stripe payout deposit + fee split
+
+### Xero account mapping (configurable in /admin/settings/xero)
+
+Settings UI lets alexa map our concepts → Xero account codes (with sensible defaults):
+
+| Our concept | Default Xero account code | Type |
+|---|---|---|
+| Sales revenue | `200` (Sales) | Revenue |
+| Accounts receivable | `610` (Accounts Receivable) | Current Asset |
+| Stripe clearing | `1120` (Stripe Clearing) — alexa creates if missing | Current Asset |
+| Chase Business Checking | `1110` (existing per QBO→Xero memory) | Bank |
+| Payment processing fees | `6100` (Bank Fees) or new "Payment Processing Fees" expense account | Expense |
+| Discounts given | `400` (Discounts) | Contra-revenue |
+
+Stored in `admin_settings.xero_account_map` JSON.
+
+### Xero contact auto-create
+
+When the first event hits Xero for a customer:
+1. Check if Shopify customer has metafield `b2b.xero_contact_id`
+2. If present: use it
+3. If not: call Xero `POST /Contacts` with name=business_name, email=email,
+   PrimaryPerson details, address. Get back contact ID. Write back to Shopify customer
+   metafield for future use.
+
+This way the mapping is durable and shared across portal + admin.
+
+### Order placement → Xero invoice
+
+**Trigger**: any time a Shopify order is created via our system (portal checkout, admin
+manual order builder, draft → completed):
+
+```js
+// pseudocode
+const order = await getShopifyOrder(orderId);
+const contactId = await ensureXeroContact(order.customer);
+const xeroInvoice = await xero('POST /api.xro/2.0/Invoices', {
+  Type: 'ACCREC',
+  Contact: { ContactID: contactId },
+  Date: order.processedAt,
+  DueDate: addDays(order.processedAt, paymentTermsDays),
+  InvoiceNumber: order.name,  // e.g. "#1234"
+  Reference: 'b2b-portal',
+  LineItems: order.lineItems.map(li => ({
+    Description: `${li.title} — ${li.variantTitle}`,
+    Quantity: li.quantity,
+    UnitAmount: li.priceSet.shopMoney.amount,
+    AccountCode: settings.xero_account_map.sales_revenue,
+    LineAmount: li.lineTotal,
+    TaxType: order.taxExempt ? 'NONE' : 'OUTPUT', // adjust to actual Xero tax codes
+  })),
+  // Order-level discount as a negative line if present (Phase 16)
+  Status: 'AUTHORISED',
+});
+// Persist mapping: order ↔ xero invoice id
+db.run('INSERT OR REPLACE INTO xero_invoice_map (order_id, xero_invoice_id) VALUES (?, ?)',
+  [order.id, xeroInvoice.InvoiceID]);
+```
+
+Status `AUTHORISED` (vs `DRAFT`) means it's a real recognized invoice in Xero — books reflect
+the sale immediately.
+
+### Order edit → Xero invoice update (ties into Phase 16)
+
+When admin edits an order via Phase 16's flow:
+1. Look up xero_invoice_id
+2. If invoice is unpaid: call `POST /Invoices/{id}` with updated LineItems → Xero recalcs
+3. If invoice is paid: can't edit directly. Create a Credit Note for the delta if items
+   removed or prices reduced; or a new Invoice if items added.
+4. Audit-log the Xero side too
+
+### Payment → Xero payment + fee handling
+
+Three payment paths from Phase 13:
+
+**A) Invoice / NET (admin marks paid)** — no fees:
+```
+POST /api.xro/2.0/Payments
+{
+  Invoice: { InvoiceID },
+  Account: { Code: settings.xero_account_map.chase_checking },
+  Date: today,
+  Amount: invoice.AmountDue
+}
+```
+Result: A/R clears, Chase increases by full amount.
+
+**B) Stripe ACH payment** (Stripe webhook `payment_intent.succeeded`):
+```
+// Step 1: record payment against invoice using Stripe Clearing as the account
+POST /Payments {
+  Invoice: { InvoiceID },
+  Account: { Code: settings.xero_account_map.stripe_clearing },
+  Date: payment.created,
+  Amount: payment.amount_cents / 100  // full invoice amount
+}
+// Result so far: A/R cleared, Stripe Clearing increased by full amount
+
+// Step 2: when Stripe payout to Chase lands (Stripe webhook payout.created):
+POST /api.xro/2.0/BankTransactions {
+  Type: 'RECEIVE',
+  Contact: { Name: 'Stripe Payouts' },  // generic; doesn't tie to customer
+  BankAccount: { Code: settings.xero_account_map.chase_checking },
+  Date: payout.arrival_date,
+  LineItems: [
+    { Description: 'Stripe payout (gross)', Quantity: 1,
+      UnitAmount: payout.gross_cents / 100,
+      AccountCode: settings.xero_account_map.stripe_clearing },  // CR Stripe Clearing
+    { Description: 'Stripe processing fees', Quantity: 1,
+      UnitAmount: -payout.fee_cents / 100,
+      AccountCode: settings.xero_account_map.processing_fees }  // DR Fees Expense
+  ]
+}
+```
+Net effect: A/R cleared, Chase increases by net deposit, Stripe Clearing nets to zero,
+Processing Fees recorded as expense. Books reconcile cleanly to Chase statement.
+
+**C) Future Chase card path** — when Chase MS API is wired: same pattern but route through
+a "Chase Card Clearing" account instead of Stripe Clearing. Settings UI just needs a new
+mapping entry.
+
+### Order-level discounts (Phase 16) → Xero
+
+Discount lines get their own LineItem on the Xero Invoice with negative UnitAmount mapped to
+the Discounts account. Shows up cleanly on the invoice + as contra-revenue on the P&L.
+
+### Reconciliation view in admin (`/admin/accounting`)
+
+Per-order: order # | Xero invoice # | invoice status (draft/authorised/paid) | payment date |
+processing fee captured | discrepancy ($ amount that should reconcile but doesn't)
+
+Helps alexa spot any orders where Xero booking failed (e.g., bridge was down) so she can
+manually re-trigger.
+
+### Failure handling
+
+- Xero call failures get retried 3× with exponential backoff
+- If all retries fail: queue the event in a `xero_pending_actions` table for later retry via
+  cron / manual button
+- Audit logs include both Shopify and Xero results
+- Admin email alert if more than N pending actions accumulate
+
+### Settings UI (`/admin/settings/xero`)
+
+- Xero account mapping (the table above, with dropdowns of fetched Xero account codes)
+- "Test connection" button — pings the bridge, fetches first 5 accounts, displays "OK"
+- "Sync now" button — manually re-trigger pending Xero actions
+- Toggle: pause Xero booking entirely (for catch-up periods)
+- Display: count of pending actions, last successful sync timestamp
+
+### Tests
+
+- Order placed → Xero invoice posted (mock the bridge response)
+- Order edited (qty change) → Xero invoice updated
+- Order edited after payment → Credit Note created instead
+- Stripe payment_intent.succeeded webhook → Xero payment recorded against Stripe Clearing
+- Stripe payout.created webhook → BankTransaction posted with gross + fee split
+- Invoice payment via admin "mark paid" → Xero payment to Chase Checking, no fee
+- Xero bridge 500 → action queued for retry, audit-logged
+- Settings UI account mapping persists + is used by all flows
+
+### Acceptance for Phase 18
+
+- alexa places (or has a customer place) a B2B order → opens Xero, sees the invoice
+  AUTHORISED with correct customer, line items, total, due date
+- alexa edits an unpaid order → Xero invoice reflects the change
+- A Stripe ACH payment lands → Xero payment recorded against the invoice immediately
+- A Stripe payout to Chase lands → bank transaction posted to Chase with the processing
+  fee correctly recorded as expense; Stripe Clearing nets to zero
+- Reconciliation page shows zero discrepancies for orders that processed cleanly
+- All tests green
