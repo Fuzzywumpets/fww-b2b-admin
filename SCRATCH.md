@@ -424,3 +424,28 @@ query($id: ID!) {
 - Response: res.setHeader('Content-Type', 'application/pdf'); res.setHeader('Content-Disposition', ...)
 - Fields: FWW logo text, order number, date, customer info, line items table, totals, "PAYMENT PENDING" stamp if not paid
 
+
+## Phase 4+5+6 complete (2026-05-26, commit 953919e)
+
+### Phase 4 notes
+- Keyboard shortcut overlay: `g+key` with 1s window (gDown flag), `?` toggles overlay, `/` focuses `.search-input`
+- PWA icon: generated from raw PNG bytes using zlib.deflateSync (no canvas dep). Solid lime-green #9BBC0E 192×192.
+- Orders CSV: route must be BEFORE `/orders/:id` (added between /orders/bulk and /orders/:id)
+- Customers CSV: route must be BEFORE `/customers/:id` (placed correctly from the start)
+
+### Phase 5 notes
+- bwip-js import: `import bwipjs from 'bwip-js'` works (has default export)
+- TEMPLATES: Avery 5160 verified: 2×13.5 + 3×189 + 2×9 = 612pt ✓, 2×36 + 10×72 = 792pt ✓
+- expandItems() skips barcodes not matching /^\d{12,13}$/
+- renderLabelsPage() must NOT reference `req` — pass `queryOrder` and `queryQ` as string params
+- Tab system: two `<div class="tab-content">` divs, JS swaps `hidden` class on tab click
+- `waitForSelector('form')` in Playwright can pick up hidden form (in display:none tab) — use ID selector instead (#product-search-form)
+- Multi-value URLSearchParams: use `.append('sel', '0'); body.append('sel', '1')` NOT `{sel: ['0','1']}`
+
+### Phase 6 notes
+- archiver ESM: NO default export. Use `import { ZipArchive } from 'archiver'` + `new ZipArchive({ zlib: { level: 6 } })`
+- ZipArchive API: `.pipe(res)`, `.append(buf, {name})`, `.finalize()`, `.on('error', ...)`
+- In MOCK mode, image exports use `Buffer.from('mock image: ' + url)` placeholder
+- Product CSV streaming: `res.write(csvLine(row))` per variant, `res.end()` at end
+- Column selection: saved per-user in admin_settings table; retrieved on next visit
+
