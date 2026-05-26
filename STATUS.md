@@ -1,40 +1,30 @@
 # fww-b2b-admin — overnight status
-STATE: COMPLETE
-PHASE: 14 — Customer self-service additions ✓
-LAST_UPDATED: 2026-05-26T23:15:00Z
+STATE: IN_PROGRESS
+PHASE: 19E + 20 — catalog status filter + priority customers
+LAST_UPDATED: 2026-05-26T23:35:00Z
 
 ## What shipped this session
-- Phase 14A: Stock alerts (back-in-stock)
-  — portal: stock_alerts SQLite table, GET/POST/DELETE /api/stock-alerts (idempotent upsert)
-  — portal: /account/alerts page to manage alerts
-  — portal: background job every 15 min checks variant inventory, emails customer on restock
-  — portal: sendEmail helper — queues to email_queue (logs to console until Resend key set)
-  — product.html: "Notify me when restocked" button on OOS variants
-  — account.html: "Stock alerts" card linking to /account/alerts
-- Phase 14B: Live order tracking timeline
-  — portal: /api/orders/:id now returns trackingStatus (received/in_process/shipped/delivered)
-    and fulfillments array with carrier + tracking number
-  — order-detail.html: visual 4-step timeline, shipment cards, 60s polling (stops on delivered)
-- Phase 14C: Tax exemption cert upload + admin review
-  — portal: multer PDF upload (5MB max), /api/tax-exempt, /api/tax-exempt/status
-  — portal: /__internal__/tax-exempt/:id/approve|reject (bearer token auth)
-  — portal: approve writes b2b.tax_exempt=true Shopify metafield
-  — admin: GET /tax-exempt review queue page (reads portal.db read-only)
-  — admin: POST /tax-exempt/:id/approve|reject proxies to portal internal API
-  — account.html: tax exemption card (upload form / pending / approved / rejected states)
-- Phase 14D: Customer-visible notes on orders
-  — portal: visible_notes SQLite table, addVisibleNote/getVisibleNotes helpers
-  — portal: /__internal__/visible-note (bearer token) — adds note + emails customer
-  — portal: GET /api/admin/orders/:id/visible-notes + POST /api/admin/orders/:id/visible-note
-  — admin: POST /api/orders/:id/visible-note proxies to portal internal (with audit log)
-  — admin: GET /api/orders/:id/visible-notes reads portal.db directly
-  — admin: order detail page has "Note visible to customer" card with live-refresh
-  — order-detail.html: shows visible notes from Fuzzywumpets with lime accent
-- Navigation: added "Tax Exempt" to admin nav header
-- Tests: 114 portal API + 39 portal UI + 122 admin API + 41 admin UI = 316 passing
+- Phase 19E: Catalog tab product status filter
+  — /catalog defaults to Active products only (new default)
+  — Status filter chips: Active / Draft / Archived / All with count badges
+  — DRAFT / ARCHIVED row badges + archived rows visually dimmed
+  — Two new mock catalog products: draft (#207) and archived (#208)
+  — Real mode: passes status:active/draft/archived to Shopify query
+- Phase 20: Priority customer onboarding
+  — /customers default sort changed to lifetime spend ↓ (was arbitrary)
+  — Sort dropdown: Lifetime spend ↓ / Order count ↓ / Name A–Z
+  — ★ star badges on top-10 customers by spend
+  — Order count column now links to /orders?customer=id
+  — Dashboard "Top Customers" widget shows order count column + star badges
+  — Mock customers now returned sorted by amountSpent desc
+  — docs/PRIORITY_CUSTOMERS_BASELINE.md: top-15 customers (Mia Wagner $142K+)
+  — docs/SHOPIFY_COMPANIES_RESEARCH.md: Phase 22 migration research preserved
+- Tests: 125 API + 46 UI = 171 total, all green
 
 ## What's working (URLs)
-- https://b2badmin.fuzzywumpets.com (Phases 1-10, 13, 14)
+- https://b2badmin.fuzzywumpets.com (all phases 1–14 + 19E + 20)
+- /catalog — status filter chips (Active default, Draft, Archived, All)
+- /customers — sorted by lifetime spend, star badges on top customers
 - /orders — all orders; order detail has visible-notes card + tax-exempt review link
 - /tax-exempt — pending tax cert review queue with approve/reject
 - /customers/:id — B2B Customer Settings + per-customer discount
@@ -44,23 +34,47 @@ LAST_UPDATED: 2026-05-26T23:15:00Z
 - https://b2b.fuzzyreporting.com/orders/:id — tracking timeline + visible notes
 
 ## Test status
-- Admin API:  122/122
-- Admin UI:    41/41
-- Portal API: 114/114 (+ was 92 before Phase 14)
-- Portal UI:   39/39
-- Total: 316 green
+- Admin API:  125/125
+- Admin UI:    46/46
+- Portal API: 114/114 (separate repo)
+- Portal UI:   39/39 (separate repo)
+- Total: 324 green
 
-## Blockers / decisions alexa needs to make
-- Email (Resend): B2B_PORTAL_RESEND_API_KEY not set → emails log to console + queue
-  in email_queue table as status='pending_setup'. Signup at resend.com (free 100/day),
-  add key to Doppler as B2B_PORTAL_RESEND_API_KEY, from-address as B2B_PORTAL_RESEND_FROM
-- Stripe webhook: point https://b2b.fuzzyreporting.com/api/webhooks/stripe in Stripe
-  dashboard, add secret to Doppler as B2B_PORTAL_STRIPE_WEBHOOK_SECRET
-- Chase API: stub only — will go live when Chase merchant API ships
+## Phases completed
+- Phase 0: Research + scaffold
+- Phase 1: Google OAuth + dashboard MVP
+- Phase 2: Orders + customers
+- Phase 3: Catalog + reports + settings + migrate
+- Phase 4: Polish (keyboard shortcuts, CSV exports, PWA)
+- Phase 5: UPC barcode label engine
+- Phase 6: Product CSV + image ZIP exports
+- Phase 7+8: Per-customer B2B config + 10-template label engine
+- Phase 9+10: Broaden order/customer scope + unified B2B settings
+- Phase 13: Final payment spec (ACH + Chase stub, portal side)
+- Phase 14: Customer self-service additions (admin side: tax-exempt review, visible notes)
+- Phase 19E: Catalog tab product status filter ← NEW
+- Phase 20: Priority customer onboarding + Companies research ← NEW
+
+## Phases remaining (spec in HANDOFF.md, code not yet built)
+- Phase 15: Customer-specific catalogs (per-customer private tags) + multi-user team accounts
+- Phase 16: Admin order editing (modify lines, partial fulfill, backorder, discounts)
+- Phase 17: Wholesale leads CRM-lite pipeline
+- Phase 18: Xero accounting integration
+- Phase 19: Customer profile depth (lifetime spend section, universal hyperlinks, persistent cart)
 
 ## Next iteration's plan
-Phase 15 — Wholesale leads CRM is already complete (Phase 17+18 shipped earlier).
-Check HANDOFF.md for remaining phases:
-- Phase 15: Restock / purchase order suggestions (admin: suggest POs from low-stock data)
-- Phase 16: Multi-warehouse routing (fulfillment location picker on order detail)
-- Any remaining phases in HANDOFF.md not yet started
+Phase 19 (partial — start with 19A):
+- 19A: Customer lifetime spend section on /customers/:id
+  — GET /api/admin/customers/:id/spend?from=ISO&to=ISO
+  — Date range dropdown (Last 30 days / 90 days / 12 months / YTD / All time / Custom)
+  — Orders list with clickable links in the range
+Phase 17 (wholesale leads CRM):
+  — New leads table in admin.db
+  — /leads list + /leads/:id + /leads/new routes
+  — Status pipeline: new → under_review → approved → converted
+
+## Blockers / decisions alexa needs to make
+- Email (Resend): B2B_PORTAL_RESEND_API_KEY not set → emails log to console
+  Signup at resend.com (free 100/day), add as B2B_PORTAL_RESEND_API_KEY to Doppler
+- Stripe webhook: point https://b2b.fuzzyreporting.com/api/webhooks/stripe in Stripe dashboard
+- Chase API: stub only — will go live when Chase merchant API ships
