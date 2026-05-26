@@ -2513,3 +2513,202 @@ re-researching.
 - Dashboard has a "Top customers" widget linking directly to the heavy hitters
 - Companies research is preserved in repo for the future migration phase
 - All tests green
+
+## Phase 21 — Xero customer sync on B2B creation
+
+alexa's directive 2026-05-26 (from companion Xero thread): every new B2B customer in Shopify
+must be immediately pushed to Xero as a Contact, keyed by Shopify customer ID. Existing 40 B2B
+contacts already migrated by hand 2026-05-26 — this phase handles **new** customers going
+forward + reads the migration mapping for **existing** customer references.
+
+### Reference doc
+
+Full setup notes shipped by alexa pasted into `docs/XERO_CUSTOMER_SYNC.md` (created in 21A
+below). Read it before implementing. Key facts:
+
+- **Primary mapping key:** Xero `Contact.AccountNumber` = numeric Shopify customer ID (e.g.
+  `"8902606455019"`)
+- **Migration mapping JSON:** `data/shopify_to_xero_mapping.json` (scp'd from alexa's
+  ~/projects/qbo-to-xero/b2b-push/) — has `by_shopify_id` + `by_xero_contact_id` indexes
+- **B2B ContactGroup:** `c5afb0f1-8a59-4db8-be57-83548c361669`
+- **Tracking category:** Customer Type → B2B (`d7d93d75-877a-4e9e-89de-69e7159dc9d2` /
+  `5fe38929-9904-412c-8e43-ecb410d6749d`)
+- **Wholesale income account:** `4150` (Sales:B2B Sales)
+- **Default currency:** USD
+- **Xero bridge:** `https://fww-xero-bridge.alex-037.workers.dev/xero` w/ Doppler
+  `XERO_BRIDGE_BEARER`
+- **Insider exclusions:** Shopify customer IDs `4742401425601` (Alexander Lass) and
+  `5163530813633` (Mason Flowers) — never sync
+
+### 21A — Mapping file + reference doc placement
+
+**Files to create/place** (loop will do this):
+- `data/shopify_to_xero_mapping.json` — the migration map (alexa will scp from local)
+- `docs/XERO_CUSTOMER_SYNC.md` — the full setup notes alexa pasted (copy-paste from HANDOFF.md
+  section above into a dedicated doc)
+
+**`.gitignore` rule**: keep `data/shopify_to_xero_mapping.json` IN git (small, useful, public-safe
+— just IDs and names). Don't gate it behind a fetch.
+
+### 21B — Sync helper module
+
+Create `lib/xero-customer-sync.mjs` exporting:
+
+```js
+/**
+ * Resolve a Shopify customer ID to a Xero ContactID.
+ * Tries (1) the local mapping JSON first, then (2) live Xero query by AccountNumber.
+ * Returns { xeroContactId, xeroName, isMerged, source } or null if not in Xero.
+ */
+export async function resolveXeroContact(shopifyCustomerId) { ... }
+
+/**
+ * Create a new Xero contact for a freshly b2b-tagged Shopify customer.
+ * Idempotent — checks mapping + live AccountNumber first; no-op if already exists.
+ * Returns { xeroContactId, created: bool }.
+ */
+export async function syncCustomerToXero(shopifyCustomerId, customerData) { ... }
+
+/**
+ * Check if a Shopify customer is on the insider exclusion list.
+ */
+export function isInsider(shopifyCustomerId) {
+  return ['4742401425601', '5163530813633'].includes(String(shopifyCustomerId));
+}
+```
+
+**Behavior of `syncCustomerToXero`:**
+1. If insider → log + return `{xeroContactId: null, skipped: 'insider'}`
+2. Look up in `shopify_to_xero_mapping.json` → if hit, return existing
+3. Live query Xero `GET /Contacts?where=AccountNumber=="<id>"` via bridge → if hit, return existing + update local mapping
+4. If still no hit → create new:
+   ```
+   POST /api.xro/2.0/Contacts
+   {
+     "Contacts": [{
+       "Name": "<business name OR firstName+lastName if no company>",
+       "AccountNumber": "<numeric Shopify customer ID>",
+       "EmailAddress": "<primary>",
+       "ContactPersons": [{ FirstName, LastName, EmailAddress, IncludeInEmails: true }],
+       "Addresses": [{ AddressType: "STREET", AddressLine1, City, Region, PostalCode, Country }],
+       "DefaultCurrency": "USD",
+       "SalesDefaultAccountCode": "4150",
+       "SalesTrackingCategories": [{
+         "TrackingCategoryName": "Customer Type",
+         "TrackingOptionName": "B2B"
+       }]
+     }]
+   }
+   ```
+5. Add to B2B ContactGroup:
+   ```
+   PUT /api.xro/2.0/ContactGroups/c5afb0f1-8a59-4db8-be57-83548c361669/Contacts
+   { "Contacts": [{ "ContactID": "<new id>" }] }
+   ```
+6. Append to `shopify_to_xero_mapping.json` so subsequent lookups are local
+7. Audit log: `xero_customer_sync_created` with both IDs
+8. Return `{xeroContactId, created: true}`
+
+**Customer name derivation** (`customerData.businessName` preferred, fallback to person name):
+- If `customer.defaultAddress?.company` present → use that
+- Else `firstName + ' ' + lastName`
+- Else `email` (last resort)
+
+### 21C — Sync triggers (when to call `syncCustomerToXero`)
+
+**Three trigger paths** that should all result in Xero sync:
+
+1. **Lead conversion (Phase 17)**: when `/leads/:id/convert` creates the Shopify customer +
+   adds `b2b` tag → immediately call `syncCustomerToXero(newShopifyId, customerData)` →
+   surface result in conversion success modal ("✓ Synced to Xero as contact <name>")
+
+2. **Manual b2b tag add (admin UI)**: on `/admin/customers/:id`, when admin adds the `b2b`
+   tag → fire post-save hook → `syncCustomerToXero` → flash success/failure
+
+3. **Webhook backfill (defensive)**: register a Shopify `customers/update` webhook on the
+   admin (path `/webhooks/shopify/customer-update`). When a customer gets the `b2b` tag added
+   externally (e.g. via Shopify admin directly), the webhook fires → sync to Xero. Idempotent
+   (returns existing on second call).
+
+### 21D — "Synced with Xero" indicator on customer detail
+
+On `/admin/customers/:id`, add a small badge near the customer header:
+
+```
+┌─ Customer ──────────────────────────────────────────────┐
+│ Mia Wagner                          [B2B]               │
+│ mia@example.com                                          │
+│                                                          │
+│ ✓ Synced with Xero  ·  contact: cea397fa-c20b-...       │ ← NEW
+│   (last verified: 2 minutes ago) [refresh]              │
+│                                                          │
+│ ... (existing settings card etc) ...                    │
+└──────────────────────────────────────────────────────────┘
+```
+
+**States:**
+- ✓ **Synced** (green) — resolved via mapping or live query; show first 8 chars of ContactID + tooltip with full
+- ⚠ **Not synced yet** (yellow) — has `b2b` tag but no Xero match; show "Sync now" button
+- ⊘ **Insider** (gray) — on exclusion list; no action needed
+- ✗ **Error** (red) — last sync attempt failed; show error tooltip + "Retry" button
+
+**Click the Xero contact ID** → opens `https://go.xero.com/Contacts/View/{contactId}` in new tab
+(deep link to Xero admin for the contact).
+
+**Endpoint** `GET /api/admin/customers/:id/xero-status` → returns `{state, xeroContactId, xeroName, lastChecked}`.
+
+### 21E — Merged contact awareness
+
+The mapping file already encodes 2 merge cases:
+- Shopify `6909696999659` (Angie Roe) → Xero "Pro-Mohs Canine Supply" (primary `5462357967041`)
+- Shopify `7669502509291` (Bradley Phifer) → Xero "The Dog Shoppe" (primary `8902606455019`)
+
+When admin views one of these "merged child" customers:
+- Show banner: "⚭ This Shopify customer is merged into Xero contact **Pro-Mohs Canine Supply**
+  along with Mike Ward (#5462357967041). Invoices for this customer post to the merged contact."
+- Link to the primary's `/admin/customers/<primaryShopifyId>`
+
+### 21F — Pending Pat Walsh resolution
+
+Per alexa's notes: Pat Walsh (Shopify ID — look up from top-15) is still pending review in
+`approved.json` on alexa's local. Action item for next manual ops session: run
+`node review.mjs` from `~/projects/qbo-to-xero/b2b-push/` to push her contact. Once done,
+re-export `shopify_to_xero_mapping.json` and update the VPS copy.
+
+**No code changes required for this phase** — just record the TODO in `docs/XERO_CUSTOMER_SYNC.md`
+and surface a "1 customer pending Xero sync" widget on the dashboard if her status is
+"Not synced".
+
+### 21G — Cross-reference with Phase 18 (Xero invoice booking)
+
+Phase 18 already calls Xero to book invoices on order placement. It MUST use
+`resolveXeroContact(order.customer.id)` before booking — never blindly create a duplicate
+contact. If `resolveXeroContact` returns null AND customer is `b2b`-tagged, call
+`syncCustomerToXero` first, then proceed with invoice. If customer is NOT b2b (e.g. retail
+walk-in via portal), skip Xero booking entirely.
+
+This makes Phase 21 a hard prerequisite for Phase 18's customer-side logic. Order Phase 21
+BEFORE Phase 18 in the implementation queue.
+
+### Tests
+
+- 21B: `resolveXeroContact` for known Shopify ID `8902606455019` returns "The Dog Shoppe"
+- 21B: `resolveXeroContact` for merged case `6909696999659` returns "Pro-Mohs Canine Supply" with `isMerged=true`
+- 21B: `resolveXeroContact` for insider `4742401425601` returns null (insider check)
+- 21B: `syncCustomerToXero` for new (non-existing) Shopify customer creates + adds to B2B group + updates mapping
+- 21B: `syncCustomerToXero` second call same ID returns existing (idempotent)
+- 21C: Phase 17 lead conversion triggers Xero sync — verify mapping has new entry
+- 21D: Customer detail page shows green "Synced with Xero" badge for known customers
+- 21D: Insider customer shows gray "Insider" badge
+- 21E: Merged customer shows the merge banner
+- 21G: Phase 18 invoice booking uses `resolveXeroContact` and doesn't create dup
+
+### Acceptance for Phase 21
+
+- Mapping JSON + reference doc live in repo at agreed paths
+- `lib/xero-customer-sync.mjs` exports the 3 functions; full test coverage
+- Lead conversion (Phase 17) and manual b2b-tag add both trigger Xero sync
+- Customer detail page shows clear "Synced with Xero" / "Not synced" / "Insider" badge
+- Merged contacts show the merge banner
+- Phase 18 invoice booking respects the resolve helper (no dup creation)
+- All tests green
