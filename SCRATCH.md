@@ -190,6 +190,48 @@ fww-b2b-admin/
 ## Append below this line, future iterations
 ---
 
+## Phase 13 complete (2026-05-26)
+
+### Portal: per-customer discount refactor
+- `buildCatalog()` now returns `{ rawProducts, builtAt, buildMs }` — no b2bPrice
+- `/api/catalog` applies `applyCustomerDiscount(p.msrp, req.session)` at request time
+- `applyCustomerDiscount(price, session)` uses `session.b2b.discount_pct ?? B2B_DISCOUNT`
+- `getCatalog()` now checks `catalogCache.rawProducts` (not `.products`)
+- Sessions table has new `b2b` JSON column; `setSess/getSess` handle it
+- `newSession(customer)` expects `customer.b2bMetafieldEdges` (array of {node:{key,value}})
+- Auth callback adds `raw.b2bMetafieldEdges = raw.metafields?.edges || []` before newSession
+- `/__test__/session` supports `{ b2b: { discount_pct, allow_order_on_invoice, ... } }` override
+
+### Portal: Stripe ACH
+- `stripeClient = new Stripe(STRIPE_SK)` (null in mock mode or if key missing)
+- `POST /api/stripe/create-payment-intent`: creates PI with `payment_method_types: ['us_bank_account']`
+  + `verification_method: 'instant'` + Financial Connections permissions
+- `POST /api/webhooks/stripe`: handles `payment_intent.succeeded` → `orderMarkAsPaid` + `updateOrderStatus`
+  - Body can be Buffer OR already-parsed object (due to global express.json() running first)
+- `POST /api/checkout`: takes `method=invoice|stripe_ach|chase_stub`, `paymentIntentId` (optional)
+  - Invoice: checks allow_order_on_invoice, no discount, tags=['b2b-portal']
+  - Stripe ACH: 3% discount via `appliedDiscount` on DraftOrderInput, tags include payment:stripe-ach-pending
+  - Chase stub: tags include payment:chase-stub, no discount
+- orders_log: new columns `payment_method`, `stripe_payment_intent_id`; `getOrderByStripePI(piId)`
+
+### Admin: Chase invoice stub
+- `POST /orders/:id/send-chase-invoice`: logs audit entry, returns {ok,status:'stubbed'} for JSON
+  or redirects to order with success flash for form POST
+- Flash key: `chase_invoice_queued`
+
+### Stripe keys
+- B2B_PORTAL_STRIPE_PK = pk_live_51SC1yk... (in Doppler, LIVE account)
+- B2B_PORTAL_STRIPE_SK = sk_live_... (107 chars, in Doppler)
+- B2B_PORTAL_STRIPE_WEBHOOK_SECRET = needs to be set; create endpoint at
+  https://b2b.fuzzyreporting.com/api/webhooks/stripe in Stripe dashboard
+
+### Phase 14 prep
+- Need Resend API key for email: check `doppler secrets --only-names | grep RESEND`
+- If not present: sign up at https://resend.com, add as B2B_PORTAL_RESEND_API_KEY
+- Stock alerts background job: use setInterval(15 * 60 * 1000) in portal server
+- Tax cert files: store under `data/tax-certs/` in portal dir (gitignored)
+---
+
 ## Phase 9+10 complete (2026-05-26, commit 35f5dbe)
 
 ### Phase 9 notes

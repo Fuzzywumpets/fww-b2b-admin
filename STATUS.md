@@ -1,50 +1,49 @@
 # fww-b2b-admin — overnight status
 STATE: IN_PROGRESS
-PHASE: 13 — payment methods at checkout (b2b-portal cross-repo)
-LAST_UPDATED: 2026-05-26T22:15:00Z
+PHASE: 14 — Customer self-service additions
+LAST_UPDATED: 2026-05-26T22:30:00Z
 
 ## What shipped this session
-- Phase 9: Broadened /orders and /customers default scope to ALL data
-  — filter chips (source for orders, segment for customers)
-  — source badge per order row
-  — colored tag chips per customer row
-  — SparkLayer + POS mock data for testing
-- Phase 10: Unified "B2B Customer Settings" section (4 fields)
-  — merged Dropship Config + B2B Pricing into one card
-  — added allow_order_on_invoice boolean toggle
-  — dropped min_order_usd + payment_terms from per-customer scope
-  — help text under each field
+- Phase 13: multi-payment checkout on b2b-portal (cross-repo) + Chase stub on admin
+  — b2b-portal: Stripe ACH (us_bank_account only), Invoice (gated by allow_order_on_invoice),
+    Chase stub modal, 3% prompt-pay discount on ACH
+  — b2b-portal: per-customer discount_pct from b2b.* metafields replaces flat 50%
+  — b2b-portal: auth callback fetches metafields, session stores b2b config
+  — b2b-admin: "Send Chase invoice link" button + stub endpoint on order detail
+  — 7 new portal API tests + 3 new admin API tests, all green
 
 ## What's working (URLs)
-- https://b2badmin.fuzzywumpets.com (login page + full Phase 1-10 dashboard)
-- /orders — all orders, filter chips: All / B2B portal / SparkLayer / POS / Manual
-- /customers — all customers, filter chips: All / B2B-tagged / SparkLayer / Has orders / No orders
-- /customers/:id — unified B2B Customer Settings section (4 fields)
+- https://b2badmin.fuzzywumpets.com (Phases 1-10 + Phase 13 admin additions)
+- /orders — all orders with source filter chips + "Send Chase Invoice" button
+- /customers — all customers with segment filter chips
+- /customers/:id — B2B Customer Settings (4 fields) + per-customer discount
+- https://b2b.fuzzyreporting.com/checkout — 3 payment methods:
+  Invoice (NET 30, gated) / Bank transfer ACH (Stripe, 3% off) / Chase stub (modal)
 
 ## Test status
-- API: 105/105
-- UI:  41/41
-- Total: 130/130 green
+- Admin API: 108/108
+- Admin UI:  41/41
+- Portal API: 92/92
+- Portal UI:  39/39
+- Total: 280 green
 
 ## Blockers / decisions alexa needs to make
-- Phase 13 (Stripe ACH): Stripe account needed → keys in Doppler as B2B_PORTAL_STRIPE_PK + _SK
-  If not yet created: https://stripe.com/register (~10 min)
-- Phase 12B (Zelle auto-reconcile): Needs alexa to forward a Chase Zelle-received email
-  so the bill-scanner handler knows the exact subject + body format
+- Stripe webhook secret: create endpoint in Stripe dashboard pointing to
+  https://b2b.fuzzyreporting.com/api/webhooks/stripe and add secret to Doppler as
+  B2B_PORTAL_STRIPE_WEBHOOK_SECRET (without it, webhooks still work but w/o sig verification)
+- Chase API: Phase 13 Chase button is stubbed — logs intent only; will become real
+  when Chase merchant API ships
 
 ## Next iteration's plan
-1. **Phase 13**: payment methods at checkout on b2b-portal
-   - New checkout UI: Invoice / ACH (Stripe) / Chase stub
-   - 3% prompt-pay discount when ACH selected
-   - Changes are in ~/projects/fww-b2b-portal/server.mjs
-   - Stub Chase "Pay with card" modal (no backend yet)
-   - Stub "Send Chase invoice link" button on /admin/orders/:id
-   - If Stripe keys in Doppler → wire real Stripe ACH flow
-   - If no Stripe keys → build mock Stripe flow (tag payment:stripe-ach-pending)
+Phase 14 — Customer self-service additions (on b2b-portal):
+- 14A: Stock alerts (back-in-stock notifications) — new stock_alerts SQLite table,
+  /api/stock-alerts CRUD, 15-min background job, Resend API email
+- 14B: Live order tracking — Received→In process→Shipped→Delivered timeline on /orders/:id,
+  includes Shopify fulfillment trackingInfo + polling
+- 14C: Tax exemption cert upload — multipart file upload, admin review queue,
+  b2b.tax_exempt metafield, orders created tax-exempt when approved
+- 14D: Customer-visible notes on orders — visible_notes SQLite, admin adds note on order,
+  customer sees on portal, email sent via Resend
 
-2. **After Phase 13**: Phase 14 (stock alerts, live tracking, tax cert, visible notes)
-   and Phase 15 (catalog visibility, multi-user team accounts) — all on b2b-portal
-
-## Notes
-- Phase 11/12 superseded by Phase 13 (final payment spec)
-- b2b-portal cross-repo changes authorized per HANDOFF.md Phase 10/13
+Check Doppler for B2B_PORTAL_RESEND_API_KEY before starting 14A/14D.
+Resend signup: https://resend.com (free tier 100/day) if key not present.
