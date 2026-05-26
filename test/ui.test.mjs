@@ -731,6 +731,48 @@ await test('/orders/1001 discount modal opens on button click', async (page, ctx
   assert.ok(isVisible, 'Discount modal should be visible');
 });
 
+// ── Phase 18: Xero accounting UI ─────────────────────────────────────────────
+
+await test('/settings/xero renders account mapping form', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/settings/xero`);
+  const title = await page.locator('h1').first().textContent();
+  assert.ok(title?.includes('Xero'), 'Missing Xero settings title');
+  const input = await page.locator('input[name="sales_revenue"]').first();
+  assert.ok(await input.isVisible(), 'sales_revenue input should be visible');
+});
+
+await test('/accounting renders reconciliation page with sections', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/accounting`);
+  const h1 = await page.locator('h1').first().textContent();
+  assert.ok(h1?.includes('Accounting'), 'Missing Accounting page title');
+  const html = await page.content();
+  assert.ok(html.includes('Xero Invoice Map'), 'Missing invoice map section');
+});
+
+await test('/orders/1001 shows Xero sidebar card', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/orders/1001`);
+  const html = await page.content();
+  assert.ok(html.includes('Xero'), 'Missing Xero card in order detail');
+});
+
+await test('/settings/xero saves and shows success flash', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/settings/xero`);
+  await page.fill('input[name="sales_revenue"]', '200');
+  await page.fill('input[name="chase_checking"]', '1110');
+  await page.click('button[type="submit"]');
+  await page.waitForURL(/settings\/xero/);
+  const html = await page.content();
+  assert.ok(html.includes('saved'), 'Should show success message after save');
+});
+
 await browser.close();
 
 console.log(`\n  ${passed} passed, ${failed} failed`);

@@ -1726,5 +1726,111 @@ await test('GET /orders/1001 → shows edit order button', async () => {
   assert.ok(html.includes('Apply discount'), 'Discount button missing');
 });
 
+// ── Phase 18: Xero accounting integration ─────────────────────────────────────
+
+await test('GET /settings/xero → renders account mapping form', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/settings/xero`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  assert.ok(html.includes('Xero Integration Settings'), 'Missing Xero settings title');
+  assert.ok(html.includes('sales_revenue'), 'Missing sales_revenue field');
+  assert.ok(html.includes('chase_checking'), 'Missing chase_checking field');
+});
+
+await test('POST /settings/xero → saves account map and redirects', async () => {
+  const cookie = await seedSession();
+  const body = new URLSearchParams({
+    sales_revenue: '200', accounts_receivable: '610', chase_checking: '1110',
+    stripe_clearing: '1120', processing_fees: '6100', discounts: '400', payment_terms_days: '30',
+  });
+  const res = await fetch(`${BASE}/settings/xero`, {
+    method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: body.toString(), redirect: 'manual',
+  });
+  assert.ok([301, 302].includes(res.status), 'Should redirect after save');
+  assert.ok(res.headers.get('location')?.includes('flash=ok'), 'Should redirect with ok flash');
+});
+
+await test('GET /accounting → renders reconciliation page', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/accounting`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  assert.ok(html.includes('Accounting Reconciliation'), 'Missing accounting title');
+  assert.ok(html.includes('Xero Invoice Map'), 'Missing invoice map section');
+  assert.ok(html.includes('Pending Actions'), 'Missing pending actions section');
+});
+
+await test('POST /api/admin/xero/test → returns ok in mock mode', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/api/admin/xero/test`, {
+    method: 'POST', headers: { Cookie: cookie },
+  });
+  assert.equal(res.status, 200);
+  const json = await res.json();
+  assert.equal(json.ok, true, 'Should return ok');
+  assert.ok(json.accounts >= 0, 'Should return account count');
+});
+
+await test('POST /api/admin/xero/sync → triggers retry and returns results', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/api/admin/xero/sync`, {
+    method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ _redirect: '' }).toString(), redirect: 'manual',
+  });
+  // Will redirect since no JSON Accept header and no _redirect body param with value
+  // Let's try JSON mode
+  const res2 = await fetch(`${BASE}/api/admin/xero/sync`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Accept': 'application/json', 'Content-Type': 'application/json' },
+    body: '{}',
+  });
+  assert.equal(res2.status, 200);
+  const json = await res2.json();
+  assert.equal(json.ok, true, 'Should return ok');
+  assert.ok('done' in json, 'Should include done count');
+});
+
+await test('POST /orders/1001/xero/sync → creates Xero invoice and redirects', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/orders/1001/xero/sync`, {
+    method: 'POST', headers: { Cookie: cookie },
+    redirect: 'manual',
+  });
+  assert.ok([301, 302].includes(res.status), 'Should redirect');
+  assert.ok(res.headers.get('location')?.includes('xero'), 'Should redirect with xero flash');
+});
+
+await test('POST /orders/1001/mark-paid → triggers Xero payment queue (non-blocking)', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/orders/1001/mark-paid`, {
+    method: 'POST', headers: { Cookie: cookie },
+    redirect: 'manual',
+  });
+  assert.ok([301, 302].includes(res.status), 'Should redirect after mark-paid');
+  // Verify redirect goes to order page with success
+  assert.ok(res.headers.get('location')?.includes('/orders/1001'), 'Should redirect to order');
+});
+
+await test('GET /orders/1001 → shows Sync to Xero button', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/orders/1001`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  assert.ok(html.includes('Xero'), 'Should show Xero button/card');
+  assert.ok(html.includes('/orders/1001/xero/sync'), 'Should have Xero sync form');
+});
+
+await test('GET /accounting → requires auth', async () => {
+  const res = await fetch(`${BASE}/accounting`, { redirect: 'manual' });
+  assert.ok([301, 302].includes(res.status), 'Should redirect to login');
+});
+
+await test('GET /settings/xero → requires auth', async () => {
+  const res = await fetch(`${BASE}/settings/xero`, { redirect: 'manual' });
+  assert.ok([301, 302].includes(res.status), 'Should redirect to login');
+});
+
 console.log(`\n  ${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);

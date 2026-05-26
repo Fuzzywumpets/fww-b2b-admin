@@ -145,6 +145,26 @@ db.exec(`
     changes_json TEXT,
     ts INTEGER NOT NULL
   );
+
+  CREATE TABLE IF NOT EXISTS xero_invoice_map (
+    order_id TEXT PRIMARY KEY,
+    xero_invoice_id TEXT,
+    xero_contact_id TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    synced_at INTEGER,
+    error_text TEXT
+  );
+
+  CREATE TABLE IF NOT EXISTS xero_pending_actions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    action_type TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    retries INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    last_attempt_at INTEGER,
+    error_text TEXT
+  );
 `);
 
 export default db;
@@ -348,4 +368,46 @@ export function fulfillBackorder(orderId, lineItemId) {
 export function logOrderEdit(orderId, editedBy, staffNote, changesJson) {
   db.prepare('INSERT INTO order_edit_log (order_id, edited_by, staff_note, changes_json, ts) VALUES (?, ?, ?, ?, ?)')
     .run(orderId, editedBy, staffNote || null, JSON.stringify(changesJson), Date.now());
+}
+
+// ── Xero accounting ───────────────────────────────────────────────────────────
+
+export function getXeroMap(orderId) {
+  return db.prepare('SELECT * FROM xero_invoice_map WHERE order_id = ?').get(orderId) || null;
+}
+
+export function setXeroMap(orderId, xeroInvoiceId, xeroContactId, status, errorText = null) {
+  db.prepare(`
+    INSERT OR REPLACE INTO xero_invoice_map (order_id, xero_invoice_id, xero_contact_id, status, synced_at, error_text)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(orderId, xeroInvoiceId || null, xeroContactId || null, status, Date.now(), errorText);
+}
+
+export function addXeroPending(actionType, payload) {
+  return db.prepare(`
+    INSERT INTO xero_pending_actions (action_type, payload_json, status, retries, created_at)
+    VALUES (?, ?, 'pending', 0, ?)
+  `).run(actionType, JSON.stringify(payload), Date.now()).lastInsertRowid;
+}
+
+export function getXeroPending(status = 'pending') {
+  return db.prepare('SELECT * FROM xero_pending_actions WHERE status = ? ORDER BY created_at ASC').all(status);
+}
+
+export function markXeroPendingDone(id) {
+  db.prepare("UPDATE xero_pending_actions SET status = 'done', last_attempt_at = ? WHERE id = ?").run(Date.now(), id);
+}
+
+export function markXeroPendingFailed(id, errorText, retries) {
+  db.prepare(`
+    UPDATE xero_pending_actions SET status = 'failed', error_text = ?, retries = ?, last_attempt_at = ? WHERE id = ?
+  `).run(String(errorText).slice(0, 500), retries, Date.now(), id);
+}
+
+export function getXeroPendingCount() {
+  return db.prepare("SELECT COUNT(*) as n FROM xero_pending_actions WHERE status = 'pending'").get().n;
+}
+
+export function getXeroInvoiceMaps({ limit = 200 } = {}) {
+  return db.prepare('SELECT * FROM xero_invoice_map ORDER BY synced_at DESC LIMIT ?').all(limit);
 }

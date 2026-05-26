@@ -23,6 +23,7 @@ import {
   createLead, getLeads, getLeadCounts, getLead, updateLead,
   addLeadNote, getLeadNotes, addLeadStatusHistory, getLeadStatusHistory,
   upsertBackorder, getBackordersForOrder, fulfillBackorder, logOrderEdit,
+  getXeroMap, setXeroMap, addXeroPending, getXeroPending, markXeroPendingDone, markXeroPendingFailed, getXeroPendingCount, getXeroInvoiceMaps,
 } from './db.mjs';
 import { generateInvoicePdf } from './pdf.mjs';
 import { renderLabelSheet, expandItems, TEMPLATES as LABEL_TEMPLATES, DEFAULT_FIELDS } from './labels.mjs';
@@ -42,6 +43,8 @@ const COOKIE_NAME = 'b2b_admin_sid';
 const B2B_PUB_ID  = 'gid://shopify/Publication/199709720811';
 const PORTAL_INTERNAL_TOKEN = process.env.B2B_PORTAL_INTERNAL_TOKEN || '';
 const PORTAL_INTERNAL_URL   = process.env.B2B_PORTAL_INTERNAL_URL || 'http://127.0.0.1:8793';
+const XERO_BRIDGE_URL       = 'https://fww-xero-bridge.alex-037.workers.dev/xero';
+const XERO_BEARER           = process.env.XERO_BRIDGE_BEARER || '';
 
 const app = express();
 app.use(express.json());
@@ -101,6 +104,198 @@ async function callPortalInternal(method, path, body) {
   } catch (e) {
     return { ok: false, error: String(e) };
   }
+}
+
+// ── Xero accounting integration ───────────────────────────────────────────────
+
+function xeroMockResponse(method, xeroPath, body) {
+  if (xeroPath.includes('/Contacts')) {
+    return { Contacts: [{ ContactID: 'mock-contact-xero', Name: body?.Contacts?.[0]?.Name || 'Mock Contact', EmailAddress: body?.Contacts?.[0]?.EmailAddress || '' }] };
+  }
+  if (xeroPath.includes('/Invoices') && method !== 'GET') {
+    return { Invoices: [{ InvoiceID: 'mock-inv-' + Date.now(), InvoiceNumber: body?.Invoices?.[0]?.InvoiceNumber || 'MOCK001', Status: 'AUTHORISED', AmountDue: 100 }] };
+  }
+  if (xeroPath.includes('/Invoices') && method === 'GET') {
+    return { Invoices: [{ InvoiceID: 'mock-inv-get', InvoiceNumber: 'MOCK001', Status: 'AUTHORISED', AmountDue: 100 }] };
+  }
+  if (xeroPath.includes('/Payments')) {
+    return { Payments: [{ PaymentID: 'mock-pay-' + Date.now(), Status: 'AUTHORISED' }] };
+  }
+  if (xeroPath.includes('/Accounts')) {
+    return { Accounts: [{ Code: '200', Name: 'Sales', Type: 'REVENUE', AccountID: 'acc-200' }, { Code: '610', Name: 'Accounts Receivable', Type: 'CURRENT', AccountID: 'acc-610' }, { Code: '1110', Name: 'Chase Business Checking', Type: 'BANK', AccountID: 'acc-1110' }, { Code: '1120', Name: 'Stripe Clearing', Type: 'CURRENT', AccountID: 'acc-1120' }, { Code: '6100', Name: 'Bank Fees', Type: 'EXPENSE', AccountID: 'acc-6100' }, { Code: '400', Name: 'Discounts', Type: 'REVENUE', AccountID: 'acc-400' }] };
+  }
+  return {};
+}
+
+async function xeroRequest(method, xeroPath, body = null) {
+  if (MOCK || !XERO_BEARER) {
+    return { ok: true, body: xeroMockResponse(method, xeroPath, body) };
+  }
+  const payload = { method, path: xeroPath };
+  if (body) payload.body = body;
+  const resp = await fetch(XERO_BRIDGE_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${XERO_BEARER}` },
+    body: JSON.stringify(payload),
+  });
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`Xero bridge ${method} ${xeroPath} → ${resp.status}: ${text.slice(0, 300)}`);
+  }
+  const json = await resp.json();
+  if (!json.ok) throw new Error(`Xero API error: ${JSON.stringify(json.body || json).slice(0, 300)}`);
+  return json;
+}
+
+function getXeroAccountMap() {
+  return {
+    sales_revenue:        getSetting('xero_sales_revenue')        || '200',
+    accounts_receivable:  getSetting('xero_accounts_receivable')  || '610',
+    chase_checking:       getSetting('xero_chase_checking')       || '1110',
+    stripe_clearing:      getSetting('xero_stripe_clearing')      || '1120',
+    processing_fees:      getSetting('xero_processing_fees')      || '6100',
+    discounts:            getSetting('xero_discounts')            || '400',
+    payment_terms_days:   Number(getSetting('xero_payment_terms_days') || '30'),
+  };
+}
+
+function toXeroDate(isoString) {
+  if (!isoString) return new Date().toISOString().slice(0, 10);
+  return new Date(isoString).toISOString().slice(0, 10);
+}
+
+function addDays(isoString, days) {
+  const d = new Date(isoString || new Date());
+  d.setDate(d.getDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+
+async function ensureXeroContact(customer) {
+  // customer: { id (GID), displayName, email }
+  const name  = customer.displayName || customer.email || 'Unknown Customer';
+  const email = customer.email || '';
+  const res = await xeroRequest('PUT', '/api.xro/2.0/Contacts', {
+    Contacts: [{ Name: name, EmailAddress: email }],
+  });
+  const contact = res.body?.Contacts?.[0];
+  if (!contact?.ContactID) throw new Error('Xero contact create failed: ' + JSON.stringify(res.body).slice(0, 200));
+  return contact.ContactID;
+}
+
+async function createXeroInvoice(order, accountMap) {
+  // order: Shopify order object with lineItems, customer, etc.
+  const orderId   = shopifyNumericId(order.id);
+  const existing  = getXeroMap(orderId);
+  if (existing?.xero_invoice_id && existing.status === 'synced') return existing.xero_invoice_id;
+
+  const contactId = await ensureXeroContact(order.customer || { displayName: 'Unknown', email: '' });
+
+  const lineItems = (order.lineItems?.edges || []).map(e => {
+    const li     = e.node;
+    const price  = parseFloat(li.originalUnitPriceSet?.presentmentMoney?.amount || li.discountedUnitPriceSet?.presentmentMoney?.amount || '0');
+    const qty    = li.quantity || 1;
+    return {
+      Description:    `${li.title}${li.variantTitle ? ' — ' + li.variantTitle : ''}`,
+      Quantity:        qty,
+      UnitAmount:      price,
+      AccountCode:     accountMap.sales_revenue,
+      TaxType:         'NONE',
+      LineAmount:      Math.round(price * qty * 100) / 100,
+    };
+  });
+
+  // Add order-level discounts if present (as negative line)
+  if (order.discountApplications?.edges?.length) {
+    for (const da of order.discountApplications.edges) {
+      const app = da.node;
+      if (app.value?.__typename === 'MoneyV2') {
+        lineItems.push({ Description: `Discount: ${app.title || 'Order discount'}`, Quantity: 1, UnitAmount: -parseFloat(app.value.amount || '0'), AccountCode: accountMap.discounts, TaxType: 'NONE' });
+      }
+    }
+  }
+
+  const orderDate  = toXeroDate(order.processedAt || order.createdAt);
+  const dueDate    = addDays(orderDate, accountMap.payment_terms_days);
+  const totalPrice = parseFloat(order.totalPriceSet?.presentmentMoney?.amount || '0');
+
+  const res = await xeroRequest('PUT', '/api.xro/2.0/Invoices', {
+    Invoices: [{
+      Type:           'ACCREC',
+      Contact:        { ContactID: contactId },
+      Date:           orderDate,
+      DueDate:        dueDate,
+      InvoiceNumber:  order.name || ('#' + orderId),
+      Reference:      'b2b-admin',
+      LineItems:      lineItems.length ? lineItems : [{ Description: 'B2B Order', Quantity: 1, UnitAmount: totalPrice, AccountCode: accountMap.sales_revenue, TaxType: 'NONE' }],
+      Status:         'AUTHORISED',
+    }],
+  });
+  const inv = res.body?.Invoices?.[0];
+  if (!inv?.InvoiceID) throw new Error('Xero invoice create failed: ' + JSON.stringify(res.body).slice(0, 300));
+  setXeroMap(orderId, inv.InvoiceID, contactId, 'synced');
+  return inv.InvoiceID;
+}
+
+async function recordXeroPayment(orderId, xeroInvoiceId, amount, date, accountCode) {
+  const payDate = date ? toXeroDate(date) : new Date().toISOString().slice(0, 10);
+  const res = await xeroRequest('PUT', '/api.xro/2.0/Payments', {
+    Payments: [{
+      Invoice:  { InvoiceID: xeroInvoiceId },
+      Account:  { Code: accountCode },
+      Date:     payDate,
+      Amount:   amount,
+    }],
+  });
+  const pay = res.body?.Payments?.[0];
+  if (!pay?.PaymentID) throw new Error('Xero payment create failed: ' + JSON.stringify(res.body).slice(0, 300));
+  return pay.PaymentID;
+}
+
+async function syncOrderToXero(numId, actorEmail) {
+  const order = await getOrderDetail(numId);
+  if (!order) throw new Error('Order not found: ' + numId);
+  const accountMap = getXeroAccountMap();
+  try {
+    const xeroInvoiceId = await createXeroInvoice(order, accountMap);
+    auditLog(actorEmail, 'xero:invoice_synced', shopifyOrderGid(numId), null, { xeroInvoiceId });
+    return { ok: true, xeroInvoiceId };
+  } catch (err) {
+    const pendingId = addXeroPending('create_invoice', { orderId: numId, error: err.message });
+    setXeroMap(numId, null, null, 'pending_retry', err.message);
+    auditLog(actorEmail, 'xero:invoice_failed', shopifyOrderGid(numId), null, { error: err.message, pendingId });
+    throw err;
+  }
+}
+
+async function retryXeroPending() {
+  const pending = getXeroPending('pending');
+  const accountMap = getXeroAccountMap();
+  const results = { done: 0, failed: 0, skipped: 0 };
+  for (const action of pending) {
+    if (action.retries >= 3) { results.skipped++; continue; }
+    const payload = JSON.parse(action.payload_json);
+    try {
+      if (action.action_type === 'create_invoice') {
+        const order = await getOrderDetail(payload.orderId);
+        if (!order) { markXeroPendingFailed(action.id, 'Order not found', action.retries + 1); results.failed++; continue; }
+        const xeroInvoiceId = await createXeroInvoice(order, accountMap);
+        markXeroPendingDone(action.id);
+        setXeroMap(payload.orderId, xeroInvoiceId, null, 'synced');
+        results.done++;
+      } else if (action.action_type === 'record_payment') {
+        await recordXeroPayment(payload.orderId, payload.xeroInvoiceId, payload.amount, payload.date, payload.accountCode);
+        markXeroPendingDone(action.id);
+        results.done++;
+      } else {
+        markXeroPendingFailed(action.id, 'Unknown action type: ' + action.action_type, action.retries + 1);
+        results.failed++;
+      }
+    } catch (err) {
+      markXeroPendingFailed(action.id, err.message, action.retries + 1);
+      results.failed++;
+    }
+  }
+  return results;
 }
 
 // ── Mock data ─────────────────────────────────────────────────────────────────
@@ -532,7 +727,7 @@ function layout({ title, session, activePath = '/', content, extraHead = '' }) {
     ['/', 'Dashboard'], ['/orders', 'Orders'], ['/customers', 'Customers'],
     ['/leads', 'Leads'], ['/catalog', 'Catalog'], ['/reports', 'Reports'],
     ['/labels', 'Labels'], ['/exports', 'Exports'],
-    ['/tax-exempt', 'Tax Exempt'],
+    ['/tax-exempt', 'Tax Exempt'], ['/accounting', 'Accounting'],
     ['/settings', 'Settings'],
   ];
   return `<!DOCTYPE html>
@@ -1075,6 +1270,8 @@ function renderVisibleNotesList(notes) {
 function renderOrderDetail(session, order, flash) {
   const numId    = shopifyNumericId(order.id);
   const isPaid   = order.displayFinancialStatus === 'PAID';
+  // Xero map (read from SQLite)
+  const xeroMap  = getXeroMap(numId);
   const isFulfilled = ['FULFILLED','PARTIALLY_FULFILLED'].includes(order.displayFulfillmentStatus);
   const finStatus = (order.displayFinancialStatus || '').toLowerCase();
   const fulStatus = (order.displayFulfillmentStatus || '').toLowerCase().replace(/_/g, '-');
@@ -1180,6 +1377,12 @@ function renderOrderDetail(session, order, flash) {
     ? `<div class="alert alert-success">Fulfillment recorded.</div>`
     : flash === 'backorder_flagged'
     ? `<div class="alert alert-success">Line item marked as backordered.</div>`
+    : flash === 'xero_synced'
+    ? `<div class="alert alert-success">Xero invoice created/synced.</div>`
+    : flash === 'xero_paid'
+    ? `<div class="alert alert-success">Xero payment recorded.</div>`
+    : flash === 'xero_failed'
+    ? `<div class="alert alert-warning">Xero sync failed — queued for retry. Check /accounting.</div>`
     : flash === 'edit_failed' || flash === 'fulfillment_failed' || flash === 'discount_failed'
     ? `<div class="alert alert-warning">Action failed — check server logs.</div>`
     : '';
@@ -1291,6 +1494,9 @@ function renderOrderDetail(session, order, flash) {
         <a href="/orders/${h(numId)}/invoice.pdf" class="btn btn-secondary">PDF Invoice</a>
         <form method="POST" action="/orders/${h(numId)}/send-chase-invoice" style="display:inline">
           <button class="btn btn-secondary" onclick="return confirm('Queue Chase invoice link for ${h(order.name)}?\\n\\nNote: Chase API not yet wired — this logs the intent.')">Send Chase Invoice</button>
+        </form>
+        <form method="POST" action="/orders/${h(numId)}/xero/sync" style="display:inline">
+          <button class="btn btn-ghost" title="Create or refresh Xero invoice for this order">${xeroMap?.status === 'synced' ? '✓ Xero synced' : 'Sync to Xero'}</button>
         </form>
       </div>
     </div>
@@ -1438,6 +1644,24 @@ function renderOrderDetail(session, order, flash) {
         <div class="card">
           <div class="card-header"><h2>Tags</h2></div>
           <div class="tags-list">${(order.tags||[]).map(t => `<span class="tag">${h(t)}</span>`).join(' ')}</div>
+        </div>
+        <div class="card">
+          <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
+            <h2>Xero</h2>
+            <a href="/accounting" class="link" style="font-size:12px">View all →</a>
+          </div>
+          ${xeroMap?.status === 'synced'
+            ? `<p class="text-sm"><span class="badge badge-paid">Synced</span></p>
+               <p class="text-sm text-muted" style="font-size:12px">Invoice: <code>${h(xeroMap.xero_invoice_id)}</code></p>
+               <p class="text-sm text-muted" style="font-size:12px">Last synced ${fmtDate(new Date(xeroMap.synced_at).toISOString())}</p>`
+            : xeroMap?.status === 'pending_retry'
+            ? `<p class="text-sm"><span class="badge badge-pending">Retry queued</span></p>
+               <p class="text-sm text-muted" style="font-size:11px">${h(xeroMap.error_text || '')}</p>`
+            : `<p class="text-sm text-muted">Not synced to Xero yet.</p>
+               <form method="POST" action="/orders/${h(numId)}/xero/sync" style="margin-top:8px">
+                 <button class="btn btn-ghost btn-sm">Create Xero invoice</button>
+               </form>`
+          }
         </div>
       </div>
     </div>
@@ -2602,6 +2826,31 @@ app.post('/orders/:id/mark-paid', requireAuth, async (req, res) => {
     }
   }
   auditLog(req.adminSession.email, 'mark_paid', shopifyOrderGid(numId), null, null);
+
+  // Trigger Xero payment recording (non-blocking — queue on failure)
+  (async () => {
+    try {
+      const accountMap = getXeroAccountMap();
+      const xeroEntry  = getXeroMap(numId);
+      let xeroInvoiceId = xeroEntry?.xero_invoice_id;
+      if (!xeroInvoiceId) {
+        // Try to create invoice first if not yet synced
+        const order = await getOrderDetail(numId);
+        if (order) xeroInvoiceId = await createXeroInvoice(order, accountMap);
+      }
+      if (xeroInvoiceId) {
+        const order = await getOrderDetail(numId);
+        const amount = parseFloat(order?.totalPriceSet?.presentmentMoney?.amount || '0');
+        await recordXeroPayment(numId, xeroInvoiceId, amount, null, accountMap.chase_checking);
+        auditLog(req.adminSession.email, 'xero:payment_recorded', shopifyOrderGid(numId), null, { xeroInvoiceId, amount });
+      }
+    } catch (err) {
+      console.error('Xero payment record failed (queued):', err.message);
+      const xeroEntry = getXeroMap(numId);
+      addXeroPending('record_payment', { orderId: numId, xeroInvoiceId: xeroEntry?.xero_invoice_id || null, error: err.message });
+    }
+  })();
+
   res.redirect(`/orders/${numId}?success=marked_paid`);
 });
 
@@ -5222,6 +5471,203 @@ app.post('/leads/:id/convert', requireAuth, async (req, res) => {
   const numId = shopifyCustomerId ? shopifyCustomerId.split('/').pop() : null;
   if (numId) return res.redirect('/customers/' + numId);
   res.redirect('/leads/' + lead.id);
+});
+
+// ── Xero accounting routes ────────────────────────────────────────────────────
+
+function renderXeroSettings(session, flash) {
+  const accountMap = getXeroAccountMap();
+  const flashHtml  = flash ? `<div class="alert ${flash.ok ? 'alert-success' : 'alert-error'}" style="margin-bottom:1rem">${h(flash.msg)}</div>` : '';
+  const field = (key, label, help = '') => `
+    <div class="settings-field">
+      <label class="settings-label">${h(label)}</label>
+      <input type="text" name="${key}" value="${h(accountMap[key])}" class="filter-input" style="width:160px">
+      ${help ? `<span class="text-muted" style="font-size:12px;margin-left:8px">${h(help)}</span>` : ''}
+    </div>`;
+  const pendingCount = getXeroPendingCount();
+  return layout({ title: 'Xero Settings', session, activePath: '/settings', content: `
+    <div class="page-header">
+      <h1>Xero Integration Settings</h1>
+      <a href="/settings" class="btn btn-ghost btn-sm">← Back to Settings</a>
+    </div>
+    ${flashHtml}
+    ${pendingCount > 0 ? `<div class="alert alert-warning" style="margin-bottom:1rem">⚠ ${pendingCount} Xero action(s) pending retry. <a href="/accounting" class="link">View in Accounting →</a></div>` : ''}
+    <div class="card" style="max-width:640px">
+      <div class="card-header"><h2>Account Code Mapping</h2></div>
+      <p class="text-muted" style="margin-bottom:1rem;font-size:13px">Map FWW concepts to your Xero account codes. These are the numeric codes from your chart of accounts (e.g., "200" for Sales).</p>
+      <form method="POST" action="/settings/xero">
+        <div class="settings-grid" style="gap:12px">
+          ${field('sales_revenue',       'Sales Revenue',           'Default: 200')}
+          ${field('accounts_receivable', 'Accounts Receivable (A/R)', 'Default: 610')}
+          ${field('chase_checking',      'Chase Business Checking', 'Default: 1110')}
+          ${field('stripe_clearing',     'Stripe Clearing',         'Default: 1120')}
+          ${field('processing_fees',     'Payment Processing Fees', 'Default: 6100')}
+          ${field('discounts',           'Discounts Given',         'Default: 400')}
+          ${field('payment_terms_days',  'Default Payment Terms (days)', 'Default: 30 (NET 30)')}
+        </div>
+        <div style="margin-top:1.5rem;display:flex;gap:8px">
+          <button type="submit" class="btn btn-primary">Save account mapping</button>
+          <a href="/accounting" class="btn btn-ghost">View reconciliation →</a>
+        </div>
+      </form>
+    </div>
+    <div class="card" style="max-width:640px;margin-top:1rem">
+      <div class="card-header"><h2>Connection</h2></div>
+      <p class="text-muted" style="font-size:13px">Bridge: <code>fww-xero-bridge.alex-037.workers.dev</code></p>
+      <p class="text-muted" style="font-size:13px">Bearer: ${XERO_BEARER ? '<span class="badge badge-paid">Configured</span>' : '<span class="badge badge-pending">Not configured (XERO_BRIDGE_BEARER)</span>'}</p>
+      <div style="margin-top:12px;display:flex;gap:8px">
+        <form method="POST" action="/api/admin/xero/test" id="xero-test-form">
+          <button type="submit" class="btn btn-secondary btn-sm" onclick="testXeroConnection(event)">Test connection</button>
+        </form>
+        <span id="xero-test-result" style="font-size:13px;line-height:32px"></span>
+      </div>
+    </div>
+    <script>
+    async function testXeroConnection(e) {
+      e.preventDefault();
+      const el = document.getElementById('xero-test-result');
+      el.textContent = 'Testing…';
+      try {
+        const r = await fetch('/api/admin/xero/test', { method: 'POST' });
+        const j = await r.json();
+        el.textContent = j.ok ? '✓ Connected — ' + j.accounts + ' accounts found' : '✗ ' + (j.error || 'Failed');
+        el.style.color = j.ok ? 'var(--lime)' : 'var(--danger)';
+      } catch (err) { el.textContent = '✗ ' + err.message; el.style.color = 'var(--danger)'; }
+    }
+    </script>
+  ` });
+}
+
+function renderAccounting(session, data) {
+  const { invoiceMaps, pendingActions, pendingCount } = data;
+  const pendingCountBadge = pendingCount > 0 ? `<span class="badge badge-pending">${pendingCount}</span>` : '<span class="badge badge-paid">0</span>';
+
+  const invoiceRows = invoiceMaps.map(r => `<tr>
+    <td><span class="mono">${h(r.order_id)}</span></td>
+    <td>${r.xero_invoice_id ? `<span class="mono">${h(r.xero_invoice_id)}</span>` : '<span class="text-muted">—</span>'}</td>
+    <td><span class="badge badge-${r.status === 'synced' ? 'paid' : r.status === 'pending_retry' ? 'warning' : 'pending'}">${h(r.status)}</span></td>
+    <td class="text-muted">${r.synced_at ? fmtDate(new Date(r.synced_at).toISOString()) : '—'}</td>
+    <td class="text-sm" style="max-width:200px;overflow:hidden;text-overflow:ellipsis">${r.error_text ? h(r.error_text.slice(0,80)) : '—'}</td>
+    <td><a href="/orders/${h(r.order_id)}" class="link">View order</a></td>
+  </tr>`).join('') || '<tr><td colspan="6" class="text-muted text-center">No orders synced to Xero yet.</td></tr>';
+
+  const pendingRows = pendingActions.map(r => {
+    const payload = JSON.parse(r.payload_json || '{}');
+    return `<tr>
+      <td>${h(r.action_type)}</td>
+      <td>${r.retries}</td>
+      <td><span class="badge badge-${r.status === 'done' ? 'paid' : r.status === 'failed' ? 'danger' : 'pending'}">${h(r.status)}</span></td>
+      <td class="text-muted">${fmtDate(new Date(r.created_at).toISOString())}</td>
+      <td class="text-sm" style="max-width:200px;overflow:hidden;text-overflow:ellipsis">${r.error_text ? h(r.error_text.slice(0,60)) : '—'}</td>
+      <td>${payload.orderId ? `<a href="/orders/${h(payload.orderId)}" class="link">#${h(payload.orderId)}</a>` : '—'}</td>
+    </tr>`;
+  }).join('') || '<tr><td colspan="6" class="text-muted text-center">No pending actions.</td></tr>';
+
+  return layout({ title: 'Accounting', session, activePath: '/accounting', content: `
+    <div class="page-header">
+      <h1>Accounting Reconciliation</h1>
+      <div style="display:flex;gap:8px">
+        <form method="POST" action="/api/admin/xero/sync">
+          <button class="btn btn-primary btn-sm" onclick="this.textContent='Syncing…'">Retry pending actions</button>
+        </form>
+        <a href="/settings/xero" class="btn btn-ghost btn-sm">Xero settings →</a>
+      </div>
+    </div>
+    <div class="report-stats" style="margin-bottom:1.5rem">
+      <div class="stat-card">
+        <div class="stat-value">${invoiceMaps.filter(r => r.status === 'synced').length}</div>
+        <div class="stat-label">Synced to Xero</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-value">${pendingCountBadge}</div>
+        <div class="stat-label">Pending retry</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-value">${invoiceMaps.length}</div>
+        <div class="stat-label">Total tracked</div>
+      </div>
+    </div>
+    <div class="card" style="margin-bottom:1rem">
+      <div class="card-header"><h2>Xero Invoice Map</h2></div>
+      <div class="table-wrap">
+        <table class="data-table data-table-sm">
+          <thead><tr><th>Order ID</th><th>Xero Invoice ID</th><th>Status</th><th>Last Synced</th><th>Error</th><th></th></tr></thead>
+          <tbody>${invoiceRows}</tbody>
+        </table>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
+        <h2>Pending Actions</h2>
+        ${pendingCount > 0 ? `<form method="POST" action="/api/admin/xero/sync" style="display:inline"><button class="btn btn-primary btn-xs">Retry all</button></form>` : ''}
+      </div>
+      <div class="table-wrap">
+        <table class="data-table data-table-sm">
+          <thead><tr><th>Action</th><th>Retries</th><th>Status</th><th>Created</th><th>Error</th><th>Order</th></tr></thead>
+          <tbody>${pendingRows}</tbody>
+        </table>
+      </div>
+    </div>
+  ` });
+}
+
+app.get('/settings/xero', requireAuth, (req, res) => {
+  const flash = req.query.flash ? { ok: req.query.flash === 'ok', msg: req.query.msg || '' } : null;
+  res.send(renderXeroSettings(req.adminSession, flash));
+});
+
+app.post('/settings/xero', requireAuth, (req, res) => {
+  const fields = ['sales_revenue','accounts_receivable','chase_checking','stripe_clearing','processing_fees','discounts','payment_terms_days'];
+  try {
+    for (const f of fields) {
+      if (req.body[f] !== undefined) setSetting('xero_' + f, String(req.body[f]).trim().slice(0, 20));
+    }
+    auditLog(req.adminSession.email, 'settings:xero', null, null, Object.fromEntries(fields.map(f => ['xero_'+f, req.body[f]])));
+    res.redirect('/settings/xero?flash=ok&msg=Xero+settings+saved.');
+  } catch (err) {
+    res.redirect(`/settings/xero?flash=err&msg=${encodeURIComponent(err.message)}`);
+  }
+});
+
+app.get('/accounting', requireAuth, (req, res) => {
+  const invoiceMaps = getXeroInvoiceMaps();
+  const pendingActions = getXeroPending('pending').concat(getXeroPending('failed'));
+  const pendingCount = getXeroPendingCount();
+  res.send(renderAccounting(req.adminSession, { invoiceMaps, pendingActions, pendingCount }));
+});
+
+app.post('/api/admin/xero/test', requireAuth, async (req, res) => {
+  try {
+    const result = await xeroRequest('GET', '/api.xro/2.0/Accounts');
+    const accounts = result.body?.Accounts?.length || 0;
+    res.json({ ok: true, accounts, message: `Connected — ${accounts} accounts found` });
+  } catch (err) {
+    res.json({ ok: false, error: err.message });
+  }
+});
+
+app.post('/api/admin/xero/sync', requireAuth, async (req, res) => {
+  try {
+    const results = await retryXeroPending();
+    auditLog(req.adminSession.email, 'xero:sync', null, null, results);
+    if (req.accepts('json') && !req.body._redirect) {
+      return res.json({ ok: true, ...results });
+    }
+    res.redirect(`/accounting?flash=ok&msg=${encodeURIComponent(`Sync complete: ${results.done} done, ${results.failed} failed, ${results.skipped} skipped.`)}`);
+  } catch (err) {
+    if (req.accepts('json')) return res.json({ ok: false, error: err.message });
+    res.redirect(`/accounting?flash=err&msg=${encodeURIComponent(err.message)}`);
+  }
+});
+
+app.post('/orders/:id/xero/sync', requireAuth, async (req, res) => {
+  const numId = req.params.id;
+  try {
+    const result = await syncOrderToXero(numId, req.adminSession.email);
+    res.redirect(`/orders/${numId}?success=xero_synced`);
+  } catch (err) {
+    res.redirect(`/orders/${numId}?success=xero_failed`);
+  }
 });
 
 // Static
