@@ -189,3 +189,135 @@ fww-b2b-admin/
 
 ## Append below this line, future iterations
 ---
+
+## Phase 1 complete (2026-05-26, commit dde366c)
+
+### Files built
+- db.mjs — SQLite (in-memory in MOCK mode, ./data/admin.db in prod)
+- server.mjs — full rewrite: cookie helpers (no cookie-parser dep), requireAuth, OAuth flow, dashboard
+- public/admin.css — dense operator CSS, brand colors, responsive
+- test/api.test.mjs + test/ui.test.mjs — 24 tests all green
+
+### Cookie handling note
+- No cookie-parser dep. Manual getCookie() parses req.headers.cookie.
+- Session IDs are 64-char hex (crypto.randomBytes(32).toString('hex')), URL-safe, no encoding issues.
+- `sessionCookie(sid)` helper builds Set-Cookie string; `sessionCookie(null, true)` clears it.
+- Secure flag is set in prod (MOCK=false), not in mock mode.
+
+### Mock mode
+- B2B_ADMIN_MOCK=1: uses :memory: SQLite, returns hardcoded dashboard data, /auth/login auto-logins
+- /__test__/session?email=X seeds a session + sets cookie + returns { ok, sid, email }
+- run-tests.sh starts server on port 8894 with MOCK=1
+
+### Gotcha: stale process on port 8894
+- If run-tests.sh crashed without cleanup, port 8894 stays occupied.
+- Next run sees wrong server. Fix: `kill $(lsof -ti:8894)` then re-run.
+
+### Service management
+- Old process (from before systemd) sat on 8794 and blocked restarts. Kill manually first.
+- `lsof -i :8794` to check. `sudo systemctl restart fww-b2b-admin.service` only works if port is free.
+
+## Phase 2 starting next iteration
+
+### Draft orders mutation (manual order builder)
+```graphql
+mutation draftOrderCreate($input: DraftOrderInput!) {
+  draftOrderCreate(input: $input) {
+    draftOrder { id invoiceUrl totalPrice }
+    userErrors { field message }
+  }
+}
+# variables: { "input": {
+#   "lineItems": [{ "variantId": "gid://shopify/ProductVariant/...", "quantity": 2, "appliedDiscount": { "value": 50, "valueType": "PERCENTAGE" } }],
+#   "customerId": "gid://shopify/Customer/...",
+#   "shippingAddress": { ... },
+#   "note": "Manual order via b2b-admin",
+#   "tags": ["b2b-portal", "b2b-manual-order"]
+# }}
+
+mutation draftOrderComplete($id: ID!, $paymentPending: Boolean!) {
+  draftOrderComplete(id: $id, paymentPending: $paymentPending) {
+    draftOrder { order { id name } }
+    userErrors { field message }
+  }
+}
+# variables: { "id": "gid://shopify/DraftOrder/...", "paymentPending": true }
+```
+
+### B2B orders list query (paginated)
+```graphql
+query($q: String!, $first: Int!, $after: String) {
+  orders(first: $first, query: $q, after: $after, sortKey: PROCESSED_AT, reverse: true) {
+    edges {
+      cursor
+      node {
+        id name processedAt
+        customer { id displayName email }
+        displayFinancialStatus displayFulfillmentStatus
+        totalPriceSet { presentmentMoney { amount currencyCode } }
+        note tags
+        lineItems(first: 3) { edges { node { title quantity variant { sku } } } }
+      }
+    }
+    pageInfo { hasNextPage endCursor }
+  }
+}
+```
+
+### Customer list query (b2b-tagged, sorted by amountSpent)
+```graphql
+query($q: String!, $first: Int!, $after: String) {
+  customers(first: $first, query: $q, after: $after, sortKey: AMOUNT_SPENT, reverse: true) {
+    edges {
+      cursor
+      node {
+        id displayName email phone
+        tags
+        amountSpent { amount currencyCode }
+        numberOfOrders
+        defaultAddress { city province country }
+        metafields(first: 5, namespace: "b2b") {
+          edges { node { key value } }
+        }
+      }
+    }
+    pageInfo { hasNextPage endCursor }
+  }
+}
+# variables: { "q": "tag:b2b", "first": 50 }
+```
+
+### Order detail (full)
+```graphql
+query($id: ID!) {
+  order(id: $id) {
+    id name processedAt createdAt cancelledAt
+    customer { id displayName email phone }
+    displayFinancialStatus displayFulfillmentStatus
+    totalPriceSet { presentmentMoney { amount currencyCode } }
+    subtotalPriceSet { presentmentMoney { amount currencyCode } }
+    totalShippingPriceSet { presentmentMoney { amount currencyCode } }
+    totalTaxSet { presentmentMoney { amount currencyCode } }
+    note tags
+    shippingAddress { firstName lastName address1 address2 city province zip country }
+    billingAddress { firstName lastName address1 address2 city province zip country }
+    lineItems(first: 50) {
+      edges { node {
+        id title quantity
+        variant { id sku price inventoryQuantity }
+        discountedUnitPriceSet { presentmentMoney { amount currencyCode } }
+        originalUnitPriceSet { presentmentMoney { amount currencyCode } }
+      }}
+    }
+    fulfillments { status trackingInfo { number url company } createdAt }
+    transactions(first: 10) { id status kind gateway createdAt amountSet { presentmentMoney { amount currencyCode } } }
+  }
+}
+```
+
+### PDF invoice
+- Install pdfkit: `npm install pdfkit`
+- Build in server.mjs or a separate pdf.mjs helper
+- Response: res.setHeader('Content-Type', 'application/pdf'); res.setHeader('Content-Disposition', ...)
+- Fields: FWW logo text, order number, date, customer info, line items table, totals, "PAYMENT PENDING" stamp if not paid
+
