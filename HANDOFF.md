@@ -882,3 +882,139 @@ margin %).
 - alexa toggles "Allow order on invoice" off for a customer who's been slow paying → customer
   hits checkout and sees the "contact us" message instead of the invoice button
 - All actions audit-logged. Tests green.
+
+## Phase 11 — Payment methods at checkout (research + phased plan)
+
+The b2b portal currently has ONE checkout path: create a Shopify draft order marked unpaid, which
+the customer hits via a "Place order on invoice" button (gated by Phase 10's
+`allow_order_on_invoice`). alexa wants multiple payment methods at the customer-facing checkout.
+
+This phase is **mostly research + scoping** plus the first easy build. Each payment method maps
+to a small spec the agent can implement once alexa decides which to ship and after she's set up
+any required merchant accounts.
+
+### Payment method comparison (current as of 2026)
+
+| Method | Card/ACH fees (2026) | Integration effort | Merchant account needed |
+|---|---|---|---|
+| **Invoice (NET)** | 0% | TRIVIAL (already partly built) | none |
+| **Zelle "pay-on-trust"** | 0% (P2P) | EASY (~1 day) | Chase Business already has Zelle |
+| **Stripe** (unlocks cards + Apple Pay + Google Pay + ACH) | 2.9% + $0.30 cards; **$5 flat ACH for $1k+** | MEDIUM (~3 days) | new Stripe account |
+| **PayPal Checkout** | 3.49% + $0.49 cards; **1% capped $10 ACH via PayPal Invoicing** | EASY (~2 days) | existing PayPal Business account |
+| **Amazon Pay** | 2.9% + $0.35 (US); +20–30% conversion via trusted brand | EASY (~2 days) | new Amazon Pay merchant |
+| **Shop Pay** (Shopify Pay) | 2.9% + $0.30, but only via Shopify Checkout redirect | EASY (~1 day) — redirect-based | existing Shopify Payments |
+| **Chase Payment Solutions** | TBD | UNAVAILABLE — wait for GA | n/a yet |
+
+Sources: searches 2026-05-26 (PayPal/Stripe/Amazon Pay 2026 fee comparisons; Chase Developer
+portal status — currently only Account Data Sharing APIs, not merchant payment APIs).
+
+### Recommended phased rollout (build in this order)
+
+#### Phase 11A — Zelle pseudo-flow (build first; no SDK, no merchant setup)
+
+- 0% fees, alexa already accepts Zelle via Chase Business.
+- No JS SDK; this is a "manual reconciliation" flow.
+- At checkout: new "Pay via Zelle" radio option. Selecting it shows:
+  ```
+  Send $XXX.XX via Zelle to wholesale@fuzzywumpets.com
+  Include "Order #XXXX" in the memo.
+  Your order is reserved for 72 hours pending receipt of payment.
+  ```
+- On submit: creates Shopify order, `financialStatus=PENDING`, tagged `payment:zelle-pending`,
+  note "Awaiting Zelle from {email}, order placed {timestamp}".
+- alexa marks paid in admin once she sees the Zelle hit her bank (existing mark-paid flow).
+- **Effort**: ~1 day. Pure copy + tagging logic.
+
+#### Phase 11B — Stripe (cards + Apple Pay + Google Pay + ACH in one shot)
+
+- ONE integration unlocks 4 payment methods. Best ROI.
+- Recommended: **Stripe Payment Element** (modern, one-line embed). Renders cards + Apple Pay +
+  Google Pay + Link automatically based on customer's device.
+- **ACH support is the killer feature for B2B**: $5 flat fee on $1k+ orders vs 2.9% on cards
+  saves alexa real money on wholesale-sized invoices.
+- Flow:
+  1. Customer hits /checkout, picks "Credit card / Apple Pay / Google Pay" tab → loads Stripe
+     Payment Element
+  2. Customer enters card / selects digital wallet
+  3. On submit, our server creates a Stripe PaymentIntent for the cart total
+  4. Stripe processes payment, webhook fires → server creates Shopify order with
+     `financialStatus=PAID`
+- **What alexa needs to do**: create a Stripe account (~10 min, free), share publishable + secret
+  keys → I push to Doppler as `B2B_PORTAL_STRIPE_PK` + `_SK`.
+- **Effort**: ~3 days for full flow + webhook + tests.
+
+#### Phase 11C — PayPal Checkout
+
+- Most-recognized button after digital wallets.
+- Mature JS SDK: `<script src="https://www.paypal.com/sdk/js?client-id=...&components=buttons">`
+- Renders a PayPal button → user pays in popup → callback returns order id → server captures →
+  Shopify order created `PAID`.
+- alexa already has a PayPal Business account (per memory `convention_shopify_paypal_categorization`)
+- **Effort**: ~2 days.
+- Note: PayPal's "Pay in 4" / BNPL options come for free with the same SDK if enabled.
+
+#### Phase 11D — Shop Pay (lightest weight, but redirects out)
+
+- Easy because Shopify's hosted checkout already accepts Shop Pay.
+- Implementation: instead of customer paying in portal, redirect to Shopify's hosted draft-order
+  checkout URL (we already create the draft order). Shop Pay button appears there alongside
+  other methods Shopify supports.
+- Pro: zero new integration; leverages Shopify Payments PCI compliance.
+- Con: customer leaves our domain briefly during checkout. UX feels less integrated.
+- **Effort**: ~1 day. Just a "Pay via Shopify checkout" button that opens the draft order's
+  `invoiceUrl`.
+
+#### Phase 11E — Amazon Pay (later, optional)
+
+- 20-30% conversion lift per merchant data, but requires Amazon Pay Business account setup.
+- JS SDK + server-side checkout-session creation.
+- Worth doing once Stripe + PayPal + Zelle + Invoice are live and we want one more option.
+- **Effort**: ~2-3 days.
+
+#### Phase 11F — Chase Payment Solutions (deferred — not GA yet)
+
+- Chase Developer portal currently exposes Account Data Sharing APIs (banking), NOT a merchant
+  checkout API for browser modal flows.
+- Chase Paymentech (the older gateway) requires a full gateway integration (Orbital, etc.) and
+  is complex/legacy.
+- Action: **monitor https://developer.chase.com/ quarterly** for a public "Chase Pay" merchant
+  SDK launch. When it ships, file a new Phase to integrate.
+- Until then, do not build against the older Paymentech gateway.
+
+### Checkout UI changes (applies to all options above)
+
+Replace today's single "Place order on invoice" button with a payment-method picker:
+
+```
+┌─ Payment method ─────────────────────────────────┐
+│  ◯ Pay later (invoice)           NET 30 default  │  ← only if allow_order_on_invoice
+│  ◯ Credit card / Apple Pay / Google Pay (Stripe) │
+│  ◯ PayPal                                        │
+│  ◯ Zelle                                         │
+│  ◯ Shop Pay (Shopify checkout)                   │
+└──────────────────────────────────────────────────┘
+[ Place order — $XXX.XX ]
+```
+
+Per-option visibility rules:
+- "Invoice" only if `customer.allow_order_on_invoice` (Phase 10)
+- "Zelle" / "PayPal" / "Stripe" / "Shop Pay" — show for everyone with the relevant accounts set up
+
+Server endpoint pattern: `POST /api/checkout?method={invoice|stripe|paypal|zelle|shoppay}` →
+branch based on method → orchestrate the right flow.
+
+### What alexa needs to set up (in order)
+
+1. **Zelle** — already have via Chase Business. No setup. (0 minutes)
+2. **Stripe account** — go to https://stripe.com/register, ~10 min signup. Give me the publishable
+   + secret keys (I push to Doppler). (10 minutes)
+3. **PayPal Developer app** — alexa already has PayPal Business. Go to
+   https://developer.paypal.com → My Apps → create REST API app → get client_id + secret. (~10 minutes)
+4. **Amazon Pay** — only if she wants it. Apply at https://pay.amazon.com/signup. (1-2 days for approval)
+
+### Acceptance for Phase 11 (research-only completion)
+
+- Document checked in: this section in HANDOFF.md
+- alexa confirms which methods to actually build (recommend: Invoice ✓ already, Zelle next, then
+  Stripe, then PayPal, then Shop Pay as cheap addition)
+- Future Phases 11A-F each ship one method when alexa has set up the corresponding merchant account
