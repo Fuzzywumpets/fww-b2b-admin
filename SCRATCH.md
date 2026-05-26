@@ -190,6 +190,34 @@ fww-b2b-admin/
 ## Append below this line, future iterations
 ---
 
+## Phase 19B + 19C + 16 complete (2026-05-27)
+
+### Phase 19B: Universal hyperlinks
+- `tagChip(t, { linked: true })` generates `<a href="/customers?tag=...">` — use in customer list
+- Audit log: `auditTargetLink()` function parses GID (`gid://shopify/Order/X` → `/orders/X`, Customer same)
+  and `lead:N` → `/leads/N`. Email → `<a href="mailto:...">`.
+- express.urlencoded changed to `{ extended: true }` to parse bracket-notation form fields (e.g. `qtys[li1]`)
+
+### Phase 19C: Product detail page
+- GET /products/:id — `getProductDetail(numericId)` → mock uses MOCK_PRODUCTS + MOCK_CATALOG_PRODUCTS
+- `MOCK_VARIANT_PRODUCT` Map built from MOCK_PRODUCTS: `v301` → `'201'`, `301` → `'201'`, etc.
+- Order detail line items: resolve productNum from `item.variant?.product?.id` (real) or MOCK_VARIANT_PRODUCT lookup
+- /catalog/:id now redirects to /products/:id instead of /catalog?highlight=
+
+### Phase 16: Order editing
+- POST /orders/:id/edit — `orderEditBegin` → `orderEditSetQuantity` → `orderEditCommit` (real);
+  mock: applies to mockOrderOverrides
+- POST /orders/:id/discount — separate route; in real mode: begin+addCustomItem(-$X)+commit
+- POST /orders/:id/fulfill — `fulfillmentCreate` mutation; mock adds to mockOrderOverrides.fulfillments
+- POST /orders/:id/backorder — saves to SQLite backorders table (UNIQUE on order_id+line_item_id)
+- GET /api/orders/:id/backorders — returns JSON for backorder API
+- db.mjs: backorders table (order_id, line_item_id, quantity, eta_date, status=pending/fulfilled)
+  + order_edit_log table; helpers: upsertBackorder, getBackordersForOrder, fulfillBackorder, logOrderEdit
+- Edit mode JS: toggleEditMode(enable) shows/hides #edit-mode-bar, #edit-save-bar, qty inputs, remove btns
+- Modals: #discount-modal, #fulfill-modal, #backorder-modal (position:fixed overlay, Escape to close)
+
+### Next: Phase 18 (Xero accounting) or Phase 15 (customer catalogs)
+
 ## Phase 19A + 17 complete (2026-05-27)
 
 ### Phase 19A: Customer spend section
