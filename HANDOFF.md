@@ -2410,3 +2410,106 @@ Status:  [ All ]  [ Active (default) ]  [ Draft ]  [ Archived ]
 - /admin/catalog?status=all → shows every product regardless of status
 - Status chip counts match the filtered list size
 - Archived row visibly dimmed
+
+## Phase 20 — Priority customer onboarding + Companies research archive
+
+alexa's directive 2026-05-26: when bringing real customer/order data into the admin, **prioritize
+customers with significant order history**. Surface Mia Wagner, Mike Ward, etc first so the admin
+gets battle-tested against high-volume accounts before lower-tier ones.
+
+Companies migration deferred to future loop (Path A — ship current queue first, migrate later).
+Companies research preserved in docs for that future phase.
+
+### 20A — Priority customer surfacing in admin
+
+**Goal:** when alexa opens `/admin/customers` she sees the most operationally important customers
+first by default, not alphabetical or arbitrary order.
+
+**Default sort on `/admin/customers`:**
+- Change default sort from name → **lifetime spend descending**
+- Sort options dropdown: Lifetime spend ↓ (default) · Recent activity ↓ · Order count ↓ · Name A-Z · Newest first
+- URL persists sort: `?sort=lifetime_spend_desc`
+
+**Priority customers (top 15 by lifetime spend as of 2026-05-26):**
+
+| # | Name | Orders | Lifetime |
+|---|---|---|---|
+| 1 | Mia Wagner | 254 | $142,838.99 |
+| 2 | James Mohs | 36 | $46,063.98 |
+| 3 | Angie Roe | 27 | $42,477.55 |
+| 4 | Mike Ward | 19 | $28,727.87 |
+| 5 | Kathi Luljak | 34 | $18,895.14 |
+| 6 | Susan Arafat | 5 | $15,154.47 |
+| 7 | Amber McCune | 10 | $15,005.69 |
+| 8 | Tina Medley | 6 | $11,131.84 |
+| 9 | Mary Holsen | 10 | $9,086.69 |
+| 10 | Cyndi Skinner | 3 | $8,549.48 |
+| 11 | Stephan Olschewski | 11 | $8,034.99 |
+| 12 | Pat Walsh | 12 | $6,827.31 |
+| 13 | Megan Schriefer | 11 | $6,318.54 |
+| 14 | Lisa Zilney | 5 | $3,771.70 |
+| 15 | Tracy Best | 3 | $2,415.00 |
+
+Combined lifetime revenue: ~$355K across top 15.
+
+**Test fixtures + dev seed:**
+- Save current top-15 snapshot to `docs/PRIORITY_CUSTOMERS_BASELINE.md` (the table above + the
+  shopify-bridge query used to generate it)
+- Phase 19A's lifetime-spend computation MUST work end-to-end on each of these 15 first
+- Manual smoke test: open each of the top 5 customer profiles after Phase 19 ships and confirm
+  lifetime spend matches Shopify admin
+
+**Quick wins flagged for top customers:**
+- Add a small ⭐ badge next to top-10-by-spend customer rows ("top customer" indicator)
+- Customer detail page: show "Rank: #N of B2B customers by lifetime spend" small text under name
+- Dashboard widget: "Top 5 B2B customers by lifetime spend" with quick links — gives alexa
+  one-click access to her most important accounts
+
+### 20B — Shopify Companies research archive (no code, docs only)
+
+Companies migration is **deferred** to a future phase (likely Phase 22+ after current queue
+settles). Preserve the research now so the next loop iteration has full context without
+re-researching.
+
+**Action:**
+- Create `docs/SHOPIFY_COMPANIES_RESEARCH.md` in the repo with the full research brief
+- Key facts to record:
+  1. Companies available on Basic/Grow/Advanced as of 2026-04-02 changelog
+  2. Same OAuth flow as standard Customer Account API — no re-arch needed
+  3. Native multi-buyer + multi-location + payment terms + tax exemption + catalog assignment
+  4. Built-in admin UI for Customer → Company migration (up to 250 at a time, order history follows)
+  5. 3-catalog cap on non-Plus (FWW has 1, fine)
+  6. Native NOT supported: credit limits (still metafield-based)
+  7. SparkLayer + Companies don't interoperate — our SparkLayer-replacement strategy is right
+- Include the source citations (Shopify changelog, help docs, GraphQL refs, SparkLayer docs)
+
+**Future Phase 22 outline** (record in docs/SHOPIFY_COMPANIES_RESEARCH.md):
+- Migrate the top 15 priority customers (above) to Shopify Companies via admin bulk action
+- Per-customer metafields (`b2b.discount_pct`, `allow_order_on_invoice`, `dropship_*`)
+  → migrate to native Company/Location config (payment terms, catalog assignment)
+- Phase 15B magic-link team accounts → retire in favor of native Company Contacts
+- Phase 14C tax cert upload → consider retiring in favor of native Location-level tax exemption
+  (keep the upload-and-approve UX but write to Company instead of SQLite)
+- Portal session model: detect `company_id` from logged-in Contact; route B2B logic via Company
+
+**Not in scope for this Phase 20:**
+- No code changes to Customer/Customer-API integration
+- No new GraphQL queries for Company objects yet
+- No migration of any customer record
+- Magic-link team accounts (Phase 15B) STAYS on the current queue per Path A
+
+### Tests
+
+- `/admin/customers` loads with lifetime-spend-descending default
+- Sort dropdown switches between options + URL updates
+- Mia Wagner's profile renders correctly with $142K+ lifetime
+- Dashboard widget shows top 5 customers with click-through
+- docs/SHOPIFY_COMPANIES_RESEARCH.md exists and includes all 10 research points + sources
+
+### Acceptance for Phase 20
+
+- alexa opens /admin/customers → Mia Wagner is at the top
+- Each of the top-15 customer profiles loads cleanly (Phase 19A spend section validated against them)
+- Dashboard has a "Top customers" widget linking directly to the heavy hitters
+- Companies research is preserved in repo for the future migration phase
+- All tests green
