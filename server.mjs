@@ -22,6 +22,7 @@ import {
   logLabelBatch, logExportBatch,
   createLead, getLeads, getLeadCounts, getLead, updateLead,
   addLeadNote, getLeadNotes, addLeadStatusHistory, getLeadStatusHistory,
+  upsertBackorder, getBackordersForOrder, fulfillBackorder, logOrderEdit,
 } from './db.mjs';
 import { generateInvoicePdf } from './pdf.mjs';
 import { renderLabelSheet, expandItems, TEMPLATES as LABEL_TEMPLATES, DEFAULT_FIELDS } from './labels.mjs';
@@ -44,7 +45,7 @@ const PORTAL_INTERNAL_URL   = process.env.B2B_PORTAL_INTERNAL_URL || 'http://127
 
 const app = express();
 app.use(express.json());
-app.use(express.urlencoded({ extended: false }));
+app.use(express.urlencoded({ extended: true }));
 
 // ── Portal integration (read portal SQLite + call portal internal API) ────────
 
@@ -439,6 +440,17 @@ const MOCK_CUSTOMER_REVENUE = [
   { id: '104', name: 'Pet Paradise',        email: 'buy@petparadise.com',   revenue: 4200,  orders: 7,  aov: 600 },
   { id: '105', name: 'Paw Central',         email: 'orders@pawcentral.com', revenue: 2890,  orders: 5,  aov: 578 },
 ];
+
+// Build variant → product lookup from MOCK_PRODUCTS (mock mode only)
+const MOCK_VARIANT_PRODUCT = new Map(); // variantId (short like 'v301') → productNumericId
+for (const p of MOCK_PRODUCTS) {
+  const pNum = shopifyNumericId(p.id);
+  for (const { node: v } of (p.variants?.edges || [])) {
+    const vNum = shopifyNumericId(v.id);
+    MOCK_VARIANT_PRODUCT.set(`v${vNum}`, pNum);
+    MOCK_VARIANT_PRODUCT.set(vNum, pNum); // also map numeric form
+  }
+}
 
 const MOCK_PRODUCT_REVENUE = [
   { id: '201', title: 'Elite Collar',           sku: 'EC-001-*', revenue: 8640,  units: 240 },
@@ -1036,7 +1048,7 @@ async function getOrderDetail(numericId) {
         shippingAddress{firstName lastName address1 address2 city province zip country}
         billingAddress{firstName lastName address1 address2 city province zip country}
         lineItems(first:50){edges{node{id title quantity
-          variant{id sku price inventoryQuantity}
+          variant{id sku price inventoryQuantity product{id title}}
           discountedUnitPriceSet{presentmentMoney{amount currencyCode}}
           originalUnitPriceSet{presentmentMoney{amount currencyCode}}
         }}}
@@ -1087,15 +1099,36 @@ function renderOrderDetail(session, order, flash) {
     ${timelineStep('Delivered', step4done, step4curr)}
   </div>`;
 
+  // Backorders for this order (from SQLite) — must be before lineItemsHtml
+  const backordersForOrder = getBackordersForOrder(`gid://shopify/Order/${numId}`);
+  const backorderMap = new Map(backordersForOrder.map(b => [b.line_item_id, b]));
+
   // Line items table
   const lineItems = (order.lineItems?.edges || []).map(e => e.node);
   const lineItemsHtml = lineItems.map(item => {
     const unitPrice = parseFloat(item.discountedUnitPriceSet?.presentmentMoney?.amount ?? item.originalUnitPriceSet?.presentmentMoney?.amount ?? 0);
     const rowTotal  = unitPrice * (item.quantity || 0);
-    return `<tr>
-      <td>${h(item.title)}</td>
+    // Resolve product ID: from GraphQL `variant.product.id` or mock lookup
+    const varId = item.variant?.id || '';
+    const productGid = item.variant?.product?.id;
+    const productNum = productGid ? shopifyNumericId(productGid) : (MOCK_VARIANT_PRODUCT.get(varId) || MOCK_VARIANT_PRODUCT.get(shopifyNumericId(varId)));
+    const titleCell = productNum
+      ? `<a href="/products/${productNum}" class="link">${h(item.title)}</a>`
+      : h(item.title);
+    const bo = backorderMap.get(item.id);
+    const boBadge = bo ? `<span class="badge badge-warning" title="ETA: ${bo.eta_date || 'unknown'}">⚠ Backorder</span>` : '';
+    const boBtn = `<button type="button" class="btn btn-ghost btn-xs edit-remove-btn" style="display:none;margin-left:4px"
+      onclick="toggleBackorderModal('${h(item.id)}','${h(item.title).replace(/'/g,"\\'")}','${item.quantity}',true)">Backorder</button>`;
+    return `<tr data-removed="0">
+      <td>${titleCell} ${boBadge}${boBtn}
+        <input type="hidden" name="removes" value="${h(item.id)}" disabled id="remove_${h(item.id)}">
+      </td>
       <td class="mono">${h(item.variant?.sku || '—')}</td>
-      <td class="text-right">${item.quantity}</td>
+      <td class="text-right">
+        <span class="edit-qty-static">${item.quantity}</span>
+        <input type="number" name="qtys[${h(item.id)}]" value="${item.quantity}" min="0" class="edit-qty-input" style="display:none;width:60px">
+        <button type="button" class="btn btn-ghost btn-xs edit-remove-btn" style="display:none;margin-left:4px" onclick="markRemove('${h(item.id)}',this)">✕</button>
+      </td>
       <td class="text-right">${fmtMoney(unitPrice)}</td>
       <td class="text-right">${fmtMoney(rowTotal)}</td>
     </tr>`;
@@ -1139,7 +1172,63 @@ function renderOrderDetail(session, order, flash) {
     ? `<div class="alert alert-success">Note saved.</div>`
     : flash === 'chase_invoice_queued'
     ? `<div class="alert alert-success">Chase invoice intent logged. Wire Chase API to send the real link.</div>`
+    : flash === 'order_edited'
+    ? `<div class="alert alert-success">Order updated.</div>`
+    : flash === 'discount_applied'
+    ? `<div class="alert alert-success">Discount applied.</div>`
+    : flash === 'fulfilled'
+    ? `<div class="alert alert-success">Fulfillment recorded.</div>`
+    : flash === 'backorder_flagged'
+    ? `<div class="alert alert-success">Line item marked as backordered.</div>`
+    : flash === 'edit_failed' || flash === 'fulfillment_failed' || flash === 'discount_failed'
+    ? `<div class="alert alert-warning">Action failed — check server logs.</div>`
     : '';
+
+  // Edit mode JS (16A)
+  const editModeScript = `<script>
+  function toggleEditMode(enable) {
+    document.getElementById('edit-mode-bar').style.display = enable ? 'block' : 'none';
+    document.getElementById('edit-save-bar').style.display = enable ? 'block' : 'none';
+    document.getElementById('edit-btn').style.display = enable ? 'none' : 'inline-flex';
+    document.querySelectorAll('.edit-qty-input').forEach(el => { el.style.display = enable ? 'inline-block' : 'none'; el.disabled = !enable; });
+    document.querySelectorAll('.edit-qty-static').forEach(el => { el.style.display = enable ? 'none' : 'inline'; });
+    document.querySelectorAll('.edit-remove-btn').forEach(el => { el.style.display = enable ? 'inline-flex' : 'none'; });
+    if (!enable) { document.querySelectorAll('tr[data-removed]').forEach(r => { r.dataset.removed = '0'; r.style.opacity = '1'; }); }
+  }
+  function markRemove(liId, btn) {
+    const row = btn.closest('tr');
+    const removed = row.dataset.removed === '1';
+    row.dataset.removed = removed ? '0' : '1';
+    row.style.opacity = removed ? '1' : '0.4';
+    const input = document.getElementById('remove_' + liId);
+    if (input) input.disabled = removed;
+  }
+  function toggleDiscountModal(show) {
+    document.getElementById('discount-modal').style.display = show ? 'flex' : 'none';
+  }
+  function toggleFulfillModal(show) {
+    document.getElementById('fulfill-modal').style.display = show ? 'flex' : 'none';
+  }
+  function toggleBackorderModal(liId, liTitle, liQty, show) {
+    const m = document.getElementById('backorder-modal');
+    if (show) {
+      m.style.display = 'flex';
+      document.getElementById('bo-li-id').value = liId || '';
+      document.getElementById('bo-li-title').value = liTitle || '';
+      document.getElementById('bo-quantity').value = liQty || 1;
+    } else {
+      m.style.display = 'none';
+    }
+  }
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape') {
+      document.getElementById('discount-modal').style.display = 'none';
+      document.getElementById('fulfill-modal').style.display = 'none';
+      document.getElementById('backorder-modal').style.display = 'none';
+    }
+  });
+  </script>`;
+
 
   const visibleNotesScript = `
     <script>
@@ -1180,6 +1269,7 @@ function renderOrderDetail(session, order, flash) {
 
   return layout({ title: order.name || 'Order', session, activePath: '/orders', content: `
     ${visibleNotesScript}
+    ${editModeScript}
     <div class="breadcrumb-row"><a href="/orders" class="breadcrumb">← Orders</a></div>
     ${flashHtml}
     <div class="detail-header">
@@ -1195,6 +1285,9 @@ function renderOrderDetail(session, order, flash) {
         ${!isPaid ? `<form method="POST" action="/orders/${h(numId)}/mark-paid" style="display:inline">
           <button class="btn btn-success" onclick="return confirm('Mark ${h(order.name)} as paid?')">Mark Paid</button>
         </form>` : ''}
+        <button id="edit-btn" class="btn btn-secondary" onclick="toggleEditMode(true)">Edit order</button>
+        <button class="btn btn-secondary" onclick="toggleFulfillModal(true)">Fulfill items</button>
+        <button class="btn btn-ghost" onclick="toggleDiscountModal(true)">Apply discount</button>
         <a href="/orders/${h(numId)}/invoice.pdf" class="btn btn-secondary">PDF Invoice</a>
         <form method="POST" action="/orders/${h(numId)}/send-chase-invoice" style="display:inline">
           <button class="btn btn-secondary" onclick="return confirm('Queue Chase invoice link for ${h(order.name)}?\\n\\nNote: Chase API not yet wired — this logs the intent.')">Send Chase Invoice</button>
@@ -1205,7 +1298,14 @@ function renderOrderDetail(session, order, flash) {
     <div class="detail-grid">
       <div class="detail-main">
         <div class="card">
-          <div class="card-header"><h2>Line Items</h2></div>
+          <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
+            <h2>Line Items</h2>
+            <span id="edit-mode-bar" style="display:none">
+              <span style="font-size:12px;color:var(--muted);margin-right:8px">✏ Edit mode</span>
+              <button type="button" class="btn btn-ghost btn-sm" onclick="toggleEditMode(false)">Cancel</button>
+            </span>
+          </div>
+          <form method="POST" action="/orders/${h(numId)}/edit" id="edit-form">
           <table class="data-table">
             <thead><tr><th>Item</th><th>SKU</th><th class="text-right">Qty</th><th class="text-right">Unit</th><th class="text-right">Total</th></tr></thead>
             <tbody>${lineItemsHtml}</tbody>
@@ -1214,6 +1314,87 @@ function renderOrderDetail(session, order, flash) {
             <div class="totals-row"><span>Subtotal</span><span>${sub}</span></div>
             <div class="totals-row"><span>Shipping</span><span>${ship}</span></div>
             <div class="totals-row totals-total"><span>Total</span><span>${total}</span></div>
+          </div>
+          <div id="edit-save-bar" style="display:none;padding:12px 0;border-top:1px solid var(--border);margin-top:8px">
+            <input type="text" name="staffNote" placeholder="Staff note (optional)" class="filter-input" style="width:60%;margin-right:8px">
+            <button type="submit" class="btn btn-primary">Save changes</button>
+            <button type="button" class="btn btn-ghost" onclick="toggleEditMode(false)" style="margin-left:4px">Cancel</button>
+          </div>
+          </form>
+        </div>
+        ${/* Discount modal */''}<div id="discount-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center">
+          <div style="background:#fff;border-radius:8px;padding:24px;min-width:340px;max-width:480px">
+            <h3 style="margin:0 0 16px">Apply order discount</h3>
+            <form method="POST" action="/orders/${h(numId)}/discount">
+              <div style="margin-bottom:12px">
+                <label style="font-size:13px;font-weight:500">Type</label><br>
+                <select name="type" class="filter-select" style="width:100%;margin-top:4px">
+                  <option value="pct">Percentage (%)</option>
+                  <option value="fixed">Fixed amount ($)</option>
+                </select>
+              </div>
+              <div style="margin-bottom:12px">
+                <label style="font-size:13px;font-weight:500">Value</label><br>
+                <input type="number" name="value" step="0.01" min="0" class="filter-input" style="width:100%;margin-top:4px" placeholder="e.g. 10">
+              </div>
+              <div style="margin-bottom:16px">
+                <label style="font-size:13px;font-weight:500">Reason (required)</label><br>
+                <input type="text" name="reason" class="filter-input" style="width:100%;margin-top:4px" placeholder="e.g. Loyalty discount" required>
+              </div>
+              <div style="display:flex;gap:8px">
+                <button type="submit" class="btn btn-primary">Apply discount</button>
+                <button type="button" class="btn btn-ghost" onclick="toggleDiscountModal(false)">Cancel</button>
+              </div>
+            </form>
+          </div>
+        </div>
+        ${/* Fulfill modal */''}<div id="fulfill-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center">
+          <div style="background:#fff;border-radius:8px;padding:24px;min-width:400px;max-width:560px;max-height:80vh;overflow-y:auto">
+            <h3 style="margin:0 0 16px">Fulfill items</h3>
+            <form method="POST" action="/orders/${h(numId)}/fulfill">
+              <div style="margin-bottom:12px">
+                ${lineItems.map(item => {
+                  const bo = backorderMap.get(item.id);
+                  return `<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;font-size:13px">
+                    <input type="checkbox" name="sel_${h(item.id)}" value="1" checked style="flex-shrink:0">
+                    <span style="flex:1">${h(item.title)}${bo ? ' <span class="badge badge-warning">Backorder</span>' : ''}</span>
+                    <input type="number" name="lineItems[${h(item.id)}]" value="${item.quantity}" min="0" max="${item.quantity}" style="width:60px">
+                  </div>`;
+                }).join('')}
+              </div>
+              <div style="margin-bottom:12px;display:flex;gap:8px">
+                <input type="text" name="trackingCompany" class="filter-input" style="flex:1" placeholder="Carrier (e.g. USPS)">
+                <input type="text" name="trackingNumber" class="filter-input" style="flex:2" placeholder="Tracking number">
+              </div>
+              <label style="display:flex;align-items:center;gap:6px;font-size:13px;margin-bottom:16px">
+                <input type="checkbox" name="notifyCustomer" value="1"> Email customer with tracking info
+              </label>
+              <div style="display:flex;gap:8px">
+                <button type="submit" class="btn btn-primary">Record fulfillment</button>
+                <button type="button" class="btn btn-ghost" onclick="toggleFulfillModal(false)">Cancel</button>
+              </div>
+            </form>
+          </div>
+        </div>
+        ${/* Backorder modal */''}<div id="backorder-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center">
+          <div style="background:#fff;border-radius:8px;padding:24px;min-width:340px;max-width:480px">
+            <h3 style="margin:0 0 16px">Mark as backordered</h3>
+            <form method="POST" action="/orders/${h(numId)}/backorder">
+              <input type="hidden" name="lineItemId" id="bo-li-id">
+              <input type="hidden" name="lineItemTitle" id="bo-li-title">
+              <div style="margin-bottom:12px">
+                <label style="font-size:13px;font-weight:500">Quantity backordered</label><br>
+                <input type="number" name="quantity" id="bo-quantity" min="1" class="filter-input" style="width:100%;margin-top:4px">
+              </div>
+              <div style="margin-bottom:16px">
+                <label style="font-size:13px;font-weight:500">Expected ship date (optional)</label><br>
+                <input type="date" name="eta" class="filter-input" style="width:100%;margin-top:4px">
+              </div>
+              <div style="display:flex;gap:8px">
+                <button type="submit" class="btn btn-primary">Mark backordered</button>
+                <button type="button" class="btn btn-ghost" onclick="toggleBackorderModal(null,null,null,false)">Cancel</button>
+              </div>
+            </form>
           </div>
         </div>
         <div class="card">
@@ -1326,7 +1507,7 @@ async function getCustomersData(filters) {
   }
 }
 
-function tagChip(t) {
+function tagChip(t, { linked = false } = {}) {
   const tl = (t || '').toLowerCase();
   let cls = 'tag-chip-default';
   if (tl === 'b2b') cls = 'tag-chip-b2b';
@@ -1334,6 +1515,9 @@ function tagChip(t) {
   else if (tl === 'b2b-admin') cls = 'tag-chip-admin';
   else if (tl.startsWith('b2b-tier:gold')) cls = 'tag-chip-gold';
   else if (tl.startsWith('b2b-tier:')) cls = 'tag-chip-tier';
+  if (linked) {
+    return `<a href="/customers?tag=${encodeURIComponent(t)}" class="tag-chip ${cls}">${h(t)}</a>`;
+  }
   return `<span class="tag-chip ${cls}">${h(t)}</span>`;
 }
 
@@ -1349,7 +1533,7 @@ function renderCustomersList(session, data, filters) {
     const location = addr ? `${addr.city || ''}${addr.province ? ', '+addr.province : ''}` : '—';
     const visibleTags = (c.tags || []).slice(0, 3);
     const moreTags    = (c.tags || []).length - visibleTags.length;
-    const tagBadges   = visibleTags.map(tagChip).join('') + (moreTags > 0 ? `<span class="tag-chip tag-chip-more" title="${h((c.tags||[]).join(', '))}">+${moreTags}</span>` : '');
+    const tagBadges   = visibleTags.map(t => tagChip(t, { linked: true })).join('') + (moreTags > 0 ? `<span class="tag-chip tag-chip-more" title="${h((c.tags||[]).join(', '))}">+${moreTags}</span>` : '');
     const isTop = (filters.sort || 'lifetime_spend_desc') === 'lifetime_spend_desc' && idx < TOP_CUSTOMER_THRESHOLD;
     const starBadge = isTop ? `<span class="top-customer-star" title="Top customer by lifetime spend">★</span>` : '';
     return `<tr>
@@ -2473,6 +2657,215 @@ app.get('/orders/:id/invoice.pdf', requireAuth, async (req, res) => {
   }
 });
 
+// ── Phase 16: Order editing, partial fulfillment, backorder ──────────────────
+
+// 16A: Edit order line items (qty changes, remove, add, price override)
+app.post('/orders/:id/edit', requireAuth, async (req, res) => {
+  const numId   = req.params.id;
+  const session = req.adminSession;
+  const { qtys, removes, staffNote, discountPct, discountFixed, discountReason } = req.body;
+  // qtys: { lineItemId: newQty, ... }   removes: [lineItemId, ...]
+  const qtysMap   = Object.fromEntries(Object.entries(qtys || {}).map(([k,v]) => [k, parseInt(v,10) || 0]));
+  const removeSet = new Set([removes || []].flat());
+
+  const changes = { qtys: qtysMap, removes: [...removeSet], discountPct, discountFixed, discountReason };
+
+  if (MOCK) {
+    const order = getMockOrder(numId);
+    if (!order) return res.status(404).json({ error: 'order not found' });
+    // Apply changes to mockOrderOverrides
+    const overrides = mockOrderOverrides.get(numId) || {};
+    const newEdges = (order.lineItems?.edges || []).filter(e => !removeSet.has(e.node.id)).map(e => {
+      const newQty = qtysMap[e.node.id] ?? e.node.quantity;
+      return { node: { ...e.node, quantity: newQty } };
+    });
+    overrides.lineItems = { edges: newEdges };
+    // Recalculate totals
+    let subtotal = 0;
+    for (const e of newEdges) {
+      const price = parseFloat(e.node.discountedUnitPriceSet?.presentmentMoney?.amount || 0);
+      subtotal += price * (e.node.quantity || 0);
+    }
+    if (discountPct) subtotal = subtotal * (1 - parseFloat(discountPct) / 100);
+    if (discountFixed) subtotal = subtotal - parseFloat(discountFixed);
+    overrides.subtotalPriceSet = { presentmentMoney: { amount: subtotal.toFixed(2), currencyCode: 'USD' } };
+    overrides.totalPriceSet    = { presentmentMoney: { amount: (subtotal + parseFloat(order.totalShippingPriceSet?.presentmentMoney?.amount || 0)).toFixed(2), currencyCode: 'USD' } };
+    mockOrderOverrides.set(numId, overrides);
+    logOrderEdit(`gid://shopify/Order/${numId}`, session.email, staffNote, changes);
+    auditLog(session.email, 'order_edit', `gid://shopify/Order/${numId}`, null, changes);
+    return res.redirect(`/orders/${numId}?success=order_edited`);
+  }
+
+  // Real mode: use Shopify orderEdit* mutation suite
+  try {
+    const orderId = `gid://shopify/Order/${numId}`;
+    const beginResult = await shopifyFetch(`
+      mutation begin($id:ID!){orderEditBegin(id:$id){calculatedOrder{id}userErrors{field message}}}
+    `, { id: orderId });
+    const calcId = beginResult.data?.orderEditBegin?.calculatedOrder?.id;
+    if (!calcId) {
+      const errs = beginResult.data?.orderEditBegin?.userErrors || [];
+      throw new Error(errs.map(e => e.message).join(', ') || 'orderEditBegin failed');
+    }
+    // Apply qty changes and removes
+    for (const [liId, newQty] of Object.entries(qtysMap)) {
+      if (!removeSet.has(liId)) {
+        await shopifyFetch(`mutation setQty($id:ID!,$li:ID!,$qty:Int!,$r:Boolean!){
+          orderEditSetQuantity(id:$id,lineItemId:$li,quantity:$qty,restock:$r){
+            calculatedOrder{id} userErrors{field message}}}`,
+          { id: calcId, li: liId, qty: newQty, r: false });
+      }
+    }
+    for (const liId of removeSet) {
+      await shopifyFetch(`mutation setQty($id:ID!,$li:ID!,$qty:Int!,$r:Boolean!){
+        orderEditSetQuantity(id:$id,lineItemId:$li,quantity:$qty,restock:$r){
+          calculatedOrder{id} userErrors{field message}}}`,
+        { id: calcId, li: liId, qty: 0, r: true });
+    }
+    // Apply order-level discount as a custom item
+    if ((discountPct || discountFixed) && discountReason) {
+      // Fetch current order total to compute discount amount
+      const totResult = await shopifyFetch(`query($id:ID!){order(id:$id){subtotalPriceSet{presentmentMoney{amount}}}}`, { id: orderId });
+      const subTotal = parseFloat(totResult.data?.order?.subtotalPriceSet?.presentmentMoney?.amount || 0);
+      const discAmt = discountPct ? subTotal * parseFloat(discountPct) / 100 : parseFloat(discountFixed || 0);
+      await shopifyFetch(`mutation addItem($id:ID!,$title:String!,$price:Money!,$qty:Int!){
+        orderEditAddCustomItem(id:$id,title:$title,price:$price,quantity:$qty){
+          calculatedOrder{id} userErrors{field message}}}`,
+        { id: calcId, title: `Order discount: ${discountReason}`, price: `-${discAmt.toFixed(2)}`, qty: 1 });
+    }
+    // Commit
+    await shopifyFetch(`mutation commit($id:ID!,$notify:Boolean!,$note:String){
+      orderEditCommit(id:$id,notifyCustomer:$notify,staffNote:$note){
+        order{id} userErrors{field message}}}`,
+      { id: calcId, notify: false, note: staffNote || null });
+    logOrderEdit(orderId, session.email, staffNote, changes);
+    auditLog(session.email, 'order_edit', orderId, null, changes);
+    res.redirect(`/orders/${numId}?success=order_edited`);
+  } catch (err) {
+    console.error('order edit error:', err.message);
+    res.redirect(`/orders/${numId}?error=edit_failed`);
+  }
+});
+
+// 16B: Order-level discount (standalone; can also be triggered via /edit)
+app.post('/orders/:id/discount', requireAuth, async (req, res) => {
+  const numId  = req.params.id;
+  const { type, value, reason } = req.body;
+  if (!value || !reason) return res.redirect(`/orders/${numId}?error=discount_missing_fields`);
+  const changes = { discountType: type, discountValue: value, reason };
+  if (MOCK) {
+    const order = getMockOrder(numId);
+    if (!order) return res.status(404).json({ error: 'not found' });
+    const overrides = mockOrderOverrides.get(numId) || {};
+    const sub = parseFloat(order.subtotalPriceSet?.presentmentMoney?.amount || 0);
+    const discAmt = type === 'pct' ? sub * parseFloat(value) / 100 : parseFloat(value);
+    const newSub = Math.max(0, sub - discAmt);
+    overrides.subtotalPriceSet = { presentmentMoney: { amount: newSub.toFixed(2), currencyCode: 'USD' } };
+    overrides.totalPriceSet    = { presentmentMoney: { amount: (newSub + parseFloat(order.totalShippingPriceSet?.presentmentMoney?.amount || 0)).toFixed(2), currencyCode: 'USD' } };
+    overrides._discountLine    = { type, value, reason, amount: discAmt.toFixed(2) };
+    mockOrderOverrides.set(numId, overrides);
+    auditLog(req.adminSession.email, 'order_discount', `gid://shopify/Order/${numId}`, null, changes);
+    return res.redirect(`/orders/${numId}?success=discount_applied`);
+  }
+  // Real mode: delegate to /orders/:id/edit with discount fields only
+  try {
+    const orderId = `gid://shopify/Order/${numId}`;
+    const beginResult = await shopifyFetch(`mutation begin($id:ID!){orderEditBegin(id:$id){calculatedOrder{id}userErrors{field message}}}`, { id: orderId });
+    const calcId = beginResult.data?.orderEditBegin?.calculatedOrder?.id;
+    if (!calcId) throw new Error('begin failed');
+    const totResult = await shopifyFetch(`query($id:ID!){order(id:$id){subtotalPriceSet{presentmentMoney{amount}}}}`, { id: orderId });
+    const subTotal = parseFloat(totResult.data?.order?.subtotalPriceSet?.presentmentMoney?.amount || 0);
+    const discAmt  = type === 'pct' ? subTotal * parseFloat(value) / 100 : parseFloat(value);
+    await shopifyFetch(`mutation addItem($id:ID!,$title:String!,$price:Money!,$qty:Int!){
+      orderEditAddCustomItem(id:$id,title:$title,price:$price,quantity:$qty){calculatedOrder{id}userErrors{field message}}}`,
+      { id: calcId, title: `Order discount: ${reason}`, price: `-${discAmt.toFixed(2)}`, qty: 1 });
+    await shopifyFetch(`mutation commit($id:ID!,$notify:Boolean!){orderEditCommit(id:$id,notifyCustomer:$notify){order{id}userErrors{field message}}}`,
+      { id: calcId, notify: false });
+    auditLog(req.adminSession.email, 'order_discount', orderId, null, changes);
+    res.redirect(`/orders/${numId}?success=discount_applied`);
+  } catch (err) {
+    console.error('discount error:', err.message);
+    res.redirect(`/orders/${numId}?error=discount_failed`);
+  }
+});
+
+// 16C: Partial fulfillment
+app.post('/orders/:id/fulfill', requireAuth, async (req, res) => {
+  const numId   = req.params.id;
+  const session = req.adminSession;
+  const { lineItems: liRaw, trackingCompany, trackingNumber, notifyCustomer } = req.body;
+  // liRaw: { lineItemId: qty, ... } or { 'li1': '2', 'li2': '3' }
+  const lineItemsMap = Object.fromEntries(
+    Object.entries(liRaw || {}).map(([k, v]) => [k, parseInt(v, 10) || 0]).filter(([,qty]) => qty > 0)
+  );
+  if (!Object.keys(lineItemsMap).length) return res.redirect(`/orders/${numId}?error=no_items_selected`);
+
+  if (MOCK) {
+    const order = getMockOrder(numId);
+    if (!order) return res.status(404).json({ error: 'not found' });
+    const overrides = mockOrderOverrides.get(numId) || {};
+    const tracking = trackingNumber ? [{ number: trackingNumber, url: null, company: trackingCompany || '' }] : [];
+    const existingFulfillments = overrides.fulfillments || order.fulfillments || [];
+    overrides.fulfillments = [...existingFulfillments, {
+      status: 'SUCCESS', trackingInfo: tracking, createdAt: new Date().toISOString(),
+      lineItemIds: Object.keys(lineItemsMap),
+    }];
+    overrides.displayFulfillmentStatus = 'PARTIALLY_FULFILLED';
+    // Mark backorders as fulfilled for matched lines
+    for (const liId of Object.keys(lineItemsMap)) {
+      fulfillBackorder(`gid://shopify/Order/${numId}`, liId);
+    }
+    mockOrderOverrides.set(numId, overrides);
+    auditLog(session.email, 'order_fulfill', `gid://shopify/Order/${numId}`, null, { lineItems: lineItemsMap, trackingNumber });
+    return res.redirect(`/orders/${numId}?success=fulfilled`);
+  }
+
+  // Real mode: fulfillmentCreate mutation
+  try {
+    const orderId    = `gid://shopify/Order/${numId}`;
+    const liInputs   = Object.entries(lineItemsMap).map(([id, quantity]) => ({ id, quantity }));
+    const trackInput = trackingNumber ? { company: trackingCompany || '', number: trackingNumber, url: null } : null;
+    const result = await shopifyFetch(`
+      mutation fulfill($input:FulfillmentInput!){fulfillmentCreate(input:$input){
+        fulfillment{id status} userErrors{field message}}}`,
+      { input: {
+          orderId,
+          lineItemsByFulfillmentOrder: liInputs.map(li => ({ fulfillmentOrderId: null, lineItemIds: [li.id], quantities: [li.quantity] })),
+          trackingInfo: trackInput,
+          notifyCustomer: !!notifyCustomer,
+        }
+      });
+    const errs = result.data?.fulfillmentCreate?.userErrors || [];
+    if (errs.length) throw new Error(errs.map(e => e.message).join(', '));
+    // Mark any matching backorders as fulfilled
+    for (const liId of Object.keys(lineItemsMap)) {
+      fulfillBackorder(orderId, liId);
+    }
+    auditLog(session.email, 'order_fulfill', orderId, null, { lineItems: lineItemsMap, trackingNumber });
+    res.redirect(`/orders/${numId}?success=fulfilled`);
+  } catch (err) {
+    console.error('fulfillment error:', err.message);
+    res.redirect(`/orders/${numId}?error=fulfillment_failed`);
+  }
+});
+
+// 16D: Backorder flag per line item
+app.post('/orders/:id/backorder', requireAuth, (req, res) => {
+  const numId   = req.params.id;
+  const { lineItemId, lineItemTitle, quantity, eta } = req.body;
+  if (!lineItemId) return res.redirect(`/orders/${numId}?error=missing_line_item`);
+  const orderId = `gid://shopify/Order/${numId}`;
+  upsertBackorder(orderId, lineItemId, lineItemTitle || '', parseInt(quantity, 10) || 0, eta || null, req.adminSession.email);
+  auditLog(req.adminSession.email, 'order_backorder', orderId, null, { lineItemId, lineItemTitle, eta });
+  res.redirect(`/orders/${numId}?success=backorder_flagged`);
+});
+
+// API: get backorders for an order (used by order detail page)
+app.get('/api/orders/:id/backorders', requireAuth, (req, res) => {
+  const orderId = `gid://shopify/Order/${req.params.id}`;
+  res.json({ backorders: getBackordersForOrder(orderId) });
+});
+
 // ── Phase 14D: Visible notes API (proxies to portal internal) ─────────────────
 
 app.post('/api/orders/:id/visible-note', requireAuth, async (req, res) => {
@@ -3086,8 +3479,7 @@ app.get('/catalog', requireAuth, async (req, res) => {
 });
 
 app.get('/catalog/:id', requireAuth, async (req, res) => {
-  // Redirect to catalog with product highlighted — full detail view is a Phase 4 enhancement
-  res.redirect(`/catalog?highlight=${encodeURIComponent(req.params.id)}`);
+  res.redirect(`/products/${req.params.id}`);
 });
 
 app.post('/catalog/:id/publish', requireAuth, async (req, res) => {
@@ -3145,6 +3537,194 @@ app.post('/catalog/bulk', requireAuth, async (req, res) => {
     auditLog(req.adminSession.email, `catalog:bulk:${action}`, gid, null, null);
   }
   res.redirect('/catalog');
+});
+
+// ── Phase 19C: Product detail ─────────────────────────────────────────────────
+
+async function getProductDetail(numericId) {
+  if (MOCK) {
+    const p = MOCK_PRODUCTS.find(x => shopifyNumericId(x.id) === numericId);
+    if (!p) return null;
+    // Find related orders for this product
+    const variantSkus = new Set((p.variants?.edges || []).map(e => e.node.sku));
+    const relatedOrders = MOCK_ORDERS.filter(o =>
+      (o.lineItems?.edges || []).some(li => variantSkus.has(li.node.variant?.sku))
+    ).slice(0, 10).map(o => ({
+      id: o.id, name: o.name, processedAt: o.processedAt,
+      customer: o.customer,
+      displayFinancialStatus: o.displayFinancialStatus,
+      total: o.totalPriceSet?.presentmentMoney?.amount,
+    }));
+    const catalogEntry = MOCK_CATALOG_PRODUCTS.find(x => shopifyNumericId(x.id) === numericId);
+    return {
+      ...p,
+      status: catalogEntry?.status || 'active',
+      publishedOnB2B: catalogEntry?.publishedOnB2B ?? true,
+      relatedOrders,
+    };
+  }
+  try {
+    const result = await shopifyFetch(`
+      query($id:ID!){product(id:$id){
+        id title handle vendor productType status tags
+        featuredImage{url altText}
+        images(first:10){edges{node{url altText}}}
+        variants(first:50){edges{node{
+          id title sku barcode price compareAtPrice inventoryQuantity
+          inventoryItem{tracked}
+        }}}
+        publishedOnPublication(publicationId:"${B2B_PUB_ID}")
+      }}`, { id: `gid://shopify/Product/${numericId}` });
+    const p = result.data?.product;
+    if (!p) return null;
+    // Fetch recent orders containing this product
+    const ordersResult = await shopifyFetch(`
+      query($q:String!){orders(first:10,query:$q,sortKey:PROCESSED_AT,reverse:true){
+        edges{node{id name processedAt
+          customer{id displayName email}
+          displayFinancialStatus
+          totalPriceSet{presentmentMoney{amount}}
+        }}
+      }}`, { q: `sku:${(p.variants?.edges?.[0]?.node?.sku || '')}` });
+    const relatedOrders = (ordersResult.data?.orders?.edges || []).map(e => ({
+      id: e.node.id, name: e.node.name, processedAt: e.node.processedAt,
+      customer: e.node.customer,
+      displayFinancialStatus: e.node.displayFinancialStatus,
+      total: e.node.totalPriceSet?.presentmentMoney?.amount,
+    }));
+    return { ...p, publishedOnB2B: p.publishedOnPublication, relatedOrders };
+  } catch (err) {
+    console.error('getProductDetail error:', err.message);
+    return null;
+  }
+}
+
+function renderProductDetail(session, product) {
+  const numId = shopifyNumericId(product.id);
+  const variants = (product.variants?.edges || []).map(e => e.node);
+  const images   = (product.images?.edges || []).map(e => e.node);
+  const tags     = product.tags || [];
+  const style    = tags.find(t => t.startsWith('Style_'))?.replace('Style_', '') || '';
+  const isB2B    = product.publishedOnB2B;
+
+  const variantRows = variants.map(v => `<tr>
+    <td>${h(v.title)}</td>
+    <td class="mono">${h(v.sku || '—')}</td>
+    <td class="mono">${h(v.barcode || '—')}</td>
+    <td class="text-right">${fmtMoney(v.price)}</td>
+    <td class="text-right text-muted">${fmtMoney(v.compareAtPrice)}</td>
+    <td class="text-right ${v.inventoryQuantity <= 0 ? 'text-danger' : v.inventoryQuantity < 10 ? 'text-warning' : ''}">${v.inventoryQuantity ?? '—'}</td>
+  </tr>`).join('');
+
+  const imageThumbs = images.slice(0, 6).map(img =>
+    `<img src="${h(img.url)}" alt="${h(img.altText || '')}" style="width:80px;height:80px;object-fit:cover;border-radius:4px;border:1px solid var(--border)">`
+  ).join('');
+
+  const relatedOrderRows = (product.relatedOrders || []).map(o => {
+    const oNum = shopifyNumericId(o.id);
+    const cNum = o.customer ? shopifyNumericId(o.customer.id) : null;
+    return `<tr>
+      <td><a href="/orders/${oNum}" class="link">${h(o.name)}</a></td>
+      <td>${cNum ? `<a href="/customers/${cNum}" class="link">${h(o.customer.displayName)}</a>` : '—'}</td>
+      <td class="text-muted">${fmtDate(o.processedAt)}</td>
+      <td><span class="badge badge-${(o.displayFinancialStatus||'').toLowerCase()}">${h(o.displayFinancialStatus||'')}</span></td>
+      <td class="text-right mono">${fmtMoney(o.total)}</td>
+    </tr>`;
+  }).join('');
+
+  const shopifyEditUrl = `https://admin.shopify.com/store/fuzzywumpets/products/${numId}`;
+
+  return layout({ title: product.title, session, activePath: '/catalog', content: `
+    <div class="breadcrumb-row"><a href="/catalog" class="breadcrumb">← Catalog</a></div>
+    <div class="detail-header">
+      <div class="detail-header-left">
+        <h1>${h(product.title)}</h1>
+        <p class="text-muted">
+          ${h(product.vendor || '')}${product.productType ? ` · ${h(product.productType)}` : ''}
+          ${style ? ` · <strong>${h(style)}</strong>` : ''}
+          · <code>${h(product.handle || '')}</code>
+        </p>
+        <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:6px">
+          <span class="badge badge-${(product.status||'active').toLowerCase()}">${h(product.status||'Active')}</span>
+          <span class="badge ${isB2B ? 'badge-success' : 'badge-secondary'}">${isB2B ? 'B2B Published' : 'Not on B2B'}</span>
+          ${tags.map(t => tagChip(t)).join('')}
+        </div>
+      </div>
+      <div class="detail-header-actions">
+        <a href="${h(shopifyEditUrl)}" target="_blank" rel="noopener" class="btn btn-secondary">Edit in Shopify ↗</a>
+        ${isB2B
+          ? `<form method="POST" action="/catalog/${numId}/unpublish" style="display:inline">
+              <button class="btn btn-ghost btn-sm">Remove from B2B</button></form>`
+          : `<form method="POST" action="/catalog/${numId}/publish" style="display:inline">
+              <button class="btn btn-primary btn-sm">Publish to B2B</button></form>`}
+      </div>
+    </div>
+
+    <div class="detail-grid">
+      <div class="detail-main">
+        ${imageThumbs ? `<div class="card"><div class="card-header"><h2>Images</h2></div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap">${imageThumbs}</div></div>` : ''}
+
+        <div class="card">
+          <div class="card-header"><h2>Variants (${variants.length})</h2></div>
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead><tr>
+                <th>Variant</th><th>SKU</th><th>UPC/Barcode</th>
+                <th class="text-right">Price (MSRP)</th>
+                <th class="text-right">Compare at</th>
+                <th class="text-right">Inventory</th>
+              </tr></thead>
+              <tbody>${variantRows || '<tr><td colspan="6" class="empty-state">No variants</td></tr>'}</tbody>
+            </table>
+          </div>
+        </div>
+
+        ${product.relatedOrders?.length ? `<div class="card">
+          <div class="card-header"><h2>Recent orders with this product</h2></div>
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead><tr><th>Order</th><th>Customer</th><th>Date</th><th>Status</th><th class="text-right">Total</th></tr></thead>
+              <tbody>${relatedOrderRows}</tbody>
+            </table>
+          </div>
+        </div>` : ''}
+      </div>
+
+      <div class="detail-side">
+        <div class="card">
+          <div class="card-header"><h2>Publication status</h2></div>
+          <p>
+            <span class="badge ${isB2B ? 'badge-success' : 'badge-secondary'}">
+              ${isB2B ? '✓ On B2B catalog' : '✗ Not on B2B catalog'}
+            </span>
+          </p>
+        </div>
+        <div class="card">
+          <div class="card-header"><h2>Details</h2></div>
+          <table class="mini-table">
+            <tr><td class="text-muted">Vendor</td><td>${h(product.vendor || '—')}</td></tr>
+            <tr><td class="text-muted">Type</td><td>${h(product.productType || '—')}</td></tr>
+            <tr><td class="text-muted">Handle</td><td><code>${h(product.handle || '—')}</code></td></tr>
+            <tr><td class="text-muted">Style</td><td>${h(style || '—')}</td></tr>
+            <tr><td class="text-muted">Shopify ID</td><td><code>${numId}</code></td></tr>
+          </table>
+        </div>
+      </div>
+    </div>
+  ` });
+}
+
+app.get('/products/:id', requireAuth, async (req, res) => {
+  const numId = req.params.id;
+  const product = await getProductDetail(numId);
+  if (!product) {
+    return res.status(404).send(layout({ title: 'Product not found', session: req.adminSession, activePath: '/catalog', content: `
+      <div class="breadcrumb-row"><a href="/catalog" class="breadcrumb">← Catalog</a></div>
+      <div class="empty-state">Product ${h(numId)} not found</div>
+    ` }));
+  }
+  res.send(renderProductDetail(req.adminSession, product));
 });
 
 // ── Reports ───────────────────────────────────────────────────────────────────
@@ -3581,11 +4161,29 @@ app.get('/audit', requireAuth, (req, res) => {
   const total = getAuditLogCount();
   const pages = Math.ceil(total / limit);
 
+  function auditTargetLink(target) {
+    if (!target) return '—';
+    // Shopify GID: gid://shopify/Order/123, gid://shopify/Customer/456
+    const gidM = /^gid:\/\/shopify\/(Order|Customer)\/(\d+)$/.exec(target);
+    if (gidM) {
+      const [, type, id] = gidM;
+      const url = type === 'Order' ? `/orders/${id}` : `/customers/${id}`;
+      const label = `${type} #${id}`;
+      return `<a href="${url}" class="link">${h(label)}</a>`;
+    }
+    // Short patterns: "lead:5"
+    const shortM = /^lead:(\d+)$/.exec(target);
+    if (shortM) {
+      return `<a href="/leads/${shortM[1]}" class="link">${h(target)}</a>`;
+    }
+    return `<span title="${h(target)}" style="max-width:200px;display:inline-block;overflow:hidden;text-overflow:ellipsis;vertical-align:bottom">${h(target)}</span>`;
+  }
+
   const tableRows = rows.map(r => `<tr>
     <td class="mono text-sm">${new Date(r.ts).toISOString().replace('T',' ').slice(0,19)}</td>
-    <td>${h(r.email)}</td>
+    <td><a href="mailto:${h(r.email)}" class="link">${h(r.email)}</a></td>
     <td class="mono">${h(r.action)}</td>
-    <td class="text-sm text-muted" style="max-width:200px;overflow:hidden;text-overflow:ellipsis">${h(r.target||'—')}</td>
+    <td class="text-sm text-muted">${auditTargetLink(r.target)}</td>
     <td class="text-sm mono" style="max-width:150px;overflow:hidden;text-overflow:ellipsis">${h(r.after_val||'')}</td>
   </tr>`).join('');
 

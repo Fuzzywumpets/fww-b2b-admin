@@ -660,6 +660,77 @@ await test('/leads/new form creates a lead and redirects to detail', async (page
   assert.ok(html.includes('Activity'), 'Activity section missing');
 });
 
+// ── Phase 19B + 19C: Hyperlinks + Product detail ─────────────────────────────
+console.log('\nUI tests — Phase 19B + 19C: Hyperlinks + Product detail:');
+
+await test('/customers tag chips link to filtered customer list', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/customers`);
+  await page.waitForSelector('.data-table');
+  const tagLink = await page.$('a.tag-chip');
+  assert.ok(tagLink !== null, 'Tag chip should be an anchor element');
+  const href = await tagLink.getAttribute('href');
+  assert.ok(href?.includes('/customers?tag='), 'Tag chip href should filter by tag');
+});
+
+await test('/products/201 renders product detail page', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/products/201`);
+  await page.waitForSelector('.detail-header');
+  const html = await page.content();
+  assert.ok(html.includes('Elite Collar'), 'Product title missing');
+  assert.ok(html.includes('Variants'), 'Variants section missing');
+  assert.ok(html.includes('Edit in Shopify'), 'Edit in Shopify link missing');
+});
+
+await test('/orders/1001 order detail has Edit order button', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/orders/1001`);
+  await page.waitForSelector('.detail-header');
+  const html = await page.content();
+  assert.ok(html.includes('Edit order'), 'Edit order button missing');
+  assert.ok(html.includes('Fulfill items'), 'Fulfill items button missing');
+});
+
+// ── Phase 16: Order editing UI ────────────────────────────────────────────────
+console.log('\nUI tests — Phase 16: Order editing UI:');
+
+await test('/orders/1001 edit mode activates on button click', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/orders/1001`);
+  await page.waitForSelector('#edit-btn');
+  await page.click('#edit-btn');
+  const editBar = await page.$('#edit-mode-bar');
+  const isVisible = await editBar?.isVisible();
+  assert.ok(isVisible, 'Edit mode bar should be visible after clicking Edit order');
+});
+
+await test('/orders/1001 fulfill modal opens on button click', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/orders/1001`);
+  await page.waitForSelector('button[onclick="toggleFulfillModal(true)"]');
+  await page.click('button[onclick="toggleFulfillModal(true)"]');
+  const modal = await page.$('#fulfill-modal');
+  const isVisible = await modal?.isVisible();
+  assert.ok(isVisible, 'Fulfill modal should be visible');
+});
+
+await test('/orders/1001 discount modal opens on button click', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/orders/1001`);
+  await page.waitForSelector('button[onclick="toggleDiscountModal(true)"]');
+  await page.click('button[onclick="toggleDiscountModal(true)"]');
+  const modal = await page.$('#discount-modal');
+  const isVisible = await modal?.isVisible();
+  assert.ok(isVisible, 'Discount modal should be visible');
+});
+
 await browser.close();
 
 console.log(`\n  ${passed} passed, ${failed} failed`);

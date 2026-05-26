@@ -1564,5 +1564,167 @@ await test('GET /leads?status=under_review → filters by status', async () => {
   assert.ok(html.includes('Under Review') || html.includes('filter-chip-active'), 'Status filter not applied');
 });
 
+// ── Phase 19B: Universal hyperlinks ──────────────────────────────────────────
+console.log('\nAPI tests — Phase 19B: Universal hyperlinks:');
+
+await test('GET /customers → tag chips are clickable links', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/customers`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  // Tag chips should be <a> links pointing to /customers?tag=...
+  assert.ok(html.includes('href="/customers?tag='), 'Tag chips should be anchor links');
+});
+
+await test('GET /audit → email is a mailto link', async () => {
+  const cookie = await seedSession();
+  // Seed an audit log entry first (via login)
+  await fetch(`${BASE}/`, { headers: { Cookie: cookie } });
+  const res = await fetch(`${BASE}/audit`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  assert.ok(html.includes('href="mailto:'), 'Audit email should be a mailto link');
+});
+
+await test('GET /audit → GID targets become clickable order/customer links', async () => {
+  const cookie = await seedSession();
+  // Mark paid to generate an audit log entry with a GID target
+  await fetch(`${BASE}/orders/1001/mark-paid`, {
+    method: 'POST', headers: { Cookie: cookie }, redirect: 'manual',
+  });
+  const res = await fetch(`${BASE}/audit`, { headers: { Cookie: cookie } });
+  const html = await res.text();
+  assert.ok(html.includes('href="/orders/'), 'Audit GID target should link to order detail');
+});
+
+// ── Phase 19C: Product detail page ───────────────────────────────────────────
+console.log('\nAPI tests — Phase 19C: Product detail page:');
+
+await test('GET /products/201 → returns product detail for Elite Collar', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/products/201`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  assert.ok(html.includes('Elite Collar'), 'Product title missing');
+  assert.ok(html.includes('EC-001-S-NV'), 'Variant SKU missing');
+  assert.ok(html.includes('Edit in Shopify'), 'Edit in Shopify link missing');
+});
+
+await test('GET /products/9999 → returns 404 for non-existent product', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/products/9999`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 404);
+});
+
+await test('GET /products/:id → requires auth', async () => {
+  const res = await fetch(`${BASE}/products/201`, { redirect: 'manual' });
+  assert.ok([301, 302].includes(res.status), 'Should redirect unauthenticated request');
+});
+
+await test('GET /catalog/:id → redirects to /products/:id', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/catalog/201`, { headers: { Cookie: cookie }, redirect: 'manual' });
+  assert.equal(res.status, 302);
+  assert.ok(res.headers.get('location')?.includes('/products/201'), 'Should redirect to /products/201');
+});
+
+await test('GET /orders/1001 → line item title links to /products/:id', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/orders/1001`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  // Elite Collar (variant v301) maps to product 201
+  assert.ok(html.includes('href="/products/201"'), 'Product link missing from line item');
+});
+
+// ── Phase 16: Order editing, fulfillment, backorder ──────────────────────────
+console.log('\nAPI tests — Phase 16: Order editing + fulfillment + backorder:');
+
+await test('POST /orders/1001/edit → changes qty and redirects', async () => {
+  const cookie = await seedSession();
+  const body = new URLSearchParams();
+  body.append('qtys[li1]', '3');
+  body.append('staffNote', 'Test edit');
+  const res = await fetch(`${BASE}/orders/1001/edit`, {
+    method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: body.toString(), redirect: 'manual',
+  });
+  assert.ok([301, 302].includes(res.status), 'Should redirect after edit');
+  assert.ok(res.headers.get('location')?.includes('order_edited'), 'Should redirect with success flash');
+});
+
+await test('POST /orders/1001/edit with remove → removes line item', async () => {
+  const cookie = await seedSession();
+  const body = new URLSearchParams();
+  body.append('removes', 'li2');
+  const res = await fetch(`${BASE}/orders/1001/edit`, {
+    method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: body.toString(), redirect: 'manual',
+  });
+  assert.ok([301, 302].includes(res.status), 'Should redirect after edit');
+});
+
+await test('POST /orders/1002/discount → applies discount and redirects', async () => {
+  const cookie = await seedSession();
+  const body = new URLSearchParams({ type: 'pct', value: '10', reason: 'Loyalty' });
+  const res = await fetch(`${BASE}/orders/1002/discount`, {
+    method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: body.toString(), redirect: 'manual',
+  });
+  assert.ok([301, 302].includes(res.status), 'Should redirect after discount');
+  assert.ok(res.headers.get('location')?.includes('discount_applied'), 'Should have success flash');
+});
+
+await test('POST /orders/1003/fulfill → records fulfillment and redirects', async () => {
+  const cookie = await seedSession();
+  const body = new URLSearchParams({
+    'lineItems[li4]': '5',
+    trackingCompany: 'USPS',
+    trackingNumber: 'TEST123',
+  });
+  const res = await fetch(`${BASE}/orders/1003/fulfill`, {
+    method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: body.toString(), redirect: 'manual',
+  });
+  assert.ok([301, 302].includes(res.status), 'Should redirect after fulfill');
+  assert.ok(res.headers.get('location')?.includes('fulfilled'), 'Should have success flash');
+});
+
+await test('POST /orders/1001/backorder → flags backorder in SQLite', async () => {
+  const cookie = await seedSession();
+  const body = new URLSearchParams({ lineItemId: 'li1', lineItemTitle: 'Elite Collar', quantity: '3', eta: '2026-07-01' });
+  const res = await fetch(`${BASE}/orders/1001/backorder`, {
+    method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: body.toString(), redirect: 'manual',
+  });
+  assert.ok([301, 302].includes(res.status), 'Should redirect after backorder');
+  assert.ok(res.headers.get('location')?.includes('backorder_flagged'), 'Should have success flash');
+});
+
+await test('GET /api/orders/1001/backorders → returns backorders JSON', async () => {
+  const cookie = await seedSession();
+  // First create a backorder
+  const body = new URLSearchParams({ lineItemId: 'li_test', lineItemTitle: 'Test Item', quantity: '2' });
+  await fetch(`${BASE}/orders/1001/backorder`, {
+    method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: body.toString(), redirect: 'manual',
+  });
+  const res = await fetch(`${BASE}/api/orders/1001/backorders`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const json = await res.json();
+  assert.ok(Array.isArray(json.backorders), 'Should return backorders array');
+  assert.ok(json.backorders.some(b => b.line_item_id === 'li_test'), 'Should find the test backorder');
+});
+
+await test('GET /orders/1001 → shows edit order button', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/orders/1001`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  assert.ok(html.includes('toggleEditMode'), 'Edit mode JS missing');
+  assert.ok(html.includes('Fulfill items'), 'Fulfill button missing');
+  assert.ok(html.includes('Apply discount'), 'Discount button missing');
+});
+
 console.log(`\n  ${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);

@@ -122,6 +122,29 @@ db.exec(`
     changed_by TEXT,
     changed_at INTEGER NOT NULL
   );
+
+  CREATE TABLE IF NOT EXISTS backorders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id TEXT NOT NULL,
+    line_item_id TEXT NOT NULL,
+    line_item_title TEXT,
+    quantity INTEGER NOT NULL DEFAULT 0,
+    eta_date TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at INTEGER NOT NULL,
+    created_by TEXT,
+    notified INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(order_id, line_item_id)
+  );
+
+  CREATE TABLE IF NOT EXISTS order_edit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id TEXT NOT NULL,
+    edited_by TEXT NOT NULL,
+    staff_note TEXT,
+    changes_json TEXT,
+    ts INTEGER NOT NULL
+  );
 `);
 
 export default db;
@@ -298,4 +321,31 @@ export function addLeadStatusHistory(leadId, fromStatus, toStatus, note, changed
 
 export function getLeadStatusHistory(leadId) {
   return db.prepare('SELECT * FROM lead_status_history WHERE lead_id = ? ORDER BY changed_at ASC').all(leadId);
+}
+
+// ── Backorders ────────────────────────────────────────────────────────────────
+
+export function upsertBackorder(orderId, lineItemId, lineItemTitle, quantity, etaDate, createdBy) {
+  db.prepare(`
+    INSERT INTO backorders (order_id, line_item_id, line_item_title, quantity, eta_date, status, created_at, created_by, notified)
+    VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, 0)
+    ON CONFLICT(order_id, line_item_id) DO UPDATE SET
+      eta_date = excluded.eta_date, quantity = excluded.quantity, status = 'pending',
+      created_at = excluded.created_at, created_by = excluded.created_by
+  `).run(orderId, lineItemId, lineItemTitle, quantity, etaDate || null, Date.now(), createdBy);
+}
+
+export function getBackordersForOrder(orderId) {
+  return db.prepare('SELECT * FROM backorders WHERE order_id = ? AND status = ? ORDER BY created_at DESC')
+    .all(orderId, 'pending');
+}
+
+export function fulfillBackorder(orderId, lineItemId) {
+  db.prepare("UPDATE backorders SET status = 'fulfilled' WHERE order_id = ? AND line_item_id = ?")
+    .run(orderId, lineItemId);
+}
+
+export function logOrderEdit(orderId, editedBy, staffNote, changesJson) {
+  db.prepare('INSERT INTO order_edit_log (order_id, edited_by, staff_note, changes_json, ts) VALUES (?, ?, ?, ?, ?)')
+    .run(orderId, editedBy, staffNote || null, JSON.stringify(changesJson), Date.now());
 }
