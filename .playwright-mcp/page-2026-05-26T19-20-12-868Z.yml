@@ -1,0 +1,155 @@
+- generic [active] [ref=e1]:
+  - banner [ref=e2]:
+    - generic [ref=e3]:
+      - link "FW admin" [ref=e4] [cursor=pointer]:
+        - /url: /
+        - generic [ref=e5]: FW
+        - generic [ref=e6]: admin
+      - navigation [ref=e7]:
+        - link "Dashboard" [ref=e8] [cursor=pointer]:
+          - /url: /
+        - link "Orders" [ref=e9] [cursor=pointer]:
+          - /url: /orders
+        - link "Customers" [ref=e10] [cursor=pointer]:
+          - /url: /customers
+        - link "Catalog" [ref=e11] [cursor=pointer]:
+          - /url: /catalog
+        - link "Reports" [ref=e12] [cursor=pointer]:
+          - /url: /reports
+        - link "Settings" [ref=e13] [cursor=pointer]:
+          - /url: /settings
+      - generic [ref=e14]:
+        - generic [ref=e15]: alex@fuzzywumpets.com
+        - link "Sign out" [ref=e16] [cursor=pointer]:
+          - /url: /auth/logout
+  - main [ref=e17]:
+    - generic [ref=e18]:
+      - heading "Dashboard" [level=1] [ref=e19]
+      - generic [ref=e20]: Tuesday, May 26, 2026
+    - generic [ref=e21]:
+      - generic [ref=e22]:
+        - generic [ref=e23]:
+          - heading "Open Orders" [level=2] [ref=e24]
+          - link "View all →" [ref=e25] [cursor=pointer]:
+            - /url: /orders?status=open
+        - generic [ref=e26]: "3"
+        - paragraph [ref=e27]: awaiting payment
+        - table [ref=e28]:
+          - rowgroup [ref=e29]:
+            - row "Order Customer Amount Status" [ref=e30]:
+              - columnheader "Order" [ref=e31]
+              - columnheader "Customer" [ref=e32]
+              - columnheader "Amount" [ref=e33]
+              - columnheader "Status" [ref=e34]
+          - rowgroup [ref=e35]:
+            - row "#1001 Acme Pet Supply $450.00 PENDING" [ref=e36]:
+              - cell "#1001" [ref=e37]:
+                - link "#1001" [ref=e38] [cursor=pointer]:
+                  - /url: /orders/gid%3A%2F%2Fshopify%2FOrder%2F1001
+              - cell "Acme Pet Supply" [ref=e39]
+              - cell "$450.00" [ref=e40]
+              - cell "PENDING" [ref=e41]:
+                - generic [ref=e42]: PENDING
+            - row "#1002 Happy Paws Boutique $285.50 PENDING" [ref=e43]:
+              - cell "#1002" [ref=e44]:
+                - link "#1002" [ref=e45] [cursor=pointer]:
+                  - /url: /orders/gid%3A%2F%2Fshopify%2FOrder%2F1002
+              - cell "Happy Paws Boutique" [ref=e46]
+              - cell "$285.50" [ref=e47]
+              - cell "PENDING" [ref=e48]:
+                - generic [ref=e49]: PENDING
+            - row "#1003 Doggo Depot $1,200.00 AUTHORIZED" [ref=e50]:
+              - cell "#1003" [ref=e51]:
+                - link "#1003" [ref=e52] [cursor=pointer]:
+                  - /url: /orders/gid%3A%2F%2Fshopify%2FOrder%2F1003
+              - cell "Doggo Depot" [ref=e53]
+              - cell "$1,200.00" [ref=e54]
+              - cell "AUTHORIZED" [ref=e55]:
+                - generic [ref=e56]: AUTHORIZED
+      - generic [ref=e57]:
+        - generic [ref=e58]:
+          - heading "This Week" [level=2] [ref=e59]
+          - link "View →" [ref=e60] [cursor=pointer]:
+            - /url: /orders?date=7d
+        - generic [ref=e61]: "5"
+        - paragraph [ref=e62]: B2B orders in last 7 days
+      - generic [ref=e63]:
+        - generic [ref=e64]:
+          - heading "Top Customers" [level=2] [ref=e65]
+          - link "View all →" [ref=e66] [cursor=pointer]:
+            - /url: /customers
+        - table [ref=e67]:
+          - rowgroup [ref=e68]:
+            - row "Customer Spend (90d)" [ref=e69]:
+              - columnheader "Customer" [ref=e70]
+              - columnheader "Spend (90d)" [ref=e71]
+          - rowgroup [ref=e72]:
+            - row "Acme Pet Supply buyer@acme.com $4,520.00" [ref=e73]:
+              - cell "Acme Pet Supply buyer@acme.com" [ref=e74]:
+                - link "Acme Pet Supply" [ref=e75] [cursor=pointer]:
+                  - /url: /customers/gid%3A%2F%2Fshopify%2FCustomer%2F101
+                - generic [ref=e76]: buyer@acme.com
+              - cell "$4,520.00" [ref=e77]
+            - row "Happy Paws Boutique orders@happypaws.com $2,890.00" [ref=e78]:
+              - cell "Happy Paws Boutique orders@happypaws.com" [ref=e79]:
+                - link "Happy Paws Boutique" [ref=e80] [cursor=pointer]:
+                  - /url: /customers/gid%3A%2F%2Fshopify%2FCustomer%2F102
+                - generic [ref=e81]: orders@happypaws.com
+              - cell "$2,890.00" [ref=e82]
+            - row "Doggo Depot wholesale@doggo.com $1,850.00" [ref=e83]:
+              - cell "Doggo Depot wholesale@doggo.com" [ref=e84]:
+                - link "Doggo Depot" [ref=e85] [cursor=pointer]:
+                  - /url: /customers/gid%3A%2F%2Fshopify%2FCustomer%2F103
+                - generic [ref=e86]: wholesale@doggo.com
+              - cell "$1,850.00" [ref=e87]
+            - row "Pet Paradise buy@petparadise.com $1,200.00" [ref=e88]:
+              - cell "Pet Paradise buy@petparadise.com" [ref=e89]:
+                - link "Pet Paradise" [ref=e90] [cursor=pointer]:
+                  - /url: /customers/gid%3A%2F%2Fshopify%2FCustomer%2F104
+                - generic [ref=e91]: buy@petparadise.com
+              - cell "$1,200.00" [ref=e92]
+            - row "Paw Central orders@pawcentral.com $890.00" [ref=e93]:
+              - cell "Paw Central orders@pawcentral.com" [ref=e94]:
+                - link "Paw Central" [ref=e95] [cursor=pointer]:
+                  - /url: /customers/gid%3A%2F%2Fshopify%2FCustomer%2F105
+                - generic [ref=e96]: orders@pawcentral.com
+              - cell "$890.00" [ref=e97]
+      - generic [ref=e98]:
+        - generic [ref=e99]:
+          - heading "Low Stock (B2B)" [level=2] [ref=e100]
+          - link "Catalog →" [ref=e101] [cursor=pointer]:
+            - /url: /catalog?stock=low
+        - table [ref=e102]:
+          - rowgroup [ref=e103]:
+            - row "Product / Variant SKU Qty" [ref=e104]:
+              - columnheader "Product / Variant" [ref=e105]
+              - columnheader "SKU" [ref=e106]
+              - columnheader "Qty" [ref=e107]
+          - rowgroup [ref=e108]:
+            - row "Elite Collar (Small) Small / Navy EC-001-S-NV 2" [ref=e109]:
+              - cell "Elite Collar (Small) Small / Navy" [ref=e110]:
+                - link "Elite Collar (Small)" [ref=e111] [cursor=pointer]:
+                  - /url: /catalog/gid%3A%2F%2Fshopify%2FProduct%2F201
+                - generic [ref=e112]: Small / Navy
+              - cell "EC-001-S-NV" [ref=e113]
+              - cell "2" [ref=e114]
+            - row "Luxe Leash LL-005 5" [ref=e115]:
+              - cell "Luxe Leash" [ref=e116]:
+                - link "Luxe Leash" [ref=e117] [cursor=pointer]:
+                  - /url: /catalog/gid%3A%2F%2Fshopify%2FProduct%2F202
+              - cell "LL-005" [ref=e118]
+              - cell "5" [ref=e119]
+            - row "Simplicity Collar Medium / Red SC-002-M-RD 7" [ref=e120]:
+              - cell "Simplicity Collar Medium / Red" [ref=e121]:
+                - link "Simplicity Collar" [ref=e122] [cursor=pointer]:
+                  - /url: /catalog/gid%3A%2F%2Fshopify%2FProduct%2F203
+                - generic [ref=e123]: Medium / Red
+              - cell "SC-002-M-RD" [ref=e124]
+              - cell "7" [ref=e125]
+            - row "Everyday Collar Bundle XL ECB-010-XL 8" [ref=e126]:
+              - cell "Everyday Collar Bundle XL" [ref=e127]:
+                - link "Everyday Collar Bundle" [ref=e128] [cursor=pointer]:
+                  - /url: /catalog/gid%3A%2F%2Fshopify%2FProduct%2F204
+                - generic [ref=e129]: XL
+              - cell "ECB-010-XL" [ref=e130]
+              - cell "8" [ref=e131]

@@ -1054,6 +1054,8 @@ function renderOrderDetail(session, order, flash) {
     ? `<div class="alert alert-success">Order marked as paid.</div>`
     : flash === 'note_saved'
     ? `<div class="alert alert-success">Note saved.</div>`
+    : flash === 'chase_invoice_queued'
+    ? `<div class="alert alert-success">Chase invoice intent logged. Wire Chase API to send the real link.</div>`
     : '';
 
   return layout({ title: order.name || 'Order', session, activePath: '/orders', content: `
@@ -1073,6 +1075,9 @@ function renderOrderDetail(session, order, flash) {
           <button class="btn btn-success" onclick="return confirm('Mark ${h(order.name)} as paid?')">Mark Paid</button>
         </form>` : ''}
         <a href="/orders/${h(numId)}/invoice.pdf" class="btn btn-secondary">PDF Invoice</a>
+        <form method="POST" action="/orders/${h(numId)}/send-chase-invoice" style="display:inline">
+          <button class="btn btn-secondary" onclick="return confirm('Queue Chase invoice link for ${h(order.name)}?\\n\\nNote: Chase API not yet wired — this logs the intent.')">Send Chase Invoice</button>
+        </form>
       </div>
     </div>
     ${timeline}
@@ -2164,6 +2169,23 @@ app.post('/orders/:id/note', requireAuth, async (req, res) => {
   }
   auditLog(req.adminSession.email, 'update_note', shopifyOrderGid(numId), null, { note });
   res.redirect(`/orders/${numId}?success=note_saved`);
+});
+
+app.post('/orders/:id/send-chase-invoice', requireAuth, async (req, res) => {
+  const numId = req.params.id;
+  const order = await getOrderDetail(numId);
+  if (!order) return res.status(404).json({ error: 'Order not found' });
+  const customerEmail = order.customer?.email || 'unknown';
+  // Stub mode: log intent, return success. When Chase API is wired, replace this with real call.
+  auditLog(req.adminSession.email, 'chase_invoice_queued', shopifyOrderGid(numId), null, {
+    order_name: order.name,
+    customer_email: customerEmail,
+    note: 'Chase API not yet wired — logged intent only',
+  });
+  if (req.headers['content-type']?.includes('application/json')) {
+    return res.json({ ok: true, status: 'stubbed', message: 'Chase invoice intent logged. Wire Chase API to send real link.' });
+  }
+  res.redirect(`/orders/${numId}?success=chase_invoice_queued`);
 });
 
 app.get('/orders/:id/invoice.pdf', requireAuth, async (req, res) => {

@@ -1190,5 +1190,39 @@ await test('POST /labels/print with thermal template returns PDF', async () => {
   assert.ok(res.headers.get('content-type')?.includes('pdf'), 'Should be PDF');
 });
 
+// ── Phase 13: Chase invoice link stub ──
+console.log('\nAPI tests — Phase 13: Chase invoice link stub:');
+
+await test('POST /orders/1001/send-chase-invoice (JSON) → stub response', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/orders/1001/send-chase-invoice`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+  });
+  assert.equal(res.status, 200);
+  const j = await res.json();
+  assert.equal(j.ok, true);
+  assert.equal(j.status, 'stubbed');
+});
+
+await test('POST /orders/1001/send-chase-invoice (form) → redirects to order with success', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/orders/1001/send-chase-invoice`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    redirect: 'manual',
+  });
+  assert.equal(res.status, 302);
+  assert.ok(res.headers.get('location')?.includes('chase_invoice_queued'));
+});
+
+await test('POST /orders/1001/send-chase-invoice requires auth', async () => {
+  const res = await fetch(`${BASE}/orders/1001/send-chase-invoice`, {
+    method: 'POST', redirect: 'manual',
+  });
+  assert.equal(res.status, 302);
+  assert.ok(res.headers.get('location')?.includes('/login'));
+});
+
 console.log(`\n  ${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);

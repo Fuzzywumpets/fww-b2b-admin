@@ -1,0 +1,10 @@
+- generic [ref=e2]:
+  - generic [ref=e3]:
+    - generic [ref=e4]: FW
+    - generic [ref=e5]: admin
+  - paragraph [ref=e6]: Fuzzywumpets Internal Dashboard
+  - link "Sign in with Google" [ref=e7] [cursor=pointer]:
+    - /url: /auth/login
+    - img [ref=e8]
+    - text: Sign in with Google
+  - paragraph [ref=e13]: Access restricted to authorized Fuzzywumpets admin emails.
