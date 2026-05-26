@@ -2,18 +2,27 @@
  * fww-b2b-admin — Fuzzywumpets internal ops dashboard.
  * Phase 1: Google OAuth + dashboard MVP.
  * Phase 2: Orders + Customers pages.
+ * Phase 3: Catalog + Reports + Settings + Migrate.
+ * Phase 4: Polish — keyboard shortcuts, CSV exports, PWA manifest.
+ * Phase 5: UPC barcode label engine.
+ * Phase 6: Product CSV + image ZIP exports.
  */
 import express from 'express';
 import crypto from 'node:crypto';
 import path from 'node:path';
+import fs from 'node:fs';
+import zlib from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
+import { ZipArchive } from 'archiver';
 import {
   createSession, getSession, deleteSession, auditLog,
   getCustomerNotes, setCustomerNotes, getDropshipCache, setDropshipCache,
   getSetting, setSetting, getGlobalSettings, getAuditLog, getAuditLogCount,
+  logLabelBatch, logExportBatch,
 } from './db.mjs';
 import { generateInvoicePdf } from './pdf.mjs';
+import { renderLabelSheet, expandItems, TEMPLATES as LABEL_TEMPLATES } from './labels.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const MOCK  = process.env.B2B_ADMIN_MOCK === '1';
@@ -189,26 +198,49 @@ const MOCK_CUSTOMERS = [
 
 const MOCK_PRODUCTS = [
   { id: 'gid://shopify/Product/201', title: 'Elite Collar', handle: 'elite-collar',
+    vendor: 'Fuzzywumpets', productType: 'Dog Collar', tags: ['Style_Elite', 'b2b'],
+    featuredImage: { url: 'https://cdn.shopify.com/mock/elite-collar-1.jpg', altText: 'Elite Collar' },
+    images: { edges: [
+      { node: { url: 'https://cdn.shopify.com/mock/elite-collar-1.jpg', altText: '' } },
+      { node: { url: 'https://cdn.shopify.com/mock/elite-collar-2.jpg', altText: '' } },
+    ]},
     variants: { edges: [
-      { node: { id: 'gid://shopify/ProductVariant/301', title: 'Small / Navy', sku: 'EC-001-S-NV', price: '36.00', inventoryQuantity: 24 } },
-      { node: { id: 'gid://shopify/ProductVariant/302', title: 'Medium / Navy', sku: 'EC-001-M-NV', price: '36.00', inventoryQuantity: 12 } },
-      { node: { id: 'gid://shopify/ProductVariant/307', title: 'Large / Navy', sku: 'EC-001-L-NV', price: '36.00', inventoryQuantity: 0 } },
+      { node: { id: 'gid://shopify/ProductVariant/301', title: 'Small / Navy', sku: 'EC-001-S-NV', price: '36.00', compareAtPrice: '54.00', barcode: '012345678901', inventoryQuantity: 24 } },
+      { node: { id: 'gid://shopify/ProductVariant/302', title: 'Medium / Navy', sku: 'EC-001-M-NV', price: '36.00', compareAtPrice: '54.00', barcode: '012345678902', inventoryQuantity: 12 } },
+      { node: { id: 'gid://shopify/ProductVariant/307', title: 'Large / Navy',  sku: 'EC-001-L-NV', price: '36.00', compareAtPrice: '54.00', barcode: '',             inventoryQuantity: 0  } },
     ]}
   },
   { id: 'gid://shopify/Product/202', title: 'Luxe Leash', handle: 'luxe-leash',
+    vendor: 'Fuzzywumpets', productType: 'Dog Leash', tags: ['Style_Luxe', 'b2b'],
+    featuredImage: { url: 'https://cdn.shopify.com/mock/luxe-leash-1.jpg', altText: 'Luxe Leash' },
+    images: { edges: [
+      { node: { url: 'https://cdn.shopify.com/mock/luxe-leash-1.jpg', altText: '' } },
+    ]},
     variants: { edges: [
-      { node: { id: 'gid://shopify/ProductVariant/303', title: 'Default Title', sku: 'LL-005', price: '75.00', inventoryQuantity: 5 } },
+      { node: { id: 'gid://shopify/ProductVariant/303', title: 'Default Title', sku: 'LL-005', price: '75.00', compareAtPrice: '112.00', barcode: '012345678903', inventoryQuantity: 5 } },
     ]}
   },
   { id: 'gid://shopify/Product/203', title: 'Simplicity Collar', handle: 'simplicity-collar',
+    vendor: 'Fuzzywumpets', productType: 'Dog Collar', tags: ['Style_Simplicity', 'b2b'],
+    featuredImage: { url: 'https://cdn.shopify.com/mock/simplicity-collar-1.jpg', altText: 'Simplicity Collar' },
+    images: { edges: [
+      { node: { url: 'https://cdn.shopify.com/mock/simplicity-collar-1.jpg', altText: '' } },
+      { node: { url: 'https://cdn.shopify.com/mock/simplicity-collar-2.jpg', altText: '' } },
+      { node: { url: 'https://cdn.shopify.com/mock/simplicity-collar-3.jpg', altText: '' } },
+    ]},
     variants: { edges: [
-      { node: { id: 'gid://shopify/ProductVariant/304', title: 'Medium / Red', sku: 'SC-002-M-RD', price: '22.00', inventoryQuantity: 7 } },
-      { node: { id: 'gid://shopify/ProductVariant/305', title: 'Large / Red', sku: 'SC-002-L-RD', price: '22.00', inventoryQuantity: 18 } },
+      { node: { id: 'gid://shopify/ProductVariant/304', title: 'Medium / Red', sku: 'SC-002-M-RD', price: '22.00', compareAtPrice: '33.00', barcode: '012345678904', inventoryQuantity: 7  } },
+      { node: { id: 'gid://shopify/ProductVariant/305', title: 'Large / Red',  sku: 'SC-002-L-RD', price: '22.00', compareAtPrice: '33.00', barcode: '012345678905', inventoryQuantity: 18 } },
     ]}
   },
   { id: 'gid://shopify/Product/204', title: 'Everyday Collar Bundle', handle: 'everyday-collar-bundle',
+    vendor: 'Fuzzywumpets', productType: 'Dog Collar', tags: ['Style_Everyday', 'b2b'],
+    featuredImage: { url: 'https://cdn.shopify.com/mock/everyday-bundle-1.jpg', altText: 'Everyday Collar Bundle' },
+    images: { edges: [
+      { node: { url: 'https://cdn.shopify.com/mock/everyday-bundle-1.jpg', altText: '' } },
+    ]},
     variants: { edges: [
-      { node: { id: 'gid://shopify/ProductVariant/306', title: 'XL', sku: 'ECB-010-XL', price: '60.00', inventoryQuantity: 8 } },
+      { node: { id: 'gid://shopify/ProductVariant/306', title: 'XL', sku: 'ECB-010-XL', price: '60.00', compareAtPrice: '90.00', barcode: '012345678906', inventoryQuantity: 8 } },
     ]}
   },
 ];
@@ -360,7 +392,9 @@ function gfonts() {
 function layout({ title, session, activePath = '/', content, extraHead = '' }) {
   const navItems = [
     ['/', 'Dashboard'], ['/orders', 'Orders'], ['/customers', 'Customers'],
-    ['/catalog', 'Catalog'], ['/reports', 'Reports'], ['/settings', 'Settings'],
+    ['/catalog', 'Catalog'], ['/reports', 'Reports'],
+    ['/labels', 'Labels'], ['/exports', 'Exports'],
+    ['/settings', 'Settings'],
   ];
   return `<!DOCTYPE html>
 <html lang="en">
@@ -368,6 +402,8 @@ function layout({ title, session, activePath = '/', content, extraHead = '' }) {
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>${h(title)} — FWW Admin</title>
+  <link rel="manifest" href="/manifest.json">
+  <meta name="theme-color" content="#9BBC0E">
   ${gfonts()}
   <link rel="stylesheet" href="/admin.css">
   ${extraHead}
@@ -392,6 +428,61 @@ function layout({ title, session, activePath = '/', content, extraHead = '' }) {
   <main class="main-content">
     ${content}
   </main>
+  <div id="kb-overlay" class="kb-overlay hidden" role="dialog" aria-modal="true" aria-label="Keyboard shortcuts">
+    <div class="kb-overlay-inner">
+      <h3>Keyboard Shortcuts</h3>
+      <table class="kb-table">
+        <tr><td><kbd>/</kbd></td><td>Focus search</td></tr>
+        <tr><td><kbd>g</kbd> <kbd>d</kbd></td><td>Go to Dashboard</td></tr>
+        <tr><td><kbd>g</kbd> <kbd>o</kbd></td><td>Go to Orders</td></tr>
+        <tr><td><kbd>g</kbd> <kbd>c</kbd></td><td>Go to Customers</td></tr>
+        <tr><td><kbd>g</kbd> <kbd>l</kbd></td><td>Go to Catalog</td></tr>
+        <tr><td><kbd>g</kbd> <kbd>r</kbd></td><td>Go to Reports</td></tr>
+        <tr><td><kbd>g</kbd> <kbd>b</kbd></td><td>Go to Labels</td></tr>
+        <tr><td><kbd>g</kbd> <kbd>e</kbd></td><td>Go to Exports</td></tr>
+        <tr><td><kbd>?</kbd></td><td>Toggle this overlay</td></tr>
+        <tr><td><kbd>Esc</kbd></td><td>Close overlay</td></tr>
+      </table>
+      <button class="btn btn-ghost btn-sm" onclick="document.getElementById('kb-overlay').classList.add('hidden')">Close</button>
+    </div>
+  </div>
+  <script>
+  (function() {
+    var gDown = false, gTimer = null;
+    document.addEventListener('keydown', function(e) {
+      var tag = (e.target.tagName || '').toUpperCase();
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+      if (e.key === '?' && !e.shiftKey && !e.ctrlKey && !e.metaKey) {
+        var o = document.getElementById('kb-overlay');
+        if (o) o.classList.toggle('hidden');
+        return;
+      }
+      if (e.key === 'Escape') {
+        var o = document.getElementById('kb-overlay');
+        if (o) o.classList.add('hidden');
+        return;
+      }
+      if (e.key === '/' && !e.ctrlKey && !e.metaKey) {
+        e.preventDefault();
+        var s = document.querySelector('.search-input, #filter-q, input[type="search"]');
+        if (s) s.focus();
+        return;
+      }
+      if (e.key === 'g' && !e.ctrlKey && !e.metaKey) {
+        gDown = true;
+        clearTimeout(gTimer);
+        gTimer = setTimeout(function() { gDown = false; }, 1000);
+        return;
+      }
+      if (gDown) {
+        gDown = false;
+        clearTimeout(gTimer);
+        var map = { d: '/', o: '/orders', c: '/customers', l: '/catalog', r: '/reports', b: '/labels', e: '/exports', s: '/settings' };
+        if (map[e.key]) { e.preventDefault(); window.location = map[e.key]; }
+      }
+    });
+  })();
+  </script>
 </body>
 </html>`;
 }
@@ -1489,10 +1580,68 @@ async function submitNewOrder(req, session) {
   }
 }
 
+// ── PWA icon generator ────────────────────────────────────────────────────────
+// Creates a minimal RGB PNG at startup (lime green #9BBC0E with "FW" approximated).
+function generateIconPng(size, r, g, b) {
+  const crcTable = new Uint32Array(256);
+  for (let i = 0; i < 256; i++) {
+    let c = i;
+    for (let j = 0; j < 8; j++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+    crcTable[i] = c;
+  }
+  function crc32(buf) {
+    let crc = 0xFFFFFFFF;
+    for (const byte of buf) crc = crcTable[(crc ^ byte) & 0xFF] ^ (crc >>> 8);
+    return (crc ^ 0xFFFFFFFF) >>> 0;
+  }
+  function chunk(type, data) {
+    const typeBuf = Buffer.from(type);
+    const lenBuf = Buffer.allocUnsafe(4); lenBuf.writeUInt32BE(data.length);
+    const crcBuf = Buffer.allocUnsafe(4);
+    crcBuf.writeUInt32BE(crc32(Buffer.concat([typeBuf, data])));
+    return Buffer.concat([lenBuf, typeBuf, data, crcBuf]);
+  }
+  const rowSize = 1 + size * 3;
+  const raw = Buffer.allocUnsafe(size * rowSize);
+  for (let y = 0; y < size; y++) {
+    raw[y * rowSize] = 0;
+    for (let x = 0; x < size; x++) {
+      const i = y * rowSize + 1 + x * 3;
+      raw[i] = r; raw[i+1] = g; raw[i+2] = b;
+    }
+  }
+  const ihdr = Buffer.allocUnsafe(13);
+  ihdr.writeUInt32BE(size, 0); ihdr.writeUInt32BE(size, 4);
+  ihdr[8] = 8; ihdr[9] = 2; ihdr[10] = 0; ihdr[11] = 0; ihdr[12] = 0;
+  return Buffer.concat([
+    Buffer.from([137,80,78,71,13,10,26,10]),
+    chunk('IHDR', ihdr),
+    chunk('IDAT', zlib.deflateSync(raw)),
+    chunk('IEND', Buffer.alloc(0)),
+  ]);
+}
+
+const ICON_PATH = path.join(__dirname, 'public', 'icon-192.png');
+if (!fs.existsSync(ICON_PATH)) {
+  fs.writeFileSync(ICON_PATH, generateIconPng(192, 0x9B, 0xBC, 0x0E));
+}
+
 // ── Routes ────────────────────────────────────────────────────────────────────
 
 app.get('/healthz', (_req, res) => {
   res.json({ ok: true, app: 'fww-b2b-admin', ts: Date.now() });
+});
+
+app.get('/manifest.json', (_req, res) => {
+  res.json({
+    name: 'FWW Admin',
+    short_name: 'FWWadmin',
+    start_url: '/',
+    display: 'standalone',
+    background_color: '#FFFFFF',
+    theme_color: '#9BBC0E',
+    icons: [{ src: '/icon-192.png', sizes: '192x192', type: 'image/png' }],
+  });
 });
 
 // Mock: seed session
@@ -1631,6 +1780,44 @@ app.post('/orders/bulk', requireAuth, async (req, res) => {
   res.redirect('/orders?success=marked_paid');
 });
 
+// Phase 4: Orders CSV export (must be before /orders/:id to avoid route conflict)
+app.get('/orders/export.csv', requireAuth, async (req, res) => {
+  const ts = new Date().toISOString().slice(0, 10);
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename="fww-b2b-orders-${ts}.csv"`);
+  res.write(csvLine(['order_number','date','customer','email','financial_status','fulfillment_status','total','tags','note']));
+  const orders = MOCK
+    ? MOCK_ORDERS
+    : await (async () => {
+        const all = [];
+        let after = null;
+        for (let page = 0; page < 20; page++) {
+          const result = await shopifyFetch(
+            `query($q:String!,$first:Int!,$after:String){orders(first:$first,query:$q,after:$after,sortKey:PROCESSED_AT,reverse:true){edges{cursor node{name processedAt customer{displayName email} displayFinancialStatus displayFulfillmentStatus totalPriceSet{presentmentMoney{amount}} note tags}}pageInfo{hasNextPage endCursor}}}`,
+            { q: 'tag:b2b-portal', first: 250, after });
+          const edges = result.data?.orders?.edges || [];
+          all.push(...edges.map(e => e.node));
+          if (!result.data?.orders?.pageInfo?.hasNextPage) break;
+          after = result.data.orders.pageInfo.endCursor;
+        }
+        return all;
+      })();
+  for (const o of orders) {
+    res.write(csvLine([
+      o.name,
+      o.processedAt ? o.processedAt.slice(0,10) : '',
+      o.customer?.displayName || '',
+      o.customer?.email || '',
+      o.displayFinancialStatus || '',
+      o.displayFulfillmentStatus || '',
+      o.totalPriceSet?.presentmentMoney?.amount || '',
+      Array.isArray(o.tags) ? o.tags.join('|') : (o.tags || ''),
+      o.note || '',
+    ]));
+  }
+  res.end();
+});
+
 app.get('/orders/:id', requireAuth, async (req, res) => {
   const order = await getOrderDetail(req.params.id);
   if (!order) return res.status(404).send(layout({ title: '404', session: req.adminSession, activePath: '/orders',
@@ -1691,6 +1878,46 @@ app.get('/orders/:id/invoice.pdf', requireAuth, async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+// Phase 4: Customers CSV export
+app.get('/customers/export.csv', requireAuth, async (req, res) => {
+  const ts = new Date().toISOString().slice(0, 10);
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename="fww-b2b-customers-${ts}.csv"`);
+  res.write(csvLine(['customer_id','name','email','phone','tags','lifetime_spend','orders','city','province','country']));
+  const customers = MOCK
+    ? MOCK_CUSTOMERS
+    : await (async () => {
+        const all = [];
+        let after = null;
+        for (let page = 0; page < 10; page++) {
+          const result = await shopifyFetch(
+            `query($q:String!,$first:Int!,$after:String){customers(first:$first,query:$q,after:$after,sortKey:AMOUNT_SPENT,reverse:true){edges{cursor node{id displayName email phone tags amountSpent{amount} numberOfOrders defaultAddress{city province country}}}pageInfo{hasNextPage endCursor}}}`,
+            { q: 'tag:b2b', first: 250, after });
+          const edges = result.data?.customers?.edges || [];
+          all.push(...edges.map(e => e.node));
+          if (!result.data?.customers?.pageInfo?.hasNextPage) break;
+          after = result.data.customers.pageInfo.endCursor;
+        }
+        return all;
+      })();
+  for (const c of customers) {
+    const addr = c.defaultAddress || {};
+    res.write(csvLine([
+      shopifyNumericId(c.id),
+      c.displayName || '',
+      c.email || '',
+      c.phone || '',
+      Array.isArray(c.tags) ? c.tags.join('|') : (c.tags || ''),
+      c.amountSpent?.amount || '',
+      c.numberOfOrders || '',
+      addr.city || '',
+      addr.province || '',
+      addr.country || '',
+    ]));
+  }
+  res.end();
 });
 
 // ── Customers ──
@@ -2565,6 +2792,570 @@ app.get('/audit', requireAuth, (req, res) => {
     </table>
     ${pagination}
   ` }));
+});
+
+// ── Phase 5: Labels ───────────────────────────────────────────────────────────
+
+// Mock data for labels (products with barcodes for test/demo)
+const MOCK_LABEL_PRODUCTS = MOCK_PRODUCTS;
+
+async function getProductsForLabels(ids) {
+  if (MOCK) {
+    if (ids && ids.length) return MOCK_LABEL_PRODUCTS.filter(p => ids.includes(shopifyNumericId(p.id)));
+    return MOCK_LABEL_PRODUCTS;
+  }
+  const gids = ids.map(id => `gid://shopify/Product/${id}`);
+  const result = await shopifyFetch(`
+    query($ids:[ID!]!){nodes(ids:$ids){... on Product{
+      id handle title vendor productType tags barcode
+      variants(first:30){edges{node{id title sku price compareAtPrice barcode inventoryQuantity}}}
+    }}}`, { ids: gids });
+  return (result.data?.nodes || []).filter(Boolean);
+}
+
+async function getOrderForLabels(numericId) {
+  if (MOCK) {
+    const o = MOCK_ORDERS.find(o => shopifyNumericId(o.id) === numericId);
+    if (!o) return null;
+    return { order: o, items: o.lineItems.edges.map(e => {
+      const v = e.node.variant || {};
+      return {
+        barcode: v.barcode || '',
+        title: e.node.title,
+        variantTitle: v.sku || 'Default Title',
+        price: v.price || '0.00',
+        qty: e.node.quantity,
+      };
+    })};
+  }
+  const result = await shopifyFetch(`
+    query($id:ID!){order(id:$id){
+      name
+      lineItems(first:50){edges{node{
+        title quantity
+        variant{id sku price barcode displayName}
+      }}}
+    }}`, { id: `gid://shopify/Order/${numericId}` });
+  const o = result.data?.order;
+  if (!o) return null;
+  return {
+    order: o,
+    items: o.lineItems.edges.map(e => ({
+      barcode: e.node.variant?.barcode || '',
+      title: e.node.title,
+      variantTitle: e.node.variant?.displayName || e.node.variant?.sku || '',
+      price: e.node.variant?.price || '0.00',
+      qty: e.node.quantity,
+    })),
+  };
+}
+
+function renderLabelsPage(session, { source, orderData, productItems, flash, savedTemplate, savedShowPrice, savedMode, queryOrder = '', queryQ = '' }) {
+  const templateOptions = Object.entries(LABEL_TEMPLATES)
+    .map(([k, v]) => `<option value="${h(k)}"${k === (savedTemplate || 'avery-5160') ? ' selected' : ''}>${h(v.name)}</option>`)
+    .join('');
+
+  const optionsForm = `
+    <div class="settings-section" style="margin-top:1rem">
+      <h3 style="font-size:0.9rem;margin-bottom:0.75rem">Options</h3>
+      <div class="form-row">
+        <label>Label size</label>
+        <select name="template" class="form-input">${templateOptions}</select>
+      </div>
+      <div class="form-row" style="gap:0.5rem;align-items:center">
+        <label style="display:flex;align-items:center;gap:0.4rem;cursor:pointer">
+          <input type="checkbox" name="showPrice" value="1"${savedShowPrice !== '0' ? ' checked' : ''}>
+          Show retail price
+        </label>
+      </div>
+      <div class="form-row" style="gap:1rem;align-items:center">
+        <span>Detail level:</span>
+        <label style="display:flex;align-items:center;gap:0.3rem;cursor:pointer">
+          <input type="radio" name="mode" value="product"${savedMode === 'product' ? ' checked' : ''}> Product only
+        </label>
+        <label style="display:flex;align-items:center;gap:0.3rem;cursor:pointer">
+          <input type="radio" name="mode" value="product+variant"${savedMode !== 'product' ? ' checked' : ''}> Product + variant
+        </label>
+      </div>
+    </div>`;
+
+  const flashHtml = flash ? `<div class="alert ${flash.ok ? 'alert-success' : 'alert-error'}" style="margin-bottom:1rem">${h(flash)}</div>` : '';
+
+  // Build items table if we have data
+  let itemsTable = '';
+  let hiddenItems = '';
+  const allItems = source === 'order' ? (orderData?.items || []) : (productItems || []);
+  const skippedCount = allItems.filter(i => !i.barcode || !/^\d{12,13}$/.test(String(i.barcode))).length;
+
+  if (allItems.length) {
+    const skippedWarn = skippedCount > 0
+      ? `<div class="alert alert-error" style="margin-bottom:0.75rem">${skippedCount} variant${skippedCount > 1 ? 's have' : ' has'} no valid UPC barcode and will be skipped.</div>`
+      : '';
+    const rows = allItems.map((item, idx) => {
+      const hasBarcode = item.barcode && /^\d{12,13}$/.test(String(item.barcode));
+      return `<tr class="${hasBarcode ? '' : 'row-muted'}">
+        <td><input type="checkbox" name="sel" value="${idx}"${hasBarcode ? ' checked' : ' disabled'} class="item-sel"></td>
+        <td>${h(item.title)}</td>
+        <td class="text-sm text-muted">${h(item.variantTitle || '')}</td>
+        <td class="mono text-sm">${hasBarcode ? h(item.barcode) : '<span class="text-muted">—</span>'}</td>
+        <td><input type="number" name="item_qty_${idx}" value="${item.qty || 1}" min="1" max="999" style="width:60px" class="form-input form-input-sm"></td>
+        <td class="text-sm">${item.price ? '$' + h(String(item.price)) : '—'}</td>
+      </tr>
+      <input type="hidden" name="item_barcode_${idx}" value="${h(item.barcode || '')}">
+      <input type="hidden" name="item_title_${idx}" value="${h(item.title || '')}">
+      <input type="hidden" name="item_variant_${idx}" value="${h(item.variantTitle || '')}">
+      <input type="hidden" name="item_price_${idx}" value="${h(item.price || '')}">`;
+    }).join('');
+    itemsTable = `
+      <input type="hidden" name="item_count" value="${allItems.length}">
+      ${skippedWarn}
+      <div class="table-wrap" style="margin-top:0.75rem">
+        <table class="data-table data-table-sm">
+          <thead><tr><th style="width:30px"></th><th>Product</th><th>Variant</th><th>UPC</th><th style="width:70px">Qty</th><th>Price</th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>
+      <div style="margin-top:1rem;display:flex;gap:0.75rem;flex-wrap:wrap">
+        <button type="submit" formaction="/labels/preview" formtarget="_blank" class="btn btn-secondary">Preview PDF</button>
+        <button type="submit" formaction="/labels/print" class="btn btn-primary">Download PDF</button>
+      </div>`;
+  }
+
+  const sourceOrderId = orderData?.order?.name ? `#${shopifyNumericId(orderData.order.id || '')}` : '';
+
+  const fromOrderTab = `
+    <div>
+      <form method="GET" action="/labels" style="display:flex;gap:0.5rem;align-items:center;margin-bottom:0.75rem">
+        <input type="hidden" name="source" value="order">
+        <input type="text" name="order" placeholder="Order # (e.g. 1001)" class="form-input search-input" style="width:220px" value="${h(queryOrder)}">
+        <button type="submit" class="btn btn-secondary">Load Order</button>
+      </form>
+      ${source === 'order' && orderData ? `<p class="text-muted text-sm">Loaded order ${h(orderData.order?.name || '')}</p>` : ''}
+      ${source === 'order' && !orderData ? '<p class="alert alert-error">Order not found.</p>' : ''}
+      ${source === 'order' && allItems.length ? `<form method="POST">${optionsForm}${itemsTable}</form>` : ''}
+    </div>`;
+
+  const fromProductsTab = `
+    <div>
+      <form method="GET" action="/labels" id="product-search-form" style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap;margin-bottom:0.75rem">
+        <input type="hidden" name="source" value="products">
+        <input type="text" name="q" placeholder="Search products..." class="form-input search-input" style="width:240px" value="${h(queryQ)}">
+        <button type="submit" class="btn btn-secondary">Search</button>
+      </form>
+      ${source === 'products' && productItems !== null ? `<form method="POST">${optionsForm}${itemsTable}</form>` : ''}
+    </div>`;
+
+  return layout({ title: 'Labels', session, activePath: '/labels', content: `
+    <div class="page-header"><h1>Barcode Labels</h1></div>
+    ${flashHtml}
+    <div class="tab-bar">
+      <button class="tab${source !== 'products' ? ' active' : ''}" data-tab="from-order">From an Order</button>
+      <button class="tab${source === 'products' ? ' active' : ''}" data-tab="from-products">From Products</button>
+    </div>
+    <div class="tab-content${source !== 'products' ? '' : ' hidden'}" id="from-order">${fromOrderTab}</div>
+    <div class="tab-content${source === 'products' ? '' : ' hidden'}" id="from-products">${fromProductsTab}</div>
+    <script>
+    document.querySelectorAll('.tab').forEach(function(t) {
+      t.addEventListener('click', function() {
+        document.querySelectorAll('.tab').forEach(function(x) { x.classList.remove('active'); });
+        document.querySelectorAll('.tab-content').forEach(function(x) { x.classList.add('hidden'); });
+        this.classList.add('active');
+        document.getElementById(this.dataset.tab).classList.remove('hidden');
+      });
+    });
+    </script>
+  ` });
+}
+
+app.get('/labels', requireAuth, async (req, res) => {
+  const source = req.query.source || 'order';
+  const savedTemplate = getSetting('last_label_template', req.adminSession.email) || 'avery-5160';
+  const savedShowPrice = getSetting('last_label_show_price', req.adminSession.email) ?? '1';
+  const savedMode = getSetting('last_label_mode', req.adminSession.email) || 'product+variant';
+  const queryOrder = req.query.order || '';
+  const queryQ = req.query.q || '';
+
+  if (source === 'order' && queryOrder) {
+    const orderData = await getOrderForLabels(queryOrder);
+    return res.send(renderLabelsPage(req.adminSession, { source: 'order', orderData, productItems: null, flash: null, savedTemplate, savedShowPrice, savedMode, queryOrder, queryQ }));
+  }
+
+  if (source === 'products') {
+    const q = queryQ.toLowerCase();
+    const rawProducts = await getProductsForLabels(null);
+    const filtered = q
+      ? rawProducts.filter(p => p.title.toLowerCase().includes(q) || (p.handle || '').includes(q))
+      : rawProducts;
+    const productItems = filtered.flatMap(p =>
+      p.variants.edges.map(e => ({
+        barcode: e.node.barcode || '',
+        title: p.title,
+        variantTitle: e.node.title !== 'Default Title' ? e.node.title : '',
+        price: e.node.price || '0.00',
+        qty: 1,
+      }))
+    );
+    return res.send(renderLabelsPage(req.adminSession, { source: 'products', orderData: null, productItems, flash: null, savedTemplate, savedShowPrice, savedMode, queryOrder, queryQ }));
+  }
+
+  res.send(renderLabelsPage(req.adminSession, { source: 'order', orderData: null, productItems: null, flash: null, savedTemplate, savedShowPrice, savedMode, queryOrder, queryQ }));
+});
+
+// Shared label PDF generator for preview + print
+async function handleLabelsPdf(req, res, disposition) {
+  const itemCount = parseInt(req.body.item_count) || 0;
+  const template = req.body.template || 'avery-5160';
+  const showPrice = req.body.showPrice === '1' || req.body.showPrice === 'on';
+  const mode = req.body.mode === 'product' ? 'product' : 'product+variant';
+
+  const items = [];
+  for (let i = 0; i < itemCount; i++) {
+    const sel = [req.body.sel || []].flat();
+    if (!sel.includes(String(i))) continue;
+    items.push({
+      barcode: String(req.body[`item_barcode_${i}`] || ''),
+      title:   String(req.body[`item_title_${i}`]   || ''),
+      variantTitle: String(req.body[`item_variant_${i}`] || ''),
+      price:   String(req.body[`item_price_${i}`]   || ''),
+      qty: parseInt(req.body[`item_qty_${i}`]) || 1,
+    });
+  }
+
+  if (!items.length) return res.status(400).json({ error: 'No items selected.' });
+
+  try {
+    const { pdf, skipped } = await renderLabelSheet({ template, items, options: { showPrice, mode } });
+    const { labels } = expandItems(items);
+
+    // Save preferences
+    setSetting('last_label_template', template, req.adminSession.email);
+    setSetting('last_label_show_price', showPrice ? '1' : '0', req.adminSession.email);
+    setSetting('last_label_mode', mode, req.adminSession.email);
+    logLabelBatch(req.adminSession.email, template, items.length, labels.length);
+    auditLog(req.adminSession.email, 'label:generate', template, null, { items: items.length, labels: labels.length });
+
+    const ts = new Date().toISOString().slice(0, 10);
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `${disposition}; filename="fww-labels-${ts}.pdf"`);
+    res.send(pdf);
+  } catch (err) {
+    console.error('Label PDF error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+}
+
+app.post('/labels/preview', requireAuth, (req, res) => handleLabelsPdf(req, res, 'inline'));
+app.post('/labels/print',   requireAuth, (req, res) => handleLabelsPdf(req, res, 'attachment'));
+
+// ── Phase 6: Exports ──────────────────────────────────────────────────────────
+
+async function getProductsForExport(ids) {
+  if (MOCK) {
+    if (ids && ids.length) return MOCK_PRODUCTS.filter(p => ids.includes(shopifyNumericId(p.id)));
+    return MOCK_PRODUCTS;
+  }
+  const gids = ids.map(id => `gid://shopify/Product/${id}`);
+  const result = await shopifyFetch(`
+    query($ids:[ID!]!){nodes(ids:$ids){... on Product{
+      id handle title vendor productType tags
+      featuredImage{url altText}
+      images(first:30){edges{node{url altText}}}
+      variants(first:50){edges{node{
+        id title sku barcode price compareAtPrice inventoryQuantity inventoryPolicy
+        createdAt updatedAt
+      }}}
+      createdAt updatedAt
+    }}}`, { ids: gids });
+  return (result.data?.nodes || []).filter(Boolean);
+}
+
+async function getAllB2bProductIds() {
+  if (MOCK) return MOCK_PRODUCTS.map(p => shopifyNumericId(p.id));
+  const ids = [];
+  let after = null;
+  for (let page = 0; page < 20; page++) {
+    const result = await shopifyFetch(
+      `query($q:String!,$first:Int!,$after:String){products(first:$first,query:$q,after:$after){edges{node{id}}pageInfo{hasNextPage endCursor}}}`,
+      { q: `publication_id:${B2B_PUB_ID.split('/').pop()}`, first: 250, after });
+    const edges = result.data?.products?.edges || [];
+    ids.push(...edges.map(e => shopifyNumericId(e.node.id)));
+    if (!result.data?.products?.pageInfo?.hasNextPage) break;
+    after = result.data.products.pageInfo.endCursor;
+  }
+  return ids;
+}
+
+function renderExportsLanding(session) {
+  return layout({ title: 'Exports', session, activePath: '/exports', content: `
+    <div class="page-header"><h1>Exports</h1></div>
+    <div class="exports-cards">
+      <a href="/exports/csv" class="export-card">
+        <div class="export-card-icon">CSV</div>
+        <h3>Product CSV</h3>
+        <p>Export product + variant data (handle, SKU, UPC, price, inventory) as CSV. One row per variant.</p>
+      </a>
+      <a href="/exports/images" class="export-card">
+        <div class="export-card-icon">ZIP</div>
+        <h3>Product Images</h3>
+        <p>Download main photos or full image galleries as a ZIP file. Original resolution from Shopify CDN.</p>
+      </a>
+    </div>
+  ` });
+}
+
+function renderExportsCsv(session, { products, selectedIds, columns, flash }) {
+  const ALL_COLS = [
+    ['product_handle','Handle'], ['product_title','Title'], ['vendor','Vendor'], ['product_type','Type'],
+    ['style','Style'], ['tags','Tags'], ['variant_id','Variant ID'], ['variant_title','Variant Title'],
+    ['sku','SKU'], ['barcode','UPC/Barcode'], ['price','Price (MSRP)'], ['b2b_price','B2B Price'],
+    ['compare_at_price','Compare At'], ['inventory_qty','Inventory'], ['inventory_policy','Inv. Policy'],
+    ['created_at','Created'], ['updated_at','Updated'],
+  ];
+  const selCols = columns || ALL_COLS.map(([k]) => k);
+  const colChecks = ALL_COLS.map(([k, label]) =>
+    `<label class="col-check"><input type="checkbox" name="cols" value="${k}"${selCols.includes(k) ? ' checked' : ''}> ${h(label)}</label>`
+  ).join('');
+  const productRows = products.map(p => {
+    const numId = shopifyNumericId(p.id);
+    const selected = selectedIds.includes(numId);
+    return `<tr>
+      <td><input type="checkbox" name="ids" value="${numId}"${selected ? ' checked' : ''} class="item-sel"></td>
+      <td>${h(p.title)}</td>
+      <td class="text-sm text-muted">${h(p.vendor || '')}</td>
+      <td class="text-sm">${p.variants.edges.length} variant${p.variants.edges.length !== 1 ? 's' : ''}</td>
+    </tr>`;
+  }).join('');
+  const selectedCount = selectedIds.length || products.length;
+  const estRows = MOCK ? selectedCount * 2 : selectedCount * 3;
+
+  return layout({ title: 'CSV Export', session, activePath: '/exports', content: `
+    <div class="page-header">
+      <h1>Product CSV Export</h1>
+      <a href="/exports" class="btn btn-ghost btn-sm">← Exports</a>
+    </div>
+    ${flash ? `<div class="alert alert-error" style="margin-bottom:1rem">${h(flash)}</div>` : ''}
+    <form method="POST" action="/exports/csv">
+      <div class="exports-layout">
+        <section class="settings-section">
+          <h3>Select Products</h3>
+          <div style="margin-bottom:0.5rem;display:flex;gap:0.5rem;align-items:center">
+            <a href="/exports/csv?select=all" class="btn btn-ghost btn-sm">Select all B2B (${products.length})</a>
+            <a href="/exports/csv?select=none" class="btn btn-ghost btn-sm">Clear</a>
+          </div>
+          <div class="table-wrap" style="max-height:360px;overflow-y:auto">
+            <table class="data-table data-table-sm">
+              <thead><tr><th style="width:30px"></th><th>Product</th><th>Vendor</th><th>Variants</th></tr></thead>
+              <tbody>${productRows || '<tr><td colspan="4" class="empty-state">No products.</td></tr>'}</tbody>
+            </table>
+          </div>
+        </section>
+        <section class="settings-section">
+          <h3>Columns</h3>
+          <div class="col-checks">${colChecks}</div>
+          <div style="margin-top:1.25rem">
+            <p class="text-muted text-sm">~${estRows} rows (1 per variant)</p>
+            <button type="submit" class="btn btn-primary" style="margin-top:0.5rem">Download CSV</button>
+          </div>
+        </section>
+      </div>
+    </form>
+  ` });
+}
+
+function renderExportsImages(session, { products, selectedIds, mode, flash }) {
+  const productRows = products.map(p => {
+    const numId = shopifyNumericId(p.id);
+    const selected = selectedIds.includes(numId);
+    const imgCount = mode === 'gallery' ? (p.images?.edges?.length || 1) : 1;
+    return `<tr>
+      <td><input type="checkbox" name="ids" value="${numId}"${selected ? ' checked' : ''} class="item-sel"></td>
+      <td>${h(p.title)}</td>
+      <td class="text-sm text-muted">${h(p.vendor || '')}</td>
+      <td class="text-sm" id="img-count-${numId}">${imgCount} image${imgCount !== 1 ? 's' : ''}</td>
+    </tr>`;
+  }).join('');
+  const totalImgs = selectedIds.length
+    ? products.filter(p => selectedIds.includes(shopifyNumericId(p.id))).reduce((s, p) => s + (mode === 'gallery' ? (p.images?.edges?.length || 1) : 1), 0)
+    : products.reduce((s, p) => s + (mode === 'gallery' ? (p.images?.edges?.length || 1) : 1), 0);
+
+  return layout({ title: 'Image Export', session, activePath: '/exports', content: `
+    <div class="page-header">
+      <h1>Product Image Export</h1>
+      <a href="/exports" class="btn btn-ghost btn-sm">← Exports</a>
+    </div>
+    ${flash ? `<div class="alert alert-error" style="margin-bottom:1rem">${h(flash)}</div>` : ''}
+    <form method="POST" action="/exports/images" id="images-form">
+      <div class="exports-layout">
+        <section class="settings-section">
+          <h3>Select Products</h3>
+          <div style="margin-bottom:0.5rem;display:flex;gap:0.5rem;align-items:center">
+            <a href="/exports/images?select=all" class="btn btn-ghost btn-sm">Select all B2B (${products.length})</a>
+            <a href="/exports/images?select=none" class="btn btn-ghost btn-sm">Clear</a>
+          </div>
+          <div class="table-wrap" style="max-height:360px;overflow-y:auto">
+            <table class="data-table data-table-sm">
+              <thead><tr><th style="width:30px"></th><th>Product</th><th>Vendor</th><th>Images</th></tr></thead>
+              <tbody>${productRows || '<tr><td colspan="4" class="empty-state">No products.</td></tr>'}</tbody>
+            </table>
+          </div>
+        </section>
+        <section class="settings-section">
+          <h3>Image Mode</h3>
+          <div style="display:flex;flex-direction:column;gap:0.5rem">
+            <label style="display:flex;align-items:center;gap:0.4rem;cursor:pointer">
+              <input type="radio" name="mode" value="main-only"${mode !== 'gallery' ? ' checked' : ''}> Main photo only
+            </label>
+            <label style="display:flex;align-items:center;gap:0.4rem;cursor:pointer">
+              <input type="radio" name="mode" value="gallery"${mode === 'gallery' ? ' checked' : ''}> Main + all gallery images
+            </label>
+          </div>
+          <div style="margin-top:1.25rem">
+            <p class="text-muted text-sm" id="img-total-est">~${totalImgs} image${totalImgs !== 1 ? 's' : ''} estimated</p>
+            <button type="submit" class="btn btn-primary" style="margin-top:0.5rem">Download ZIP</button>
+          </div>
+        </section>
+      </div>
+    </form>
+  ` });
+}
+
+app.get('/exports', requireAuth, (req, res) => {
+  res.send(renderExportsLanding(req.adminSession));
+});
+
+app.get('/exports/csv', requireAuth, async (req, res) => {
+  const allIds = await getAllB2bProductIds();
+  const products = await getProductsForExport(allIds);
+  const select = req.query.select;
+  const selectedIds = select === 'none' ? [] : select === 'all' ? allIds : allIds;
+  const savedCols = getSetting('last_export_csv_cols', req.adminSession.email);
+  const columns = savedCols ? savedCols.split(',') : null;
+  res.send(renderExportsCsv(req.adminSession, { products, selectedIds, columns, flash: null }));
+});
+
+app.post('/exports/csv', requireAuth, async (req, res) => {
+  const ids = [req.body.ids || []].flat().filter(Boolean);
+  const cols = [req.body.cols || []].flat().filter(Boolean);
+  if (!ids.length) {
+    const allIds = await getAllB2bProductIds();
+    const products = await getProductsForExport(allIds);
+    return res.send(renderExportsCsv(req.adminSession, { products, selectedIds: [], columns: cols, flash: 'Select at least one product.' }));
+  }
+  if (!cols.length) {
+    const products = await getProductsForExport(ids);
+    return res.send(renderExportsCsv(req.adminSession, { products, selectedIds: ids, columns: null, flash: 'Select at least one column.' }));
+  }
+
+  // Save prefs
+  setSetting('last_export_csv_cols', cols.join(','), req.adminSession.email);
+
+  const products = await getProductsForExport(ids);
+  const ts = new Date().toISOString().slice(0, 10);
+
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename="fww-products-${ts}.csv"`);
+  res.write(csvLine(cols));
+
+  let totalRows = 0;
+  for (const p of products) {
+    const style = (p.tags || []).find(t => t.startsWith('Style_'))?.slice(6) || '';
+    const tagStr = (p.tags || []).join('|');
+    for (const ve of p.variants.edges) {
+      const v = ve.node;
+      const b2bPrice = (parseFloat(v.price || 0) * 0.5).toFixed(2);
+      const rowData = {
+        product_handle: p.handle || '',
+        product_title: p.title || '',
+        vendor: p.vendor || '',
+        product_type: p.productType || '',
+        style,
+        tags: tagStr,
+        variant_id: shopifyNumericId(v.id || ''),
+        variant_title: v.title || '',
+        sku: v.sku || '',
+        barcode: v.barcode || '',
+        price: v.price || '',
+        b2b_price: b2bPrice,
+        compare_at_price: v.compareAtPrice || '',
+        inventory_qty: v.inventoryQuantity ?? '',
+        inventory_policy: v.inventoryPolicy || '',
+        created_at: (v.createdAt || p.createdAt || '').slice(0, 10),
+        updated_at: (v.updatedAt || p.updatedAt || '').slice(0, 10),
+      };
+      res.write(csvLine(cols.map(c => rowData[c] ?? '')));
+      totalRows++;
+    }
+  }
+  res.end();
+  logExportBatch(req.adminSession.email, 'csv', products.length, totalRows, 0);
+  auditLog(req.adminSession.email, 'export:csv', null, null, { products: products.length, rows: totalRows, cols: cols.length });
+});
+
+app.get('/exports/images', requireAuth, async (req, res) => {
+  const allIds = await getAllB2bProductIds();
+  const products = await getProductsForExport(allIds);
+  const select = req.query.select;
+  const selectedIds = select === 'none' ? [] : allIds;
+  const savedMode = getSetting('last_export_img_mode', req.adminSession.email) || 'main-only';
+  res.send(renderExportsImages(req.adminSession, { products, selectedIds, mode: savedMode, flash: null }));
+});
+
+app.post('/exports/images', requireAuth, async (req, res) => {
+  const ids = [req.body.ids || []].flat().filter(Boolean);
+  const mode = req.body.mode === 'gallery' ? 'gallery' : 'main-only';
+  if (!ids.length) {
+    const allIds = await getAllB2bProductIds();
+    const products = await getProductsForExport(allIds);
+    return res.send(renderExportsImages(req.adminSession, { products, selectedIds: [], mode, flash: 'Select at least one product.' }));
+  }
+
+  setSetting('last_export_img_mode', mode, req.adminSession.email);
+  const products = await getProductsForExport(ids);
+  const ts = new Date().toISOString().slice(0, 10);
+
+  res.setHeader('Content-Type', 'application/zip');
+  res.setHeader('Content-Disposition', `attachment; filename="fww-images-${ts}.zip"`);
+
+  const zip = new ZipArchive({ zlib: { level: 6 } });
+  zip.pipe(res);
+  zip.on('error', err => { console.error('zip error:', err.message); });
+
+  let totalImages = 0;
+  for (const p of products) {
+    let images = [];
+    if (mode === 'gallery') {
+      images = (p.images?.edges || []).map(e => e.node);
+      if (!images.length && p.featuredImage) images = [p.featuredImage];
+    } else {
+      if (p.featuredImage) images = [p.featuredImage];
+      else if (p.images?.edges?.length) images = [p.images.edges[0].node];
+    }
+    for (let i = 0; i < images.length; i++) {
+      const img = images[i];
+      const url = img.url || '';
+      const ext = path.extname(new URL(url, 'https://cdn.shopify.com').pathname) || '.jpg';
+      const name = mode === 'gallery'
+        ? `${p.handle}_${String(i + 1).padStart(2, '0')}${ext}`
+        : `${p.handle}${ext}`;
+      try {
+        if (MOCK) {
+          zip.append(Buffer.from(`mock image: ${url}`), { name });
+        } else {
+          const r = await fetch(url);
+          if (r.ok) {
+            const buf = Buffer.from(await r.arrayBuffer());
+            zip.append(buf, { name });
+          }
+        }
+        totalImages++;
+      } catch (err) {
+        console.error(`image fetch error ${url}:`, err.message);
+      }
+    }
+  }
+  zip.finalize();
+  logExportBatch(req.adminSession.email, 'images', products.length, totalImages, 0);
+  auditLog(req.adminSession.email, 'export:images', mode, null, { products: products.length, images: totalImages });
 });
 
 // Static

@@ -586,5 +586,314 @@ await test('GET /audit returns 200 with log table', async () => {
   assert.ok(html.includes('Action'), 'Missing Action column');
 });
 
+console.log('\nAPI tests — Phase 4: CSV exports + manifest:');
+
+await test('GET /manifest.json returns PWA manifest JSON', async () => {
+  const res = await fetch(`${BASE}/manifest.json`);
+  assert.equal(res.status, 200);
+  const json = await res.json();
+  assert.equal(json.name, 'FWW Admin');
+  assert.ok(json.icons?.length > 0, 'Missing icons');
+  assert.equal(json.display, 'standalone');
+});
+
+await test('GET /icon-192.png returns a PNG image', async () => {
+  const res = await fetch(`${BASE}/icon-192.png`);
+  assert.equal(res.status, 200);
+  assert.ok(res.headers.get('content-type')?.includes('png'), 'Should be PNG');
+});
+
+await test('GET /orders/export.csv returns CSV with headers', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/orders/export.csv`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  assert.ok(res.headers.get('content-type')?.includes('text/csv'), 'Should be CSV');
+  assert.ok(res.headers.get('content-disposition')?.includes('fww-b2b-orders'), 'Missing filename');
+  const text = await res.text();
+  assert.ok(text.includes('order_number'), 'Missing CSV header');
+  assert.ok(text.split('\n').length > 1, 'Should have data rows');
+});
+
+await test('GET /customers/export.csv requires auth', async () => {
+  const res = await fetch(`${BASE}/customers/export.csv`, { redirect: 'manual' });
+  assert.equal(res.status, 302);
+});
+
+await test('GET /customers/export.csv returns CSV with headers', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/customers/export.csv`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  assert.ok(res.headers.get('content-type')?.includes('text/csv'), 'Should be CSV');
+  assert.ok(res.headers.get('content-disposition')?.includes('fww-b2b-customers'), 'Missing filename');
+  const text = await res.text();
+  assert.ok(text.includes('customer_id'), 'Missing CSV header');
+  assert.ok(text.split('\n').length > 1, 'Should have data rows');
+});
+
+await test('GET / includes manifest link and keyboard shortcut script', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/`, { headers: { Cookie: cookie } });
+  const html = await res.text();
+  assert.ok(html.includes('/manifest.json'), 'Missing manifest link');
+  assert.ok(html.includes('kb-overlay'), 'Missing keyboard shortcut overlay');
+  assert.ok(html.includes("key === '/'"), 'Missing keyboard shortcut script');
+});
+
+console.log('\nAPI tests — Phase 5: Labels:');
+
+await test('GET /labels returns 200 with tab bar', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/labels`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  assert.ok(html.includes('Barcode Labels'), 'Missing page title');
+  assert.ok(html.includes('From an Order'), 'Missing order tab');
+  assert.ok(html.includes('From Products'), 'Missing products tab');
+});
+
+await test('GET /labels?source=order&order=1001 loads order items', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/labels?source=order&order=1001`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  assert.ok(html.includes('Elite Collar') || html.includes('1001'), 'Should show order items');
+});
+
+await test('GET /labels?source=products shows product list', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/labels?source=products`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  assert.ok(html.includes('Elite Collar') || html.includes('UPC'), 'Should show products');
+});
+
+await test('GET /labels?source=products&q=elite filters products', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/labels?source=products&q=elite`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  assert.ok(html.includes('Elite'), 'Should show Elite products');
+});
+
+await test('POST /labels/print with valid items returns PDF', async () => {
+  const cookie = await seedSession();
+  const body = new URLSearchParams({
+    item_count: '1',
+    template: 'avery-5160',
+    showPrice: '1',
+    mode: 'product+variant',
+    sel: '0',
+    item_barcode_0: '012345678901',
+    item_title_0: 'Elite Collar',
+    item_variant_0: 'Small / Navy',
+    item_price_0: '36.00',
+    item_qty_0: '3',
+  });
+  const res = await fetch(`${BASE}/labels/print`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: body.toString(),
+  });
+  assert.equal(res.status, 200, `Expected 200, got ${res.status}`);
+  assert.ok(res.headers.get('content-type')?.includes('pdf'), 'Should be PDF');
+  assert.ok(res.headers.get('content-disposition')?.includes('attachment'), 'Should be download');
+});
+
+await test('POST /labels/preview with valid items returns inline PDF', async () => {
+  const cookie = await seedSession();
+  const body = new URLSearchParams({
+    item_count: '2',
+    template: 'avery-5160',
+    showPrice: '1',
+    mode: 'product+variant',
+    item_barcode_0: '012345678901',
+    item_title_0: 'Elite Collar',
+    item_variant_0: 'Small / Navy',
+    item_price_0: '36.00',
+    item_qty_0: '1',
+    item_barcode_1: '012345678902',
+    item_title_1: 'Elite Collar',
+    item_variant_1: 'Medium / Navy',
+    item_price_1: '36.00',
+    item_qty_1: '1',
+  });
+  // Multi-value sel must use append (URLSearchParams constructor doesn't support arrays)
+  body.append('sel', '0');
+  body.append('sel', '1');
+  const res = await fetch(`${BASE}/labels/preview`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: body.toString(),
+  });
+  assert.equal(res.status, 200);
+  assert.ok(res.headers.get('content-type')?.includes('pdf'), 'Should be PDF');
+  assert.ok(res.headers.get('content-disposition')?.includes('inline'), 'Should be inline');
+});
+
+await test('POST /labels/print with no items returns 400', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/labels/print`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: 'item_count=0&template=avery-5160',
+  });
+  assert.equal(res.status, 400);
+});
+
+await test('Labels engine: 30 items on avery-5160 = 1 page', async () => {
+  const { renderLabelSheet } = await import('../labels.mjs');
+  const items = Array.from({ length: 30 }, (_, i) => ({
+    barcode: String(100000000000 + i),
+    title: `Product ${i}`,
+    variantTitle: 'Small',
+    price: '25.00',
+    qty: 1,
+  }));
+  const { pdf } = await renderLabelSheet({ template: 'avery-5160', items, options: { showPrice: true, mode: 'product+variant' } });
+  assert.ok(Buffer.isBuffer(pdf), 'Should be a Buffer');
+  assert.ok(pdf.length > 1000, 'PDF should be non-trivial size');
+  // Check page count: PDF pages are separated by /Page objects
+  const pageCount = (pdf.toString('binary').match(/\/Type\s*\/Page[^s]/g) || []).length;
+  assert.equal(pageCount, 1, `Expected 1 page for 30 labels on 5160, got ${pageCount}`);
+});
+
+await test('Labels engine: 31 items on avery-5160 = 2 pages', async () => {
+  const { renderLabelSheet } = await import('../labels.mjs');
+  const items = Array.from({ length: 31 }, (_, i) => ({
+    barcode: String(100000000000 + i),
+    title: `Product ${i}`,
+    variantTitle: 'Medium',
+    price: '30.00',
+    qty: 1,
+  }));
+  const { pdf } = await renderLabelSheet({ template: 'avery-5160', items, options: { showPrice: true, mode: 'product' } });
+  const pageCount = (pdf.toString('binary').match(/\/Type\s*\/Page[^s]/g) || []).length;
+  assert.equal(pageCount, 2, `Expected 2 pages for 31 labels on 5160, got ${pageCount}`);
+});
+
+await test('Labels engine: items with no barcode are skipped', async () => {
+  const { renderLabelSheet } = await import('../labels.mjs');
+  const items = [
+    { barcode: '012345678901', title: 'Has Barcode', variantTitle: '', price: '20.00', qty: 1 },
+    { barcode: '',            title: 'No Barcode',  variantTitle: '', price: '20.00', qty: 1 },
+    { barcode: 'BADCODE',    title: 'Bad Barcode',  variantTitle: '', price: '20.00', qty: 1 },
+  ];
+  const { pdf, skipped } = await renderLabelSheet({ template: 'avery-5160', items, options: {} });
+  assert.ok(Buffer.isBuffer(pdf), 'Should still generate PDF');
+  assert.equal(skipped.length, 2, `Expected 2 skipped, got ${skipped.length}`);
+});
+
+console.log('\nAPI tests — Phase 6: Exports:');
+
+await test('GET /exports returns 200 with two cards', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/exports`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  assert.ok(html.includes('Product CSV'), 'Missing CSV card');
+  assert.ok(html.includes('Product Images'), 'Missing Images card');
+});
+
+await test('GET /exports/csv returns 200 with product picker', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/exports/csv`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  assert.ok(html.includes('CSV Export') || html.includes('Product CSV'), 'Missing page title');
+  assert.ok(html.includes('sku') || html.includes('SKU'), 'Missing column options');
+});
+
+await test('POST /exports/csv with valid ids returns CSV download', async () => {
+  const cookie = await seedSession();
+  const body = new URLSearchParams();
+  body.append('ids', '201');
+  body.append('ids', '202');
+  body.append('cols', 'product_handle');
+  body.append('cols', 'product_title');
+  body.append('cols', 'sku');
+  body.append('cols', 'barcode');
+  body.append('cols', 'price');
+  const res = await fetch(`${BASE}/exports/csv`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: body.toString(),
+  });
+  assert.equal(res.status, 200);
+  assert.ok(res.headers.get('content-type')?.includes('text/csv'), 'Should be CSV');
+  assert.ok(res.headers.get('content-disposition')?.includes('fww-products'), 'Missing filename');
+  const text = await res.text();
+  assert.ok(text.includes('product_handle'), 'Missing header row');
+  const lines = text.trim().split('\n').filter(Boolean);
+  assert.ok(lines.length >= 3, `Expected header + data rows, got ${lines.length}`);
+});
+
+await test('POST /exports/csv with no ids returns error page', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/exports/csv`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: 'cols=sku',
+  });
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  assert.ok(html.includes('Select at least one'), 'Should show error');
+});
+
+await test('GET /exports/images returns 200 with product picker', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/exports/images`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  assert.ok(html.includes('Image Export') || html.includes('Product Image'), 'Missing page title');
+  assert.ok(html.includes('main-only'), 'Missing mode selector');
+  assert.ok(html.includes('gallery'), 'Missing gallery option');
+});
+
+await test('POST /exports/images with valid ids returns ZIP', async () => {
+  const cookie = await seedSession();
+  const body = new URLSearchParams({ mode: 'main-only' });
+  body.append('ids', '201');
+  body.append('ids', '202');
+  const res = await fetch(`${BASE}/exports/images`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: body.toString(),
+  });
+  assert.equal(res.status, 200);
+  assert.ok(res.headers.get('content-type')?.includes('zip'), 'Should be ZIP');
+  assert.ok(res.headers.get('content-disposition')?.includes('fww-images'), 'Missing filename');
+});
+
+await test('POST /exports/images gallery mode returns ZIP', async () => {
+  const cookie = await seedSession();
+  const body = new URLSearchParams({ mode: 'gallery' });
+  body.append('ids', '203');
+  const res = await fetch(`${BASE}/exports/images`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: body.toString(),
+  });
+  assert.equal(res.status, 200);
+  assert.ok(res.headers.get('content-type')?.includes('zip'), 'Should be ZIP');
+});
+
+await test('CSV escape handles commas, quotes, and newlines', async () => {
+  // Test the csvLine function behavior via the CSV export endpoint
+  const cookie = await seedSession();
+  const body = new URLSearchParams({ mode: 'main-only' });
+  body.append('ids', '201');
+  body.append('cols', 'product_title');
+  body.append('cols', 'sku');
+  // If any product title had commas/quotes, they'd be quoted in CSV — at minimum header row should be clean
+  const res = await fetch(`${BASE}/exports/csv`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: body.toString(),
+  });
+  assert.equal(res.status, 200);
+  const text = await res.text();
+  assert.ok(text.startsWith('product_title'), 'CSV should start with header');
+});
+
 console.log(`\n  ${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);

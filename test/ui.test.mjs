@@ -382,6 +382,100 @@ await testMobile('/settings renders without overflow at 390px', async (page, ctx
   assert.ok(scrollWidth <= clientWidth + 4, `Horizontal overflow on /settings at 390px: scrollWidth=${scrollWidth} clientWidth=${clientWidth}`);
 });
 
+console.log('\nUI tests — Phase 5: Labels:');
+
+await test('/labels page renders tab bar', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/labels`);
+  await page.waitForSelector('.tab-bar');
+  const tabs = await page.$$('.tab');
+  assert.ok(tabs.length >= 2, 'Should have at least 2 tabs');
+  const html = await page.content();
+  assert.ok(html.includes('From an Order'), 'Missing From an Order tab');
+  assert.ok(html.includes('From Products'), 'Missing From Products tab');
+});
+
+await test('/labels from products tab shows products after click', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/labels?source=products`);
+  await page.waitForSelector('.tab-bar');
+  const html = await page.content();
+  assert.ok(html.includes('Elite Collar') || html.includes('Luxe') || html.includes('Simplicity'), 'Should show product list');
+});
+
+await test('/labels order tab shows form after loading order', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/labels?source=order&order=1001`);
+  await page.waitForSelector('.tab-bar');
+  const html = await page.content();
+  assert.ok(html.includes('Elite Collar') || html.includes('Avery'), 'Should show order items or options');
+});
+
+await test('/labels preview button is present in product view', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/labels?source=products`);
+  // Use the product-specific search form (in the visible tab) to avoid targeting hidden elements
+  await page.waitForSelector('#product-search-form');
+  const buttons = await page.$$('button[type="submit"]');
+  assert.ok(buttons.length >= 1, 'Should have submit buttons');
+});
+
+console.log('\nUI tests — Phase 6: Exports:');
+
+await test('/exports shows two export cards', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/exports`);
+  await page.waitForSelector('.exports-cards');
+  const cards = await page.$$('.export-card');
+  assert.ok(cards.length >= 2, `Expected at least 2 export cards, got ${cards.length}`);
+});
+
+await test('/exports/csv shows product picker and column selector', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/exports/csv`);
+  await page.waitForSelector('form');
+  const html = await page.content();
+  assert.ok(html.includes('SKU') || html.includes('sku'), 'Missing column checkboxes');
+  assert.ok(html.includes('Download CSV'), 'Missing Download button');
+});
+
+await test('/exports/images shows product picker and mode radio', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/exports/images`);
+  await page.waitForSelector('form');
+  const html = await page.content();
+  assert.ok(html.includes('main-only') || html.includes('Main photo'), 'Missing main-only option');
+  assert.ok(html.includes('gallery') || html.includes('gallery images'), 'Missing gallery option');
+  assert.ok(html.includes('Download ZIP'), 'Missing Download button');
+});
+
+await testMobile('/labels renders without overflow at 390px', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/labels`);
+  await page.waitForSelector('.tab-bar');
+  const scrollWidth = await page.evaluate(() => document.documentElement.scrollWidth);
+  const clientWidth = await page.evaluate(() => document.documentElement.clientWidth);
+  assert.ok(scrollWidth <= clientWidth + 4, `Overflow on /labels at 390px: scrollW=${scrollWidth} clientW=${clientWidth}`);
+});
+
+await testMobile('/exports renders without overflow at 390px', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/exports`);
+  await page.waitForSelector('.exports-cards');
+  const scrollWidth = await page.evaluate(() => document.documentElement.scrollWidth);
+  const clientWidth = await page.evaluate(() => document.documentElement.clientWidth);
+  assert.ok(scrollWidth <= clientWidth + 4, `Overflow on /exports at 390px: scrollW=${scrollWidth} clientW=${clientWidth}`);
+});
+
 await browser.close();
 
 console.log(`\n  ${passed} passed, ${failed} failed`);

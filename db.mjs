@@ -168,3 +168,13 @@ export function getAuditLog({ limit = 100, offset = 0 } = {}) {
 export function getAuditLogCount() {
   return db.prepare('SELECT COUNT(*) as n FROM admin_audit_log').get().n;
 }
+
+export function logLabelBatch(email, template, itemCount, totalLabels) {
+  db.prepare(`INSERT INTO label_batches (email, ts, template, item_count, total_labels) VALUES (?, ?, ?, ?, ?)`)
+    .run(email, Date.now(), template, itemCount, totalLabels);
+}
+
+export function logExportBatch(email, type, productCount, rowOrImageCount, bytesOutApprox) {
+  db.prepare(`INSERT INTO export_batches (email, ts, type, product_count, row_or_image_count, bytes_out_approx) VALUES (?, ?, ?, ?, ?, ?)`)
+    .run(email, Date.now(), type, productCount, rowOrImageCount, bytesOutApprox || 0);
+}

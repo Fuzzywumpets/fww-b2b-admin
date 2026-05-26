@@ -12,7 +12,9 @@
     "node": ">=20"
   },
   "dependencies": {
+    "archiver": "^8.0.0",
     "better-sqlite3": "^11.5.0",
+    "bwip-js": "^4.10.1",
     "express": "^5.2.1",
     "pdfkit": "^0.18.0"
   },
