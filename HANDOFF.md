@@ -1018,3 +1018,261 @@ branch based on method → orchestrate the right flow.
 - alexa confirms which methods to actually build (recommend: Invoice ✓ already, Zelle next, then
   Stripe, then PayPal, then Shop Pay as cheap addition)
 - Future Phases 11A-F each ship one method when alexa has set up the corresponding merchant account
+
+## Phase 11 — REVISION (ACH-only constraint)
+
+**alexa's decision 2026-05-26:** Stripe and PayPal are only acceptable if we can RESTRICT them
+to ACH-only. Her existing Chase merchant account has much lower CC fees than Stripe (2.9%+30¢)
+or PayPal (3.49%+49¢), so any credit-card processing stays at Chase (handled out-of-band for
+now until Chase's checkout API GA).
+
+This drops several options from the earlier Phase 11 plan. Revised payment methods:
+
+### IN — methods to build (all 0–1% fees)
+
+| # | Method | Fees | Effort | Why it survives |
+|---|---|---|---|---|
+| 1 | **Invoice (NET terms)** | 0% | already partly built | direct, no third party |
+| 2 | **Zelle pseudo-flow** | 0% | ~1d | Chase Business already has Zelle |
+| 3 | **Stripe ACH** (`us_bank_account` only) | 0.8% capped at $5 | ~2d | massive savings on B2B-sized orders |
+| 4 | **PayPal Invoicing** (ACH only via invoice link) | 1% capped at $10 | ~1d | leverages existing PayPal Business |
+
+### OUT — methods to NOT build
+
+- ❌ **Stripe Payment Element with cards** — would default to CC; we'd be paying 2.9% instead of Chase's lower rate
+- ❌ **Apple Pay / Google Pay** — these tokenize a credit card. Same problem.
+- ❌ **PayPal Checkout** (regular) — defaults to CC fallback if PayPal balance is insufficient
+- ❌ **Shop Pay** — runs through Shopify Payments at 2.9%+30¢, not Chase
+- ❌ **Amazon Pay** — CC-based
+- ❌ **Chase Payment Solutions** — still deferred (no GA merchant API)
+
+### How to actually constrain Stripe to ACH only
+
+Set up the PaymentIntent with explicit method restriction. Stripe's API:
+
+```js
+const intent = await stripe.paymentIntents.create({
+  amount: cents,
+  currency: 'usd',
+  payment_method_types: ['us_bank_account'],          // EXPLICIT: only ACH
+  payment_method_options: {
+    us_bank_account: {
+      verification_method: 'instant',                  // Plaid/Financial Connections (instant)
+      financial_connections: { permissions: ['payment_method'] }
+    }
+  },
+});
+```
+
+On the front-end, Stripe Elements (`paymentElement` with `paymentMethodTypes: ['us_bank_account']`)
+renders ONLY the bank-account flow — no card field visible at all. Customer connects bank via
+Stripe's Plaid integration (Financial Connections), authorizes the debit, and we capture.
+
+ACH verifications take 1-2 business days unless using Stripe's Financial Connections (then it's
+instant). Either way the order can be created on submit with `financialStatus=PENDING` until
+the bank transfer settles.
+
+### How to actually constrain PayPal to ACH only
+
+This is harder. PayPal Checkout's standard JS button always includes card fallback. **The
+workaround is to skip PayPal Checkout entirely and use PayPal Invoicing.**
+
+PayPal Invoicing flow:
+1. Customer hits "Pay via PayPal Invoice" at checkout
+2. Our server creates a Shopify draft order (financialStatus=PENDING)
+3. Our server calls PayPal Invoicing API: `POST /v2/invoicing/invoices` to generate an invoice
+4. PayPal emails the customer (or we can show the invoice link in-app)
+5. Customer opens the PayPal invoice and selects "Pay by bank" → 1% capped $10
+6. We webhook on `INVOICING.INVOICE.PAID` → mark Shopify order PAID
+
+The customer CAN still pay the PayPal invoice with a card, BUT the prominent option on PayPal's
+invoice page is "Pay by bank" (ACH). To strongly steer them: include a note in the invoice
+description saying "ACH bank transfer preferred to save processing fees."
+
+### How to actually constrain Zelle (already inherently 0%)
+
+No changes needed — Zelle is peer-to-peer 0%. The pseudo-flow remains: customer selects Zelle,
+sees instructions, manually pays to wholesale@fuzzywumpets.com, alexa marks paid in admin.
+
+### Revised checkout UI
+
+```
+┌─ Payment method ─────────────────────────────────────────┐
+│  ◯ Pay later (invoice)                NET 30 default     │ ← if allow_order_on_invoice
+│  ◯ Zelle                              free, manual        │
+│  ◯ Bank transfer (Stripe ACH)         0.8% capped $5      │
+│  ◯ PayPal Invoice (ACH)               1% capped $10       │
+│                                                            │
+│  Cards: please contact us — wholesale@fuzzywumpets.com    │
+└────────────────────────────────────────────────────────────┘
+```
+
+(The fee labels visible to the customer can be hidden — that's internal info. UI just shows the
+method names.)
+
+### Setup needed (alexa)
+
+1. **Zelle** — already done
+2. **Stripe account** — sign up at https://stripe.com/register (~10 min). Tell me when done; I'll
+   grab pk/sk and push to Doppler. Enable **Financial Connections** in dashboard for instant
+   bank verification (free).
+3. **PayPal Developer app** — your PayPal Business has Invoicing built in; just need REST API
+   client_id+secret from https://developer.paypal.com → My Apps. (~10 min)
+
+### Acceptance for revised Phase 11
+
+- 4 payment methods visible at checkout (when their merchant setup is done)
+- Stripe ACH option only shows bank-account flow (no card UI ever)
+- PayPal Invoicing option creates a PayPal invoice and links the customer to pay
+- All methods create the Shopify order with appropriate financial status
+- Webhook handling for Stripe + PayPal sets order to PAID once funds settle
+- Cards stay routed to Chase out-of-band — UI explicitly tells the customer to contact for CC
+
+## Phase 12 — Prompt-pay discount + Zelle auto-reconciliation
+
+Two related additions to the payment system from Phase 11 (revised).
+
+### 12A — 3% prompt-pay discount
+
+Encourage customers to pay immediately via low-fee methods (Stripe ACH or Zelle) instead of
+taking the NET-30 invoice. The discount is conditional on BOTH:
+- Payment completes upon order (not deferred / invoiced)
+- Method is **Stripe ACH** OR **Zelle**
+
+(Specifically NOT: invoice/NET, PayPal Invoicing where payment lands later via email link, or
+any future card method. The discount is for IMMEDIATE pay-at-checkout via low-fee rails only.)
+
+#### Settings
+
+In `/settings`, add two fields:
+
+- **`prompt_pay_discount_pct`** (integer, default 3) — the percent off subtotal
+- **`prompt_pay_enabled`** (boolean, default true) — global toggle
+
+In `/customers/:id` B2B Settings (Phase 10's section), add ONE optional override:
+
+- **`block_prompt_pay_discount`** (boolean override, default unset → inherits global setting) —
+  use case: customer is on bad terms / abusing the discount → admin turns it off for them.
+  Persisted as metafield `b2b.block_prompt_pay_discount`.
+
+#### Checkout UX
+
+When the customer picks "Bank transfer (Stripe ACH)" or "Zelle" at checkout, the order total
+updates dynamically to show:
+
+```
+Subtotal:                          $1,250.00
+Prompt-pay discount (3%):           −$37.50
+Total:                             $1,212.50
+```
+
+For Invoice / NET / PayPal Invoicing methods, the discount line disappears and total returns
+to subtotal.
+
+A help tooltip next to the discount line: "Save 3% by paying immediately via ACH or Zelle.
+Available on bank transfers and Zelle only."
+
+#### Server logic
+
+When the order is created (`POST /api/checkout`), compute:
+
+```js
+const eligible = settings.prompt_pay_enabled
+              && !customer.block_prompt_pay_discount
+              && (method === 'stripe_ach' || method === 'zelle');
+const discountPct = eligible ? settings.prompt_pay_discount_pct : 0;
+const discountAmount = subtotal * (discountPct / 100);
+```
+
+Apply as a Shopify discount line on the order (use `draftOrderCreate` with
+`appliedDiscount: { value: discountPct, valueType: 'PERCENTAGE', title: 'Prompt-pay (ACH/Zelle)' }`).
+
+**Critical for Zelle**: the discount is applied OPTIMISTICALLY at order creation, but the order
+is `financialStatus=PENDING` until Zelle is verified. If Zelle never arrives within the
+reservation window (default 72 hours), the order gets voided entirely — discount goes away with
+it. No "remove the discount but keep the order" partial state.
+
+For Stripe ACH: same optimism. Order pending until ACH settles (instant via Financial
+Connections, otherwise 1-2 business days). If ACH fails, order voids.
+
+#### Tests
+
+- Customer picks Stripe ACH → discount applied
+- Customer picks Zelle → discount applied
+- Customer picks Invoice → no discount
+- Customer picks PayPal Invoicing → no discount
+- Customer with `block_prompt_pay_discount=true` → no discount on any method
+- Settings discount = 5 → applies 5% instead of default 3%
+- Settings `prompt_pay_enabled=false` → no discount for anyone
+
+---
+
+### 12B — Zelle auto-reconciliation via Gmail (extend bill scanner)
+
+#### The problem
+
+Zelle has no merchant API, webhook, or reconciliation endpoint. The order arrives unpaid; alexa
+has to check Chase manually and mark paid. That's friction we can remove.
+
+#### The solution
+
+**Chase sends an email to your business email every time a Zelle payment hits.** Your existing
+`fww-bill-scanner` project on fww-vps-1 already watches Gmail + processes structured data from
+emails via Claude. Extend it (or build a sibling) to watch for Zelle-receipt emails and
+auto-mark matching b2b orders paid.
+
+#### How it works
+
+1. Customer places order at b2b portal, picks Zelle → order created with:
+   - `financialStatus: PENDING`
+   - `tag: payment:zelle-pending`
+   - `note: "Awaiting Zelle from {customer.email}, expected $XXX.XX, order #YYYY"`
+2. Customer goes to their bank app, sends Zelle to `wholesale@fuzzywumpets.com` (or whatever
+   alias alexa picks). Memo: `Order #YYYY`.
+3. Chase sends an email: *"You received a Zelle payment of $XXX.XX from {customer name}"*.
+4. fww-bill-scanner Gmail watcher catches the email (subject pattern: `received a Zelle payment`).
+5. Claude parses: amount, sender name+email, memo (extract order #), date.
+6. Watcher calls b2b-admin: `POST /api/admin/zelle/reconcile` with the parsed payload.
+7. b2b-admin queries pending orders tagged `payment:zelle-pending` with matching amount +
+   (if memo had order #) matching order name.
+8. Match found → mark order `PAID` via `orderMarkAsPaid` mutation → add note "Auto-reconciled
+   from Zelle email at {ts}" → audit-log.
+9. No match → escalate: tag the Zelle email "needs-review" and add to a `/admin/zelle/unmatched`
+   queue for alexa to manually reconcile.
+
+#### What changes in each codebase
+
+**fww-bill-scanner** (existing project at `~/projects/fww-bill-scanner` on VPS):
+- Add new email handler: `chase-zelle-handler.mjs`
+- Subject filter: regex match on Chase's Zelle-received subject template (sample needed; alexa
+  can forward a recent Zelle-received email so we know the exact format)
+- Claude prompt: extract { amount_usd, sender_name, sender_email, memo, received_at }
+- POST result to `https://b2badmin.fuzzywumpets.com/api/admin/zelle/reconcile` with shared
+  bearer token (new Doppler secret `B2B_ADMIN_ZELLE_RECONCILE_TOKEN`)
+
+**fww-b2b-admin**:
+- New endpoint: `POST /api/admin/zelle/reconcile` (bearer auth, not Google OAuth — server-to-
+  server from bill scanner)
+- Matching logic: scan SQLite `orders_log` (or Shopify directly) for orders with tag
+  `payment:zelle-pending`, financialStatus PENDING, and (a) amount matches within ±$0.50,
+  AND (b) if memo included order #, that takes priority
+- On match: call `orderMarkAsPaid` via shopify-bridge, update tag from `pending` to `received`,
+  add note, audit-log
+- On no match / multiple ambiguous matches: respond 200 with `{ status: 'queued_for_review' }`
+  + insert into `zelle_unmatched` SQLite table for `/admin/zelle/unmatched` review page
+
+#### Build sequence
+
+1. **First**: alexa forwards a recent Chase Zelle-received email so we know the exact subject
+   + body format
+2. **Second**: extend bill-scanner with the new handler (~half day)
+3. **Third**: add /api/admin/zelle/reconcile + admin queue page (~half day)
+4. **Fourth**: end-to-end test — send yourself a small Zelle, verify auto-reconcile
+
+#### Acceptance for Phase 12B
+
+- A Zelle payment lands in Chase → email arrives → within 5 min, matching b2b order is
+  auto-marked paid in admin with note "Auto-reconciled from Zelle email"
+- Unmatched Zelle payments show up at `/admin/zelle/unmatched` for manual review (alexa picks
+  the matching order, clicks "Reconcile to this order")
+- alexa never has to manually mark a Zelle order paid in the happy path
