@@ -1,56 +1,48 @@
 # fww-b2b-admin — overnight status
 STATE: IN_PROGRESS
-PHASE: 19B + 19C + 16 — hyperlinks, product detail, order editing
-LAST_UPDATED: 2026-05-27T04:00:00Z
+PHASE: 18 — Xero accounting integration
+LAST_UPDATED: 2026-05-27T05:30:00Z
 
 ## What shipped this session
-- Phase 19B: Universal hyperlinks
-  — Tag chips in customer list are clickable links → /customers?tag=X
-  — Audit log email column is mailto: link
-  — Audit log GID targets (gid://shopify/Order/*, Customer/*) link to detail pages
-  — Lead targets link to /leads/:id
-- Phase 19C: Product detail page /products/:id
-  — Fetches product from Shopify (or MOCK_PRODUCTS in mock mode)
-  — Shows: variants table (SKU, barcode, price, inventory), tags, publication status,
-    related orders, image gallery thumbnails, Edit in Shopify deep link
-  — /catalog/:id now redirects to /products/:id
-  — Order detail line item titles link to /products/:id (resolved from variant.product.id
-    or mock MOCK_VARIANT_PRODUCT lookup map)
-- Phase 16: Admin order editing
-  — 16A: Edit order mode — "Edit order" button activates qty inputs + Remove buttons per line;
-    POST /orders/:id/edit via orderEditBegin/commit (real mode) or mockOrderOverrides (mock)
-  — 16B: Order discount modal — percentage or fixed, reason required;
-    POST /orders/:id/discount
-  — 16C: Partial fulfillment modal — per-line checkboxes + qty, carrier + tracking number;
-    POST /orders/:id/fulfill → fulfillmentCreate mutation (real) or mock override
-  — 16D: Backorder flag — per-line "Backorder" button (visible in edit mode), ETA date;
-    POST /orders/:id/backorder saves to SQLite backorders table; badge on line item if active;
-    GET /api/orders/:id/backorders returns JSON
-  — SQLite: backorders + order_edit_log tables; new db helper functions
-  — express.urlencoded extended:true to correctly parse bracket-notation form fields
-- Tests: 151 API + 57 UI = 208 total, all green
+- Phase 18: Xero accounting integration
+  — xero_invoice_map + xero_pending_actions SQLite tables + 8 helper functions
+  — xeroRequest() bridge helper (mock: stubs Contacts/Invoices/Payments/Accounts endpoints)
+  — ensureXeroContact(), createXeroInvoice(), recordXeroPayment() core logic
+  — retryXeroPending() with 3x retry cap; syncOrderToXero() on-demand
+  — GET/POST /settings/xero: account code mapping (sales_revenue, A/R, chase_checking,
+    stripe_clearing, processing_fees, discounts, payment_terms_days)
+  — GET /accounting: reconciliation view (invoice map + pending retry queue + counts)
+  — POST /api/admin/xero/test: connection test, returns account count
+  — POST /api/admin/xero/sync: manual retry trigger for pending actions
+  — POST /orders/:id/xero/sync: per-order Xero invoice sync button
+  — mark-paid route: non-blocking async Xero payment record (queue on failure)
+  — Order detail: Xero sidebar card (synced/retry-queued/not-synced states)
+  — "Accounting" added to header nav
+  — 10 new API tests + 4 new UI tests
 
 ## What's working (URLs)
-- https://b2badmin.fuzzywumpets.com (all phases 1–14 + 16 + 17 + 19A–C + 19E + 20)
+- https://b2badmin.fuzzywumpets.com (all phases 1–20)
+- /accounting — Xero reconciliation view (synced orders, pending retries, counts)
+- /settings/xero — account code mapping + connection test button
+- /orders/:id — Xero sidebar card + "Sync to Xero" button in action bar
+- /orders/:id/xero/sync — creates Xero AUTHORISED invoice for any order
+- mark-paid → auto-triggers Xero payment recording (non-blocking)
 - /products/:id — product detail page with variants, publications, related orders
 - /orders/:id — edit mode (qty/remove/add), discount modal, fulfill modal, backorder per line
 - /leads — wholesale leads pipeline with status workflow
-- /leads/new — create new lead
-- /leads/:id — lead detail with timeline, status change, notes, convert to customer
 - /customers — sorted by lifetime spend, star badges, clickable tag chips
 - /customers/:id — Spend section with date range + orders list
-- /audit — audit log with mailto: email links + GID target links to order/customer detail
 - /catalog — status filter chips (Active default, Draft, Archived, All)
 - /tax-exempt — pending tax cert review queue with approve/reject
 - https://b2b.fuzzyreporting.com/checkout — 3 payment methods
 - https://b2b.fuzzyreporting.com/account — stock alerts + tax cert + portal activity
 
 ## Test status
-- Admin API:  151/151
-- Admin UI:    57/57
+- Admin API:  161/161
+- Admin UI:    61/61
 - Portal API: 114/114 (separate repo)
 - Portal UI:   39/39 (separate repo)
-- Total: 361 green
+- Total: 375 green
 
 ## Phases completed
 - Phase 0: Research + scaffold
@@ -64,31 +56,50 @@ LAST_UPDATED: 2026-05-27T04:00:00Z
 - Phase 9+10: Broaden order/customer scope + unified B2B settings
 - Phase 13: Final payment spec (ACH + Chase stub, portal side)
 - Phase 14: Customer self-service additions (admin side: tax-exempt review, visible notes)
-- Phase 16: Admin order editing (edit lines, discount, partial fulfillment, backorder) ← NEW
+- Phase 16: Admin order editing (edit lines, discount, partial fulfillment, backorder)
 - Phase 17: Wholesale leads CRM
+- Phase 18: Xero accounting integration ← NEW
 - Phase 19A: Customer spend section on /customers/:id
-- Phase 19B: Universal hyperlinks (tag chips, audit log GID links, mailto) ← NEW
-- Phase 19C: Product detail page /products/:id ← NEW
+- Phase 19B: Universal hyperlinks (tag chips, audit log GID links, mailto)
+- Phase 19C: Product detail page /products/:id
 - Phase 19E: Catalog tab product status filter
 - Phase 20: Priority customer onboarding + Companies research
 
 ## Phases remaining (spec in HANDOFF.md, code not yet built)
 - Phase 15: Customer-specific catalogs (per-customer private tags) + multi-user team accounts
-- Phase 18: Xero accounting integration
 - Phase 19D: Persistent cart (b2b portal cross-repo)
 - Phase 16E: Billing alignment with partial fulfillment (partial invoices with letter suffix)
 
+## Xero integration details (for alexa)
+- Bridge: https://fww-xero-bridge.alex-037.workers.dev/xero (XERO_BRIDGE_BEARER in Doppler ✓)
+- Trigger: admin marks an order paid → Xero payment auto-recorded (non-blocking)
+- Manual: any order detail page → "Sync to Xero" button → creates AUTHORISED invoice
+- Account codes: defaults are 200/610/1110/1120/6100/400 — configure at /settings/xero
+- Failures: queued in xero_pending_actions; retry at /accounting → "Retry pending actions"
+- Connection test: /settings/xero → "Test connection" button → shows account count
+
 ## Next iteration's plan
-Phase 18 (Xero accounting integration — high business value):
-  — xero_invoice_map SQLite table
-  — /api/admin/xero/* endpoints (order placed → invoice, payment → Xero payment)
-  — Settings page /settings/xero with account mapping UI
-  — Trigger on order mark-paid → Xero payment record
-  — Accounting reconciliation view /admin/accounting
-Phase 15 (customer-specific catalogs + team accounts) if Phase 18 is complex
+Phase 15 (customer-specific catalogs + multi-user team accounts):
+  15A: catalog_access_tags per-customer metafield
+      — admin: chip-style multi-select on /customers/:id B2B Settings
+      — portal: filter catalog per customer's access tags
+      — private tag list in /admin/settings
+  15B: multi-user team accounts (magic-link invite flow)
+      — companies + company_users + magic_link_codes SQLite tables
+      — POST /account/team/invite (primary user sends email invite)
+      — GET /team-login?email=&token= (invitee clicks link → session)
+      — POST /team-login (future logins: email + 6-digit code)
+      — Session carries company_id; orders attributed to primary customer
+
+OR Phase 16E (partial invoices):
+  — Partial invoice (fulfilled items only), letter suffix (#1234-A, #1234-B)
+  — partial_invoices SQLite table
+  — "Generate invoice for fulfilled items only" mode on /orders/:id
 
 ## Blockers / decisions alexa needs to make
 - Email (Resend): B2B_PORTAL_RESEND_API_KEY not set → emails log to console
   Signup at resend.com (free 100/day), add as B2B_PORTAL_RESEND_API_KEY to Doppler
 - Stripe webhook: point https://b2b.fuzzyreporting.com/api/webhooks/stripe in Stripe dashboard
 - Chase API: stub only — will go live when Chase merchant API ships
+- Xero: account codes default to 200/610/1110/1120/6100/400 — verify these match your Xero COA
+  Then test via /settings/xero → "Test connection"

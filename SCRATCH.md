@@ -190,6 +190,37 @@ fww-b2b-admin/
 ## Append below this line, future iterations
 ---
 
+## Phase 18 complete (2026-05-27)
+
+### Xero bridge
+- URL: `https://fww-xero-bridge.alex-037.workers.dev/xero`
+- Bearer: XERO_BRIDGE_BEARER in Doppler (confirmed present)
+- Request format: `POST bridge-url` with body `{ method, path, body }` (no `query` param needed)
+- Response: `{ ok: boolean, body: { Contacts/Invoices/Payments/Accounts... } }`
+
+### Xero API operations
+- Create/upsert contact: `PUT /api.xro/2.0/Contacts` with `{ Contacts: [{Name, EmailAddress}] }`
+- Create AUTHORISED invoice: `PUT /api.xro/2.0/Invoices` with full LineItems array, Status: 'AUTHORISED'
+- Record payment: `PUT /api.xro/2.0/Payments` with `{ Payments: [{Invoice:{InvoiceID}, Account:{Code}, Date, Amount}] }`
+- Fetch accounts (test): `GET /api.xro/2.0/Accounts` → `{ Accounts: [{Code, Name, Type, AccountID}] }`
+
+### Xero integration flow
+1. mark-paid: async non-blocking → createXeroInvoice (if not synced) → recordXeroPayment
+2. On order detail: "Sync to Xero" button → POST /orders/:id/xero/sync
+3. Failures queued in xero_pending_actions (max 3 retries)
+4. Retry: /accounting → "Retry pending actions" OR POST /api/admin/xero/sync
+
+### Account code defaults (configured in /settings/xero, stored as admin_settings keys)
+- xero_sales_revenue = "200"
+- xero_accounts_receivable = "610"  
+- xero_chase_checking = "1110"
+- xero_stripe_clearing = "1120"
+- xero_processing_fees = "6100"
+- xero_discounts = "400"
+- xero_payment_terms_days = "30"
+
+### Next: Phase 15 or Phase 16E
+
 ## Phase 19B + 19C + 16 complete (2026-05-27)
 
 ### Phase 19B: Universal hyperlinks
