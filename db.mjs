@@ -78,6 +78,50 @@ db.exec(`
     row_or_image_count INTEGER DEFAULT 0,
     bytes_out_approx INTEGER DEFAULT 0
   );
+
+  CREATE TABLE IF NOT EXISTS leads (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    email TEXT UNIQUE NOT NULL,
+    business_name TEXT,
+    contact_name TEXT,
+    phone TEXT,
+    website TEXT,
+    business_type TEXT,
+    estimated_monthly_volume_usd INTEGER,
+    source TEXT,
+    source_detail TEXT,
+    status TEXT NOT NULL DEFAULT 'new',
+    application_data_json TEXT,
+    sales_tax_state TEXT,
+    sales_tax_id TEXT,
+    custom_tags TEXT,
+    assigned_to TEXT,
+    next_followup_due TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    converted_at INTEGER,
+    shopify_customer_id TEXT,
+    rejected_reason TEXT
+  );
+
+  CREATE TABLE IF NOT EXISTS lead_notes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    lead_id INTEGER REFERENCES leads(id),
+    author_email TEXT NOT NULL,
+    body TEXT NOT NULL,
+    note_type TEXT NOT NULL DEFAULT 'general',
+    created_at INTEGER NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS lead_status_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    lead_id INTEGER REFERENCES leads(id),
+    from_status TEXT,
+    to_status TEXT NOT NULL,
+    note TEXT,
+    changed_by TEXT,
+    changed_at INTEGER NOT NULL
+  );
 `);
 
 export default db;
@@ -177,4 +221,81 @@ export function logLabelBatch(email, template, itemCount, totalLabels) {
 export function logExportBatch(email, type, productCount, rowOrImageCount, bytesOutApprox) {
   db.prepare(`INSERT INTO export_batches (email, ts, type, product_count, row_or_image_count, bytes_out_approx) VALUES (?, ?, ?, ?, ?, ?)`)
     .run(email, Date.now(), type, productCount, rowOrImageCount, bytesOutApprox || 0);
+}
+
+// ── Wholesale leads ────────────────────────────────────────────────────────────
+
+export function createLead(fields) {
+  const now = Date.now();
+  const r = db.prepare(`
+    INSERT INTO leads (email, business_name, contact_name, phone, website, business_type,
+      estimated_monthly_volume_usd, source, source_detail, status, custom_tags,
+      assigned_to, next_followup_due, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', ?, ?, ?, ?, ?)
+  `).run(
+    fields.email, fields.business_name || null, fields.contact_name || null,
+    fields.phone || null, fields.website || null, fields.business_type || null,
+    fields.estimated_monthly_volume_usd ? parseInt(fields.estimated_monthly_volume_usd, 10) : null,
+    fields.source || null, fields.source_detail || null,
+    fields.custom_tags || null, fields.assigned_to || null,
+    fields.next_followup_due || null, now, now
+  );
+  return r.lastInsertRowid;
+}
+
+export function getLeads({ status, search, limit = 100, offset = 0 } = {}) {
+  let where = '1=1';
+  const params = [];
+  if (status && status !== 'all') { where += ' AND status = ?'; params.push(status); }
+  if (search) {
+    where += ' AND (email LIKE ? OR business_name LIKE ? OR contact_name LIKE ?)';
+    const like = `%${search}%`;
+    params.push(like, like, like);
+  }
+  return db.prepare(`SELECT * FROM leads WHERE ${where} ORDER BY updated_at DESC LIMIT ? OFFSET ?`)
+    .all(...params, limit, offset);
+}
+
+export function getLeadCounts() {
+  const rows = db.prepare(`SELECT status, COUNT(*) as n FROM leads GROUP BY status`).all();
+  const counts = {};
+  for (const r of rows) counts[r.status] = r.n;
+  return counts;
+}
+
+export function getLead(id) {
+  return db.prepare('SELECT * FROM leads WHERE id = ?').get(id) || null;
+}
+
+export function updateLead(id, fields) {
+  const allowed = ['email','business_name','contact_name','phone','website','business_type',
+    'estimated_monthly_volume_usd','source','source_detail','status','custom_tags',
+    'assigned_to','next_followup_due','converted_at','shopify_customer_id','rejected_reason'];
+  const sets = [];
+  const vals = [];
+  for (const [k, v] of Object.entries(fields)) {
+    if (allowed.includes(k)) { sets.push(`${k} = ?`); vals.push(v); }
+  }
+  if (!sets.length) return;
+  sets.push('updated_at = ?');
+  vals.push(Date.now(), id);
+  db.prepare(`UPDATE leads SET ${sets.join(', ')} WHERE id = ?`).run(...vals);
+}
+
+export function addLeadNote(leadId, authorEmail, body, noteType = 'general') {
+  return db.prepare(`INSERT INTO lead_notes (lead_id, author_email, body, note_type, created_at) VALUES (?, ?, ?, ?, ?)`)
+    .run(leadId, authorEmail, body, noteType, Date.now()).lastInsertRowid;
+}
+
+export function getLeadNotes(leadId) {
+  return db.prepare('SELECT * FROM lead_notes WHERE lead_id = ? ORDER BY created_at ASC').all(leadId);
+}
+
+export function addLeadStatusHistory(leadId, fromStatus, toStatus, note, changedBy) {
+  db.prepare(`INSERT INTO lead_status_history (lead_id, from_status, to_status, note, changed_by, changed_at) VALUES (?, ?, ?, ?, ?, ?)`)
+    .run(leadId, fromStatus || null, toStatus, note || null, changedBy || null, Date.now());
+}
+
+export function getLeadStatusHistory(leadId) {
+  return db.prepare('SELECT * FROM lead_status_history WHERE lead_id = ? ORDER BY changed_at ASC').all(leadId);
 }

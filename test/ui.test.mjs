@@ -598,6 +598,68 @@ await test('/customers shows star badge on top-spend customer', async (page, ctx
   assert.ok(html.includes('top-customer-star'), 'Top customer star badge missing');
 });
 
+// ── Phase 19A: Customer spend section ─────────────────────────────────────────
+console.log('\nUI tests — Phase 19A: Customer spend section:');
+
+await test('/customers/:id shows Spend section with date range selector', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/customers/101`);
+  await page.waitForSelector('#spend-card');
+  const html = await page.content();
+  assert.ok(html.includes('spend-card'), 'Spend card missing');
+  assert.ok(html.includes('spend-preset'), 'Date range dropdown missing');
+});
+
+await test('/customers/:id spend section loads range data via AJAX', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/customers/101`);
+  await page.waitForSelector('#spend-card');
+  await page.waitForFunction(() => {
+    const loading = document.getElementById('spend-loading');
+    return loading && loading.style.display === 'none';
+  }, { timeout: 5000 });
+  const rangeTotal = await page.$eval('#spend-range-total', el => el.textContent);
+  assert.ok(rangeTotal !== '—', 'Range total should be populated after AJAX load: ' + rangeTotal);
+});
+
+// ── Phase 17: Wholesale Leads CRM UI ──────────────────────────────────────────
+console.log('\nUI tests — Phase 17: Wholesale leads CRM:');
+
+await test('/leads nav link is present in header', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/`);
+  await page.waitForSelector('.header-nav');
+  const html = await page.content();
+  assert.ok(html.includes('/leads') && html.includes('Leads'), 'Leads nav link missing');
+});
+
+await test('/leads page renders with status filter chips', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/leads`);
+  await page.waitForSelector('.page-header-row');
+  const html = await page.content();
+  assert.ok(html.includes('Wholesale Leads'), 'Page title missing');
+  assert.ok(html.includes('filter-chip'), 'Status filter chips missing');
+});
+
+await test('/leads/new form creates a lead and redirects to detail', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/leads/new`);
+  await page.waitForSelector('form');
+  await page.fill('input[name="email"]', `ui-test-${Date.now()}@example.com`);
+  await page.fill('input[name="business_name"]', 'UI Test Boutique');
+  await page.click('button[type="submit"]');
+  await page.waitForURL(/\/leads\/\d+/);
+  const html = await page.content();
+  assert.ok(html.includes('UI Test Boutique'), 'Business name missing after create');
+  assert.ok(html.includes('Activity'), 'Activity section missing');
+});
+
 await browser.close();
 
 console.log(`\n  ${passed} passed, ${failed} failed`);

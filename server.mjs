@@ -20,6 +20,8 @@ import {
   getCustomerNotes, setCustomerNotes, getDropshipCache, setDropshipCache,
   getSetting, setSetting, getGlobalSettings, getAuditLog, getAuditLogCount,
   logLabelBatch, logExportBatch,
+  createLead, getLeads, getLeadCounts, getLead, updateLead,
+  addLeadNote, getLeadNotes, addLeadStatusHistory, getLeadStatusHistory,
 } from './db.mjs';
 import { generateInvoicePdf } from './pdf.mjs';
 import { renderLabelSheet, expandItems, TEMPLATES as LABEL_TEMPLATES, DEFAULT_FIELDS } from './labels.mjs';
@@ -516,7 +518,7 @@ function gfonts() {
 function layout({ title, session, activePath = '/', content, extraHead = '' }) {
   const navItems = [
     ['/', 'Dashboard'], ['/orders', 'Orders'], ['/customers', 'Customers'],
-    ['/catalog', 'Catalog'], ['/reports', 'Reports'],
+    ['/leads', 'Leads'], ['/catalog', 'Catalog'], ['/reports', 'Reports'],
     ['/labels', 'Labels'], ['/exports', 'Exports'],
     ['/tax-exempt', 'Tax Exempt'],
     ['/settings', 'Settings'],
@@ -1627,7 +1629,32 @@ function renderCustomerDetail(session, customer, recentOrders, notes, _dropshipC
        ${h(addr.city||'')}, ${h(addr.province||'')} ${h(addr.zip||'')}<br>${h(addr.country||'')}`
     : '<span class="text-muted">No address on file</span>';
 
-  return layout({ title: customer.displayName || 'Customer', session, activePath: '/customers', content: `
+  // Date range presets for spend section
+  const now    = new Date();
+  const ymd    = d => d.toISOString().split('T')[0];
+  const daysAgo = n => { const d = new Date(now); d.setDate(d.getDate() - n); return d; };
+  const spendPresets = [
+    { label: 'Last 7 days',    from: ymd(daysAgo(7)),   to: ymd(now) },
+    { label: 'Last 30 days',   from: ymd(daysAgo(30)),  to: ymd(now) },
+    { label: 'Last 90 days',   from: ymd(daysAgo(90)),  to: ymd(now) },
+    { label: 'Last 12 months', from: ymd(daysAgo(365)), to: ymd(now) },
+    { label: 'Year to date',   from: `${now.getFullYear()}-01-01`, to: ymd(now) },
+    { label: 'All time',       from: '2000-01-01', to: ymd(now) },
+  ];
+
+  return layout({ title: customer.displayName || 'Customer', session, activePath: '/customers',
+    extraHead: `<style>
+      .spend-header{display:flex;align-items:baseline;gap:1rem;flex-wrap:wrap;margin-bottom:0.75rem;}
+      .spend-lifetime{font-size:1.5rem;font-weight:700;color:#000;}
+      .spend-count{color:#666;font-size:0.9rem;}
+      .spend-range-bar{display:flex;align-items:center;gap:0.5rem;margin-bottom:0.75rem;}
+      .spend-range-totals{display:flex;gap:2rem;margin-bottom:0.75rem;padding:0.5rem 0.75rem;background:#f8f9fa;border-radius:6px;}
+      .spend-range-stat{display:flex;flex-direction:column;}
+      .spend-range-val{font-size:1.1rem;font-weight:700;}
+      .spend-range-lbl{font-size:0.78rem;color:#666;}
+      #spend-orders-body tr.voided{opacity:0.5;text-decoration:line-through;}
+    </style>`,
+    content: `
     <div class="breadcrumb-row"><a href="/customers" class="breadcrumb">← Customers</a></div>
     ${flashHtml}
     <div class="detail-header">
@@ -1641,6 +1668,93 @@ function renderCustomerDetail(session, customer, recentOrders, notes, _dropshipC
     </div>
     <div class="detail-grid">
       <div class="detail-main">
+
+        <!-- Phase 19A: Spend section -->
+        <div class="card" id="spend-card">
+          <div class="card-header"><h2>Spend</h2></div>
+          <div class="spend-header">
+            <span class="spend-lifetime">${fmtMoney(customer.amountSpent?.amount, customer.amountSpent?.currencyCode)}</span>
+            <span class="spend-count">lifetime · ${customer.numberOfOrders || 0} orders</span>
+          </div>
+          <div class="spend-range-bar">
+            <label for="spend-preset" style="font-size:0.85rem;color:#555">Show spend for:</label>
+            <select id="spend-preset" class="input input-sm" style="width:auto">
+              ${spendPresets.map((p, i) => `<option value="${h(p.from)}|${h(p.to)}"${i === 1 ? ' selected' : ''}>${h(p.label)}</option>`).join('')}
+              <option value="custom">Custom range…</option>
+            </select>
+            <span id="spend-custom-row" style="display:none;gap:0.35rem;align-items:center">
+              <input type="date" id="spend-from" class="input input-sm">
+              <span>to</span>
+              <input type="date" id="spend-to" class="input input-sm">
+              <button id="spend-custom-go" class="btn btn-secondary btn-sm">Go</button>
+            </span>
+          </div>
+          <div id="spend-range-totals" class="spend-range-totals">
+            <div class="spend-range-stat"><span class="spend-range-val" id="spend-range-total">—</span><span class="spend-range-lbl">in range</span></div>
+            <div class="spend-range-stat"><span class="spend-range-val" id="spend-range-count">—</span><span class="spend-range-lbl">orders</span></div>
+          </div>
+          <div id="spend-orders-wrap">
+            <table class="mini-table" id="spend-orders-table" style="display:none">
+              <thead><tr><th>Order</th><th>Date</th><th class="text-right">Amount</th><th>Status</th><th></th></tr></thead>
+              <tbody id="spend-orders-body"></tbody>
+            </table>
+            <p id="spend-empty" class="text-muted small-text" style="display:none">No orders in this date range.</p>
+            <p id="spend-loading" class="text-muted small-text">Loading…</p>
+          </div>
+        </div>
+        <script>
+        (function(){
+          var custId = ${JSON.stringify(numId)};
+          var preset = document.getElementById('spend-preset');
+          var customRow = document.getElementById('spend-custom-row');
+          var fromIn = document.getElementById('spend-from');
+          var toIn   = document.getElementById('spend-to');
+          var goBtn  = document.getElementById('spend-custom-go');
+          function fmtMoney(n){ return '$' + parseFloat(n).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}); }
+          function fmtDate(s){ return new Date(s).toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'}); }
+          function loadSpend(from, to){
+            document.getElementById('spend-loading').style.display='';
+            document.getElementById('spend-orders-table').style.display='none';
+            document.getElementById('spend-empty').style.display='none';
+            fetch('/api/admin/customers/' + custId + '/spend?from=' + encodeURIComponent(from) + '&to=' + encodeURIComponent(to))
+              .then(r=>r.json()).then(function(d){
+                document.getElementById('spend-loading').style.display='none';
+                document.getElementById('spend-range-total').textContent = fmtMoney(d.rangeTotal || 0);
+                document.getElementById('spend-range-count').textContent = d.rangeCount || 0;
+                var tbody = document.getElementById('spend-orders-body');
+                tbody.innerHTML = '';
+                if (d.orders && d.orders.length > 0) {
+                  d.orders.forEach(function(o){
+                    var tr = document.createElement('tr');
+                    tr.innerHTML =
+                      '<td><a href="/orders/' + o.id + '">' + o.name + '</a></td>' +
+                      '<td class="text-muted">' + fmtDate(o.processedAt) + '</td>' +
+                      '<td class="text-right mono">' + fmtMoney(o.total) + '</td>' +
+                      '<td><span class="badge badge-' + (o.financialStatus||'').toLowerCase() + '">' + (o.financialStatus||'—') + '</span></td>' +
+                      '<td><a href="/orders/' + o.id + '/invoice.pdf" class="link text-muted small-text">invoice</a></td>';
+                    tbody.appendChild(tr);
+                  });
+                  document.getElementById('spend-orders-table').style.display='';
+                } else {
+                  document.getElementById('spend-empty').style.display='';
+                }
+              }).catch(function(){ document.getElementById('spend-loading').textContent='Error loading spend data.'; });
+          }
+          function applyPreset(){
+            var v = preset.value;
+            if(v==='custom'){ customRow.style.display='flex'; return; }
+            customRow.style.display='none';
+            var parts = v.split('|');
+            loadSpend(parts[0], parts[1]);
+          }
+          preset.addEventListener('change', applyPreset);
+          goBtn && goBtn.addEventListener('click', function(){
+            if(fromIn.value && toIn.value) loadSpend(fromIn.value, toIn.value);
+          });
+          applyPreset();
+        })();
+        </script>
+
         <div class="card">
           <div class="card-header">
             <h2>Recent Orders</h2>
@@ -2582,6 +2696,77 @@ app.put('/api/admin/customers/:id/b2b-config', requireAuth, async (req, res) => 
   const after = await getB2bConfig(numId);
   auditLog(req.adminSession.email, 'customer:b2b-config', shopifyCustomerGid(numId), before.overrides, after.overrides);
   res.json({ ok: true, ...after });
+});
+
+// ── 19A: Customer spend API ──
+app.get('/api/admin/customers/:id/spend', requireAuth, async (req, res) => {
+  const numId  = req.params.id;
+  const fromTs = req.query.from ? new Date(req.query.from).getTime() : 0;
+  const toTs   = req.query.to   ? new Date(req.query.to).getTime()   : Date.now() + 86400000;
+
+  if (MOCK) {
+    const gid = shopifyCustomerGid(numId);
+    const all = MOCK_ORDERS.filter(o => o.customer?.id === gid);
+    const lifetimeTotal = all.reduce((s, o) => s + parseFloat(o.totalPriceSet?.presentmentMoney?.amount || 0), 0);
+    const range = all.filter(o => {
+      const d = new Date(o.processedAt).getTime();
+      return d >= fromTs && d <= toTs;
+    });
+    const rangeTotal = range.reduce((s, o) => s + parseFloat(o.totalPriceSet?.presentmentMoney?.amount || 0), 0);
+    return res.json({
+      lifetimeTotal: lifetimeTotal.toFixed(2),
+      lifetimeCount: all.length,
+      rangeTotal: rangeTotal.toFixed(2),
+      rangeCount: range.length,
+      orders: range.map(o => ({
+        id:   shopifyNumericId(o.id),
+        name: o.name,
+        processedAt: o.processedAt,
+        total: o.totalPriceSet?.presentmentMoney?.amount || '0.00',
+        financialStatus: o.displayFinancialStatus,
+        fulfillmentStatus: o.displayFulfillmentStatus,
+      })),
+    });
+  }
+
+  try {
+    const gid = shopifyCustomerGid(numId);
+    const fromStr = new Date(fromTs).toISOString().split('T')[0];
+    const toStr   = new Date(toTs  ).toISOString().split('T')[0];
+    const r = await shopifyFetch(`
+      query($id:ID!,$q:String!){
+        customer(id:$id){
+          amountSpent{amount currencyCode}
+          numberOfOrders
+          orders(first:250,query:$q,sortKey:PROCESSED_AT,reverse:true){
+            edges{node{
+              id name processedAt displayFinancialStatus displayFulfillmentStatus
+              totalPriceSet{presentmentMoney{amount currencyCode}}
+            }}
+          }
+        }
+      }`, { id: gid, q: `processed_at:>=${fromStr} processed_at:<=${toStr}` });
+    const cust = r.data?.customer;
+    if (!cust) return res.status(404).json({ error: 'not found' });
+    const orders = cust.orders.edges.map(e => e.node);
+    const rangeTotal = orders.reduce((s, o) => s + parseFloat(o.totalPriceSet?.presentmentMoney?.amount || 0), 0);
+    res.json({
+      lifetimeTotal: cust.amountSpent?.amount || '0.00',
+      lifetimeCount: cust.numberOfOrders || 0,
+      rangeTotal: rangeTotal.toFixed(2),
+      rangeCount: orders.length,
+      orders: orders.map(o => ({
+        id:   shopifyNumericId(o.id),
+        name: o.name,
+        processedAt: o.processedAt,
+        total: o.totalPriceSet?.presentmentMoney?.amount || '0.00',
+        financialStatus: o.displayFinancialStatus,
+        fulfillmentStatus: o.displayFulfillmentStatus,
+      })),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ── API search ──
@@ -4005,6 +4190,440 @@ app.post('/exports/images', requireAuth, async (req, res) => {
   zip.finalize();
   logExportBatch(req.adminSession.email, 'images', products.length, totalImages, 0);
   auditLog(req.adminSession.email, 'export:images', mode, null, { products: products.length, images: totalImages });
+});
+
+// ── Phase 17: Wholesale Leads CRM ─────────────────────────────────────────────
+
+const LEAD_STATUSES = {
+  new:                 { label: 'New',                 color: 'blue',    terminal: false },
+  under_review:        { label: 'Under Review',         color: 'warning', terminal: false },
+  waiting_on_docs:     { label: 'Waiting on Docs',      color: 'orange',  terminal: false },
+  waiting_on_sales_tax:{ label: 'Waiting on Tax Cert',  color: 'orange',  terminal: false },
+  waiting_on_w9:       { label: 'Waiting on W9',        color: 'orange',  terminal: false },
+  approved:            { label: 'Approved',             color: 'success', terminal: false },
+  converted:           { label: 'Converted',            color: 'lime',    terminal: true  },
+  rejected:            { label: 'Rejected',             color: 'danger',  terminal: true  },
+  dormant:             { label: 'Dormant',              color: 'muted',   terminal: false },
+};
+
+const LEAD_TRANSITIONS = {
+  new:                  ['under_review', 'rejected'],
+  under_review:         ['waiting_on_docs','waiting_on_sales_tax','waiting_on_w9','approved','rejected','dormant'],
+  waiting_on_docs:      ['under_review','dormant','rejected'],
+  waiting_on_sales_tax: ['under_review','dormant','rejected'],
+  waiting_on_w9:        ['under_review','dormant','rejected'],
+  approved:             ['converted','rejected'],
+  converted:            [],
+  rejected:             [],
+  dormant:              ['under_review','rejected'],
+};
+
+function renderLeadsList(session, { leads, counts, flash, q, status }) {
+  const allCount = Object.values(counts).reduce((s, n) => s + n, 0);
+  const chipList = [
+    { value: 'all', label: `All (${allCount})` },
+    ...Object.entries(LEAD_STATUSES).map(([k, v]) => ({ value: k, label: `${v.label} (${counts[k] || 0})` })),
+  ];
+  const chipBar = chipList.map(c =>
+    `<a href="/leads?status=${h(c.value)}${q ? '&q=' + encodeURIComponent(q) : ''}" class="filter-chip${(status || 'all') === c.value ? ' filter-chip-active' : ''}">${h(c.label)}</a>`
+  ).join('');
+
+  const rows = leads.map(l => {
+    const st = LEAD_STATUSES[l.status] || { label: l.status, color: 'muted' };
+    const followUp = l.next_followup_due
+      ? `<span class="${l.next_followup_due < new Date().toISOString().split('T')[0] ? 'text-danger' : 'text-muted'}">${h(l.next_followup_due)}</span>`
+      : '<span class="text-muted">—</span>';
+    return `<tr>
+      <td><a href="/leads/${l.id}" class="link-strong">${h(l.business_name || '—')}</a><br><small class="text-muted">${h(l.email)}</small></td>
+      <td>${h(l.contact_name || '—')}</td>
+      <td><span class="badge badge-${st.color}">${h(st.label)}</span></td>
+      <td class="text-muted small-text">${fmtDate(new Date(l.updated_at).toISOString())}</td>
+      <td>${followUp}</td>
+      <td><a href="/leads/${l.id}" class="table-action">View →</a></td>
+    </tr>`;
+  }).join('');
+
+  const flashHtml = flash ? `<div class="alert alert-success">${h(flash)}</div>` : '';
+
+  return layout({ title: 'Wholesale Leads', session, activePath: '/leads', content: `
+    <div class="page-header-row">
+      <h1>Wholesale Leads</h1>
+      <a href="/leads/new" class="btn btn-primary">+ New Lead</a>
+    </div>
+    ${flashHtml}
+    <div class="filter-bar" style="margin-bottom:0.75rem">
+      <form method="GET" action="/leads" style="display:flex;gap:0.5rem;align-items:center;flex:1">
+        <input type="hidden" name="status" value="${h(status || 'all')}">
+        <input type="text" name="q" value="${h(q || '')}" class="input search-input" placeholder="Search name, email, business…" style="max-width:320px">
+        <button type="submit" class="btn btn-secondary btn-sm">Search</button>
+        ${q ? `<a href="/leads?status=${h(status || 'all')}" class="btn btn-ghost btn-sm">Clear</a>` : ''}
+      </form>
+    </div>
+    <div class="filter-chips-row" style="margin-bottom:1rem;display:flex;flex-wrap:wrap;gap:0.35rem">${chipBar}</div>
+    ${leads.length === 0
+      ? `<div class="empty-state card" style="padding:2rem;text-align:center"><p class="text-muted">No leads found.</p><a href="/leads/new" class="btn btn-primary" style="margin-top:0.75rem">Create first lead</a></div>`
+      : `<div class="table-wrap"><table class="data-table">
+          <thead><tr><th>Business</th><th>Contact</th><th>Status</th><th>Last Activity</th><th>Follow-up</th><th></th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table></div>`
+    }
+  ` });
+}
+
+function renderLeadNew(session, { flash, prefill = {} }) {
+  const flashHtml = flash ? `<div class="alert alert-danger">${h(flash)}</div>` : '';
+  return layout({ title: 'New Lead', session, activePath: '/leads', content: `
+    <div class="breadcrumb-row"><a href="/leads" class="breadcrumb">← Leads</a></div>
+    <div class="page-header-row"><h1>New Lead</h1></div>
+    ${flashHtml}
+    <div class="card" style="max-width:640px">
+      <form method="POST" action="/leads/new">
+        <div class="settings-grid">
+          <label>Email *</label>
+          <input type="email" name="email" value="${h(prefill.email||'')}" required class="input" placeholder="buyer@boutique.com">
+          <label>Business name</label>
+          <input type="text" name="business_name" value="${h(prefill.business_name||'')}" class="input" placeholder="Paws & Co.">
+          <label>Contact name</label>
+          <input type="text" name="contact_name" value="${h(prefill.contact_name||'')}" class="input">
+          <label>Phone</label>
+          <input type="tel" name="phone" value="${h(prefill.phone||'')}" class="input">
+          <label>Website</label>
+          <input type="url" name="website" value="${h(prefill.website||'')}" class="input" placeholder="https://…">
+          <label>Business type</label>
+          <select name="business_type" class="input">
+            <option value="">— select —</option>
+            ${['boutique','trainer','kennel','show-vendor','groomer','other'].map(t =>
+              `<option value="${t}"${prefill.business_type===t?' selected':''}>${h(t)}</option>`
+            ).join('')}
+          </select>
+          <label>Est. monthly volume ($)</label>
+          <input type="number" name="estimated_monthly_volume_usd" value="${h(String(prefill.estimated_monthly_volume_usd||''))}" class="input" min="0" step="100">
+          <label>Source</label>
+          <select name="source" class="input">
+            <option value="">— select —</option>
+            ${['tradeshow','website-form','instagram','referral','cold-outreach','other'].map(s =>
+              `<option value="${s}"${prefill.source===s?' selected':''}>${h(s)}</option>`
+            ).join('')}
+          </select>
+          <label>Source detail</label>
+          <input type="text" name="source_detail" value="${h(prefill.source_detail||'')}" class="input" placeholder="IKC 2026, @petboutique referred…">
+          <label>Follow-up date</label>
+          <input type="date" name="next_followup_due" value="${h(prefill.next_followup_due||'')}" class="input">
+        </div>
+        <div style="margin-top:1.25rem;display:flex;gap:0.75rem">
+          <button type="submit" class="btn btn-primary">Create Lead</button>
+          <a href="/leads" class="btn btn-ghost">Cancel</a>
+        </div>
+      </form>
+    </div>
+  ` });
+}
+
+function renderLeadDetail(session, { lead, notes, history, flash }) {
+  const st = LEAD_STATUSES[lead.status] || { label: lead.status, color: 'muted' };
+  const transitions = LEAD_TRANSITIONS[lead.status] || [];
+  const flashHtml = flash ? `<div class="alert alert-success">${h(flash)}</div>` : '';
+
+  // Merge notes + history into a single timeline, sorted by created_at
+  const timeline = [
+    ...notes.map(n => ({ ts: n.created_at, type: 'note', data: n })),
+    ...history.map(h2 => ({ ts: h2.changed_at, type: 'status', data: h2 })),
+  ].sort((a, b) => a.ts - b.ts);
+
+  const timelineHtml = timeline.length === 0
+    ? '<p class="text-muted small-text">No activity yet.</p>'
+    : timeline.map(item => {
+        if (item.type === 'note') {
+          const n = item.data;
+          const noteColor = { call:'blue', email:'green', meeting:'lime', system:'muted', general:'' }[n.note_type] || '';
+          return `<div class="timeline-item">
+            <div class="timeline-meta"><span class="badge badge-${noteColor} badge-xs">${h(n.note_type)}</span> <span class="text-muted small-text">${h(n.author_email)} · ${fmtDate(new Date(n.created_at).toISOString())}</span></div>
+            <div class="timeline-body">${h(n.body)}</div>
+          </div>`;
+        } else {
+          const s = item.data;
+          const newSt = LEAD_STATUSES[s.to_status] || { label: s.to_status, color: 'muted' };
+          return `<div class="timeline-item timeline-status">
+            <div class="timeline-meta"><span class="text-muted small-text">Status changed by ${h(s.changed_by || '—')} · ${fmtDate(new Date(s.changed_at).toISOString())}</span></div>
+            <div class="timeline-body">${s.from_status ? `<span class="badge badge-muted badge-xs">${h(LEAD_STATUSES[s.from_status]?.label || s.from_status)}</span> → ` : ''}<span class="badge badge-${newSt.color} badge-xs">${h(newSt.label)}</span>${s.note ? ` — ${h(s.note)}` : ''}</div>
+          </div>`;
+        }
+      }).join('');
+
+  const transitionOpts = transitions.map(t => {
+    const ts2 = LEAD_STATUSES[t] || { label: t };
+    return `<option value="${h(t)}">${h(ts2.label)}</option>`;
+  }).join('');
+
+  const convertBtn = lead.status === 'approved'
+    ? `<a href="/leads/${lead.id}/convert" class="btn btn-primary">Convert to Customer</a>`
+    : '';
+
+  return layout({ title: (lead.business_name || lead.email) + ' — Lead', session, activePath: '/leads',
+    extraHead: `<style>
+      .timeline-item{padding:0.6rem 0;border-bottom:1px solid #f0f0f0;}
+      .timeline-item:last-child{border-bottom:none;}
+      .timeline-meta{margin-bottom:0.2rem;}
+      .timeline-status .timeline-body{font-size:0.85rem;}
+      .badge-xs{font-size:0.7rem;padding:0.15rem 0.4rem;}
+      .badge-lime{background:#9BBC0E;color:#fff;}
+      .badge-orange{background:#F97316;color:#fff;}
+    </style>`,
+    content: `
+    <div class="breadcrumb-row"><a href="/leads" class="breadcrumb">← Leads</a></div>
+    ${flashHtml}
+    <div class="detail-header">
+      <div class="detail-header-left">
+        <h1>${h(lead.business_name || lead.email)}</h1>
+        <p class="text-muted">${h(lead.contact_name || '')}${lead.contact_name && lead.email ? ' · ' : ''}${h(lead.email)} <span class="badge badge-${st.color}" style="margin-left:0.5rem">${h(st.label)}</span></p>
+      </div>
+      <div class="detail-header-actions">
+        ${convertBtn}
+      </div>
+    </div>
+    <div class="detail-grid">
+      <div class="detail-main">
+        <!-- Status change -->
+        ${transitions.length > 0 ? `<div class="card">
+          <div class="card-header"><h2>Change Status</h2></div>
+          <form method="POST" action="/leads/${lead.id}/status" style="display:flex;gap:0.5rem;align-items:flex-end;flex-wrap:wrap">
+            <div>
+              <label class="field-label">New status</label>
+              <select name="new_status" class="input input-sm">${transitionOpts}</select>
+            </div>
+            <div style="flex:1;min-width:160px">
+              <label class="field-label">Note (optional)</label>
+              <input type="text" name="note" class="input input-sm" placeholder="Reason or context…">
+            </div>
+            <button type="submit" class="btn btn-secondary btn-sm">Update</button>
+          </form>
+        </div>` : ''}
+
+        <!-- Timeline -->
+        <div class="card">
+          <div class="card-header"><h2>Activity</h2></div>
+          <div id="timeline">${timelineHtml}</div>
+        </div>
+
+        <!-- Add note -->
+        <div class="card">
+          <div class="card-header"><h2>Add Note</h2></div>
+          <form method="POST" action="/leads/${lead.id}/note">
+            <div style="display:flex;gap:0.5rem;margin-bottom:0.5rem;align-items:center">
+              <label class="field-label" style="margin:0">Type:</label>
+              <select name="note_type" class="input input-sm" style="width:auto">
+                ${['general','call','email','meeting'].map(t => `<option value="${t}">${h(t)}</option>`).join('')}
+              </select>
+            </div>
+            <textarea name="body" class="textarea" rows="3" placeholder="Note about this lead…" required></textarea>
+            <div style="margin-top:0.5rem"><button type="submit" class="btn btn-secondary btn-sm">Add Note</button></div>
+          </form>
+        </div>
+      </div>
+      <div class="detail-side">
+        <div class="card">
+          <div class="card-header"><h2>Profile</h2></div>
+          <form method="POST" action="/leads/${lead.id}/profile">
+            <div class="kv-list">
+              <div class="kv-row"><span>Email</span><strong><a href="mailto:${h(lead.email)}" class="link">${h(lead.email)}</a></strong></div>
+              ${lead.phone ? `<div class="kv-row"><span>Phone</span><strong>${h(lead.phone)}</strong></div>` : ''}
+              ${lead.website ? `<div class="kv-row"><span>Website</span><strong><a href="${h(lead.website)}" target="_blank" class="link">${h(lead.website)}</a></strong></div>` : ''}
+              ${lead.business_type ? `<div class="kv-row"><span>Type</span><strong>${h(lead.business_type)}</strong></div>` : ''}
+              ${lead.source ? `<div class="kv-row"><span>Source</span><strong>${h(lead.source)}${lead.source_detail ? ' — ' + h(lead.source_detail) : ''}</strong></div>` : ''}
+              ${lead.estimated_monthly_volume_usd ? `<div class="kv-row"><span>Est. volume</span><strong>${fmtMoney(lead.estimated_monthly_volume_usd)}/mo</strong></div>` : ''}
+              <div class="kv-row"><span>Created</span><strong class="text-muted">${fmtDate(new Date(lead.created_at).toISOString())}</strong></div>
+            </div>
+          </form>
+        </div>
+        <div class="card">
+          <div class="card-header"><h2>Follow-up</h2></div>
+          <form method="POST" action="/leads/${lead.id}/followup" style="display:flex;gap:0.5rem;align-items:center">
+            <input type="date" name="next_followup_due" value="${h(lead.next_followup_due||'')}" class="input input-sm" style="flex:1">
+            <button type="submit" class="btn btn-secondary btn-sm">Save</button>
+          </form>
+          ${lead.next_followup_due && lead.next_followup_due < new Date().toISOString().split('T')[0]
+            ? `<p class="text-danger small-text" style="margin-top:0.35rem">⚠ Overdue</p>` : ''}
+        </div>
+        ${lead.shopify_customer_id ? `<div class="card"><div class="card-header"><h2>Customer</h2></div>
+          <p><a href="/customers/${lead.shopify_customer_id.split('/').pop()}" class="link">View customer →</a></p>
+        </div>` : ''}
+      </div>
+    </div>
+  ` });
+}
+
+function renderLeadConvert(session, { lead, flash, settings }) {
+  const discountDefault = settings.b2b_discount_pct || '50';
+  const flashHtml = flash ? `<div class="alert alert-danger">${h(flash)}</div>` : '';
+  return layout({ title: 'Convert Lead to Customer', session, activePath: '/leads', content: `
+    <div class="breadcrumb-row"><a href="/leads/${lead.id}" class="breadcrumb">← ${h(lead.business_name || lead.email)}</a></div>
+    <div class="page-header-row"><h1>Convert to B2B Customer</h1></div>
+    ${flashHtml}
+    <div class="card" style="max-width:640px">
+      <p class="text-muted" style="margin-bottom:1rem">This will create a Shopify customer with the <strong>b2b</strong> tag and configure their B2B settings. The lead will be marked as converted.</p>
+      <form method="POST" action="/leads/${lead.id}/convert">
+        <div class="settings-grid">
+          <label>Display name *</label>
+          <input type="text" name="display_name" value="${h(lead.contact_name || lead.business_name || '')}" required class="input">
+          <label>Email *</label>
+          <input type="email" name="email" value="${h(lead.email)}" required class="input">
+          <label>Phone</label>
+          <input type="tel" name="phone" value="${h(lead.phone||'')}" class="input">
+          <label>B2B discount %</label>
+          <input type="number" name="discount_pct" value="${h(discountDefault)}" min="0" max="95" class="input" style="width:100px">
+          <label>Allow order on invoice</label>
+          <label class="toggle-label"><input type="checkbox" name="allow_order_on_invoice" class="toggle" checked></label>
+          <label>Drop-ship allowed</label>
+          <label class="toggle-label"><input type="checkbox" name="dropship_enabled" class="toggle"></label>
+        </div>
+        <div style="margin-top:1.25rem;display:flex;gap:0.75rem">
+          <button type="submit" class="btn btn-primary">Convert to Customer</button>
+          <a href="/leads/${lead.id}" class="btn btn-ghost">Cancel</a>
+        </div>
+      </form>
+    </div>
+  ` });
+}
+
+// Leads routes
+app.get('/leads', requireAuth, (req, res) => {
+  const status = req.query.status && req.query.status !== 'all' ? req.query.status : null;
+  const q      = String(req.query.q || '').trim();
+  const leads  = getLeads({ status, search: q || undefined });
+  const counts = getLeadCounts();
+  const flash  = req.query.flash === 'created' ? 'Lead created.' : req.query.flash === 'saved' ? 'Lead updated.' : null;
+  res.send(renderLeadsList(req.adminSession, { leads, counts, flash, q, status: req.query.status || 'all' }));
+});
+
+app.get('/leads/new', requireAuth, (req, res) => {
+  res.send(renderLeadNew(req.adminSession, { flash: null }));
+});
+
+app.post('/leads/new', requireAuth, (req, res) => {
+  const email = String(req.body.email || '').trim();
+  if (!email) return res.send(renderLeadNew(req.adminSession, { flash: 'Email is required.', prefill: req.body }));
+  try {
+    const id = createLead(req.body);
+    addLeadStatusHistory(id, null, 'new', 'Lead created', req.adminSession.email);
+    auditLog(req.adminSession.email, 'lead:create', String(id), null, { email });
+    res.redirect('/leads/' + id + '?flash=created');
+  } catch (err) {
+    const msg = err.message.includes('UNIQUE') ? 'A lead with that email already exists.' : err.message;
+    res.send(renderLeadNew(req.adminSession, { flash: msg, prefill: req.body }));
+  }
+});
+
+app.get('/leads/:id', requireAuth, (req, res) => {
+  const lead = getLead(req.params.id);
+  if (!lead) return res.status(404).send(layout({ title: '404', session: req.adminSession, activePath: '/leads',
+    content: '<h1>Lead not found</h1><a href="/leads" class="btn btn-secondary">← Leads</a>' }));
+  const notes   = getLeadNotes(lead.id);
+  const history = getLeadStatusHistory(lead.id);
+  const flash   = req.query.flash === 'created' ? 'Lead created.' : req.query.flash === 'saved' ? 'Saved.' : req.query.flash === 'status_changed' ? 'Status updated.' : null;
+  res.send(renderLeadDetail(req.adminSession, { lead, notes, history, flash }));
+});
+
+app.post('/leads/:id/status', requireAuth, (req, res) => {
+  const lead = getLead(req.params.id);
+  if (!lead) return res.redirect('/leads');
+  const newStatus = req.body.new_status;
+  const allowed = LEAD_TRANSITIONS[lead.status] || [];
+  if (!allowed.includes(newStatus)) return res.redirect('/leads/' + lead.id + '?flash=invalid_status');
+  const note = String(req.body.note || '').trim();
+  addLeadStatusHistory(lead.id, lead.status, newStatus, note || null, req.adminSession.email);
+  addLeadNote(lead.id, req.adminSession.email, `Status changed to ${LEAD_STATUSES[newStatus]?.label || newStatus}${note ? ': ' + note : ''}`, 'system');
+  updateLead(lead.id, { status: newStatus });
+  auditLog(req.adminSession.email, 'lead:status', String(lead.id), lead.status, newStatus);
+  res.redirect('/leads/' + lead.id + '?flash=status_changed');
+});
+
+app.post('/leads/:id/note', requireAuth, (req, res) => {
+  const lead = getLead(req.params.id);
+  if (!lead) return res.redirect('/leads');
+  const body = String(req.body.body || '').trim();
+  if (!body) return res.redirect('/leads/' + lead.id);
+  const noteType = ['general','call','email','meeting'].includes(req.body.note_type) ? req.body.note_type : 'general';
+  addLeadNote(lead.id, req.adminSession.email, body, noteType);
+  updateLead(lead.id, { status: lead.status });
+  res.redirect('/leads/' + lead.id + '?flash=saved');
+});
+
+app.post('/leads/:id/followup', requireAuth, (req, res) => {
+  const lead = getLead(req.params.id);
+  if (!lead) return res.redirect('/leads');
+  const date = String(req.body.next_followup_due || '').trim();
+  updateLead(lead.id, { next_followup_due: date || null });
+  res.redirect('/leads/' + lead.id + '?flash=saved');
+});
+
+app.get('/leads/:id/convert', requireAuth, (req, res) => {
+  const lead = getLead(req.params.id);
+  if (!lead) return res.redirect('/leads');
+  if (lead.status !== 'approved') return res.redirect('/leads/' + lead.id);
+  res.send(renderLeadConvert(req.adminSession, { lead, flash: null, settings: getGlobalSettings() }));
+});
+
+app.post('/leads/:id/convert', requireAuth, async (req, res) => {
+  const lead = getLead(req.params.id);
+  if (!lead) return res.redirect('/leads');
+  if (lead.status !== 'approved') return res.redirect('/leads/' + lead.id);
+
+  const email   = String(req.body.email || lead.email).trim();
+  const name    = String(req.body.display_name || '').trim();
+  const phone   = String(req.body.phone || '').trim();
+  const discPct = parseInt(req.body.discount_pct || '50', 10);
+  const allowInv = req.body.allow_order_on_invoice === 'on';
+  const dropship = req.body.dropship_enabled === 'on';
+
+  let shopifyCustomerId = null;
+
+  if (!MOCK) {
+    try {
+      // Create Shopify customer with b2b tag
+      const createResult = await shopifyFetch(`
+        mutation customerCreate($input: CustomerInput!) {
+          customerCreate(input: $input) {
+            customer { id }
+            userErrors { field message }
+          }
+        }`, {
+        input: {
+          email, firstName: name.split(' ')[0] || name, lastName: name.split(' ').slice(1).join(' ') || '',
+          phone: phone || undefined,
+          tags: ['b2b'],
+          emailMarketingConsent: { marketingState: 'NOT_SUBSCRIBED', marketingOptInLevel: 'SINGLE_OPT_IN' },
+        }
+      });
+      const errors = createResult.data?.customerCreate?.userErrors || [];
+      if (errors.length > 0) {
+        return res.send(renderLeadConvert(req.adminSession, { lead, flash: errors[0].message, settings: getGlobalSettings() }));
+      }
+      shopifyCustomerId = createResult.data?.customerCreate?.customer?.id;
+
+      // Set B2B metafields
+      if (shopifyCustomerId) {
+        const metafields = [
+          { ownerId: shopifyCustomerId, namespace: 'b2b', key: 'discount_pct',           value: String(discPct), type: 'number_integer' },
+          { ownerId: shopifyCustomerId, namespace: 'b2b', key: 'allow_order_on_invoice',  value: String(allowInv), type: 'boolean' },
+          { ownerId: shopifyCustomerId, namespace: 'b2b', key: 'dropship_enabled',        value: String(dropship), type: 'boolean' },
+        ];
+        await shopifyFetch(`mutation metafieldsSet($m:[MetafieldsSetInput!]!){ metafieldsSet(metafields:$m){ userErrors{field message} } }`, { m: metafields });
+      }
+    } catch (err) {
+      return res.send(renderLeadConvert(req.adminSession, { lead, flash: 'Shopify error: ' + err.message, settings: getGlobalSettings() }));
+    }
+  } else {
+    shopifyCustomerId = 'gid://shopify/Customer/MOCK_' + lead.id;
+  }
+
+  updateLead(lead.id, { status: 'converted', converted_at: Date.now(), shopify_customer_id: shopifyCustomerId });
+  addLeadStatusHistory(lead.id, 'approved', 'converted', 'Customer created', req.adminSession.email);
+  addLeadNote(lead.id, req.adminSession.email, 'Converted to Shopify customer ' + shopifyCustomerId, 'system');
+  auditLog(req.adminSession.email, 'lead:convert', String(lead.id), { status: 'approved' }, { status: 'converted', shopifyCustomerId });
+
+  const numId = shopifyCustomerId ? shopifyCustomerId.split('/').pop() : null;
+  if (numId) return res.redirect('/customers/' + numId);
+  res.redirect('/leads/' + lead.id);
 });
 
 // Static

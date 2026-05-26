@@ -1390,5 +1390,179 @@ await test('GET / (dashboard) → top customers widget shows spend + order count
   assert.ok(html.includes('top-customer-star'), 'Star badge missing in dashboard widget');
 });
 
+// ── Phase 19A: Customer spend API ────────────────────────────────────────────
+console.log('\nAPI tests — Phase 19A: Customer spend:');
+
+await test('GET /api/admin/customers/101/spend → returns spend data', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/api/admin/customers/101/spend?from=2026-01-01&to=2026-12-31`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const data = await res.json();
+  assert.ok(typeof data.lifetimeTotal !== 'undefined', 'lifetimeTotal missing');
+  assert.ok(typeof data.lifetimeCount !== 'undefined', 'lifetimeCount missing');
+  assert.ok(typeof data.rangeTotal !== 'undefined', 'rangeTotal missing');
+  assert.ok(typeof data.rangeCount !== 'undefined', 'rangeCount missing');
+  assert.ok(Array.isArray(data.orders), 'orders should be array');
+});
+
+await test('GET /api/admin/customers/101/spend → orders have expected fields', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/api/admin/customers/101/spend?from=2026-01-01&to=2026-12-31`, { headers: { Cookie: cookie } });
+  const data = await res.json();
+  if (data.orders.length > 0) {
+    const o = data.orders[0];
+    assert.ok(o.id, 'order.id missing');
+    assert.ok(o.name, 'order.name missing');
+    assert.ok(o.processedAt, 'order.processedAt missing');
+    assert.ok(o.total !== undefined, 'order.total missing');
+    assert.ok(o.financialStatus, 'order.financialStatus missing');
+  }
+});
+
+await test('GET /api/admin/customers/101/spend with narrow range → returns filtered orders', async () => {
+  const cookie = await seedSession();
+  // Use a date range that excludes all orders
+  const res = await fetch(`${BASE}/api/admin/customers/101/spend?from=2020-01-01&to=2020-12-31`, { headers: { Cookie: cookie } });
+  const data = await res.json();
+  assert.equal(data.rangeCount, 0, 'Should have 0 orders in 2020 range');
+  assert.equal(parseFloat(data.rangeTotal), 0, 'rangeTotal should be 0 for empty range');
+});
+
+await test('GET /api/admin/customers/101/spend requires auth → 401 for API paths', async () => {
+  const res = await fetch(`${BASE}/api/admin/customers/101/spend?from=2026-01-01&to=2026-12-31`);
+  assert.equal(res.status, 401, 'Unauthenticated API request should return 401');
+  const json = await res.json();
+  assert.ok(json.error, 'Should return JSON error');
+});
+
+// ── Phase 17: Wholesale Leads CRM ─────────────────────────────────────────────
+console.log('\nAPI tests — Phase 17: Wholesale leads CRM:');
+
+await test('GET /leads → list page renders', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/leads`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  assert.ok(html.includes('Wholesale Leads'), 'Page title missing');
+  assert.ok(html.includes('New Lead'), 'New Lead button missing');
+  assert.ok(html.includes('filter-chip'), 'Status filter chips missing');
+});
+
+await test('GET /leads/new → form renders', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/leads/new`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  assert.ok(html.includes('name="email"'), 'Email field missing');
+  assert.ok(html.includes('name="business_name"'), 'Business name field missing');
+  assert.ok(html.includes('Create Lead'), 'Submit button missing');
+});
+
+await test('POST /leads/new → creates lead, redirects to detail', async () => {
+  const cookie = await seedSession();
+  const form = new URLSearchParams({ email: `test-lead-${Date.now()}@example.com`, business_name: 'Test Boutique', contact_name: 'Jane Doe', source: 'tradeshow' });
+  const res = await fetch(`${BASE}/leads/new`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: form.toString(),
+    redirect: 'manual',
+  });
+  assert.equal(res.status, 302, 'Should redirect after create');
+  const loc = res.headers.get('location') || '';
+  assert.ok(loc.startsWith('/leads/'), 'Should redirect to lead detail');
+});
+
+await test('POST /leads/new with duplicate email → shows error', async () => {
+  const cookie = await seedSession();
+  const email  = `dup-lead-${Date.now()}@example.com`;
+  const form   = new URLSearchParams({ email, business_name: 'First' });
+  await fetch(`${BASE}/leads/new`, {
+    method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: form.toString(), redirect: 'manual',
+  });
+  // Second attempt with same email
+  const res = await fetch(`${BASE}/leads/new`, {
+    method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: form.toString(),
+  });
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  assert.ok(html.includes('already exists') || html.includes('alert'), 'Duplicate error message missing');
+});
+
+await test('GET /leads/:id → lead detail renders', async () => {
+  const cookie = await seedSession();
+  // Create a lead first
+  const email = `detail-lead-${Date.now()}@example.com`;
+  const createRes = await fetch(`${BASE}/leads/new`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ email, business_name: 'Detail Test Co' }).toString(),
+    redirect: 'manual',
+  });
+  const loc = createRes.headers.get('location') || '';
+  const leadRes = await fetch(`${BASE}${loc}`, { headers: { Cookie: cookie } });
+  assert.equal(leadRes.status, 200);
+  const html = await leadRes.text();
+  assert.ok(html.includes('Detail Test Co'), 'Business name missing');
+  assert.ok(html.includes('Activity'), 'Activity timeline missing');
+  assert.ok(html.includes('Change Status') || html.includes('Add Note'), 'Action sections missing');
+});
+
+await test('POST /leads/:id/status → changes status correctly', async () => {
+  const cookie = await seedSession();
+  const email  = `status-lead-${Date.now()}@example.com`;
+  const createRes = await fetch(`${BASE}/leads/new`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ email, business_name: 'Status Test' }).toString(),
+    redirect: 'manual',
+  });
+  const loc = createRes.headers.get('location') || '';
+  const leadId = loc.split('/leads/')[1]?.replace('?flash=created', '');
+  const statusRes = await fetch(`${BASE}/leads/${leadId}/status`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ new_status: 'under_review', note: 'Looks promising' }).toString(),
+    redirect: 'manual',
+  });
+  assert.equal(statusRes.status, 302, 'Status change should redirect');
+  const detailRes = await fetch(`${BASE}/leads/${leadId}`, { headers: { Cookie: cookie } });
+  const html = await detailRes.text();
+  assert.ok(html.includes('Under Review'), 'New status not reflected');
+});
+
+await test('POST /leads/:id/note → adds note to timeline', async () => {
+  const cookie = await seedSession();
+  const email  = `note-lead-${Date.now()}@example.com`;
+  const createRes = await fetch(`${BASE}/leads/new`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ email, business_name: 'Note Test' }).toString(),
+    redirect: 'manual',
+  });
+  const loc = createRes.headers.get('location') || '';
+  const leadId = loc.split('/leads/')[1]?.replace('?flash=created', '');
+  const uniqueNote = 'Spoke with buyer on ' + Date.now();
+  await fetch(`${BASE}/leads/${leadId}/note`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ body: uniqueNote, note_type: 'call' }).toString(),
+    redirect: 'manual',
+  });
+  const detailRes = await fetch(`${BASE}/leads/${leadId}`, { headers: { Cookie: cookie } });
+  const html = await detailRes.text();
+  assert.ok(html.includes(uniqueNote), 'Note body missing from timeline');
+  assert.ok(html.includes('call'), 'Note type missing from timeline');
+});
+
+await test('GET /leads?status=under_review → filters by status', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/leads?status=under_review`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  assert.ok(html.includes('Under Review') || html.includes('filter-chip-active'), 'Status filter not applied');
+});
+
 console.log(`\n  ${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);
