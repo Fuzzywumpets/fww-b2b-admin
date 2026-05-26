@@ -1401,3 +1401,243 @@ UI shows the discount line when the customer selects ACH; vanishes for other met
 - Admin clicks "Send Chase invoice link" on any order → audit log entry created + notification
   to alexa
 - All tests green
+
+## Phase 14 — Customer self-service additions (Tier A subset)
+
+Per alexa's review of the feature research doc, build these 4 from Tier A (the 5th — onboarding
+form — is pending alexa's own form app + signature pad work). Tier A features cherry-picked
+because they're highest-impact for FWW's specific business.
+
+### 14A — Stock alerts (back-in-stock notifications)
+
+**Customer side** (b2b portal):
+- On any product detail page (`/p/:handle`), when a variant has `inventoryQuantity <= 0` and
+  `inventoryPolicy=DENY`: show "🔔 Notify me when restocked" button next to the variant selector
+  or out-of-stock indicator.
+- Clicking opens a small inline form: "Email me at [customer.email] when this is back in stock"
+  → button "Subscribe". POST to `/api/stock-alerts` with `{variantId, productId}`.
+- Customer can manage their alerts from `/account/alerts` — list of all subscriptions, remove
+  button per row, "Clear all" button.
+
+**Server**:
+- New SQLite table on b2b portal: `stock_alerts (id, customer_id, variant_id, product_id,
+  product_title, variant_title, subscribed_at, notified_at, unsubscribed_at)`.
+- POST `/api/stock-alerts` (auth required): creates row; idempotent (no duplicate per
+  customer+variant).
+- DELETE `/api/stock-alerts/:id`: marks unsubscribed_at.
+- GET `/api/stock-alerts`: returns customer's active subscriptions.
+
+**Notification trigger**:
+- Background job on portal server: `setInterval` every 15 min, query Shopify (via shopify-
+  bridge) for variants currently in stock. Cross-reference with active stock_alerts where
+  notified_at IS NULL. Send email to subscriber + set notified_at = now().
+- Email subject: "Back in stock at Fuzzywumpets: {product_title} – {variant_title}"
+- Email body: link to PDP + "if you no longer want these alerts, unsubscribe at /account/alerts"
+- Email transport: Resend API (already provisioned as `B2B_PORTAL_RESEND_API_KEY` — check
+  Doppler; create if missing — sign up at https://resend.com if needed, free tier 100/day)
+
+**Tests**:
+- POST creates alert, idempotent on dup
+- DELETE marks unsubscribed
+- Background job detects restock + sets notified_at + (mock email) sends
+- Email queued only once per (customer, variant) pair
+
+### 14B — Live order tracking ("In process" → shipped tracking)
+
+**Customer side** (b2b portal):
+- On `/orders/:id`, replace today's order timeline / status badge with:
+  - "Received" — order placed
+  - "In process" — paid (or invoiced + admin acknowledged), Shopify fulfillment NOT yet created
+  - "Shipped" — fulfillment created in Shopify; show carrier + tracking number; link to carrier's
+    tracking URL
+  - "Delivered" — fulfillment tracked status = DELIVERED
+- Order detail page polls `/api/orders/:id` every 60 seconds while on the page (lightweight) to
+  refresh status without page reload.
+
+**Server**:
+- Update `/api/orders/:id` GraphQL query to include `fulfillments { trackingInfo { number url
+  company } status }` + `displayFulfillmentStatus`.
+- Map Shopify's fulfillment status → portal-friendly status:
+  - no fulfillment + financialStatus PENDING → "Received"
+  - no fulfillment + financialStatus PAID (or PARTIALLY_PAID) → "In process"
+  - has fulfillment + status SUCCESS → "Shopify completed" — show tracking; portal status
+    = "Shipped"
+  - tracked status = DELIVERED → "Delivered"
+- Surface the FIRST tracking number + URL prominently when shipped.
+
+**ShipStation integration (already exists via fww-shipping-bridge)**:
+- For orders fulfilled outside Shopify (manual fulfillment / ShipStation imports), check if
+  fww-shipping-bridge has the tracking info. If so, surface that too.
+- Document in SCRATCH.md the actual data path (test against one real fulfilled order).
+
+**Tests**:
+- Mock order without fulfillment → status "Received" or "In process" based on financial status
+- Mock order with fulfillment + tracking → status "Shipped" + tracking shown
+- Mock order tracked DELIVERED → status "Delivered"
+- Polling refresh updates without page reload
+
+### 14C — Tax exemption certificate upload
+
+**Customer side** (b2b portal):
+- On `/account`, new section "Tax exemption":
+  - If no cert on file: "Upload your resale certificate (PDF, max 5MB)" + state dropdown
+    (US states + territories).
+  - If pending review: "Your certificate is being reviewed. We'll email you when it's approved."
+  - If approved: "✓ Approved {state} on {date}. Orders are tax-exempt." + "Replace certificate"
+    button.
+  - If rejected: "❌ Certificate rejected: {reason}. Upload a new one." + upload form.
+
+**Server**:
+- SQLite: `tax_exempt_certs (id, customer_id, state, file_path, status, uploaded_at,
+  reviewed_at, reviewed_by, rejection_reason)`.
+- POST `/api/tax-exempt` with multipart file → save under `data/tax-certs/{customer_id}-{ts}.pdf`
+  (gitignored), insert row with status='pending', notify admin via email.
+- Admin: new `/admin/tax-exempt` page (paginated queue of pending certs); per row "View PDF" +
+  "Approve" + "Reject (reason)" actions. Audit-logged.
+- When approved: write a Shopify customer metafield `b2b.tax_exempt = true` + `b2b.tax_exempt_state = "XX"`.
+- At order creation (admin manual order builder + customer self-serve checkout): if
+  customer has `b2b.tax_exempt=true`, set order line item taxable=false.
+
+**Tests**:
+- Upload, status='pending'
+- Admin approve → status='approved', metafield written
+- Customer with approved cert → next order created tax-exempt
+- Upload >5MB → 413
+- Upload non-PDF → 400
+
+### 14D — Customer-visible internal notes (with email notification)
+
+This expands the existing `customer_notes` SQLite table (internal-only) — we now distinguish:
+- **Internal notes**: admin-only, never shown to customer (existing behavior — keep)
+- **Visible notes**: admin types, shows on customer's order detail, EMAILS the customer when added
+
+**Admin side** (b2b admin):
+- On `/admin/orders/:id`, alongside the existing internal note editor, add a **second** note
+  editor labeled "Note visible to customer". Textarea + Save button. When saved:
+  - Write to SQLite `visible_notes (id, order_id, customer_id, body, added_at, added_by)`.
+  - Send email to customer (Resend) with subject "Update on your order #{order_name}" and body
+    excerpting the note + link to `/orders/{order_id}`.
+  - Audit-log.
+
+**Customer side** (b2b portal):
+- On `/orders/:id`, render a "Notes from Fuzzywumpets" section above line items showing the
+  most recent visible note(s) with timestamp. Lime-accent border to draw the eye.
+
+**Tests**:
+- Admin adds visible note → SQLite row + email queued
+- Customer order detail shows the note
+- Internal note path unchanged (no email, not visible to customer)
+
+### Acceptance for Phase 14
+
+- A customer can subscribe to stock alerts on any out-of-stock product and gets emailed when it
+  comes back
+- A customer's order detail shows live status: Received → In process → Shipped (with tracking
+  link) → Delivered
+- A customer can upload a resale cert; admin approves; subsequent orders are tax-exempt
+- An admin can leave a customer-visible note on an order; customer gets emailed + sees it
+- All tests green
+
+---
+
+## Phase 15 — Customer-specific catalogs + multi-user team accounts
+
+### 15A — Customer-specific catalogs via custom tag
+
+Allow alexa to expose certain products only to certain customers — for private SKUs, trade-only
+lines, or one-off customizations.
+
+**Mechanism**:
+- New customer metafield `b2b.catalog_access_tags` — comma-separated list of tag names the
+  customer can access (e.g., `"private-acme,deerskin-trade"`).
+- Products that should be restricted get a Shopify tag matching one of these access tags
+  (e.g., a product tagged `private-acme` shows only to customers whose `catalog_access_tags`
+  contains `private-acme`).
+- Products WITHOUT any of these "private" tags are visible to all B2B customers (default).
+- "Private" tag list maintained in `/admin/settings` as a global string (e.g., "private-*").
+
+**Admin UI** (`/admin/customers/:id` B2B section):
+- New input "Custom catalog tags" (multi-select chip-style) — pick from the global list of
+  private tags. Stored as the metafield.
+
+**Server-side filter** (b2b portal `/api/catalog`):
+- For each product, derive `productPrivateTags = product.tags ∩ globalPrivateTagSet`.
+- If `productPrivateTags.length === 0`: visible to everyone.
+- Else: visible only if `session.b2b.catalog_access_tags ∩ productPrivateTags ≠ ∅`.
+- Same filter applied to `/api/product/:handle` (404 for unauthorized access).
+- Updates the cached catalog response — cache key needs to incorporate the customer's
+  catalog_access_tags (or we filter the cached raw catalog per request).
+
+**Tests**:
+- Customer with no access_tags → only sees products with no private tags
+- Customer with access_tag "private-acme" → also sees products tagged private-acme
+- Customer hits /p/private-acme-collar without access → 404
+
+### 15B — Multi-user team accounts (NEW)
+
+A B2B customer (the primary) can invite additional team members to log in to the portal under
+their account. Invited users authenticate via magic-link email (separate from Shopify Customer
+Account API).
+
+**Data model** (b2b portal SQLite):
+- `companies (id, primary_shopify_customer_id, display_name, created_at)`
+- `company_users (id, company_id, email, display_name, role, status, invited_at, last_login_at)`
+  - `role` ∈ ['primary', 'member', 'admin'] — primary is the Shopify customer; member places
+    orders; admin = member + can manage other team members
+  - `status` ∈ ['invited', 'active', 'revoked']
+- `magic_link_codes (id, email, code_hash, company_id, expires_at, consumed_at)`
+
+**Auth flow for invited users**:
+1. Primary user goes to `/account/team` → "Invite team member" → enters email + role
+2. Portal creates company_users row with status='invited'; emails the invitee a magic link:
+   `https://b2b.fuzzyreporting.com/team-login?email=invitee@x.com&token=<one-time>`
+3. Invitee clicks link → enters their name → portal mints session for them tied to the
+   company_id → status='active', last_login_at=now()
+4. Future logins: invitee goes to `/team-login` → enters email → portal emails a 6-digit code
+   (15-min TTL) → enters code → session minted
+5. Sessions for invited users use the SAME session cookie scheme as Shopify-authed sessions
+   but session record stores `company_user_id` + `company_id` instead of customer_id directly.
+   When making Shopify API calls, the portal uses the company's primary_shopify_customer_id.
+
+**Portal behavior for invited users**:
+- See the same catalog (with the company's catalog_access_tags applied)
+- See the same per-customer pricing (the company's discount %, dropship config)
+- Place orders on behalf of the company (orders show the primary's name + an optional
+  "Placed by {member.name}" note)
+- Cannot see/edit the primary's payment methods, tax cert, addresses (unless role=admin)
+- See shared order history + saved lists (everyone on the team sees the same data)
+
+**Primary's team management UI** (`/account/team`):
+- List of team members with email, role, status, last active
+- "Invite member" form (email + role)
+- "Revoke access" button per row
+- "Change role" (member ↔ admin)
+- Primary cannot revoke themselves
+
+**Constraint**: only the primary (Shopify-authed customer) can invite/revoke. Admin role can
+manage other team members but not the primary.
+
+**Tests**:
+- Primary invites a member → email sent + row created
+- Member clicks magic link → session minted
+- Member places an order → order tagged with primary's customer_id + note "Placed by {member.email}"
+- Member tries to access primary-only routes (payment methods, tax cert) → 403
+- Revoked member's session is invalidated immediately
+
+**Magic link security**:
+- Codes are 6-digit numeric (avoid confusion with O/0)
+- Stored as bcrypt hash, not plaintext
+- 15-minute TTL
+- Rate limit: max 3 code requests per email per hour
+- Single-use (consumed_at set on first use)
+
+### Acceptance for Phase 15
+
+- alexa can configure custom catalog tags per customer in admin → those customers see
+  additional private products
+- A primary customer can invite team members from /account/team
+- Invited members get a magic-link email, click it, set their name, get session, can browse
+  the catalog + place orders on the company's behalf
+- Orders placed by team members are attributed to the primary's Shopify customer but carry
+  a "Placed by {member.email}" note
+- Tests green

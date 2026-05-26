@@ -1,48 +1,33 @@
 # fww-b2b-admin — overnight status
-STATE: DONE
-PHASE: 7+8 — per-customer overrides + label engine 10 templates — SHIPPED
-LAST_UPDATED: 2026-05-26T21:40:00Z
 
-## What shipped this session
+STATE: IN_PROGRESS
+PHASE: 9 → 10 → 13 → 14 → 15 (resume + ship pending phases)
+LAST_UPDATED: 2026-05-26T22:30:00Z
 
-### Phase 7: Per-customer B2B config overrides
-- `GET /api/admin/customers/:id/b2b-config` — returns { effective, overrides, defaults }
-- `PUT /api/admin/customers/:id/b2b-config` — JSON API to set/clear overrides
-- `POST /customers/:id/b2b-config` — form handler (redirects to customer page with flash)
-- `getB2bConfig()` / `applyB2bConfigUpdate()` helpers — works in mock + calls metafieldsSet/metafieldsDelete in real mode
-- **"B2B Pricing & Terms" section** on /customers/:id — shows effective value with
-  (default)/(override) badge per field; blank input = clear override; non-blank = set override.
-- Audit-logged to admin_audit_log on every change.
-- Mock: customer 101 has discount_pct=60 override (demo/test).
+## Where things stand
+Phases 1-8 SHIPPED. Phases 9, 10, 11-rev, 12, 13, 14, 15 are pending — most spec'd in
+HANDOFF.md, agent should ship them in order. Phase 11/12 superseded by Phase 13 (final
+payment spec).
 
-### Phase 8: Label engine 10 templates + 6-checkbox fields
-- **10 templates total**: Avery 5160, 5161 (NEW), 5163, 5167, 8195 + 5 thermal singles
-  (thermal-4x6, thermal-2.25x1.25, thermal-2x1, thermal-3x2, thermal-2x2).
-  Thermal = one label per PDF page at exact label dimensions.
-- **6-checkbox field selector** replaces old binary product/variant + show-price toggles:
-  Product name · Variant name · MSRP · SKU · UPC barcode (graphic) · UPC digits (text)
-- Options form always visible on /labels page (not hidden behind item load).
-- User's last-used template + fields saved per-email in admin_settings (key: last_label_fields).
+Tests baseline: 117/117 green (from Phase 1-8). New tests land with each phase.
 
-## What's working (URLs)
-- https://b2badmin.fuzzywumpets.com (live, Google OAuth, all phases)
-- /customers/101 — B2B Pricing & Terms section with override badge
-- /labels — 10 templates in dropdown, 6-checkbox field selector
+## Phase build order this loop
+1. **Phase 9**: broaden /admin/orders + /admin/customers default scope to ALL orders/customers
+   (currently filtered to b2b-portal-tagged orders only — leaving page nearly empty in prod)
+2. **Phase 10**: refine the per-customer overrides to exactly 4 fields (drop min_order_usd
+   + payment_terms from per-customer scope; add allow_order_on_invoice boolean)
+3. **Phase 13**: payment methods at checkout — invoice + Stripe ACH + Chase stubs + 3%
+   prompt-pay (supersedes Phase 11/12). Stripe keys ALREADY IN DOPPLER (B2B_PORTAL_STRIPE_PK
+   + _SK). Build the customer-side checkout flow on b2b-portal repo (cross-repo authorized
+   for this work).
+4. **Phase 14**: customer self-service — stock alerts, live tracking (in-process → shipped),
+   tax-exempt cert upload, customer-visible notes with email
+5. **Phase 15**: per-customer catalog visibility via custom tag + multi-user team accounts
+   via magic-link auth
 
-## Test status
-- API: 97/97
-- UI:  41/41
-- Total: 138 green
-
-## Blockers / decisions alexa needs to make
-None.
-
-## Phases shipped
-- Phase 1: Google OAuth + dashboard MVP ✓
-- Phase 2: orders + customers ✓
-- Phase 3: catalog + reports + settings + migrate ✓
-- Phase 4: polish (keyboard shortcuts, PWA, CSV exports) ✓
-- Phase 5: UPC barcode label engine ✓
-- Phase 6: product CSV + image exports ✓
-- Phase 7: per-customer B2B config overrides ✓
-- Phase 8: 10 label templates + 6-checkbox fields ✓
+## Pending external deps
+- Phase 1 onboarding form deferred until alexa provides her app code
+- Phase 14 signature pad: use SignaturePad.js (open source) + pdfkit
+- Phase 14 email transport: Resend (free 100/day) — sign up + push API key to Doppler as
+  B2B_PORTAL_RESEND_API_KEY if not already there
+- Phase 14B ShipStation tracking: pull from existing fww-shipping-bridge worker
