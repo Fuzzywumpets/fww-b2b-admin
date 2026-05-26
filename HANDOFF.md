@@ -234,3 +234,138 @@ alexa authorized full autonomous execution. Install deps, create secrets, set up
 to Doppler — just do it. Document in STATUS.md. Only pause for the FORBIDDEN list.
 
 Now: ship.
+
+## Phase 5 — UPC Barcode Label Engine (build after Phase 3; can be parallel with Phase 4)
+
+A self-service tool for alexa (or any admin user) to generate printable UPC barcode label sheets,
+either from a specific order or from a manually-selected list of products.
+
+### Routes
+
+- **`/labels`** — landing page with two flows:
+  - **From an order**: order picker (search by order number, customer, recent orders), review
+    line items × qty, optionally edit qty per row, set options, preview, download PDF
+  - **From products**: product multi-select picker (search by title/SKU/handle, paginated, filter
+    by B2B publication and/or vendor), set quantity per row (default 1), set options, preview,
+    download PDF
+- **`/labels/preview`** (POST) — accepts labels payload + options, returns inline PDF preview
+- **`/labels/print`** (POST) — accepts labels payload + options, returns `Content-Disposition: attachment` PDF
+
+### Options (form on every label run)
+
+- **Label size** dropdown — at minimum these Avery sheet templates:
+  - `Avery 5160` — 1" × 2-5/8", 30/sheet (Letter, 3 columns × 10 rows). DEFAULT.
+  - `Avery 5163` — 2" × 4", 10/sheet (Letter, 2 columns × 5 rows)
+  - `Avery 5167` — 1/2" × 1-3/4", 80/sheet (Letter, 4 columns × 20 rows). Smallest, useful for collars.
+  - `Avery 8195` — 2/3" × 1-3/4", 60/sheet
+  - Add more templates over time as alexa requests them.
+- **Show retail price** toggle (default ON)
+- **Detail level** radio:
+  - `Product only` — just the product title + UPC + (optional price). Used when you want a single
+    label per product regardless of variant.
+  - `Product + variant` — product title + variant title (e.g. "Small / Red") + UPC + (optional price)
+- **Quantity** per row (in product/order list) — defaults to line-item qty for orders, 1 for products
+
+### Data sourcing
+
+- UPC code = Shopify variant's `barcode` field (12-digit UPC-A typical; could also be 13-digit EAN-13).
+  - If barcode field is empty → skip that variant and surface a "X variants have no UPC, skipping"
+    warning in the UI before generating.
+- Product title = `product.title`
+- Variant title = `variant.title` (use `variant.displayName` if cleaner)
+- Retail price = `variant.price` (MSRP) — labels go on physical product, MSRP not B2B discount
+- For "Product only" mode where a product has multiple variants: use the first variant's barcode and
+  hide variant title. (Or: use product-level barcode if Shopify product has one in `product.barcode`.)
+
+### PDF generation
+
+- Use **pdfkit** (already a dep) for PDF layout + **bwip-js** (add as new dep) for barcodes — bwip-js
+  is the most maintained Node-friendly UPC/EAN generator and outputs PNG buffers that pdfkit can embed.
+- Layout per template: precompute label rect coordinates from Avery spec (margins + gutter). Draw
+  each label centered within its rect:
+    - Title (auto-shrink font if too long; allow 2 lines max)
+    - Variant subtitle (if mode == product+variant; smaller font, gray)
+    - Barcode image (centered horizontally, scaled to fit width minus 2mm padding)
+    - Human-readable digits under barcode
+    - Price line (right-aligned, bold) if "Show retail price" is on
+- Test with a sample sheet at every commit (render a PDF, assert page size + label-count match the
+  template).
+
+### Engine architecture
+
+Put the label engine in its own module `labels.mjs`:
+
+```js
+// labels.mjs (sketch)
+import PDFDocument from 'pdfkit';
+import bwipjs from 'bwip-js';
+
+export const TEMPLATES = {
+  'avery-5160': { pageW:612, pageH:792, cols:3, rows:10, labelW:189, labelH:72, marginX:18, marginY:36, gutterX:9, gutterY:0 },
+  'avery-5163': { pageW:612, pageH:792, cols:2, rows:5, labelW:288, labelH:144, marginX:18, marginY:36, gutterX:18, gutterY:0 },
+  // ... etc
+};
+
+export async function renderLabelSheet({ template, items, options }) {
+  // items: [{ title, variantTitle?, barcode, price?, qty }]
+  // options: { showPrice: bool, mode: 'product'|'product+variant' }
+  // Returns a Buffer (PDF).
+}
+
+export async function barcodePng(code, opts={}) {
+  return bwipjs.toBuffer({ bcid: 'upca', text: code, scale: 3, height: 10, includetext: true, textxalign: 'center' });
+}
+```
+
+### UI sketch
+
+**`/labels`** is a simple two-tab page:
+
+```
+┌─ Labels ────────────────────────────────────────────────────┐
+│  [ From an order ]   [ From products ]                       │
+│                                                              │
+│  ┌── Pick an order ─────────────────────────────────────┐    │
+│  │ Search: [ #1234 or customer name ____________  ] 🔍 │    │
+│  │ Recent: • #1042 — Pawsitive Inc — Mar 12             │    │
+│  │         • #1041 — Top Dog Boutique — Mar 11          │    │
+│  └─────────────────────────────────────────────────────┘    │
+│                                                              │
+│  ┌── Options ──────────────────────────────────────────┐    │
+│  │ Label size:  [Avery 5160 (1×2⅝, 30/sheet) ▾]        │    │
+│  │ ☑ Show retail price                                  │    │
+│  │ ○ Product only   ● Product + variant                 │    │
+│  └─────────────────────────────────────────────────────┘    │
+│                                                              │
+│  [ Preview ]   [ Download PDF ]                              │
+└──────────────────────────────────────────────────────────────┘
+```
+
+After picking an order or products, show an editable table of items:
+- Checkbox · Title · Variant · UPC · Qty (editable) · Price
+- "Generate" disabled if 0 items or any qty <= 0
+- "X variants missing barcode" warning visible at top if any
+
+### Persistence
+
+- Save the user's last-used template + options in `admin_settings` SQLite table (per-user via
+  email key) so the next visit pre-fills.
+- Optionally log each label batch generated to `label_batches` SQLite table (id, email, ts,
+  template, item_count, total_labels) for an audit history. Skip the actual PDF blob — too big.
+
+### Tests
+
+- API: POST /labels/preview with mock items → returns PDF Content-Type
+- API: POST /labels/print with mock order → returns PDF with attachment header
+- Engine unit: rendering 30 items on avery-5160 yields exactly 1 page
+- Engine unit: rendering 31 items on avery-5160 yields exactly 2 pages
+- Engine unit: items with missing barcode are skipped, warning surfaced
+- UI: navigate /labels → form renders, preview button works after picking products
+
+### Acceptance for Phase 5
+
+- alexa can navigate to /labels, pick an order, choose Avery 5160, click Download → gets a printable PDF
+- alexa can switch to "From products" tab, search "luxe", multi-select 3 products, set qty 5 each → 15 labels generated
+- alexa can toggle "Show retail price" and see the PDF change
+- alexa can switch detail level (product vs product+variant) and see the labels change
+- 15+ tests added for the engine + UI, all green

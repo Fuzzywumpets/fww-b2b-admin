@@ -7,7 +7,7 @@ set -a; . "$HOME/.secrets/github.env" 2>/dev/null || true; set +a
 cd "$HOME/projects/fww-b2b-admin" || exit 1
 mkdir -p runs runs/screenshots
 
-MAX_ITERS=${MAX_ITERS:-14}
+MAX_ITERS=${MAX_ITERS:-20}
 MAX_TURNS=${MAX_TURNS:-280}
 
 echo "=================================================================" >> runs/loop.log
