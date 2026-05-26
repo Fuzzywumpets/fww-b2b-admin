@@ -2895,3 +2895,253 @@ without grepping logs.
   gets a confirm dialog on mutations
 - Click [Exit impersonation] → portal session ends, audit logged, back to admin
 - All tests green
+
+## Phase 23 — Customer activity warehouse (90-day audit trail)
+
+alexa's directive 2026-05-26: capture every B2B portal interaction per logged-in customer so we
+can verify or dispute claims ("I placed an order at 3pm last Tuesday"). Retain 90 days, then
+purge.
+
+Cross-repo: `fww-b2b-portal` logs, `fww-b2b-admin` reads + displays.
+
+### 23A — Portal: activity log table + capture middleware
+
+**SQLite (portal)**: `customer_activity`
+```sql
+CREATE TABLE customer_activity (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  customer_id TEXT NOT NULL,          -- numeric Shopify customer ID (string for safety)
+  session_id TEXT,                     -- portal session cookie value (one row per session start)
+  event_type TEXT NOT NULL,            -- enum below
+  event_subtype TEXT,                  -- finer category within type
+  event_data TEXT,                     -- JSON blob, schema varies by type
+  path TEXT,                           -- request path or page URL
+  referrer TEXT,                       -- referrer URL if available
+  user_agent TEXT,                     -- truncated to 256 chars
+  ip_hash TEXT,                        -- SHA256 of IP (raw IP NEVER stored; preserves privacy + fraud detection)
+  ip_country TEXT,                     -- geolocated country code (US/CA/etc) from CF header
+  http_status INTEGER,                 -- for api_call / error types
+  duration_ms INTEGER,                 -- for page_view / api_call
+  impersonation_admin TEXT,            -- if event happened during Phase 22 impersonation, admin email
+  ts INTEGER NOT NULL                  -- epoch ms (sortable + range-queryable)
+);
+CREATE INDEX idx_activity_customer_ts ON customer_activity(customer_id, ts DESC);
+CREATE INDEX idx_activity_type_ts ON customer_activity(event_type, ts DESC);
+CREATE INDEX idx_activity_session ON customer_activity(session_id);
+```
+
+**Event types + subtypes:**
+
+| event_type | subtypes | data fields |
+|---|---|---|
+| `auth` | login, login_failed, logout, session_expired, token_refreshed | method (oauth/magic_link) |
+| `page_view` | (none) | path, referrer, duration_ms (time on page, if reported) |
+| `cart` | add, remove, qty_change, clear, view | variant_id, product_title, qty_before, qty_after, line_total |
+| `checkout` | started, method_selected, submitted, succeeded, failed, abandoned | payment_method, order_total, error_msg |
+| `order` | placed, viewed, reorder_initiated, invoice_downloaded | order_id, order_name |
+| `account` | profile_view, profile_edit, alert_subscribe, alert_unsubscribe, tax_cert_upload, team_invite_sent | (varies) |
+| `api_call` | (route name) | path, method, status, duration_ms |
+| `error` | client_js, server_5xx, payment_failed, validation | message, stack, path |
+| `impersonation` | viewed_during, action_during | admin_email, action_name |
+
+### 23B — Server-side automatic capture
+
+Express middleware in `fww-b2b-portal/server.mjs` runs on EVERY request after auth:
+
+```js
+function activityMiddleware(req, res, next) {
+  if (!req.session?.customer_id) return next();  // only log authed traffic
+  const start = Date.now();
+  res.on('finish', () => {
+    const duration = Date.now() - start;
+    const eventType = req.path.startsWith('/api/') ? 'api_call' :
+                      res.statusCode >= 500 ? 'error' :
+                      req.method === 'GET' && res.statusCode === 200 ? 'page_view' :
+                      null;
+    if (!eventType) return;
+    insertActivity({
+      customer_id: req.session.customer_id,
+      session_id: req.sessionID,
+      event_type: eventType,
+      event_subtype: eventType === 'api_call' ? req.path.split('/').slice(2,4).join('/') : null,
+      path: req.path,
+      referrer: req.get('referer') || null,
+      user_agent: (req.get('user-agent') || '').slice(0, 256),
+      ip_hash: sha256(req.ip).slice(0, 32),
+      ip_country: req.get('cf-ipcountry') || null,
+      http_status: res.statusCode,
+      duration_ms: duration,
+      impersonation_admin: req.session.impersonation?.admin_email || null,
+      ts: start
+    });
+  });
+  next();
+}
+```
+
+**Specialized event hooks** (not just middleware — explicit calls in business logic):
+- `auth` events: login success/fail in OAuth callback handlers
+- `cart` events: in cart event endpoint (Phase 19D)
+- `checkout` events: in checkout flow stages
+- `order` events: on order placement success + viewing
+- `error.client_js` events: see 23C below
+
+### 23C — Client-side error + interaction capture
+
+`public/js/activity.js` (small, loaded on every authed page):
+
+```js
+// Auto-catch JS errors
+window.addEventListener('error', (e) => {
+  navigator.sendBeacon('/api/activity', JSON.stringify({
+    event_type: 'error',
+    event_subtype: 'client_js',
+    event_data: { message: e.message, file: e.filename, line: e.lineno, col: e.colno, stack: e.error?.stack?.slice(0, 1000) },
+    path: location.pathname
+  }));
+});
+window.addEventListener('unhandledrejection', (e) => { /* similar */ });
+
+// Time on page (sent on visibilitychange→hidden)
+let pageEntered = Date.now();
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') {
+    navigator.sendBeacon('/api/activity', JSON.stringify({
+      event_type: 'page_view',
+      event_subtype: 'duration',
+      duration_ms: Date.now() - pageEntered,
+      path: location.pathname
+    }));
+  }
+});
+
+// Optional: track button clicks via data-track attribute
+document.addEventListener('click', (e) => {
+  const trackName = e.target.closest('[data-track]')?.dataset.track;
+  if (trackName) {
+    fetch('/api/activity', { method: 'POST', body: JSON.stringify({ event_type: 'click', event_subtype: trackName, path: location.pathname }) });
+  }
+});
+```
+
+`POST /api/activity` endpoint accepts these client-emitted events (rate-limited: 60/min/session).
+
+### 23D — Purge job (90-day retention)
+
+Background job in portal server, runs daily at 03:00 UTC:
+
+```js
+function purgeOldActivity() {
+  const cutoff = Date.now() - 90 * 24 * 60 * 60 * 1000;
+  const result = db.prepare('DELETE FROM customer_activity WHERE ts < ?').run(cutoff);
+  console.log(`[activity-purge] deleted ${result.changes} rows older than ${new Date(cutoff).toISOString()}`);
+  // Also VACUUM weekly to reclaim space
+  if (new Date().getDay() === 0) db.exec('VACUUM');
+}
+setInterval(purgeOldActivity, 24 * 60 * 60 * 1000);  // run daily
+purgeOldActivity();  // run on startup too
+```
+
+Audit log: per-purge `activity_purged` row with count + cutoff timestamp.
+
+### 23E — Admin: customer activity viewer
+
+New page `/admin/customers/:id/activity`:
+
+```
+┌─ Activity log: Mia Wagner ───────────────────────────────────────────┐
+│ Date range: [Last 7 days ▾]   Event type: [All ▾]   [Search…    ]    │
+│                                                                       │
+│ 2026-05-26 14:32:18  page_view   /orders                  200  124ms │
+│ 2026-05-26 14:32:05  api_call    /api/orders              200   89ms │
+│ 2026-05-26 14:31:58  page_view   /orders                  200  201ms │
+│ 2026-05-26 14:31:42  cart.add    Limited Slip × 2 (+1)    -        - │ ← link to product
+│ 2026-05-26 14:30:11  checkout.method_selected  ACH        -        - │
+│ 2026-05-26 14:29:47  page_view   /cart                    200  198ms │
+│ 2026-05-26 14:28:30  auth.login  oauth                    200        │
+│ ...                                                                   │
+│                                                                       │
+│ Showing 1–50 of 847 events  [next →]                                  │
+└───────────────────────────────────────────────────────────────────────┘
+```
+
+Filters:
+- Date range: Today / Last 24h / Last 7d / Last 30d / Last 90d / Custom
+- Event type: All / page_view / cart / checkout / order / auth / error / api_call
+- Search box: matches in path, event_subtype, event_data text
+
+Row click → expand inline showing full event_data JSON + ip_hash (first 8 chars) + country
++ user_agent + impersonation flag if applicable.
+
+**Useful canned views** (preset filter buttons):
+- "Orders placed" → event_type=order, subtype=placed
+- "Failed checkouts" → event_type=checkout, subtype=failed
+- "Errors" → event_type=error
+- "Recent logins" → event_type=auth, subtype=login
+
+**Endpoint:** `GET /api/admin/customers/:id/activity?from&to&type&q&page` — proxies to portal
+DB via the existing internal-token pattern (already used for Phase 14C tax-exempt review).
+
+### 23F — Admin: dispute resolution view (the "did they place the order?" workflow)
+
+On `/admin/customers/:id/activity`, add a button "Quick lookup":
+
+```
+[ Quick lookup: did customer place order on... ]
+  Date: [2026-05-25]  → [Check]
+```
+
+Clicking → queries activity for `event_type=order` AND `event_subtype=placed` on that date
+for the customer:
+- If found: show order_id link + exact timestamp + ip_country
+- If not found: show "No order placed by this customer on 2026-05-25. Last login: 2026-05-24
+  16:42. Last cart activity: 2026-05-23 11:08."
+
+Lets alexa answer "I placed an order Monday" claims in one click.
+
+### 23G — Privacy + security
+
+- Raw IP NEVER stored — only SHA256 hash truncated to 32 chars (still useful for
+  cross-session correlation / fraud detection but not reversible to a real address)
+- IP country code stored separately (from CF-IPCountry header) for high-level geo info
+- User-agent truncated to 256 chars (full UAs can be giant; we don't need full)
+- 90-day retention enforced by daily purge job
+- Admin viewer requires admin auth (already gated by Google OAuth + allowlist)
+- Customer can request export of their own activity (GDPR-style) — add to `/account/data-export`
+  in a future phase (NOT THIS PHASE, just noted)
+- During Phase 22 impersonation: events log `impersonation_admin` so admin actions are
+  attributable + distinguishable from real customer actions
+
+### 23H — Storage estimate
+
+Rough sizing for 30 active B2B customers:
+- ~30 customers × ~20 sessions/month × ~50 events/session ≈ 30K events/month
+- At ~500 bytes per row JSON: ~15 MB/month, ~45 MB at full 90-day retention
+- SQLite handles this trivially; no concern
+
+If usage explodes (>1M events/month), revisit: add archival cold-storage (S3/R2) tier before
+purge, or move to a TSDB.
+
+### Tests
+
+- 23A: insert + read back activity row with all fields
+- 23B: GET /products as authed customer → page_view row inserted
+- 23B: POST /api/cart/event → cart row inserted with variant_id + qty
+- 23B: 500 error response → error row inserted with http_status=500
+- 23B: impersonation session → impersonation_admin field populated
+- 23C: client beacon to /api/activity (rate-limited 60/min)
+- 23D: purge deletes rows >90 days old; recent rows preserved
+- 23E: admin GET /api/admin/customers/:id/activity filters by date + type
+- 23F: quick lookup answers "order placed on date?" correctly
+- 23G: IP stored as hash, never raw
+
+### Acceptance for Phase 23
+
+- Every authed page view, API call, cart event, checkout step, login, error gets a row in
+  `customer_activity` automatically
+- Client JS errors get reported via beacon
+- Admin can pull up any customer's activity timeline filtered by date + type
+- Quick lookup answers "did this customer place an order on X date?" in one click
+- 90-day retention enforced via daily purge
+- All raw IPs hashed; only country code preserved
+- All tests green
