@@ -770,3 +770,115 @@ returns to the same view. Trivial change once the filter state is wired.
 - alexa clicks any historical order → can download a PDF invoice
 - alexa opens /admin/customers → sees actual customer list, sorted by spend, with tag badges
 - alexa picks a high-spend customer with no `b2b` tag → can add the tag from customer detail page
+
+## Phase 10 — Per-customer config (REFINES Phase 7)
+
+alexa's clarified the exact 3 (well, 4) per-customer fields she wants on `/admin/customers/:id`.
+This supersedes the Phase 7 "per-customer overrides" list. Specifically:
+
+- **DROP** from Phase 7: `min_order_usd` and `payment_terms` are NOT per-customer; they stay as
+  global defaults in `/settings`.
+- **KEEP** from Phase 7: `discount_pct` per-customer override.
+- **KEEP** from Phase 2 (already shipped): `dropship_enabled` + `dropship_margin_pct`.
+- **NEW**: `allow_order_on_invoice` boolean.
+
+### The 4 per-customer fields (final spec)
+
+| Field | Type | Metafield | Default | UX |
+|---|---|---|---|---|
+| Discount % | integer 0–95 | `b2b.discount_pct` | 50 (from /settings) | numeric input + "Reset to default" |
+| Drop-ship allowed | boolean | `b2b.dropship_enabled` | false | toggle |
+| Drop-ship discount % | integer 0–95 | `b2b.dropship_margin_pct` | 30 | numeric input (only enabled when toggle on) |
+| Allow order on invoice | boolean | `b2b.allow_order_on_invoice` | true | toggle |
+
+Group all four into a single "B2B Customer Settings" section on `/admin/customers/:id`. Single
+"Save" button at the bottom of the section. Audit-log on save with full before/after.
+
+### Help text per toggle (visible under each input)
+
+- **Discount %**: "What percent off MSRP this customer pays. Default 50% comes from store settings."
+- **Drop-ship allowed**: "If on, this customer can choose to ship orders directly to their end
+  customer at checkout. Useful for resellers who don't carry inventory."
+- **Drop-ship discount %**: "Discount applied on drop-ship orders only (separate from standard
+  discount above). Typical 25–35% since FWW handles the fulfillment."
+- **Allow order on invoice**: "If on, the customer can place orders without paying upfront —
+  we invoice them. If off, they must pay at checkout."
+
+### Portal-side wiring (cross-repo, authorized for this loop)
+
+The b2b-portal repo at `~/projects/fww-b2b-portal` already exists on the VPS — touch it for
+these specific changes:
+
+1. **Auth callback** (`server.mjs` `/auth/callback`): when looking up the customer, also fetch
+   `metafields(namespace:"b2b", first:10)`. Parse the 4 values into the session:
+   `req.session.b2b = { discount_pct, dropship_enabled, dropship_margin_pct, allow_order_on_invoice }`.
+   Use defaults when missing.
+
+2. **Catalog pricing** (`/api/catalog`): instead of `applyDiscount(price)` using `B2B_DISCOUNT`,
+   use `session.b2b.discount_pct` (effective). NOTE: this breaks the simple shared cache. Two
+   options:
+   - **Cache RAW products** (with MSRP only); apply per-customer discount on each request from
+     the cached raw catalog. Simple + fast.
+   - Or: separate cache per discount-rate bucket (e.g., 50% bucket vs 45% bucket vs 60% bucket).
+     More complex; not worth it unless there are many distinct rates.
+   Recommended: option A. The cache layer was just added in commit `99e2aba` — refactor to
+   store raw products in `catalogCache.rawProducts` and apply discount at `/api/catalog` request time.
+
+3. **Checkout flow** (`/checkout` + `/api/checkout`):
+   - If `!session.b2b.allow_order_on_invoice`: replace the "Place order on invoice" submit
+     button with a message: "Online checkout for your account requires upfront payment. We
+     don't have card processing built yet — please email wholesale@fuzzywumpets.com to place
+     this order, or contact us to enable invoiced orders on your account."
+   - If `session.b2b.dropship_enabled`: above the shipping address section, show a toggle
+     "Drop-ship this order?" When on, reveal end-customer fields (recipient name, addr1/2,
+     city, state, zip, country, phone) AND an optional gift message textarea. On submit,
+     order's `shippingAddress` = end-customer; `billingAddress` = wholesale customer;
+     add tag `b2b-dropship`; set note `Drop-ship for {customer.displayName}`. Apply
+     `dropship_margin_pct` to line item prices INSTEAD of `discount_pct`.
+
+4. **Cart min-order display** (`/cart`): can stay using global default for now; alexa explicitly
+   said min order is NOT per-customer.
+
+### Admin UI flow
+
+`/customers/:id` page should have these sections (in order):
+
+```
+[ Customer profile — name, email, phone, tags editor ] (existing)
+[ B2B Customer Settings ]                              (Phase 10 — NEW SECTION)
+    Discount %               [50]   default applied   [Reset]
+    Drop-ship allowed        [○ off]
+    Drop-ship discount %     [30]   (disabled while drop-ship is off)
+    Allow order on invoice   [● on]
+                             [ Save changes ]
+[ Internal notes ]                                     (existing from Phase 2)
+[ Recent orders ]                                      (existing)
+```
+
+When "Drop-ship allowed" toggle is off, the "Drop-ship discount %" input should be visually
+disabled (gray, ignoring input) but its value preserved (so toggling back on restores the saved
+margin %).
+
+### Tests
+
+- API: PUT /api/admin/customers/:id/b2b-config writes the 4 metafields correctly
+- API: PUT with `dropship_enabled: false` does not delete `dropship_margin_pct` (preserve)
+- API: GET returns all 4 values with effective/override/default for each
+- API: PUT with `allow_order_on_invoice: false` writes the metafield as boolean
+- UI: toggling drop-ship off greys the discount input
+- UI: clicking Reset on discount → metafield deleted → "default applied" badge returns
+- Portal: customer with `allow_order_on_invoice: false` sees the "contact us" message at checkout
+- Portal: customer with `dropship_enabled: true` sees the drop-ship toggle on checkout
+- Portal: order created with drop-ship has the right shipping/billing split + tags + note
+
+### Acceptance
+
+- alexa opens any customer's detail page → sees the 4-field B2B Settings section with current
+  values + reset buttons
+- alexa changes a customer's discount to 40% → saves → customer logs into portal → sees
+  60%-of-MSRP pricing (40% off)
+- alexa toggles drop-ship on for a customer + sets 30% margin → customer sees drop-ship
+  option at checkout that asks for end-customer address
+- alexa toggles "Allow order on invoice" off for a customer who's been slow paying → customer
+  hits checkout and sees the "contact us" message instead of the invoice button
+- All actions audit-logged. Tests green.
