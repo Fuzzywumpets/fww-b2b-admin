@@ -580,6 +580,8 @@ body {
 .badge-dropship            { background: #EDE9FE; color: #5B21B6; }
 .badge-success             { background: #D1FAE5; color: #065F46; }
 .badge-pending             { background: #FEF3C7; color: #92400E; }
+.badge-warning             { background: #FEF3C7; color: #92400E; }
+.badge-muted               { background: var(--gray-100); color: var(--gray-500); }
 
 /* ── Breadcrumb ── */
 .breadcrumb-row { margin-bottom: 0.75rem; }

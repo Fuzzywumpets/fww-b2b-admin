@@ -476,6 +476,71 @@ await testMobile('/exports renders without overflow at 390px', async (page, ctx)
   assert.ok(scrollWidth <= clientWidth + 4, `Overflow on /exports at 390px: scrollW=${scrollWidth} clientW=${clientWidth}`);
 });
 
+// ── Phase 7: B2B config overrides UI ─────────────────────────────────────────
+console.log('\nUI tests — Phase 7: B2B config overrides:');
+
+await test('/customers/:id shows B2B pricing & terms section', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/customers/101`);
+  await page.waitForSelector('#b2b-pricing-card');
+  const html = await page.content();
+  assert.ok(html.includes('B2B Pricing'), 'Missing B2B Pricing heading');
+  assert.ok(html.includes('Discount %'), 'Missing discount field');
+  assert.ok(html.includes('Min order'), 'Missing min order field');
+  assert.ok(html.includes('Payment terms'), 'Missing payment terms field');
+});
+
+await test('customer B2B config shows override badge for customer 101', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/customers/101`);
+  await page.waitForSelector('#b2b-pricing-card');
+  const html = await page.content();
+  assert.ok(html.includes('override'), 'Should show override badge for customer 101 discount_pct=60');
+});
+
+await test('customer B2B config save form redirects with success', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/customers/103`);
+  await page.waitForSelector('#b2b-pricing-card');
+  await page.fill('input[name="discount_pct"]', '55');
+  await page.click('#b2b-pricing-card button[type="submit"]');
+  await page.waitForURL(/b2b_config_saved/);
+  const html = await page.content();
+  assert.ok(html.includes('B2B pricing config saved'), 'Missing success flash');
+});
+
+// ── Phase 8: 10 templates + 6 checkboxes UI ──────────────────────────────────
+console.log('\nUI tests — Phase 8: Label engine 10 templates + field selection:');
+
+await test('/labels shows 10 templates in dropdown', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/labels`);
+  await page.waitForSelector('.tab-bar');
+  const optionValues = await page.$$eval('select[name="template"] option', opts => opts.map(o => o.value));
+  assert.ok(optionValues.length >= 10, `Expected ≥10 template options, got ${optionValues.length}`);
+  assert.ok(optionValues.includes('avery-5161'), 'Missing avery-5161');
+  assert.ok(optionValues.includes('thermal-4x6'), 'Missing thermal-4x6');
+  assert.ok(optionValues.includes('thermal-2x1'), 'Missing thermal-2x1');
+});
+
+await test('/labels shows 6-field checkboxes with correct defaults', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/labels`);
+  await page.waitForSelector('.tab-bar');
+  const html = await page.content();
+  assert.ok(html.includes('field_productName'), 'Missing productName checkbox');
+  assert.ok(html.includes('field_upcBarcode'),   'Missing upcBarcode checkbox');
+  assert.ok(html.includes('field_sku'),          'Missing sku checkbox');
+  // SKU defaults to unchecked
+  const skuChecked = await page.$eval('input[name="field_sku"]', el => el.checked).catch(() => false);
+  assert.ok(!skuChecked, 'SKU checkbox should be unchecked by default');
+});
+
 await browser.close();
 
 console.log(`\n  ${passed} passed, ${failed} failed`);

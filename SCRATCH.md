@@ -190,6 +190,31 @@ fww-b2b-admin/
 ## Append below this line, future iterations
 ---
 
+## Phase 7+8 complete (2026-05-26, this session)
+
+### Phase 7: Per-customer B2B config overrides
+- mockB2bConfigOverrides Map<numericId, {discount_pct, min_order_usd, payment_terms}> in mock mode
+- Real mode: metafieldsSet for sets, metafieldsDelete(metafields:[{ownerId,namespace,key}]) for clears
+- Shopify `metafieldsDelete` mutation takes MetafieldIdentifierInput (ownerId + namespace + key) — no GID needed
+- getB2bConfig returns { effective, overrides, defaults }; applyB2bConfigUpdate handles mock + real
+- b2bConfig is now a required param to renderCustomerDetail (6th param, before flash)
+- Flash key: 'b2b_config_saved' → "B2B pricing config saved."
+- Customer 101 MOCK has discount_pct=60 override metafield for demo
+
+### Phase 8: 10 label templates + 6-checkbox fields
+- labels.mjs fully rewritten: DEFAULT_FIELDS export, 10 TEMPLATES, renderSheetLayout + renderThermalLayout
+- Thermal layout: page size = label size in the PDF (use `size: [labelW, labelH]` on PDFDocument + addPage)
+- barcodePng now uses includetext: false (upcDigits field handles text separately)
+- Field names in form: field_productName, field_variantName, field_msrp, field_sku, field_upcBarcode, field_upcDigits
+- Settings key for persisted fields: last_label_fields (JSON string)
+- Options form MUST always be rendered (not inside conditional items block) so tests can find it
+- Import DEFAULT_FIELDS from labels.mjs in server.mjs
+
+### Critical: options form always visible
+- renderLabelsPage now renders optionsForm unconditionally in both tabs
+- When no items loaded: `<div>${optionsForm}</div>`
+- When items loaded: `<form method="POST">${optionsForm}${itemsTable}</form>`
+
 ## Phase 1 complete (2026-05-26, commit dde366c)
 
 ### Files built

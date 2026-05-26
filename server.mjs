@@ -22,7 +22,7 @@ import {
   logLabelBatch, logExportBatch,
 } from './db.mjs';
 import { generateInvoicePdf } from './pdf.mjs';
-import { renderLabelSheet, expandItems, TEMPLATES as LABEL_TEMPLATES } from './labels.mjs';
+import { renderLabelSheet, expandItems, TEMPLATES as LABEL_TEMPLATES, DEFAULT_FIELDS } from './labels.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const MOCK  = process.env.B2B_ADMIN_MOCK === '1';
@@ -149,6 +149,7 @@ const MOCK_CUSTOMERS = [
     addresses: [{ id: 'addr1', firstName: 'John', lastName: 'Doe', address1: '123 Main St', city: 'Chicago', province: 'IL', zip: '60601', country: 'US' }],
     metafields: { edges: [
       { node: { id: 'mf1', namespace: 'b2b', key: 'dropship_enabled', value: 'false', type: 'boolean' } },
+      { node: { id: 'mf4', namespace: 'b2b', key: 'discount_pct', value: '60', type: 'number_integer' } },
     ]},
   },
   {
@@ -195,6 +196,9 @@ const MOCK_CUSTOMERS = [
     metafields: { edges: [] },
   },
 ];
+
+// In-memory override store for mock mode (Phase 7). Key = numericId string.
+const mockB2bConfigOverrides = new Map();
 
 const MOCK_PRODUCTS = [
   { id: 'gid://shopify/Product/201', title: 'Elite Collar', handle: 'elite-collar',
@@ -1174,7 +1178,118 @@ async function getCustomerRecentOrders(customerId) {
   } catch { return []; }
 }
 
-function renderCustomerDetail(session, customer, recentOrders, notes, dropshipCache, flash) {
+async function getB2bConfig(numericId) {
+  const defaults = {
+    discount_pct:  parseInt(getSetting('b2b_discount_pct') ?? '50', 10),
+    min_order_usd: parseInt(getSetting('order_minimum')    ?? '0',  10),
+    payment_terms: getSetting('payment_terms')             ?? 'Net 30',
+  };
+
+  if (MOCK) {
+    const inMemory = mockB2bConfigOverrides.get(numericId) || {};
+    const gid = shopifyCustomerGid(numericId);
+    const cust = MOCK_CUSTOMERS.find(c => c.id === gid);
+    const mfs  = cust?.metafields?.edges?.map(e => e.node) || [];
+    // Start from metafields in mock data, then apply in-memory overrides on top
+    const fromMf = {};
+    const dpStr   = mfs.find(m => m.key === 'discount_pct')?.value;
+    const moStr   = mfs.find(m => m.key === 'min_order_usd')?.value;
+    const ptStr   = mfs.find(m => m.key === 'payment_terms')?.value;
+    if (dpStr !== undefined) fromMf.discount_pct  = parseInt(dpStr, 10);
+    if (moStr !== undefined) fromMf.min_order_usd = parseInt(moStr, 10);
+    if (ptStr !== undefined) fromMf.payment_terms  = ptStr;
+
+    const overrides = { ...fromMf, ...inMemory };
+    // Null entries in inMemory mean "cleared"
+    for (const k of Object.keys(inMemory)) {
+      if (inMemory[k] === null) delete overrides[k];
+    }
+    return {
+      effective: {
+        discount_pct:  overrides.discount_pct  ?? defaults.discount_pct,
+        min_order_usd: overrides.min_order_usd ?? defaults.min_order_usd,
+        payment_terms: overrides.payment_terms ?? defaults.payment_terms,
+      },
+      overrides: {
+        discount_pct:  overrides.discount_pct  ?? null,
+        min_order_usd: overrides.min_order_usd ?? null,
+        payment_terms: overrides.payment_terms ?? null,
+      },
+      defaults,
+    };
+  }
+
+  try {
+    const result = await shopifyFetch(`
+      query($id:ID!){customer(id:$id){
+        metafields(first:20,namespace:"b2b"){edges{node{id key value type}}}
+      }}`, { id: shopifyCustomerGid(numericId) });
+    const mfs = result.data?.customer?.metafields?.edges?.map(e => e.node) || [];
+    const getVal = k => mfs.find(m => m.key === k)?.value ?? null;
+    const dpStr  = getVal('discount_pct');
+    const moStr  = getVal('min_order_usd');
+    const ptStr  = getVal('payment_terms');
+    const overrides = {
+      discount_pct:  dpStr !== null ? parseInt(dpStr, 10)  : null,
+      min_order_usd: moStr !== null ? parseInt(moStr, 10)  : null,
+      payment_terms: ptStr !== null ? ptStr                : null,
+    };
+    return {
+      effective: {
+        discount_pct:  overrides.discount_pct  ?? defaults.discount_pct,
+        min_order_usd: overrides.min_order_usd ?? defaults.min_order_usd,
+        payment_terms: overrides.payment_terms ?? defaults.payment_terms,
+      },
+      overrides,
+      defaults,
+    };
+  } catch (err) {
+    console.error('getB2bConfig error:', err.message);
+    return {
+      effective: defaults,
+      overrides: { discount_pct: null, min_order_usd: null, payment_terms: null },
+      defaults,
+    };
+  }
+}
+
+async function applyB2bConfigUpdate(numericId, { discount_pct, min_order_usd, payment_terms }) {
+  const gid = shopifyCustomerGid(numericId);
+  if (MOCK) {
+    const cur = { ...(mockB2bConfigOverrides.get(numericId) || {}) };
+    if (discount_pct  !== undefined) { cur.discount_pct  = (discount_pct  === null || discount_pct  === '') ? null : parseInt(discount_pct,  10); }
+    if (min_order_usd !== undefined) { cur.min_order_usd = (min_order_usd === null || min_order_usd === '') ? null : parseInt(min_order_usd, 10); }
+    if (payment_terms !== undefined) { cur.payment_terms = (payment_terms === null || payment_terms === '') ? null : String(payment_terms); }
+    mockB2bConfigOverrides.set(numericId, cur);
+    return;
+  }
+
+  const sets    = [];
+  const delKeys = [];
+  const fieldDefs = [
+    { key: 'discount_pct',  val: discount_pct,  type: 'number_integer' },
+    { key: 'min_order_usd', val: min_order_usd, type: 'number_integer' },
+    { key: 'payment_terms', val: payment_terms, type: 'single_line_text_field' },
+  ];
+  for (const f of fieldDefs) {
+    if (f.val === undefined) continue;
+    if (f.val === null || f.val === '') {
+      delKeys.push(f.key);
+    } else {
+      const valStr = f.type === 'number_integer' ? String(parseInt(f.val, 10)) : String(f.val).slice(0, 100);
+      sets.push({ ownerId: gid, namespace: 'b2b', key: f.key, value: valStr, type: f.type });
+    }
+  }
+  if (sets.length) {
+    await shopifyFetch(`mutation metafieldsSet($m:[MetafieldsSetInput!]!){ metafieldsSet(metafields:$m){ userErrors{field message} } }`, { m: sets });
+  }
+  if (delKeys.length) {
+    const delInputs = delKeys.map(k => ({ ownerId: gid, namespace: 'b2b', key: k }));
+    await shopifyFetch(`mutation metafieldsDelete($m:[MetafieldIdentifierInput!]!){ metafieldsDelete(metafields:$m){ deletedMetafieldIds userErrors{field message} } }`, { m: delInputs });
+  }
+}
+
+function renderCustomerDetail(session, customer, recentOrders, notes, dropshipCache, b2bConfig, flash) {
   const numId      = shopifyNumericId(customer.id);
   const metafields = customer.metafields?.edges?.map(e => e.node) || [];
   const dropshipEnabled = dropshipCache?.enabled
@@ -1187,6 +1302,8 @@ function renderCustomerDetail(session, customer, recentOrders, notes, dropshipCa
     ? `<div class="alert alert-success">Notes saved.</div>`
     : flash === 'dropship_saved'
     ? `<div class="alert alert-success">Dropship config updated.</div>`
+    : flash === 'b2b_config_saved'
+    ? `<div class="alert alert-success">B2B pricing config saved.</div>`
     : flash === 'tags_added'
     ? `<div class="alert alert-success">Tags updated.</div>`
     : '';
@@ -1250,6 +1367,34 @@ function renderCustomerDetail(session, customer, recentOrders, notes, dropshipCa
               <input type="number" id="margin_pct" name="margin_pct" value="${h(String(dropshipMargin))}" min="0" max="100" step="1" class="input input-sm" style="width:80px">
             </div>
             <div style="margin-top:0.5rem"><button type="submit" class="btn btn-secondary btn-sm">Save Dropship Config</button></div>
+          </form>
+        </div>
+        <div class="card" id="b2b-pricing-card">
+          <div class="card-header"><h2>B2B Pricing &amp; Terms</h2></div>
+          <p class="text-muted small-text" style="margin-bottom:0.75rem">Store defaults: ${h(String(b2bConfig.defaults.discount_pct))}% discount · $${h(String(b2bConfig.defaults.min_order_usd))} min order · ${h(b2bConfig.defaults.payment_terms)}. Leave blank to use default.</p>
+          <form method="POST" action="/customers/${h(numId)}/b2b-config">
+            <div class="form-row" style="margin-bottom:0.5rem;align-items:center">
+              <label style="min-width:120px">Discount %</label>
+              <div style="display:flex;align-items:center;gap:0.5rem">
+                <input type="number" name="discount_pct" value="${b2bConfig.overrides.discount_pct !== null ? h(String(b2bConfig.overrides.discount_pct)) : ''}" min="0" max="100" step="1" class="input input-sm" style="width:80px" placeholder="${h(String(b2bConfig.defaults.discount_pct))}">
+                <span class="badge ${b2bConfig.overrides.discount_pct !== null ? 'badge-warning' : 'badge-muted'}">${b2bConfig.overrides.discount_pct !== null ? 'override: ' + h(String(b2bConfig.effective.discount_pct)) + '%' : 'default'}</span>
+              </div>
+            </div>
+            <div class="form-row" style="margin-bottom:0.5rem;align-items:center">
+              <label style="min-width:120px">Min order ($)</label>
+              <div style="display:flex;align-items:center;gap:0.5rem">
+                <input type="number" name="min_order_usd" value="${b2bConfig.overrides.min_order_usd !== null ? h(String(b2bConfig.overrides.min_order_usd)) : ''}" min="0" step="1" class="input input-sm" style="width:100px" placeholder="${h(String(b2bConfig.defaults.min_order_usd))}">
+                <span class="badge ${b2bConfig.overrides.min_order_usd !== null ? 'badge-warning' : 'badge-muted'}">${b2bConfig.overrides.min_order_usd !== null ? 'override: $' + h(String(b2bConfig.effective.min_order_usd)) : 'default'}</span>
+              </div>
+            </div>
+            <div class="form-row" style="margin-bottom:0.5rem;align-items:center">
+              <label style="min-width:120px">Payment terms</label>
+              <div style="display:flex;align-items:center;gap:0.5rem">
+                <input type="text" name="payment_terms" value="${h(b2bConfig.overrides.payment_terms ?? '')}" class="input input-sm" style="width:160px" placeholder="${h(b2bConfig.defaults.payment_terms)}">
+                <span class="badge ${b2bConfig.overrides.payment_terms !== null ? 'badge-warning' : 'badge-muted'}">${b2bConfig.overrides.payment_terms !== null ? 'override' : 'default'}</span>
+              </div>
+            </div>
+            <div style="margin-top:0.5rem"><button type="submit" class="btn btn-secondary btn-sm">Save B2B Config</button></div>
           </form>
         </div>
       </div>
@@ -1928,15 +2073,16 @@ app.get('/customers', requireAuth, async (req, res) => {
 });
 
 app.get('/customers/:id', requireAuth, async (req, res) => {
-  const [customer, recentOrders] = await Promise.all([
+  const [customer, recentOrders, b2bConfig] = await Promise.all([
     getCustomerDetail(req.params.id),
     getCustomerRecentOrders(req.params.id),
+    getB2bConfig(req.params.id),
   ]);
   if (!customer) return res.status(404).send(layout({ title: '404', session: req.adminSession, activePath: '/customers',
     content: '<div class="page-header"><h1>Customer not found</h1></div><a href="/customers" class="btn btn-secondary">← Customers</a>' }));
-  const notes     = getCustomerNotes(shopifyCustomerGid(req.params.id));
-  const dropship  = getDropshipCache(shopifyCustomerGid(req.params.id));
-  res.send(renderCustomerDetail(req.adminSession, customer, recentOrders, notes, dropship, req.query.success || ''));
+  const notes    = getCustomerNotes(shopifyCustomerGid(req.params.id));
+  const dropship = getDropshipCache(shopifyCustomerGid(req.params.id));
+  res.send(renderCustomerDetail(req.adminSession, customer, recentOrders, notes, dropship, b2bConfig, req.query.success || ''));
 });
 
 app.post('/customers/:id/notes', requireAuth, (req, res) => {
@@ -1994,6 +2140,30 @@ app.post('/customers/:id/dropship', requireAuth, async (req, res) => {
   }
   auditLog(req.adminSession.email, 'update_dropship', gid, null, { enabled, marginPct });
   res.redirect(`/customers/${req.params.id}?success=dropship_saved`);
+});
+
+// ── Phase 7: B2B config overrides ─────────────────────────────────────────────
+
+app.post('/customers/:id/b2b-config', requireAuth, async (req, res) => {
+  const numId = req.params.id;
+  const before = await getB2bConfig(numId);
+  await applyB2bConfigUpdate(numId, req.body);
+  const after = await getB2bConfig(numId);
+  auditLog(req.adminSession.email, 'customer:b2b-config', shopifyCustomerGid(numId), before.overrides, after.overrides);
+  res.redirect(`/customers/${numId}?success=b2b_config_saved`);
+});
+
+app.get('/api/admin/customers/:id/b2b-config', requireAuth, async (req, res) => {
+  res.json(await getB2bConfig(req.params.id));
+});
+
+app.put('/api/admin/customers/:id/b2b-config', requireAuth, async (req, res) => {
+  const numId = req.params.id;
+  const before = await getB2bConfig(numId);
+  await applyB2bConfigUpdate(numId, req.body);
+  const after = await getB2bConfig(numId);
+  auditLog(req.adminSession.email, 'customer:b2b-config', shopifyCustomerGid(numId), before.overrides, after.overrides);
+  res.json({ ok: true, ...after });
 });
 
 // ── API search ──
@@ -2820,11 +2990,12 @@ async function getOrderForLabels(numericId) {
     return { order: o, items: o.lineItems.edges.map(e => {
       const v = e.node.variant || {};
       return {
-        barcode: v.barcode || '',
-        title: e.node.title,
-        variantTitle: v.sku || 'Default Title',
-        price: v.price || '0.00',
-        qty: e.node.quantity,
+        barcode:      v.barcode || '',
+        title:        e.node.title,
+        variantTitle: v.displayName || v.sku || 'Default Title',
+        sku:          v.sku || '',
+        price:        v.price || '0.00',
+        qty:          e.node.quantity,
       };
     })};
   }
@@ -2841,19 +3012,33 @@ async function getOrderForLabels(numericId) {
   return {
     order: o,
     items: o.lineItems.edges.map(e => ({
-      barcode: e.node.variant?.barcode || '',
-      title: e.node.title,
+      barcode:      e.node.variant?.barcode || '',
+      title:        e.node.title,
       variantTitle: e.node.variant?.displayName || e.node.variant?.sku || '',
-      price: e.node.variant?.price || '0.00',
-      qty: e.node.quantity,
+      sku:          e.node.variant?.sku || '',
+      price:        e.node.variant?.price || '0.00',
+      qty:          e.node.quantity,
     })),
   };
 }
 
-function renderLabelsPage(session, { source, orderData, productItems, flash, savedTemplate, savedShowPrice, savedMode, queryOrder = '', queryQ = '' }) {
+function renderLabelsPage(session, { source, orderData, productItems, flash, savedTemplate, savedFields, queryOrder = '', queryQ = '' }) {
+  const sf = savedFields || DEFAULT_FIELDS;
   const templateOptions = Object.entries(LABEL_TEMPLATES)
     .map(([k, v]) => `<option value="${h(k)}"${k === (savedTemplate || 'avery-5160') ? ' selected' : ''}>${h(v.name)}</option>`)
     .join('');
+
+  const fieldCheckboxes = [
+    { key: 'productName', label: 'Product name' },
+    { key: 'variantName', label: 'Variant name' },
+    { key: 'msrp',        label: 'Retail price (MSRP)' },
+    { key: 'sku',         label: 'SKU' },
+    { key: 'upcBarcode',  label: 'UPC barcode (graphic)' },
+    { key: 'upcDigits',   label: 'UPC digits (text)' },
+  ].map(f => `<label style="display:flex;align-items:center;gap:0.4rem;cursor:pointer;white-space:nowrap">
+      <input type="checkbox" name="field_${h(f.key)}" value="1"${sf[f.key] !== false ? ' checked' : ''} class="field-sel">
+      ${h(f.label)}
+    </label>`).join('');
 
   const optionsForm = `
     <div class="settings-section" style="margin-top:1rem">
@@ -2862,20 +3047,9 @@ function renderLabelsPage(session, { source, orderData, productItems, flash, sav
         <label>Label size</label>
         <select name="template" class="form-input">${templateOptions}</select>
       </div>
-      <div class="form-row" style="gap:0.5rem;align-items:center">
-        <label style="display:flex;align-items:center;gap:0.4rem;cursor:pointer">
-          <input type="checkbox" name="showPrice" value="1"${savedShowPrice !== '0' ? ' checked' : ''}>
-          Show retail price
-        </label>
-      </div>
-      <div class="form-row" style="gap:1rem;align-items:center">
-        <span>Detail level:</span>
-        <label style="display:flex;align-items:center;gap:0.3rem;cursor:pointer">
-          <input type="radio" name="mode" value="product"${savedMode === 'product' ? ' checked' : ''}> Product only
-        </label>
-        <label style="display:flex;align-items:center;gap:0.3rem;cursor:pointer">
-          <input type="radio" name="mode" value="product+variant"${savedMode !== 'product' ? ' checked' : ''}> Product + variant
-        </label>
+      <div class="form-row" style="align-items:flex-start">
+        <label style="min-width:120px;padding-top:2px">Include on label</label>
+        <div style="display:flex;flex-wrap:wrap;gap:0.5rem 1rem">${fieldCheckboxes}</div>
       </div>
     </div>`;
 
@@ -2904,6 +3078,7 @@ function renderLabelsPage(session, { source, orderData, productItems, flash, sav
       <input type="hidden" name="item_barcode_${idx}" value="${h(item.barcode || '')}">
       <input type="hidden" name="item_title_${idx}" value="${h(item.title || '')}">
       <input type="hidden" name="item_variant_${idx}" value="${h(item.variantTitle || '')}">
+      <input type="hidden" name="item_sku_${idx}" value="${h(item.sku || '')}">
       <input type="hidden" name="item_price_${idx}" value="${h(item.price || '')}">`;
     }).join('');
     itemsTable = `
@@ -2921,7 +3096,10 @@ function renderLabelsPage(session, { source, orderData, productItems, flash, sav
       </div>`;
   }
 
-  const sourceOrderId = orderData?.order?.name ? `#${shopifyNumericId(orderData.order.id || '')}` : '';
+  // Order tab: optionsForm always visible; items table conditional
+  const orderItemsSection = source === 'order' && allItems.length
+    ? `<form method="POST">${optionsForm}${itemsTable}</form>`
+    : `<div>${optionsForm}</div>`;
 
   const fromOrderTab = `
     <div>
@@ -2931,9 +3109,14 @@ function renderLabelsPage(session, { source, orderData, productItems, flash, sav
         <button type="submit" class="btn btn-secondary">Load Order</button>
       </form>
       ${source === 'order' && orderData ? `<p class="text-muted text-sm">Loaded order ${h(orderData.order?.name || '')}</p>` : ''}
-      ${source === 'order' && !orderData ? '<p class="alert alert-error">Order not found.</p>' : ''}
-      ${source === 'order' && allItems.length ? `<form method="POST">${optionsForm}${itemsTable}</form>` : ''}
+      ${source === 'order' && !orderData && queryOrder ? '<p class="alert alert-error">Order not found.</p>' : ''}
+      ${orderItemsSection}
     </div>`;
+
+  // Products tab: optionsForm always visible; items table conditional
+  const productItemsSection = source === 'products' && productItems !== null && allItems.length
+    ? `<form method="POST">${optionsForm}${itemsTable}</form>`
+    : `<div>${optionsForm}</div>`;
 
   const fromProductsTab = `
     <div>
@@ -2942,7 +3125,7 @@ function renderLabelsPage(session, { source, orderData, productItems, flash, sav
         <input type="text" name="q" placeholder="Search products..." class="form-input search-input" style="width:240px" value="${h(queryQ)}">
         <button type="submit" class="btn btn-secondary">Search</button>
       </form>
-      ${source === 'products' && productItems !== null ? `<form method="POST">${optionsForm}${itemsTable}</form>` : ''}
+      ${productItemsSection}
     </div>`;
 
   return layout({ title: 'Labels', session, activePath: '/labels', content: `
@@ -2970,14 +3153,14 @@ function renderLabelsPage(session, { source, orderData, productItems, flash, sav
 app.get('/labels', requireAuth, async (req, res) => {
   const source = req.query.source || 'order';
   const savedTemplate = getSetting('last_label_template', req.adminSession.email) || 'avery-5160';
-  const savedShowPrice = getSetting('last_label_show_price', req.adminSession.email) ?? '1';
-  const savedMode = getSetting('last_label_mode', req.adminSession.email) || 'product+variant';
+  const savedFieldsStr = getSetting('last_label_fields', req.adminSession.email);
+  const savedFields = savedFieldsStr ? JSON.parse(savedFieldsStr) : { ...DEFAULT_FIELDS };
   const queryOrder = req.query.order || '';
   const queryQ = req.query.q || '';
 
   if (source === 'order' && queryOrder) {
     const orderData = await getOrderForLabels(queryOrder);
-    return res.send(renderLabelsPage(req.adminSession, { source: 'order', orderData, productItems: null, flash: null, savedTemplate, savedShowPrice, savedMode, queryOrder, queryQ }));
+    return res.send(renderLabelsPage(req.adminSession, { source: 'order', orderData, productItems: null, flash: null, savedTemplate, savedFields, queryOrder, queryQ }));
   }
 
   if (source === 'products') {
@@ -2988,49 +3171,58 @@ app.get('/labels', requireAuth, async (req, res) => {
       : rawProducts;
     const productItems = filtered.flatMap(p =>
       p.variants.edges.map(e => ({
-        barcode: e.node.barcode || '',
-        title: p.title,
+        barcode:      e.node.barcode || '',
+        title:        p.title,
         variantTitle: e.node.title !== 'Default Title' ? e.node.title : '',
-        price: e.node.price || '0.00',
-        qty: 1,
+        sku:          e.node.sku || '',
+        price:        e.node.price || '0.00',
+        qty:          1,
       }))
     );
-    return res.send(renderLabelsPage(req.adminSession, { source: 'products', orderData: null, productItems, flash: null, savedTemplate, savedShowPrice, savedMode, queryOrder, queryQ }));
+    return res.send(renderLabelsPage(req.adminSession, { source: 'products', orderData: null, productItems, flash: null, savedTemplate, savedFields, queryOrder, queryQ }));
   }
 
-  res.send(renderLabelsPage(req.adminSession, { source: 'order', orderData: null, productItems: null, flash: null, savedTemplate, savedShowPrice, savedMode, queryOrder, queryQ }));
+  res.send(renderLabelsPage(req.adminSession, { source: 'order', orderData: null, productItems: null, flash: null, savedTemplate, savedFields, queryOrder, queryQ }));
 });
 
 // Shared label PDF generator for preview + print
 async function handleLabelsPdf(req, res, disposition) {
   const itemCount = parseInt(req.body.item_count) || 0;
-  const template = req.body.template || 'avery-5160';
-  const showPrice = req.body.showPrice === '1' || req.body.showPrice === 'on';
-  const mode = req.body.mode === 'product' ? 'product' : 'product+variant';
+  const template  = req.body.template || 'avery-5160';
+
+  // Phase 8: 6-checkbox field selection
+  const fields = {
+    productName: req.body.field_productName === '1',
+    variantName: req.body.field_variantName === '1',
+    msrp:        req.body.field_msrp        === '1',
+    sku:         req.body.field_sku         === '1',
+    upcBarcode:  req.body.field_upcBarcode  === '1',
+    upcDigits:   req.body.field_upcDigits   === '1',
+  };
+  if (!Object.values(fields).some(Boolean)) return res.status(400).json({ error: 'Select at least one field.' });
 
   const items = [];
   for (let i = 0; i < itemCount; i++) {
     const sel = [req.body.sel || []].flat();
     if (!sel.includes(String(i))) continue;
     items.push({
-      barcode: String(req.body[`item_barcode_${i}`] || ''),
-      title:   String(req.body[`item_title_${i}`]   || ''),
+      barcode:      String(req.body[`item_barcode_${i}`] || ''),
+      title:        String(req.body[`item_title_${i}`]   || ''),
       variantTitle: String(req.body[`item_variant_${i}`] || ''),
-      price:   String(req.body[`item_price_${i}`]   || ''),
-      qty: parseInt(req.body[`item_qty_${i}`]) || 1,
+      sku:          String(req.body[`item_sku_${i}`]     || ''),
+      price:        String(req.body[`item_price_${i}`]   || ''),
+      qty:          parseInt(req.body[`item_qty_${i}`])  || 1,
     });
   }
 
   if (!items.length) return res.status(400).json({ error: 'No items selected.' });
 
   try {
-    const { pdf, skipped } = await renderLabelSheet({ template, items, options: { showPrice, mode } });
+    const { pdf, skipped } = await renderLabelSheet({ template, items, fields });
     const { labels } = expandItems(items);
 
-    // Save preferences
     setSetting('last_label_template', template, req.adminSession.email);
-    setSetting('last_label_show_price', showPrice ? '1' : '0', req.adminSession.email);
-    setSetting('last_label_mode', mode, req.adminSession.email);
+    setSetting('last_label_fields', JSON.stringify(fields), req.adminSession.email);
     logLabelBatch(req.adminSession.email, template, items.length, labels.length);
     auditLog(req.adminSession.email, 'label:generate', template, null, { items: items.length, labels: labels.length });
 
