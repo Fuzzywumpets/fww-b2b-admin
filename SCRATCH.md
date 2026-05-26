@@ -190,6 +190,31 @@ fww-b2b-admin/
 ## Append below this line, future iterations
 ---
 
+## Phase 9+10 complete (2026-05-26, commit 35f5dbe)
+
+### Phase 9 notes
+- Orders default query: `qParts = []` (empty = all). Source filter adds appropriate Shopify query.
+- Shopify `sourceName` field now fetched in orders list query.
+- `deriveOrderSource(order)` helper: checks tags for 'sparklayer*', sourceName for 'pos'/'draft_order', tags for 'b2b-portal'.
+- `ORDER_SOURCE_LABELS/COLORS` map: lime=b2b-portal, blue=sparklayer, orange=pos, gray=manual, muted=online
+- Filter chips use `?source=` param; source is preserved across filter-bar submits via hidden input.
+- Customer segment filter uses `?segment=` param (different from tag filter which uses `?tag=`).
+- Mock: added orders 1005 (SparkLayer, tags=['sparklayer','b2b']) and 1006 (POS, sourceName='pos', no b2b tag).
+- Mock: added customer 106 (Top Dog Boutique, tags=['sparklayer','sparklayer-customer']).
+
+### Phase 10 notes
+- `getB2bConfig()` now returns 4 fields: discount_pct, dropship_enabled, dropship_margin_pct, allow_order_on_invoice.
+  Dropped: min_order_usd, payment_terms (global settings only now).
+- `applyB2bConfigUpdate()` handles all 4 fields. Checkbox absence from form body = false (handled at route level).
+- POST /customers/:id/b2b-config explicitly sets dropship_enabled and allow_order_on_invoice from 'false' when absent from body.
+- UI: merged Dropship Config + B2B Pricing into "B2B Customer Settings" card (id=b2b-settings-card).
+  Form id=b2b-settings-form. Single Save button at bottom.
+- dropship_margin_pct input disabled when dropship_enabled unchecked (JS onchange).
+- `allow_order_on_invoice` default = true (unset metafield = enabled).
+- Success redirect: ?success=b2b_settings_saved (flash: "B2B customer settings saved.")
+
+---
+
 ## Phase 7+8 complete (2026-05-26, this session)
 
 ### Phase 7: Per-customer B2B config overrides

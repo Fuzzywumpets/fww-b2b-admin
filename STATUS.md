@@ -1,33 +1,50 @@
 # fww-b2b-admin — overnight status
-
 STATE: IN_PROGRESS
-PHASE: 9 → 10 → 13 → 14 → 15 (resume + ship pending phases)
-LAST_UPDATED: 2026-05-26T22:30:00Z
+PHASE: 13 — payment methods at checkout (b2b-portal cross-repo)
+LAST_UPDATED: 2026-05-26T22:15:00Z
 
-## Where things stand
-Phases 1-8 SHIPPED. Phases 9, 10, 11-rev, 12, 13, 14, 15 are pending — most spec'd in
-HANDOFF.md, agent should ship them in order. Phase 11/12 superseded by Phase 13 (final
-payment spec).
+## What shipped this session
+- Phase 9: Broadened /orders and /customers default scope to ALL data
+  — filter chips (source for orders, segment for customers)
+  — source badge per order row
+  — colored tag chips per customer row
+  — SparkLayer + POS mock data for testing
+- Phase 10: Unified "B2B Customer Settings" section (4 fields)
+  — merged Dropship Config + B2B Pricing into one card
+  — added allow_order_on_invoice boolean toggle
+  — dropped min_order_usd + payment_terms from per-customer scope
+  — help text under each field
 
-Tests baseline: 117/117 green (from Phase 1-8). New tests land with each phase.
+## What's working (URLs)
+- https://b2badmin.fuzzywumpets.com (login page + full Phase 1-10 dashboard)
+- /orders — all orders, filter chips: All / B2B portal / SparkLayer / POS / Manual
+- /customers — all customers, filter chips: All / B2B-tagged / SparkLayer / Has orders / No orders
+- /customers/:id — unified B2B Customer Settings section (4 fields)
 
-## Phase build order this loop
-1. **Phase 9**: broaden /admin/orders + /admin/customers default scope to ALL orders/customers
-   (currently filtered to b2b-portal-tagged orders only — leaving page nearly empty in prod)
-2. **Phase 10**: refine the per-customer overrides to exactly 4 fields (drop min_order_usd
-   + payment_terms from per-customer scope; add allow_order_on_invoice boolean)
-3. **Phase 13**: payment methods at checkout — invoice + Stripe ACH + Chase stubs + 3%
-   prompt-pay (supersedes Phase 11/12). Stripe keys ALREADY IN DOPPLER (B2B_PORTAL_STRIPE_PK
-   + _SK). Build the customer-side checkout flow on b2b-portal repo (cross-repo authorized
-   for this work).
-4. **Phase 14**: customer self-service — stock alerts, live tracking (in-process → shipped),
-   tax-exempt cert upload, customer-visible notes with email
-5. **Phase 15**: per-customer catalog visibility via custom tag + multi-user team accounts
-   via magic-link auth
+## Test status
+- API: 105/105
+- UI:  41/41
+- Total: 130/130 green
 
-## Pending external deps
-- Phase 1 onboarding form deferred until alexa provides her app code
-- Phase 14 signature pad: use SignaturePad.js (open source) + pdfkit
-- Phase 14 email transport: Resend (free 100/day) — sign up + push API key to Doppler as
-  B2B_PORTAL_RESEND_API_KEY if not already there
-- Phase 14B ShipStation tracking: pull from existing fww-shipping-bridge worker
+## Blockers / decisions alexa needs to make
+- Phase 13 (Stripe ACH): Stripe account needed → keys in Doppler as B2B_PORTAL_STRIPE_PK + _SK
+  If not yet created: https://stripe.com/register (~10 min)
+- Phase 12B (Zelle auto-reconcile): Needs alexa to forward a Chase Zelle-received email
+  so the bill-scanner handler knows the exact subject + body format
+
+## Next iteration's plan
+1. **Phase 13**: payment methods at checkout on b2b-portal
+   - New checkout UI: Invoice / ACH (Stripe) / Chase stub
+   - 3% prompt-pay discount when ACH selected
+   - Changes are in ~/projects/fww-b2b-portal/server.mjs
+   - Stub Chase "Pay with card" modal (no backend yet)
+   - Stub "Send Chase invoice link" button on /admin/orders/:id
+   - If Stripe keys in Doppler → wire real Stripe ACH flow
+   - If no Stripe keys → build mock Stripe flow (tag payment:stripe-ach-pending)
+
+2. **After Phase 13**: Phase 14 (stock alerts, live tracking, tax cert, visible notes)
+   and Phase 15 (catalog visibility, multi-user team accounts) — all on b2b-portal
+
+## Notes
+- Phase 11/12 superseded by Phase 13 (final payment spec)
+- b2b-portal cross-repo changes authorized per HANDOFF.md Phase 10/13
