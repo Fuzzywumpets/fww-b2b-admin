@@ -1,27 +1,24 @@
 # fww-b2b-admin — overnight status
 STATE: IN_PROGRESS
-PHASE: 18 — Xero accounting integration
-LAST_UPDATED: 2026-05-27T05:30:00Z
+PHASE: 21 — Xero customer sync on B2B creation
+LAST_UPDATED: 2026-05-26T23:57:00Z
 
 ## What shipped this session
-- Phase 18: Xero accounting integration
-  — xero_invoice_map + xero_pending_actions SQLite tables + 8 helper functions
-  — xeroRequest() bridge helper (mock: stubs Contacts/Invoices/Payments/Accounts endpoints)
-  — ensureXeroContact(), createXeroInvoice(), recordXeroPayment() core logic
-  — retryXeroPending() with 3x retry cap; syncOrderToXero() on-demand
-  — GET/POST /settings/xero: account code mapping (sales_revenue, A/R, chase_checking,
-    stripe_clearing, processing_fees, discounts, payment_terms_days)
-  — GET /accounting: reconciliation view (invoice map + pending retry queue + counts)
-  — POST /api/admin/xero/test: connection test, returns account count
-  — POST /api/admin/xero/sync: manual retry trigger for pending actions
-  — POST /orders/:id/xero/sync: per-order Xero invoice sync button
-  — mark-paid route: non-blocking async Xero payment record (queue on failure)
-  — Order detail: Xero sidebar card (synced/retry-queued/not-synced states)
-  — "Accounting" added to header nav
-  — 10 new API tests + 4 new UI tests
+- Phase 21: Xero customer sync on B2B creation
+  — lib/xero-customer-sync.mjs: resolveXeroContact (mapping→live), syncCustomerToXero
+    (idempotent), isInsider (exclusion list), getXeroSyncStatus (4 states)
+  — GET /api/admin/customers/:id/xero-status — returns sync state JSON
+  — POST /api/admin/customers/:id/xero-sync — on-demand sync trigger
+  — /customers/:id sidebar: async-loading Xero card (synced/merged/insider/not_synced)
+    Merged contacts show "⚭ Merged contact" banner; insiders show gray "not applicable"
+  — Lead conversion → non-blocking Xero sync fires after Shopify customer creation
+  — b2b tag-add → non-blocking Xero sync fires when 'b2b' tag added
+  — ensureXeroContact (Phase 18) now uses resolveXeroContact first (avoids dup contacts)
+  — docs/XERO_CUSTOMER_SYNC.md: reference doc (mapping key, merged contacts, Pat Walsh TODO)
+  — 13 new API tests + 2 new UI tests (238 total, all green)
 
 ## What's working (URLs)
-- https://b2badmin.fuzzywumpets.com (all phases 1–20)
+- https://b2badmin.fuzzywumpets.com (all phases 1–21)
 - /accounting — Xero reconciliation view (synced orders, pending retries, counts)
 - /settings/xero — account code mapping + connection test button
 - /orders/:id — Xero sidebar card + "Sync to Xero" button in action bar
@@ -38,11 +35,11 @@ LAST_UPDATED: 2026-05-27T05:30:00Z
 - https://b2b.fuzzyreporting.com/account — stock alerts + tax cert + portal activity
 
 ## Test status
-- Admin API:  161/161
-- Admin UI:    61/61
+- Admin API:  174/174
+- Admin UI:    64/64
 - Portal API: 114/114 (separate repo)
 - Portal UI:   39/39 (separate repo)
-- Total: 375 green
+- Total: 391 green
 
 ## Phases completed
 - Phase 0: Research + scaffold
@@ -64,6 +61,7 @@ LAST_UPDATED: 2026-05-27T05:30:00Z
 - Phase 19C: Product detail page /products/:id
 - Phase 19E: Catalog tab product status filter
 - Phase 20: Priority customer onboarding + Companies research
+- Phase 21: Xero customer sync on B2B creation ← NEW
 
 ## Phases remaining (spec in HANDOFF.md, code not yet built)
 - Phase 15: Customer-specific catalogs (per-customer private tags) + multi-user team accounts
@@ -79,22 +77,20 @@ LAST_UPDATED: 2026-05-27T05:30:00Z
 - Connection test: /settings/xero → "Test connection" button → shows account count
 
 ## Next iteration's plan
-Phase 15 (customer-specific catalogs + multi-user team accounts):
-  15A: catalog_access_tags per-customer metafield
-      — admin: chip-style multi-select on /customers/:id B2B Settings
-      — portal: filter catalog per customer's access tags
-      — private tag list in /admin/settings
-  15B: multi-user team accounts (magic-link invite flow)
-      — companies + company_users + magic_link_codes SQLite tables
-      — POST /account/team/invite (primary user sends email invite)
-      — GET /team-login?email=&token= (invitee clicks link → session)
-      — POST /team-login (future logins: email + 6-digit code)
-      — Session carries company_id; orders attributed to primary customer
+Phase 22 (Admin "View portal as customer" impersonation):
+  22A: B2B_IMPERSONATION_SECRET Doppler secret (generate + push if missing)
+  22B: POST /api/admin/customers/:id/impersonate → HMAC-signed token + URL
+       Modal: read-only (default) vs interactive mode
+  22C: Portal GET /__impersonate__?token=<tok> → validates + creates impersonation session
+  22D: Portal: sticky red banner "Viewing as <name>" on every page; read-only enforcement
+  22E: Exit impersonation (portal + audit log)
+  22G: Security: 1hr TTL, nonce single-use, insider block, full audit trail
 
-OR Phase 16E (partial invoices):
-  — Partial invoice (fulfilled items only), letter suffix (#1234-A, #1234-B)
-  — partial_invoices SQLite table
-  — "Generate invoice for fulfilled items only" mode on /orders/:id
+OR Phase 23 (Customer activity warehouse):
+  23A: customer_activity SQLite table in portal (90-day, IP hashed, events by type)
+  23B: Express middleware auto-logs page_view + api_call on every authed request
+  23E: Admin /customers/:id/activity viewer (date range filter, event type filter)
+  23F: Quick lookup "did customer place order on date X?"
 
 ## Blockers / decisions alexa needs to make
 - Email (Resend): B2B_PORTAL_RESEND_API_KEY not set → emails log to console
