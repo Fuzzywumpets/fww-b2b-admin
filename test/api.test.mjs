@@ -1224,5 +1224,67 @@ await test('POST /orders/1001/send-chase-invoice requires auth', async () => {
   assert.ok(res.headers.get('location')?.includes('/login'));
 });
 
+// ── Phase 14D: Visible notes proxy ──────────────────────────────────────────
+console.log('\nAPI tests — Phase 14D: Visible notes:');
+
+await test('POST /api/orders/:id/visible-note (mock) → ok response', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/api/orders/1001/visible-note`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ body: 'Your order is on its way!' }),
+  });
+  assert.equal(res.status, 200);
+  const j = await res.json();
+  assert.ok(j.ok, 'visible note not ok');
+});
+
+await test('POST /api/orders/:id/visible-note → empty body → 400', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/api/orders/1001/visible-note`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ body: '' }),
+  });
+  assert.equal(res.status, 400);
+});
+
+await test('POST /api/orders/:id/visible-note → no auth → redirect to /login', async () => {
+  const res = await fetch(`${BASE}/api/orders/1001/visible-note`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ body: 'test' }),
+    redirect: 'manual',
+  });
+  assert.ok(res.status === 401 || res.status === 302, `expected 401 or 302, got ${res.status}`);
+});
+
+await test('GET /api/orders/:id/visible-notes (mock) → empty array', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/api/orders/1001/visible-notes`, {
+    headers: { Cookie: cookie },
+  });
+  assert.equal(res.status, 200);
+  const j = await res.json();
+  assert.ok(Array.isArray(j.notes), 'notes should be array');
+});
+
+// ── Phase 14C: Tax exempt review page ───────────────────────────────────────
+console.log('\nAPI tests — Phase 14C: Tax exempt review:');
+
+await test('GET /tax-exempt → 200 HTML page', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/tax-exempt`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  assert.ok(html.toLowerCase().includes('tax'), 'tax-exempt page missing tax content');
+});
+
+await test('GET /tax-exempt → no auth → redirect to /login', async () => {
+  const res = await fetch(`${BASE}/tax-exempt`, { redirect: 'manual' });
+  assert.equal(res.status, 302);
+  assert.ok(res.headers.get('location')?.includes('/login'));
+});
+
 console.log(`\n  ${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);

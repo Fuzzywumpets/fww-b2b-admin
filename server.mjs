@@ -37,10 +37,68 @@ const REDIRECT_URI         = MOCK
   : 'https://b2badmin.fuzzywumpets.com/auth/google/callback';
 const COOKIE_NAME = 'b2b_admin_sid';
 const B2B_PUB_ID  = 'gid://shopify/Publication/199709720811';
+const PORTAL_INTERNAL_TOKEN = process.env.B2B_PORTAL_INTERNAL_TOKEN || '';
+const PORTAL_INTERNAL_URL   = process.env.B2B_PORTAL_INTERNAL_URL || 'http://127.0.0.1:8793';
 
 const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
+
+// ── Portal integration (read portal SQLite + call portal internal API) ────────
+
+import Database from 'better-sqlite3';
+
+let portalDb = null;
+function getPortalDb() {
+  if (MOCK) return null;
+  if (!portalDb) {
+    const dbPath = '/home/alexa/projects/fww-b2b-portal/data/portal.db';
+    try { portalDb = new Database(dbPath, { readonly: true, fileMustExist: true }); } catch (_) {}
+  }
+  return portalDb;
+}
+
+function getVisibleNotesForOrder(shopifyOrderId) {
+  if (MOCK) return [];
+  const db = getPortalDb();
+  if (!db) return [];
+  try {
+    return db.prepare('SELECT * FROM visible_notes WHERE order_id = ? ORDER BY added_at DESC').all(shopifyOrderId).map(r => ({
+      id: r.id, orderId: r.order_id, customerId: r.customer_id,
+      body: r.body, addedAt: r.added_at, addedBy: r.added_by,
+    }));
+  } catch (_) { return []; }
+}
+
+function getPendingTaxCertsFromPortal() {
+  if (MOCK) return [];
+  const db = getPortalDb();
+  if (!db) return [];
+  try {
+    return db.prepare("SELECT * FROM tax_exempt_certs WHERE status = 'pending' ORDER BY uploaded_at ASC").all().map(r => ({
+      id: r.id, customerId: r.customer_id, state: r.state, filePath: r.file_path,
+      status: r.status, uploadedAt: r.uploaded_at,
+    }));
+  } catch (_) { return []; }
+}
+
+async function callPortalInternal(method, path, body) {
+  if (!PORTAL_INTERNAL_TOKEN) return { ok: false, error: 'no_internal_token' };
+  try {
+    const r = await fetch(`${PORTAL_INTERNAL_URL}${path}`, {
+      method,
+      headers: {
+        'Authorization': `Bearer ${PORTAL_INTERNAL_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    const j = await r.json();
+    return { ok: r.ok, ...j };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
 
 // ── Mock data ─────────────────────────────────────────────────────────────────
 const MOCK_ORDERS = [
@@ -448,6 +506,7 @@ function layout({ title, session, activePath = '/', content, extraHead = '' }) {
     ['/', 'Dashboard'], ['/orders', 'Orders'], ['/customers', 'Customers'],
     ['/catalog', 'Catalog'], ['/reports', 'Reports'],
     ['/labels', 'Labels'], ['/exports', 'Exports'],
+    ['/tax-exempt', 'Tax Exempt'],
     ['/settings', 'Settings'],
   ];
   return `<!DOCTYPE html>
@@ -977,6 +1036,15 @@ async function getOrderDetail(numericId) {
   }
 }
 
+function renderVisibleNotesList(notes) {
+  if (!notes || !notes.length) return '<p class="text-muted small-text">No visible notes yet.</p>';
+  return notes.map(n => `
+    <div style="border-left:3px solid var(--lime);padding:8px 12px;margin-bottom:8px;background:#f9fdf0;border-radius:0 4px 4px 0">
+      <div style="font-size:13px;white-space:pre-wrap">${h(n.body)}</div>
+      <div style="font-size:11px;color:var(--muted);margin-top:4px">${fmtDate(n.addedAt)} · ${h(n.addedBy)}</div>
+    </div>`).join('');
+}
+
 function renderOrderDetail(session, order, flash) {
   const numId    = shopifyNumericId(order.id);
   const isPaid   = order.displayFinancialStatus === 'PAID';
@@ -1058,7 +1126,45 @@ function renderOrderDetail(session, order, flash) {
     ? `<div class="alert alert-success">Chase invoice intent logged. Wire Chase API to send the real link.</div>`
     : '';
 
+  const visibleNotesScript = `
+    <script>
+    async function submitVisibleNote(e, orderId) {
+      e.preventDefault();
+      const body = document.getElementById('visible-note-body').value.trim();
+      if (!body) return;
+      const btn = e.target.querySelector('button[type=submit]');
+      const status = document.getElementById('visible-note-status');
+      btn.disabled = true;
+      status.textContent = 'Sending…';
+      try {
+        const r = await fetch('/api/orders/' + orderId + '/visible-note', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ body }),
+        });
+        const j = await r.json();
+        if (!r.ok) throw new Error(j.error || 'Failed');
+        document.getElementById('visible-note-body').value = '';
+        status.textContent = '✓ Note sent to customer';
+        // Refresh notes list
+        const nr = await fetch('/api/orders/' + orderId + '/visible-notes');
+        const nj = await nr.json();
+        const nl = document.getElementById('visible-notes-list');
+        if (nl && nj.notes) {
+          nl.innerHTML = nj.notes.length
+            ? nj.notes.map(n => '<div style="border-left:3px solid var(--lime);padding:8px 12px;margin-bottom:8px;background:#f9fdf0;border-radius:0 4px 4px 0"><div style="font-size:13px;white-space:pre-wrap">' + n.body.replace(/</g,'&lt;') + '</div><div style="font-size:11px;color:var(--muted);margin-top:4px">' + new Date(n.addedAt).toLocaleDateString() + ' · ' + (n.addedBy||'').replace(/</g,'&lt;') + '</div></div>').join('')
+            : '<p class="text-muted small-text">No visible notes yet.</p>';
+        }
+      } catch (err) {
+        status.textContent = '✗ ' + err.message;
+      } finally {
+        btn.disabled = false;
+      }
+    }
+    </script>`;
+
   return layout({ title: order.name || 'Order', session, activePath: '/orders', content: `
+    ${visibleNotesScript}
     <div class="breadcrumb-row"><a href="/orders" class="breadcrumb">← Orders</a></div>
     ${flashHtml}
     <div class="detail-header">
@@ -1096,10 +1202,21 @@ function renderOrderDetail(session, order, flash) {
           </div>
         </div>
         <div class="card">
-          <div class="card-header"><h2>Order Note</h2></div>
+          <div class="card-header"><h2>Order Note (internal)</h2></div>
           <form method="POST" action="/orders/${h(numId)}/note">
             <textarea name="note" class="textarea" rows="3" placeholder="Add a note for this order…">${h(order.note||'')}</textarea>
             <div style="margin-top:0.5rem"><button type="submit" class="btn btn-secondary btn-sm">Save Note</button></div>
+          </form>
+        </div>
+        <div class="card" id="visible-notes-card">
+          <div class="card-header"><h2>Note visible to customer</h2></div>
+          <div id="visible-notes-list" style="margin-bottom:10px">${renderVisibleNotesList(order.visibleNotes || [])}</div>
+          <form id="visible-note-form" onsubmit="submitVisibleNote(event, ${h(JSON.stringify(numId))})">
+            <textarea id="visible-note-body" class="textarea" rows="3" placeholder="Write a note the customer can see on their order…"></textarea>
+            <div style="margin-top:0.5rem;display:flex;gap:8px;align-items:center">
+              <button type="submit" class="btn btn-primary btn-sm">Send note to customer</button>
+              <span id="visible-note-status" style="font-size:12px;color:var(--muted)"></span>
+            </div>
           </form>
         </div>
         <div class="card">
@@ -2127,6 +2244,9 @@ app.get('/orders/:id', requireAuth, async (req, res) => {
   const order = await getOrderDetail(req.params.id);
   if (!order) return res.status(404).send(layout({ title: '404', session: req.adminSession, activePath: '/orders',
     content: '<div class="page-header"><h1>Order not found</h1></div><a href="/orders" class="btn btn-secondary">← Orders</a>' }));
+  // Attach visible notes from portal db (readonly)
+  const shopifyId = order.id.startsWith('gid://') ? order.id : `gid://shopify/Order/${order.id}`;
+  order.visibleNotes = getVisibleNotesForOrder(shopifyId);
   res.send(renderOrderDetail(req.adminSession, order, req.query.success || ''));
 });
 
@@ -2200,6 +2320,84 @@ app.get('/orders/:id/invoice.pdf', requireAuth, async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+// ── Phase 14D: Visible notes API (proxies to portal internal) ─────────────────
+
+app.post('/api/orders/:id/visible-note', requireAuth, async (req, res) => {
+  const numId = req.params.id;
+  const shopifyId = `gid://shopify/Order/${numId}`;
+  const { body } = req.body || {};
+  if (!body || !body.trim()) return res.status(400).json({ error: 'body required' });
+  if (MOCK) {
+    return res.json({ ok: true, noteId: 1, mock: true });
+  }
+  const result = await callPortalInternal('POST', `/__internal__/visible-note`, {
+    orderId: shopifyId, body, addedBy: req.adminSession.email,
+  });
+  if (!result.ok) return res.status(500).json({ error: result.error || 'failed' });
+  auditLog(req.adminSession.email, 'visible-note-add', shopifyId, null, { body });
+  res.json({ ok: true, noteId: result.noteId });
+});
+
+app.get('/api/orders/:id/visible-notes', requireAuth, (req, res) => {
+  const shopifyId = `gid://shopify/Order/${req.params.id}`;
+  res.json({ notes: getVisibleNotesForOrder(shopifyId) });
+});
+
+// ── Phase 14C: Tax exempt admin review page ───────────────────────────────────
+
+app.get('/tax-exempt', requireAuth, (req, res) => {
+  const pendingCerts = MOCK ? [] : getPendingTaxCertsFromPortal();
+  const flashHtml = req.query.success === 'approved'
+    ? `<div class="alert alert-success">Certificate approved — customer is now tax-exempt.</div>`
+    : req.query.success === 'rejected'
+    ? `<div class="alert alert-success">Certificate rejected.</div>`
+    : '';
+  const rows = pendingCerts.map(c => `
+    <tr>
+      <td><a href="/customers/${c.customerId.split('/').pop()}">${h(c.customerId.split('/').pop())}</a></td>
+      <td>${h(c.state || '—')}</td>
+      <td>${new Date(c.uploadedAt).toLocaleDateString()}</td>
+      <td>
+        <a href="${h(PORTAL_INTERNAL_URL.replace('127.0.0.1', 'b2b.fuzzyreporting.com'))}/api/admin/tax-exempt/${c.id}/file" target="_blank" class="btn btn-sm btn-secondary">View PDF</a>
+        <form method="POST" action="/tax-exempt/${c.id}/approve" style="display:inline">
+          <button class="btn btn-sm btn-success" onclick="return confirm('Approve this certificate?')">Approve</button>
+        </form>
+        <form method="POST" action="/tax-exempt/${c.id}/reject" style="display:inline">
+          <input type="hidden" name="reason" value="Certificate does not meet requirements">
+          <button class="btn btn-sm" style="border:1px solid var(--danger);color:var(--danger)" onclick="return confirm('Reject this certificate?')">Reject</button>
+        </form>
+      </td>
+    </tr>`).join('');
+  res.send(layout({ title: 'Tax Exempt Review', session: req.adminSession, activePath: '/tax-exempt', content: `
+    <div class="page-header"><h1>Tax Exemption Certs — Pending Review</h1></div>
+    ${flashHtml}
+    <div class="card">
+      <table class="data-table">
+        <thead><tr><th>Customer ID</th><th>State</th><th>Uploaded</th><th>Actions</th></tr></thead>
+        <tbody>${rows || '<tr><td colspan="4" style="text-align:center;color:var(--muted)">No pending certificates.</td></tr>'}</tbody>
+      </table>
+    </div>` }));
+});
+
+app.post('/tax-exempt/:id/approve', requireAuth, async (req, res) => {
+  if (MOCK) return res.redirect('/tax-exempt?success=approved');
+  const result = await callPortalInternal('POST', `/__internal__/tax-exempt/${req.params.id}/approve`, {
+    reviewedBy: req.adminSession.email,
+  });
+  auditLog(req.adminSession.email, 'tax-cert-approve', `cert:${req.params.id}`, null, { reviewedBy: req.adminSession.email });
+  res.redirect(`/tax-exempt?success=${result.ok ? 'approved' : 'error'}`);
+});
+
+app.post('/tax-exempt/:id/reject', requireAuth, async (req, res) => {
+  if (MOCK) return res.redirect('/tax-exempt?success=rejected');
+  const reason = String(req.body?.reason || 'Rejected').slice(0, 500);
+  const result = await callPortalInternal('POST', `/__internal__/tax-exempt/${req.params.id}/reject`, {
+    reviewedBy: req.adminSession.email, reason,
+  });
+  auditLog(req.adminSession.email, 'tax-cert-reject', `cert:${req.params.id}`, null, { reason });
+  res.redirect(`/tax-exempt?success=${result.ok ? 'rejected' : 'error'}`);
 });
 
 // Phase 4: Customers CSV export
