@@ -492,3 +492,209 @@ alexa knows what's coming.
 - alexa can select 50 products on /exports/csv, uncheck "compare_at_price" and "tags", click Download → gets a CSV with 200 rows (variants) and the right columns
 - alexa can select 10 products on /exports/images, choose "Main + all gallery", click Download → gets a ZIP with subfolders or flat-named files for ~40 images
 - Tests pass, including stream-based ones (don't load full ZIP into memory in tests; just assert headers + entry count via the archiver event)
+
+## Phase 7 — Per-customer B2B config overrides
+
+The /settings page already stores DEFAULTS for `b2b_discount_pct`, `b2b_min_order_usd`, and
+`b2b_payment_terms`. Phase 7 adds per-customer overrides on top: any individual customer can be
+configured to a different discount %, min order, and/or payment terms than the store default.
+
+### Where the override lives
+
+Per-customer overrides are stored as Shopify customer **metafields** (so they survive in
+Shopify forever even if our SQLite is wiped):
+
+| Metafield | Namespace | Key | Type | Default behavior |
+|---|---|---|---|---|
+| Discount % override | `b2b` | `discount_pct` | `number_integer` | unset → portal uses /settings default |
+| Min order override | `b2b` | `min_order_usd` | `number_integer` | unset → portal uses /settings default |
+| Payment terms override | `b2b` | `payment_terms` | `single_line_text_field` | unset → portal uses /settings default |
+
+These are SEPARATE from the dropship metafields (`b2b.dropship_enabled`, `b2b.dropship_margin_pct`)
+introduced earlier. Same namespace though.
+
+### Admin UI — `/customers/:id`
+
+Add a new section "B2B Pricing & Terms" under the existing dropship section. For each of the three
+fields, show:
+- **Current effective value** with a badge — either `(default)` or `(override)` — and the actual number/string.
+- **Editable input** with a placeholder showing the current default.
+- **Save** button (per row, or one Save at the bottom of the section — either works).
+- **Reset to default** button (only visible when an override is set).
+
+Example layout:
+
+```
+B2B Pricing & Terms
+─────────────────────────────────────────────────
+Discount %              [50] override   [Reset to default]   (default: 50)
+Minimum order ($)       [150]           default applied      (no override)
+Payment terms           [NET 30]        default applied      (no override)
+                                                      [ Save changes ]
+```
+
+### Server endpoints
+
+- `GET /api/admin/customers/:id/b2b-config` — returns current values:
+  ```json
+  {
+    "effective":  { "discount_pct": 50, "min_order_usd": 150, "payment_terms": "NET 30" },
+    "overrides":  { "discount_pct": 50, "min_order_usd": null, "payment_terms": null },
+    "defaults":   { "discount_pct": 50, "min_order_usd": 150, "payment_terms": "NET 30" }
+  }
+  ```
+- `PUT /api/admin/customers/:id/b2b-config` — body: `{ discount_pct, min_order_usd, payment_terms }`
+  (null/missing = clear that override). Calls `metafieldsSet` on the Shopify customer (or
+  `metafieldDelete` to clear), then audit-logs the change with before+after values.
+
+### How it gets used by the b2b-portal
+
+You also need to wire the portal to actually USE these overrides. This is one of the few cases
+where the b2b-admin agent is authorized to also touch the `fww-b2b-portal` repo. Specifically:
+
+1. Clone the b2b-portal repo into `/tmp/fww-b2b-portal-clone` (or use existing
+   `~/projects/fww-b2b-portal` on the VPS — it's already cloned).
+2. In `server.mjs` `/auth/callback`: when looking up the customer, add `metafields(namespace:"b2b")`
+   to the GraphQL query. Cache the per-customer override values in the portal session.
+3. In `/api/catalog`: when computing `b2bPrice`, use the customer's `discount_pct` override if set,
+   else `B2B_DISCOUNT`. Note: this means catalog pricing becomes per-customer; you'll need to
+   re-think the shared cache. Simplest approach: cache RAW products (with MSRP only), apply
+   discount at request time per customer. The cache TTL still applies. Mark this as
+   PORTAL-CACHE-CHANGE in your commit.
+4. In the cart min-order check: use customer's `min_order_usd` override if set.
+5. In the PDF invoice footer: use customer's `payment_terms` override if set.
+6. Commit + push to b2b-portal main; restart the portal service.
+
+If portal changes feel too risky to do alongside admin work, **build only the admin write side
+in Phase 7** and leave portal-side reading for a follow-up phase. Set a clear
+`PORTAL-PENDING` note in STATUS.md so alexa knows the override exists on the customer record
+but isn't being consumed yet.
+
+### Tests
+
+- API: PUT /api/admin/customers/:id/b2b-config writes correct metafieldsSet payload (mock)
+- API: PUT with null/missing fields → metafield deletes (mock)
+- API: GET returns combined effective/overrides/defaults
+- UI: customer detail page shows current effective + override status, edit/save round-trips
+- Audit log row created with before+after
+
+### Acceptance for Phase 7
+
+- alexa opens /customers/:id for a customer, sees current effective values (default or override)
+- alexa changes "Discount %" to 60 → saves → reload shows "(override)" badge with 60%
+- alexa clicks "Reset to default" on discount → metafield deleted → "(default)" badge returns
+- (if portal updated) the customer logs into b2b.fuzzyreporting.com → sees 60%-off pricing instead of 50%-off
+- All actions audit-logged
+
+---
+
+## Phase 8 — Label engine: 10 templates + checkbox field selection
+
+Extends Phase 5. The current engine has 4 Avery sheet templates and a binary product/variant
+toggle. Phase 8 expands to 10 templates total (5 Avery sheets + 5 thermal singles) and replaces
+the binary detail toggle with a 6-checkbox field selector.
+
+### Templates to support (all 10)
+
+**Avery sheet templates** (multi-label PDFs, US Letter):
+
+| Avery # | Dimensions | Labels/sheet | Layout |
+|---|---|---|---|
+| 5160 | 1" × 2⅝" | 30 | 3 cols × 10 rows (DEFAULT) |
+| 5161 | 1" × 4" | 20 | 2 cols × 10 rows |
+| 5163 | 2" × 4" | 10 | 2 cols × 5 rows |
+| 5167 | ½" × 1¾" | 80 | 4 cols × 20 rows |
+| 8195 | ⅔" × 1¾" | 60 | 4 cols × 15 rows |
+
+**Thermal single templates** (one label per PDF page, page size = label size):
+
+| Name | Dimensions | Typical use |
+|---|---|---|
+| `thermal-4x6` | 4" × 6" | Shipping (Zebra/Rollo/Dymo 4XL/Munbyn) |
+| `thermal-2.25x1.25` | 2¼" × 1¼" | Small product/barcode (Dymo 30334) |
+| `thermal-2x1` | 2" × 1" | Tight retail barcode |
+| `thermal-3x2` | 3" × 2" | Warehouse organization |
+| `thermal-2x2` | 2" × 2" | Square branding+barcode |
+
+Page dimensions for thermal templates = the label dimensions (in points, 72/inch). Each PDF
+page contains exactly one label, sized to fill the page with a small inner margin (~2-3mm).
+
+Add a `type: 'sheet' | 'thermal'` flag on each template in the `TEMPLATES` map so the engine
+can branch its layout logic.
+
+### Field selection UI — replaces the existing binary toggle
+
+Replace the current "Show retail price" toggle + "Product only / Product + variant" radio with
+a **checkbox group** labeled "Include on label". Six checkboxes:
+
+```
+Include on label:
+  ☑ Product name
+  ☑ Variant name
+  ☑ Retail price (MSRP)
+  ☐ SKU
+  ☑ UPC barcode (graphic)
+  ☑ UPC digits (12-digit human-readable text)
+```
+
+Defaults: Product name, Variant name, MSRP, UPC barcode, UPC digits. SKU off by default.
+
+If the user unchecks all → save button disabled with hint "Pick at least one field."
+
+If the user unchecks both UPC options → still allowed (useful for non-barcoded labels like a
+plain product-name tag).
+
+### Layout rules
+
+For each label rectangle (sheet or single thermal page):
+
+1. Stack enabled fields vertically:
+   - **Product name** (bold, auto-shrink to fit; max 2 lines truncating with `…`)
+   - **Variant name** (smaller font, gray)
+   - **UPC barcode graphic** (centered horizontally, scaled to fit width with a 2-3mm margin)
+   - **UPC digits** (centered under barcode in monospace font; only shown if both barcode AND
+     digits enabled — barcode without digits is allowed, digits without barcode is allowed)
+   - **SKU** (smaller, gray, prefixed "SKU: ")
+   - **MSRP** (right-aligned, bold, prefixed "$")
+
+2. Auto-shrink fonts when content overflows.
+
+3. Spacing: ~2mm vertical between elements.
+
+4. Thermal templates with very small dimensions (2×1, 2.25×1.25) may not fit all 6 fields. In
+   that case, render what fits in priority order: barcode → product name → MSRP → digits → variant → SKU. Surface a "Some fields don't fit on label X" warning in the UI before generating.
+
+### Persistence
+
+Save user's last-used template + field selection in `admin_settings` per email (already done
+for the template; just add a `label_fields_json` column).
+
+### Engine changes (`labels.mjs`)
+
+- Update `TEMPLATES` map: add 5 new entries with their exact dimensions in points (72 pt = 1 in).
+- Add `type` field per template (`'sheet'` or `'thermal'`).
+- Update `renderLabelSheet` to branch on template type:
+  - Sheet: existing grid logic
+  - Thermal: page-per-label, page size = label size, single centered label
+- Update label rendering function to take a `fields` object: `{ productName, variantName, msrp, sku, upc_barcode, upc_digits }` (all booleans).
+- Compute the layout from the enabled subset.
+
+### Tests (extend existing label tests)
+
+- Engine: renders correctly for each of the 10 templates with a 3-item input
+- Engine: page count matches template (1 page per item for thermal, ceil(n/per-sheet) for sheets)
+- Engine: with only `{ msrp: true }` enabled → label shows only price (no barcode, no name)
+- Engine: with only `{ upc_barcode: true }` → label shows only barcode
+- Engine: missing barcode + only barcode enabled → label shows fallback text + warning
+- UI: /labels page shows 10 templates in dropdown
+- UI: 6 checkboxes render and persist via admin_settings
+- UI: unchecking all checkboxes disables Generate button
+
+### Acceptance for Phase 8
+
+- alexa can pick any of the 10 templates from a dropdown labeled "Label size"
+- alexa can independently toggle 6 fields on each label
+- For a sheet template: alexa downloads a multi-label PDF
+- For a thermal template: alexa downloads a one-label-per-page PDF at the exact label dimensions
+- Settings persist between visits per user
+- All tests green
