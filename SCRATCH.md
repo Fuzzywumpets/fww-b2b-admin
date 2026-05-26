@@ -232,6 +232,45 @@ fww-b2b-admin/
 - Tax cert files: store under `data/tax-certs/` in portal dir (gitignored)
 ---
 
+## Phase 14 complete (2026-05-26, commits d1dbdca + f0c5f27)
+
+### Phase 14A: Stock alerts
+- New table: `stock_alerts` (customer_id, variant_id, customer_email, notified_at, unsubscribed_at)
+  UNIQUE(customer_id, variant_id) — upsert on subscribe (idempotent)
+- `getAllActiveStockAlerts()` returns all where unsubscribed_at IS NULL AND notified_at IS NULL
+- Background job uses `shopifyGraphQL` to query `node(id: $id) { ... on ProductVariant { availableForSale inventoryQuantity } }`
+- `sendEmail(to, subject, html)` helper: queues to email_queue, calls Resend REST if key set
+- email_queue table: to_email, subject, html, status (pending/pending_setup/sent/failed), created_at/sent_at
+- run-tests.sh passes B2B_PORTAL_INTERNAL_TOKEN=test-internal-token-mock for internal API tests
+
+### Phase 14B: Order tracking
+- /api/orders/:id now includes `trackingStatus` and `fulfillments[]`
+- trackingStatus logic: no fulfillments → received (unpaid) or in_process (paid); 
+  all fulfillments.status=SUCCESS → delivered; else shipped
+- fulfillments mapped: { status, createdAt, trackingInfo:[{number,url,company}], lineItems[] }
+- visibleNotes: getVisibleNotes(shopifyId) attached to order response
+
+### Phase 14C: Tax certs
+- Portal stores files in data/tax-certs/ (gitignored); multerUpload.single('cert')
+- `tax_exempt_certs` table: customer_id, state, file_path, status, uploaded_at, reviewed_at, reviewed_by, rejection_reason
+- Approve: updateTaxCertStatus + write b2b.tax_exempt=true metafield via shopifyGraphQL
+- Admin review page reads portal.db directly (read-only SQLite); approve/reject call portal via HTTP
+
+### Phase 14D: Visible notes
+- `visible_notes` table: order_id, customer_id, body, added_at, added_by
+- Admin creates via POST /__internal__/visible-note (bearer token) — emails customer if email found
+- Admin can also use /api/admin/orders/:id/visible-note (requires b2b-admin session)
+- Admin reads via portal.db directly: getVisibleNotesForOrder(shopifyOrderId)
+- Customer reads via /api/orders/:id (embedded) + /api/orders/:id/visible-notes
+
+### Internal API pattern
+- INTERNAL_TOKEN = B2B_PORTAL_INTERNAL_TOKEN in Doppler (already created)
+- `requireInternalToken` checks Authorization: Bearer <token>
+- Routes under /__internal__/ for admin→portal server-to-server
+- In run-tests.sh: B2B_PORTAL_INTERNAL_TOKEN=test-internal-token-mock; passed to test as INTERNAL_TOKEN
+
+---
+
 ## Phase 9+10 complete (2026-05-26, commit 35f5dbe)
 
 ### Phase 9 notes
