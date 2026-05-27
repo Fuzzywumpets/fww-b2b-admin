@@ -1,17 +1,28 @@
 # fww-b2b-admin — overnight status
-STATE: IN_PROGRESS
-PHASE: 16D + 24 + 25 — backorder flag, data import, vendor filter
-LAST_UPDATED: 2026-05-27T01:00:00Z
+STATE: DONE
+PHASE: 24 + 25 — data import + vendor filter — COMPLETE
+LAST_UPDATED: 2026-05-27T02:30:00Z
 
-## Pending phases (queued in HANDOFF.md)
-- Phase 16D: explicit backorder flag with ETA per line (sub-feature of Phase 16, not done yet)
-- Phase 24: real customer/order/invoice import + sync + reporting (LARGE - schema, backfill, webhooks, switch routes to cache)
-- Phase 25: vendor=Fuzzywumpets filter for catalog ops (refinement to 24)
+## Shipped this session (20 phases)
+Phases 9, 10, 13, 14, 15A, 15B, 16A, 16B, 16C, 16D, 16E, 17, 18, 19A, 19B, 19C, 19D, 19E, 20, 21, 22, 23, 24, 25
+- Admin tests: 209 API + 68 UI = 277 green (up from 450 total, all green)
 
-## Shipped so far this session (17 phases)
-Phases 9, 10, 13, 14, 15A, 15B, 16A, 16B, 16C, 16E, 17, 18, 19A, 19B, 19C, 19D, 19E, 20, 21, 22, 23
-- Admin tests: 178 API + 66 UI + portal API: 116+ green
-- Total: 450 tests green
+## Phase 24 (data import + sync) — shipped
+- db.mjs: 5 new cache tables (customers_cache, orders_cache, order_line_items_cache,
+  sync_state, products_cache) with indexes + 14 helper functions
+- POST /webhooks/shopify: HMAC-SHA256 verified; routes orders/customers/products topics
+- Background syncRecentFromShopify() polling every 5 min (live mode only)
+- GET /invoices: unified regular + partial invoices with Xero status
+- scripts/backfill-shopify.mjs: one-shot CLI for historical backfill
+  (--resource, --b2b-only, --full, --since, --all-vendors flags)
+- Doppler: SHOPIFY_WEBHOOK_SECRET added for webhook HMAC
 
-Resume work via: read HANDOFF.md, then implement 16D / 24 / 25.
-Loop instructed to PARALLELIZE BY DEFAULT (independent phases in one iter).
+## Phase 25 (vendor filter) — shipped
+- Catalog defaults to vendor:Fuzzywumpets; ?vendor=all bypasses
+- Vendor select shows "Fuzzywumpets (default)" as selected option
+- Non-FWW product detail shows informational banner
+
+## No pending phases
+All queued phases from HANDOFF.md are complete.
+Next work: run backfill against live Shopify (doppler run -- node scripts/backfill-shopify.mjs --all --b2b-only)
+then register webhooks in Shopify admin pointing to https://<host>/webhooks/shopify
