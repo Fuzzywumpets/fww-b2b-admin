@@ -32,6 +32,7 @@ import {
   getSyncState, setSyncState, getAllInvoicesForList, getPartialInvoicesAll,
   listCustomersFromCache,
   getCustomerCacheStats,
+  listOrdersFromCache, getOrdersCacheStats, getCustomerOrdersFromCache,
 } from './db.mjs';
 import { generateInvoicePdf } from './pdf.mjs';
 import { renderLabelSheet, expandItems, TEMPLATES as LABEL_TEMPLATES, DEFAULT_FIELDS } from './labels.mjs';
@@ -1141,6 +1142,18 @@ const FINANCIAL_STATUS_FILTER = {
 };
 
 async function getOrdersData(filters) {
+  // Phase 24D: try cache first (B2B-only by definition — joined to customers_cache where is_b2b=1)
+  if (!MOCK) {
+    try {
+      const stats = getOrdersCacheStats();
+      if (stats && stats.total > 0) {
+        const cached = listOrdersFromCache(filters);
+        return { orders: cached, hasNextPage: false, endCursor: null, total: cached.length, _fromCache: true, _syncedAt: stats.latest };
+      }
+    } catch (e) {
+      console.error('orders cache read failed, falling back to live Shopify:', e.message);
+    }
+  }
   if (MOCK) {
     let orders = MOCK_ORDERS.map(o => {
       const ov = mockOrderOverrides.get(shopifyNumericId(o.id)) || {};
@@ -1237,7 +1250,6 @@ function renderOrdersList(session, data, filters) {
       <td class="text-muted">${fmtDate(o.processedAt)}</td>
       <td class="text-muted small-text">${h(lineItemSummary)}</td>
       <td class="text-right mono">${fmtMoney(o.totalPriceSet?.presentmentMoney?.amount)}</td>
-      <td><span class="badge badge-src-${h(srcColor)}" title="${h(src)}">${h(srcLabel)}</span></td>
       <td><span class="badge badge-${h(status)}">${h(o.displayFinancialStatus)}</span></td>
       <td><span class="badge badge-ff-${h(fstatus)}">${h(o.displayFulfillmentStatus)}</span></td>
       <td><a href="/orders/${h(numId)}" class="table-action">View →</a></td>
@@ -1259,19 +1271,8 @@ function renderOrdersList(session, data, filters) {
 
   const flash = filters.success === 'marked_paid' ? `<div class="alert alert-success">Order(s) marked as paid.</div>` : '';
 
-  const sourceChips = [
-    { value: '',           label: 'All' },
-    { value: 'b2b-portal', label: 'B2B portal' },
-    { value: 'sparklayer', label: 'SparkLayer' },
-    { value: 'pos',        label: 'POS' },
-    { value: 'manual',     label: 'Manual / draft' },
-  ].map(c => {
-    const p = new URLSearchParams(currentParams);
-    if (c.value) p.set('source', c.value); else p.delete('source');
-    p.delete('after');
-    const active = (filters.source || '') === c.value;
-    return `<a href="/orders?${p}" class="filter-chip${active ? ' filter-chip-active' : ''}">${h(c.label)}</a>`;
-  }).join('');
+  // Source filter removed — all orders shown are B2B (filtered via customers_cache.is_b2b)
+  const sourceChips = '';
 
   return layout({ title: 'Orders', session, activePath: '/orders', content: `
     <div class="page-header-row">
@@ -1310,7 +1311,7 @@ function renderOrdersList(session, data, filters) {
           <thead><tr>
             <th class="col-check"><input type="checkbox" id="select-all"></th>
             <th>Order</th><th>Customer</th><th>Date</th><th>Items</th>
-            <th class="text-right">Amount</th><th>Source</th><th>Payment</th><th>Fulfillment</th><th></th>
+            <th class="text-right">Amount</th><th>Payment</th><th>Fulfillment</th><th></th>
           </tr></thead>
           <tbody>${rows}${emptyRow}</tbody>
         </table>
@@ -6560,7 +6561,7 @@ async function syncRecentFromShopify() {
         orders(first:50,query:$q,sortKey:UPDATED_AT,reverse:true){
           edges{node{
             id name processedAt updatedAt createdAt cancelledAt
-            displayFinancialStatus displayFulfillmentStatus financialStatus fulfillmentStatus
+            displayFinancialStatus displayFulfillmentStatus
             totalPriceSet{shopMoney{amount}}
             subtotalPriceSet{shopMoney{amount}}
             totalTaxSet{shopMoney{amount}}
@@ -6581,8 +6582,8 @@ async function syncRecentFromShopify() {
         updated_at: o.updatedAt ? new Date(o.updatedAt).getTime() : null,
         processed_at: o.processedAt ? new Date(o.processedAt).getTime() : null,
         cancelled_at: o.cancelledAt ? new Date(o.cancelledAt).getTime() : null,
-        financial_status: o.financialStatus?.toLowerCase(),
-        fulfillment_status: o.fulfillmentStatus?.toLowerCase(),
+        financial_status: o.displayFinancialStatus || null,
+        fulfillment_status: o.displayFulfillmentStatus || null,
         display_financial_status: o.displayFinancialStatus,
         display_fulfillment_status: o.displayFulfillmentStatus,
         total_price: parseFloat(o.totalPriceSet?.shopMoney?.amount) || 0,

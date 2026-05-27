@@ -646,7 +646,9 @@ export function listCustomersFromCache(filters = {}) {
   // Map to the shape getCustomersData returns (matching live Shopify GraphQL response)
   return rows.map(r => ({
     id: r.gid,
-    displayName: r.display_name,
+    displayName: (r.company && r.company.trim()) ? r.company.trim() : r.display_name,
+    personalName: r.display_name,
+    company: r.company,
     email: r.email,
     phone: null,
     tags: (r.tags || '').split(',').filter(Boolean),
@@ -657,6 +659,74 @@ export function listCustomersFromCache(filters = {}) {
     _fromCache: true,
     _syncedAt: r.synced_at,
   }));
+}
+
+export function listOrdersFromCache(filters = {}) {
+  // Phase 24D: B2B-only — joins customers_cache where is_b2b=1
+  const where = ['c.is_b2b = 1'];
+  const params = [];
+  if (filters.q) {
+    where.push("(o.name LIKE ? OR LOWER(c.display_name) LIKE ? OR LOWER(c.email) LIKE ? OR LOWER(COALESCE(c.company,'')) LIKE ?)");
+    const q = '%' + filters.q.toLowerCase() + '%';
+    params.push('%' + filters.q + '%', q, q, q);
+  }
+  if (filters.status === 'open') {
+    where.push("(o.financial_status IN ('PENDING','PARTIALLY_PAID','UNPAID') OR o.financial_status IS NULL)");
+  } else if (filters.status === 'paid') {
+    where.push("o.financial_status = 'PAID'");
+  } else if (filters.status === 'refunded') {
+    where.push("o.financial_status IN ('REFUNDED','PARTIALLY_REFUNDED')");
+  } else if (filters.status === 'voided') {
+    where.push("o.financial_status = 'VOIDED'");
+  }
+  if (filters.date) {
+    const days = { '7d': 7, '30d': 30, '90d': 90 }[filters.date];
+    if (days) {
+      const cutoff = Date.now() - days * 86400000;
+      where.push('o.created_at >= ?');
+      params.push(cutoff);
+    }
+  }
+  const sql = `SELECT o.*, c.display_name AS customer_display_name, c.email AS customer_email_cached, c.company AS customer_company
+               FROM orders_cache o
+               JOIN customers_cache c ON o.customer_shopify_id = c.shopify_id
+               WHERE ${where.join(' AND ')}
+               ORDER BY o.created_at DESC LIMIT 200`;
+  const rows = db.prepare(sql).all(...params);
+  return rows.map(r => ({
+    id: r.gid,
+    name: r.name,
+    processedAt: new Date(r.processed_at || r.created_at).toISOString(),
+    createdAt: new Date(r.created_at).toISOString(),
+    customer: r.customer_shopify_id ? {
+      id: 'gid://shopify/Customer/' + r.customer_shopify_id,
+      displayName: (r.customer_company && r.customer_company.trim()) ? r.customer_company.trim() : r.customer_display_name,
+      personalName: r.customer_display_name,
+      company: r.customer_company,
+      email: r.customer_email_cached,
+    } : null,
+    displayFinancialStatus: r.financial_status || r.display_financial_status,
+    displayFulfillmentStatus: r.fulfillment_status || r.display_fulfillment_status,
+    totalPriceSet: { presentmentMoney: { amount: String(r.total_price || 0), currencyCode: r.currency || 'USD' } },
+    sourceName: r.source_name,
+    note: r.note,
+    tags: (r.tags || '').split(',').filter(Boolean),
+    lineItems: { edges: [] },
+    _fromCache: true,
+  }));
+}
+
+export function getOrdersCacheStats() {
+  return db.prepare('SELECT COUNT(*) AS total, MAX(synced_at) AS latest FROM orders_cache').get();
+}
+
+export function getCustomerOrdersFromCache(customerShopifyId, opts = {}) {
+  let sql = 'SELECT * FROM orders_cache WHERE customer_shopify_id = ?';
+  const params = [customerShopifyId];
+  if (opts.from) { sql += ' AND created_at >= ?'; params.push(opts.from); }
+  if (opts.to)   { sql += ' AND created_at <= ?'; params.push(opts.to); }
+  sql += ' ORDER BY created_at DESC';
+  return db.prepare(sql).all(...params);
 }
 
 export function getCustomerCacheStats() {
