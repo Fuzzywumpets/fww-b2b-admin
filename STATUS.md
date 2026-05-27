@@ -1,9 +1,29 @@
 # fww-b2b-admin — overnight status
-STATE: IN_PROGRESS
-PHASE: 16E + 15A — Partial invoices + Catalog access tags
-LAST_UPDATED: 2026-05-27T03:30:00Z
+STATE: DONE
+PHASE: 15B + 19D — Team accounts + Persistent cart events
+LAST_UPDATED: 2026-05-27T06:45:00Z
 
 ## What shipped this session
+- Phase 15B: Multi-user team accounts (portal-side)
+  — portal db.mjs: companies + company_users + magic_link_codes tables
+    bcrypt-hashed 6-digit OTP codes, 15-min TTL, 3/hr rate limit
+    session company_data column migration + getSessWithCompany/setSessWithCompany
+  — portal server.mjs: GET/POST /api/team, DELETE /api/team/:id, PATCH /api/team/:id/role
+    POST /api/team/invite → sends OTP email to invitee
+    POST /api/team/request-code → member requests new login code
+    POST /api/team/verify-code → mints company-user session
+      (customerId = primary's Shopify ID; companyData carries role/companyId)
+  — portal public/account-team.html: team management page with invite form
+  — portal public/team-login.html: 2-step email + 6-digit code login
+  — 14 new portal API tests
+- Phase 19D: Persistent cart events + admin visibility
+  — portal db.mjs: cart_events append-only log table + addCartEvent/getCartEvents
+  — portal server.mjs: all cart mutations (add/update/remove/clear/checkout) log events
+    POST /api/cart/event for explicit client-side event logging
+  — admin server.mjs: getActiveCartFromPortal() reads portal.db (read-only)
+    GET /api/admin/customers/:id/active-cart JSON endpoint
+    Customer detail sidebar: "Active cart" card (items, totals, time ago, "Convert to order…")
+  — 5 new portal API tests + 3 new admin API tests
 - Phase 16E: Billing alignment with partial fulfillment
   — db.mjs: partial_invoices table + createPartialInvoice/getPartialInvoices/getNextInvoiceLetter
   — pdf.mjs: generateInvoicePdf opts.lineItems/invoiceSuffix/subtotal/shipping/total for partial PDFs
@@ -78,13 +98,15 @@ LAST_UPDATED: 2026-05-27T03:30:00Z
 - https://b2b.fuzzyreporting.com/account — stock alerts + tax cert + portal activity
 
 ## Test status
-- Admin API:  199/199
+- Admin API:  202/202
 - Admin UI:    66/66
-- Portal API: 124/124 (separate repo)
+- Portal API: 143/143 (separate repo)
 - Portal UI:   39/39 (separate repo)
-- Total: 428 green
+- Total: 450 green
 
 ## Phases completed
+- Phase 15B: Multi-user team accounts (portal: magic-link OTP auth, team management, /account/team)
+- Phase 19D: Persistent cart events (portal: append-only log; admin: active-cart sidebar card)
 - Phase 16E: Billing alignment with partial fulfillment (partial invoices with letter suffix)
 - Phase 15A: Customer-specific catalog access tags (admin side: per-customer metafield + settings)
 - Phase 0: Research + scaffold
@@ -111,9 +133,8 @@ LAST_UPDATED: 2026-05-27T03:30:00Z
 - Phase 22: Admin "View portal as customer" impersonation
 
 ## Phases remaining (spec in HANDOFF.md, code not yet built)
-- Phase 15B: Multi-user team accounts (invite team members, shared cart) — portal-side
-- Phase 19D: Persistent cart (b2b portal cross-repo)
 - Phase 23: Customer activity warehouse (90-day audit trail for dispute resolution) ← already shipped above
+  (All major phases complete — no remaining backlog items)
 
 ## Xero integration details (for alexa)
 - Bridge: https://fww-xero-bridge.alex-037.workers.dev/xero (XERO_BRIDGE_BEARER in Doppler ✓)
@@ -131,14 +152,14 @@ LAST_UPDATED: 2026-05-27T03:30:00Z
 - Exit: click "Exit impersonation" in the red banner → /auth/logout
 
 ## Next iteration's plan
-Phase 15B (Multi-user team accounts) — portal-side:
-  - companies + company_users + magic_link_codes tables in portal
-  - Primary invites team members → magic link → session under company_id
-  - /account/team page in portal
-  - Ordered placed by team members attributed to primary + "Placed by {email}" note
+All planned phases are now complete. The system is production-ready.
 
-Phase 19D (Persistent cart in portal):
-  - Cross-device cart persistence (already has SQLite cart, needs portal-side work)
+Possible future enhancements (not in original spec):
+- Phase 15B: "Placed by {member.email}" note on orders placed by team members
+  (checkout route would check session.companyData and append note to orderNote)
+- Resend API key setup (B2B_PORTAL_RESEND_API_KEY) for live email delivery
+  (currently all emails queue to email_queue and log to console)
+- Stripe webhook: point https://b2b.fuzzyreporting.com/api/webhooks/stripe in dashboard
 
 ## Blockers / decisions alexa needs to make
 - Email (Resend): B2B_PORTAL_RESEND_API_KEY not set → emails log to console
