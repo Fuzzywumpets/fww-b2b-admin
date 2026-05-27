@@ -3397,3 +3397,119 @@ Phase 24 also DEPENDS on:
 - /admin/reports page with at least 4 canned reports
 - Cache freshness badge + manual sync button on every detail page
 - All tests green
+
+## Phase 25 — Vendor filter: catalog operations focus on Fuzzywumpets only
+
+alexa's directive 2026-05-26: cataloging/product work only needs `vendor=Fuzzywumpets`
+products. FMS-vendor items (small toys, pads) are out of scope and just slow things down.
+B2B sales channel membership is irrelevant — vendor is the gating filter.
+
+Per existing memory: "Fuzzywumpets.com is overwhelmingly FWW vendor. FMS-vendor items exist
+but are usually messy and out-of-scope for catalog cleanup unless alexa says otherwise."
+
+### 25A — Update Phase 24 product backfill + cache
+
+When Phase 24 ships:
+- **`scripts/backfill-shopify.mjs --resource=products`** (NEW) MUST filter `vendor:Fuzzywumpets`
+  in the Shopify GraphQL query. Default behavior unless `--all-vendors` flag explicitly passed.
+- **`products_cache` table** (add to Phase 24 schema):
+  ```sql
+  CREATE TABLE products_cache (
+    shopify_id TEXT PRIMARY KEY,
+    gid TEXT NOT NULL,
+    handle TEXT,
+    title TEXT,
+    vendor TEXT,                              -- WILL always be 'Fuzzywumpets' for cataloged rows
+    product_type TEXT,
+    status TEXT,                              -- ACTIVE / DRAFT / ARCHIVED
+    template_suffix TEXT,
+    tags TEXT,                                -- comma-separated
+    publications_json TEXT,                   -- JSON: which sales channels (B2B / OS / SparkLayer / POS)
+    variants_json TEXT,                       -- JSON array (sku, price, barcode, inventory per location)
+    images_json TEXT,                         -- JSON array of image URLs
+    seo_title TEXT,
+    seo_description TEXT,
+    created_at INTEGER,
+    updated_at INTEGER,
+    synced_at INTEGER NOT NULL
+  );
+  CREATE INDEX idx_products_status ON products_cache(status);
+  CREATE INDEX idx_products_handle ON products_cache(handle);
+  CREATE INDEX idx_products_vendor ON products_cache(vendor);
+  ```
+  Estimated row count: ~450-500 FWW products (vs 1,300+ if all vendors). Faster sync, smaller DB.
+
+- **`order_line_items_cache`** (Phase 24 schema): keep ALL line items regardless of vendor
+  (orders may include FMS-vendor items the customer purchased). But add a derived flag for
+  filtering:
+  ```sql
+  ALTER TABLE order_line_items_cache ADD COLUMN is_fww_vendor INTEGER;
+  ```
+  Populated during ingest: `is_fww_vendor = (vendor === 'Fuzzywumpets' ? 1 : 0)`. Lets reports
+  filter by "FWW revenue only" vs "total order value".
+
+### 25B — Update /admin/catalog (Phase 19E)
+
+Currently `/admin/catalog` defaults to all products with status=Active. Refine:
+
+- **New default filter**: `vendor=Fuzzywumpets` ALWAYS applied unless user toggles "Show all
+  vendors" checkbox in the filter row
+- Add a small vendor pill in the filter row showing current scope: `[Vendor: Fuzzywumpets ▾]`
+  with dropdown: Fuzzywumpets (default) / All vendors / (other vendors enumerated dynamically
+  from cache)
+- URL persists: `?vendor=Fuzzywumpets&status=active`
+- Counts on status chips (Active/Draft/Archived/All) reflect the vendor filter
+
+This cuts the catalog list from ~1,300 → ~450 visible products. Much faster.
+
+### 25C — Update Phase 19C product detail (`/admin/products/:id`)
+
+No change needed — the detail page works for any product regardless of vendor. Vendor field
+is displayed in the header as already specced. Just confirm:
+- Header shows `Vendor: Fuzzywumpets` (or whatever it is) clearly
+- If vendor != Fuzzywumpets, render an info banner: "ℹ This product is from vendor X
+  (not Fuzzywumpets). Most catalog operations don't apply."
+
+### 25D — Update Phase 24F reports
+
+For revenue reports:
+- **"Sales by product/SKU"**: filter to `is_fww_vendor=1` by default; add "Include all vendors"
+  toggle
+- **"Sales by customer"** + **"B2B vs retail"**: include FULL order totals (not just FWW
+  portion) since the customer paid for the whole order
+- **NEW canned report**: "Non-FWW revenue exposure" — shows how much revenue comes through
+  non-Fuzzywumpets vendors (helps alexa decide if FMS-vendor items deserve more catalog
+  attention or can be deprecated)
+
+### 25E — Backfill performance impact
+
+With vendor filter applied:
+- Products: ~500 rows × ~5 KB each ≈ 2.5 MB cache (vs ~6 MB without filter)
+- Backfill time: ~30 sec for FWW-only vs ~90 sec for all vendors
+- Catalog page load: <200ms (sub-perceptible) once cached
+
+### 25F — Existing /catalog endpoint in admin
+
+If `/admin/catalog` currently fetches from live Shopify (pre-Phase-24), patch the GraphQL query
+to add `query: "vendor:Fuzzywumpets status:active"` filter immediately. Don't wait for Phase 24.
+This is a small one-line change that gives instant speedup.
+
+### Tests
+
+- 25A: backfill products with no flag → only Fuzzywumpets vendor rows inserted
+- 25A: backfill products `--all-vendors` → all vendors inserted
+- 25B: GET /admin/catalog with no params → only Fuzzywumpets products in response
+- 25B: GET /admin/catalog?vendor=all → all vendors
+- 25C: GET /admin/products/:id for FMS-vendor product → info banner rendered
+- 25D: reports filter by is_fww_vendor correctly
+- 25F: /admin/catalog live path includes vendor:Fuzzywumpets in Shopify query
+
+### Acceptance for Phase 25
+
+- /admin/catalog defaults to Fuzzywumpets vendor only (toggle for all)
+- Phase 24 product backfill defaults to Fuzzywumpets only
+- Order line items cache keeps all vendors but flags FWW vs other
+- Non-FWW products still viewable individually (no 404), with a clear banner indicating they're
+  out of scope for catalog ops
+- /admin/catalog load time drops noticeably (300+ products skipped)
+- All tests green
