@@ -1598,7 +1598,7 @@ function renderOrderDetail(session, order, flash) {
     ${flashHtml}
     <div class="detail-header">
       <div class="detail-header-left">
-        <h1>${h(order.name)} <span class="badge badge-${h(finStatus)}">${h(order.displayFinancialStatus)}</span>
+        <h1><a href="https://admin.shopify.com/store/fuzzywumpets/orders/${h(numId)}" target="_blank" rel="noopener" class="link" title="Open ${h(order.name)} in Shopify admin">${h(order.name)} ↗</a> <span class="badge badge-${h(finStatus)}">${h(order.displayFinancialStatus)}</span>
             <span class="badge badge-ff-${h(fulStatus)}">${h(order.displayFulfillmentStatus)}</span></h1>
         <p class="text-muted">
           ${order.customer ? `<a href="/customers/${shopifyNumericId(order.customer.id)}">${h(order.customer.displayName)}</a> · ` : ''}
@@ -1813,7 +1813,7 @@ function renderOrderDetail(session, order, flash) {
                 <div style="text-align:right">
                   <div class="mono">${fmtMoney(inv.total)}</div>
                   <div style="font-size:11px;color:var(--muted)">${fmtDate(new Date(inv.created_at).toISOString())}</div>
-                  <a href="/orders/${h(numId)}/partial-invoice/${h(inv.invoice_letter)}.pdf" class="link" style="font-size:11px">Download PDF</a>
+                  <a href="/orders/${h(numId)}/partial-invoice/${h(inv.invoice_letter)}.pdf" target="_blank" rel="noopener" class="link" style="font-size:11px">Download PDF</a>
                 </div>
               </div>`).join('')}
           </div>
@@ -2795,7 +2795,7 @@ function renderNewOrderForm(session, prefillCustomer) {
               .then(function(data){
                 if(!data.length){ results.hidden=true; return; }
                 results.innerHTML = data.map(function(item){
-                  return '<div class="autocomplete-item" data-json=\''+JSON.stringify(item).replace(/'/g,"&apos;")+'\'>'
+                  return '<div class="autocomplete-item" data-json="'+JSON.stringify(item).replace(/"/g,"&quot;")+'">'
                     + esc(item.label) + (item.sublabel?'<small>'+esc(item.sublabel)+'</small>':'') + '</div>';
                 }).join('');
                 results.hidden=false;
@@ -2805,7 +2805,7 @@ function renderNewOrderForm(session, prefillCustomer) {
         results.addEventListener('click',function(e){
           var item = e.target.closest('.autocomplete-item');
           if(!item) return;
-          var data = JSON.parse(item.dataset.json.replace(/&apos;/g,"'"));
+          var data = JSON.parse(item.dataset.json.replace(/&quot;/g, '"'));
           results.hidden=true; input.value='';
           onSelect(data);
         });
@@ -6676,7 +6676,7 @@ app.get('/invoices', requireAuth, (req, res) => {
       <td class="text-right mono">${fmtMoney(o.total_price)}</td>
       <td><span class="badge badge-${(o.financial_status||'').toLowerCase()}">${h(o.display_financial_status||o.financial_status||'—')}</span></td>
       <td>${hasXero ? `<span class="badge badge-success">Xero ✓</span> <small class="text-muted">${(xero?.xero_invoice_id||'').slice(0,8)}…</small>` : '<span class="badge badge-secondary">No Xero</span>'}</td>
-      <td>${partialInvs.length ? partialInvs.map(p => `<a href="/orders/${h(ordNum)}/invoice.pdf?letter=${p.invoice_letter}" class="link">#${ordNum}-${p.invoice_letter}</a>`).join(' ') : `<a href="/orders/${h(ordNum)}/invoice.pdf" class="link btn btn-ghost btn-xs">PDF</a>`}</td>
+      <td>${partialInvs.length ? partialInvs.map(p => `<a href="/orders/${h(ordNum)}/invoice.pdf?letter=${p.invoice_letter}" target="_blank" rel="noopener" class="link">#${ordNum}-${p.invoice_letter}</a>`).join(' ') : `<a href="/orders/${h(ordNum)}/invoice.pdf" target="_blank" rel="noopener" class="link btn btn-ghost btn-xs">PDF</a>`}</td>
     </tr>`;
   });
 
