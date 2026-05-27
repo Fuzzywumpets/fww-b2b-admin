@@ -1,9 +1,23 @@
 # fww-b2b-admin — overnight status
 STATE: IN_PROGRESS
-PHASE: 23 — Customer activity warehouse (90-day audit trail)
-LAST_UPDATED: 2026-05-27T01:55:00Z
+PHASE: 16E + 15A — Partial invoices + Catalog access tags
+LAST_UPDATED: 2026-05-27T03:30:00Z
 
 ## What shipped this session
+- Phase 16E: Billing alignment with partial fulfillment
+  — db.mjs: partial_invoices table + createPartialInvoice/getPartialInvoices/getNextInvoiceLetter
+  — pdf.mjs: generateInvoicePdf opts.lineItems/invoiceSuffix/subtotal/shipping/total for partial PDFs
+  — POST /orders/:id/partial-invoice → generates PDF, assigns letter suffix (A, B, C...), saves to SQLite
+  — GET /orders/:id/partial-invoice/:letter.pdf → re-downloads stored partial invoice
+  — GET /api/admin/orders/:id/partial-invoices → JSON list of issued invoices
+  — Order detail: "Generate Invoice" modal (fulfilled-only vs full + shipping toggle) replaces simple PDF link
+  — "Invoices issued" side card on order detail showing all prior partial invoices
+- Phase 15A: Catalog access tags (admin side)
+  — getB2bConfig reads/returns b2b.catalog_access_tags metafield
+  — applyB2bConfigUpdate writes catalog_access_tags as single_line_text_field metafield
+  — /customers/:id B2B settings: new "Custom catalog tags" input (comma-separated private product tags)
+  — /settings: new "Private catalog tags" global setting (documents which product tags are restricted)
+  — 13 new admin API tests → 199 total API, 66 UI = 265 total admin tests, all green
 - Phase 23: Customer activity warehouse (90-day audit trail)
   — Portal: customer_activity SQLite table with indexes (customer_id+ts, event_type+ts, session_id)
   — Portal: activityMiddleware auto-logs page_view + api_call on every authed request
@@ -64,13 +78,15 @@ LAST_UPDATED: 2026-05-27T01:55:00Z
 - https://b2b.fuzzyreporting.com/account — stock alerts + tax cert + portal activity
 
 ## Test status
-- Admin API:  186/186
+- Admin API:  199/199
 - Admin UI:    66/66
 - Portal API: 124/124 (separate repo)
 - Portal UI:   39/39 (separate repo)
-- Total: 415 green
+- Total: 428 green
 
 ## Phases completed
+- Phase 16E: Billing alignment with partial fulfillment (partial invoices with letter suffix)
+- Phase 15A: Customer-specific catalog access tags (admin side: per-customer metafield + settings)
 - Phase 0: Research + scaffold
 - Phase 1: Google OAuth + dashboard MVP
 - Phase 2: Orders + customers
@@ -95,10 +111,9 @@ LAST_UPDATED: 2026-05-27T01:55:00Z
 - Phase 22: Admin "View portal as customer" impersonation
 
 ## Phases remaining (spec in HANDOFF.md, code not yet built)
-- Phase 15: Customer-specific catalogs (per-customer private tags) + multi-user team accounts
+- Phase 15B: Multi-user team accounts (invite team members, shared cart) — portal-side
 - Phase 19D: Persistent cart (b2b portal cross-repo)
-- Phase 16E: Billing alignment with partial fulfillment (partial invoices with letter suffix)
-- Phase 23: Customer activity warehouse (90-day audit trail for dispute resolution)
+- Phase 23: Customer activity warehouse (90-day audit trail for dispute resolution) ← already shipped above
 
 ## Xero integration details (for alexa)
 - Bridge: https://fww-xero-bridge.alex-037.workers.dev/xero (XERO_BRIDGE_BEARER in Doppler ✓)
@@ -116,12 +131,11 @@ LAST_UPDATED: 2026-05-27T01:55:00Z
 - Exit: click "Exit impersonation" in the red banner → /auth/logout
 
 ## Next iteration's plan
-Phase 15 (Customer-specific catalogs + multi-user team accounts):
-  - Per-customer private tags that hide catalog items
-  - Team account management (invite team members, shared cart)
-
-Phase 16E (Billing alignment with partial fulfillment):
-  - Partial invoices with letter suffix (INV-1001A, INV-1001B)
+Phase 15B (Multi-user team accounts) — portal-side:
+  - companies + company_users + magic_link_codes tables in portal
+  - Primary invites team members → magic link → session under company_id
+  - /account/team page in portal
+  - Ordered placed by team members attributed to primary + "Placed by {email}" note
 
 Phase 19D (Persistent cart in portal):
   - Cross-device cart persistence (already has SQLite cart, needs portal-side work)
