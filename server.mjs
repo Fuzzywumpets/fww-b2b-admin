@@ -2050,6 +2050,27 @@ async function getCustomerDetail(numericId) {
 }
 
 async function getCustomerRecentOrders(customerId) {
+  // Phase 24D: cache first
+  if (!MOCK) {
+    try {
+      const stats = getOrdersCacheStats();
+      if (stats && stats.total > 0) {
+        const cached = getCustomerOrdersFromCache(customerId);
+        return cached.slice(0, 10).map(o => ({
+          id: o.gid,
+          name: o.name,
+          processedAt: new Date(o.processed_at || o.created_at).toISOString(),
+          displayFinancialStatus: o.financial_status || o.display_financial_status,
+          displayFulfillmentStatus: o.fulfillment_status || o.display_fulfillment_status,
+          totalPriceSet: { presentmentMoney: { amount: String(o.total_price || 0), currencyCode: o.currency || 'USD' } },
+          lineItems: { edges: [] },
+          _fromCache: true,
+        }));
+      }
+    } catch (e) {
+      console.error('recent orders cache failed, falling back to live:', e.message);
+    }
+  }
   if (MOCK) {
     const gid = shopifyCustomerGid(customerId);
     return MOCK_ORDERS.filter(o => o.customer?.id === gid).slice(0, 10);
