@@ -34,6 +34,7 @@ import {
   getCustomerCacheStats,
   listOrdersFromCache, getOrdersCacheStats, getCustomerOrdersFromCache,
   getReportsDataFromCache,
+  getTopCustomersAllTime,
 } from './db.mjs';
 import { generateInvoicePdf } from './pdf.mjs';
 import { renderLabelSheet, expandItems, TEMPLATES as LABEL_TEMPLATES, DEFAULT_FIELDS } from './labels.mjs';
@@ -1061,7 +1062,20 @@ async function getDashboardData() {
       if (!spend.has(id)) spend.set(id, { id, name: displayName, email, spend: 0 });
       spend.get(id).spend += amt;
     }
-    const topCustomers = [...spend.values()].sort((a, b) => b.spend - a.spend).slice(0, 5);
+    // Phase 20A: use all-time top from cache (instead of 90-day window from live orders)
+    let topCustomers = [];
+    try {
+      const stats = getCustomerCacheStats();
+      if (stats && stats.total > 0) {
+        topCustomers = getTopCustomersAllTime(5);
+      }
+    } catch (e) {
+      console.error('top customers cache read failed:', e.message);
+    }
+    // Fallback to 90-day window from live orders if cache is empty
+    if (topCustomers.length === 0) {
+      topCustomers = [...spend.values()].sort((a, b) => b.spend - a.spend).slice(0, 5);
+    }
     const allProducts = productsResult.data?.products?.edges?.map(e => e.node) || [];
     const lowStockItems = [];
     for (const p of allProducts) {

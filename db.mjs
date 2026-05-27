@@ -951,3 +951,23 @@ export function getReportsDataFromCache() {
     _fromCache: true,
   };
 }
+
+export function getTopCustomersAllTime(limit = 5) {
+  // All-time top B2B customers by lifetime spend (from cached customer records,
+  // which mirror Shopify customer.amountSpent — so this is true lifetime, not just cached orders).
+  return db.prepare(`
+    SELECT shopify_id AS id,
+           COALESCE(NULLIF(TRIM(company), ''), display_name) AS name,
+           email,
+           amount_spent_total AS spend,
+           orders_count AS orders
+    FROM customers_cache
+    WHERE is_b2b = 1 AND amount_spent_total > 0
+    ORDER BY amount_spent_total DESC
+    LIMIT ?
+  `).all(limit).map(r => ({
+    id: 'gid://shopify/Customer/' + r.id,
+    name: r.name, email: r.email,
+    spend: r.spend || 0, orders: r.orders || 0,
+  }));
+}
