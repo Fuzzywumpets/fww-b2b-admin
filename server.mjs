@@ -1500,7 +1500,7 @@ function renderOrderDetail(session, order, flash) {
     ? `<div class="alert alert-warning">Xero sync failed — queued for retry. Check /accounting.</div>`
     : flash === 'partial_invoice_created'
     ? `<div class="alert alert-success">Partial invoice generated.</div>`
-    : flash === 'edit_failed' || flash === 'fulfillment_failed' || flash === 'discount_failed'
+    : flash === 'order_canceled' ? `<div class="alert alert-success">Order canceled.</div>` : flash === 'cancel_failed' ? `<div class="alert alert-warning">Cancel failed — see logs.</div>` : flash === 'edit_failed' || flash === 'fulfillment_failed' || flash === 'discount_failed'
     ? `<div class="alert alert-warning">Action failed — check server logs.</div>`
     : '';
 
@@ -1543,12 +1543,16 @@ function renderOrderDetail(session, order, flash) {
   function toggleInvoiceModal(show) {
     document.getElementById('invoice-modal').style.display = show ? 'flex' : 'none';
   }
+  function toggleCancelModal(show) {
+    document.getElementById('cancel-modal').style.display = show ? 'flex' : 'none';
+  }
   document.addEventListener('keydown', e => {
     if (e.key === 'Escape') {
       document.getElementById('discount-modal').style.display = 'none';
       document.getElementById('fulfill-modal').style.display = 'none';
       document.getElementById('backorder-modal').style.display = 'none';
       document.getElementById('invoice-modal').style.display = 'none';
+      const cm = document.getElementById('cancel-modal'); if (cm) cm.style.display = 'none';
     }
   });
   </script>`;
@@ -1619,6 +1623,8 @@ function renderOrderDetail(session, order, flash) {
         <form method="POST" action="/orders/${h(numId)}/xero/sync" style="display:inline">
           <button class="btn btn-ghost" title="Create or refresh Xero invoice for this order">${xeroMap?.status === 'synced' ? '✓ Xero synced' : 'Sync to Xero'}</button>
         </form>
+        ${order.cancelledAt ? `<span class="badge badge-danger">CANCELED ${fmtDate(order.cancelledAt)}</span>` : `
+        <button type="button" class="btn btn-ghost" style="color:#c00" onclick="toggleCancelModal(true)" title="Cancel this order">Cancel order</button>`}
       </div>
     </div>
     ${timeline}
@@ -1720,6 +1726,46 @@ function renderOrderDetail(session, order, flash) {
               <div style="display:flex;gap:8px">
                 <button type="submit" class="btn btn-primary">Mark backordered</button>
                 <button type="button" class="btn btn-ghost" onclick="toggleBackorderModal(null,null,null,false)">Cancel</button>
+              </div>
+            </form>
+          </div>
+        </div>
+        ${/* Cancel modal */''}<div id="cancel-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center">
+          <div style="background:#fff;border-radius:8px;padding:24px;min-width:380px;max-width:500px">
+            <h3 style="margin:0 0 16px;color:#c00">Cancel this order?</h3>
+            <p style="color:#555;margin:0 0 16px">This will cancel ${h(order.name)} (${fmtMoney(order.totalPriceSet?.presentmentMoney?.amount)}) in Shopify. The order will be marked CANCELED and stock will be restored.</p>
+            <form method="POST" action="/orders/${h(numId)}/cancel">
+              <div style="margin-bottom:12px">
+                <label style="font-size:13px;font-weight:500">Reason</label><br>
+                <select name="reason" class="filter-select" style="width:100%;margin-top:4px">
+                  <option value="CUSTOMER">Customer request</option>
+                  <option value="INVENTORY">Inventory unavailable</option>
+                  <option value="FRAUD">Fraud</option>
+                  <option value="DECLINED">Payment declined</option>
+                  <option value="OTHER" selected>Other</option>
+                </select>
+              </div>
+              <div style="margin-bottom:12px">
+                <label style="display:flex;align-items:center;gap:6px;font-size:13px">
+                  <input type="checkbox" name="restock" value="1" checked>
+                  Restock items to inventory
+                </label>
+              </div>
+              <div style="margin-bottom:12px">
+                <label style="display:flex;align-items:center;gap:6px;font-size:13px">
+                  <input type="checkbox" name="refund" value="1" ${isPaid ? 'checked' : ''}>
+                  Refund payment (if paid)
+                </label>
+              </div>
+              <div style="margin-bottom:16px">
+                <label style="display:flex;align-items:center;gap:6px;font-size:13px">
+                  <input type="checkbox" name="notify" value="1" checked>
+                  Email customer
+                </label>
+              </div>
+              <div style="display:flex;gap:8px;justify-content:flex-end">
+                <button type="button" class="btn btn-ghost" onclick="toggleCancelModal(false)">Keep order</button>
+                <button type="submit" class="btn btn-danger" style="background:#c00;color:#fff">Cancel order</button>
               </div>
             </form>
           </div>
@@ -3574,6 +3620,51 @@ app.post('/orders/:id/discount', requireAuth, async (req, res) => {
   } catch (err) {
     console.error('discount error:', err.message);
     res.redirect(`/orders/${numId}?error=discount_failed`);
+  }
+});
+
+// Cancel order (calls Shopify orderCancel mutation)
+app.post('/orders/:id/cancel', requireAuth, async (req, res) => {
+  const numId   = req.params.id;
+  const session = req.adminSession;
+  const reason  = String(req.body.reason || 'OTHER');
+  const restock = req.body.restock === '1';
+  const refund  = req.body.refund === '1';
+  const notify  = req.body.notify === '1';
+
+  if (MOCK) {
+    const order = getMockOrder(numId);
+    if (order) {
+      const overrides = mockOrderOverrides.get(numId) || {};
+      overrides.cancelledAt = new Date().toISOString();
+      mockOrderOverrides.set(numId, overrides);
+    }
+    auditLog(session.email, 'order_cancel', `gid://shopify/Order/${numId}`, null, { reason, restock, refund, notify });
+    return res.redirect(`/orders/${numId}?success=order_canceled`);
+  }
+
+  try {
+    const orderId = `gid://shopify/Order/${numId}`;
+    const result = await shopifyFetch(`
+      mutation cancel($id:ID!,$reason:OrderCancelReason!,$refund:Boolean!,$restock:Boolean!,$notify:Boolean!,$staffNote:String){
+        orderCancel(orderId:$id, reason:$reason, refund:$refund, restock:$restock, notifyCustomer:$notify, staffNote:$staffNote){
+          job{id} userErrors{field message}
+        }
+      }`, {
+      id: orderId,
+      reason,
+      refund,
+      restock,
+      notify,
+      staffNote: `Canceled via FWW admin by ${session.email}`,
+    });
+    const errs = result.data?.orderCancel?.userErrors || [];
+    if (errs.length) throw new Error(errs.map(e => e.message).join(', '));
+    auditLog(session.email, 'order_cancel', orderId, null, { reason, restock, refund, notify });
+    res.redirect(`/orders/${numId}?success=order_canceled`);
+  } catch (err) {
+    console.error('order cancel error:', err.message);
+    res.redirect(`/orders/${numId}?error=cancel_failed&msg=${encodeURIComponent(err.message.slice(0, 200))}`);
   }
 });
 
