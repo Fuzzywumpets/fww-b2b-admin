@@ -1,9 +1,26 @@
 # fww-b2b-admin — overnight status
 STATE: IN_PROGRESS
-PHASE: 22 — Admin "View portal as customer" impersonation
-LAST_UPDATED: 2026-05-27T01:30:00Z
+PHASE: 23 — Customer activity warehouse (90-day audit trail)
+LAST_UPDATED: 2026-05-27T01:55:00Z
 
 ## What shipped this session
+- Phase 23: Customer activity warehouse (90-day audit trail)
+  — Portal: customer_activity SQLite table with indexes (customer_id+ts, event_type+ts, session_id)
+  — Portal: activityMiddleware auto-logs page_view + api_call on every authed request
+  — Portal: auth event hooks — login/logout explicitly logged with method + IP hash
+  — Portal: POST /api/activity client-side beacon endpoint (rate-limited 60/min/session)
+  — Portal: purgeOldActivity() 90-day retention: runs on startup + daily at 03:00 UTC
+  — Portal: GET /__internal__/activity?customerId=... admin-to-portal internal API
+    supports from/to/type/q/page filters; returns rows + total + lastLogin + lastCart
+  — Admin: /customers/:id/activity — activity viewer page with date/type/q filters
+    canned views (Orders placed, Failed checkouts, Errors, Recent logins)
+    row click → expands inline to show event_data + IP hash + country + UA + impersonation flag
+  — Admin: GET /api/admin/customers/:id/activity — JSON API endpoint
+  — Admin: GET /api/admin/customers/:id/activity/lookup — quick dispute resolution
+    "did customer place an order on date X?" → found/not-found with context
+  — Admin: "Activity log" link added to customer detail header
+  — IP stored as SHA256 hash (32 chars), never raw — privacy-preserving + fraud-detectable
+  — 8 new admin API tests + 8 new portal API tests → 415 total, all green
 - Phase 22: Admin "View portal as customer" impersonation
   — B2B_IMPERSONATION_SECRET Doppler secret (64-char hex, generated + pushed)
   — Admin db.mjs: impersonation_nonces table (nonce, customerId, adminEmail, readOnly, exp, used_at)
@@ -47,11 +64,11 @@ LAST_UPDATED: 2026-05-27T01:30:00Z
 - https://b2b.fuzzyreporting.com/account — stock alerts + tax cert + portal activity
 
 ## Test status
-- Admin API:  178/178
+- Admin API:  186/186
 - Admin UI:    66/66
-- Portal API: 116/116 (separate repo)
+- Portal API: 124/124 (separate repo)
 - Portal UI:   39/39 (separate repo)
-- Total: 399 green
+- Total: 415 green
 
 ## Phases completed
 - Phase 0: Research + scaffold
@@ -74,7 +91,8 @@ LAST_UPDATED: 2026-05-27T01:30:00Z
 - Phase 19E: Catalog tab product status filter
 - Phase 20: Priority customer onboarding + Companies research
 - Phase 21: Xero customer sync on B2B creation
-- Phase 22: Admin "View portal as customer" impersonation ← NEW
+- Phase 23: Customer activity warehouse (90-day audit trail) ← NEW
+- Phase 22: Admin "View portal as customer" impersonation
 
 ## Phases remaining (spec in HANDOFF.md, code not yet built)
 - Phase 15: Customer-specific catalogs (per-customer private tags) + multi-user team accounts
@@ -98,11 +116,15 @@ LAST_UPDATED: 2026-05-27T01:30:00Z
 - Exit: click "Exit impersonation" in the red banner → /auth/logout
 
 ## Next iteration's plan
-Phase 23 (Customer activity warehouse):
-  23A: customer_activity SQLite table in portal (90-day, events by type)
-  23B: Express middleware auto-logs page_view + api_call on every authed request
-  23E: Admin /customers/:id/activity viewer (date range filter, event type filter)
-  23F: Quick lookup "did customer access portal on date X?"
+Phase 15 (Customer-specific catalogs + multi-user team accounts):
+  - Per-customer private tags that hide catalog items
+  - Team account management (invite team members, shared cart)
+
+Phase 16E (Billing alignment with partial fulfillment):
+  - Partial invoices with letter suffix (INV-1001A, INV-1001B)
+
+Phase 19D (Persistent cart in portal):
+  - Cross-device cart persistence (already has SQLite cart, needs portal-side work)
 
 ## Blockers / decisions alexa needs to make
 - Email (Resend): B2B_PORTAL_RESEND_API_KEY not set → emails log to console
