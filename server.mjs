@@ -2672,7 +2672,7 @@ function renderNewOrderForm(session, prefillCustomer) {
           <div class="card" style="margin-top:1rem">
             <div class="card-header"><h2>Line Items</h2></div>
             <div style="position:relative;margin-bottom:0.75rem">
-              <input type="text" id="product-search" class="input" placeholder="Search product by title or SKU…" autocomplete="off">
+              <div style="display:flex;gap:8px;align-items:center"><input type="text" id="product-search" class="input" placeholder="Search product by title or SKU…" autocomplete="off" style="flex:1"><button type="button" class="btn btn-ghost btn-sm" onclick="addCustomItem()">+ Custom item</button></div>
               <div id="product-results" class="autocomplete-dropdown" hidden></div>
             </div>
             <table class="data-table" id="line-items-table">
@@ -2846,6 +2846,30 @@ function renderNewOrderForm(session, prefillCustomer) {
         renderLineItems(); updateTotals();
       });
 
+      // Add custom (non-catalog) line item
+      window.addCustomItem = function() {
+        var title = prompt('Custom item title (e.g. "Custom collar — Bree"):');
+        if (!title) return;
+        var priceStr = prompt('Unit price for "' + title + '" (in USD):');
+        if (priceStr == null) return;
+        var price = parseFloat(priceStr);
+        if (isNaN(price) || price < 0) { alert('Invalid price'); return; }
+        var qtyStr = prompt('Quantity:', '1');
+        if (qtyStr == null) return;
+        var qty = parseInt(qtyStr, 10);
+        if (isNaN(qty) || qty < 1) { alert('Invalid quantity'); return; }
+        lineItems.push({
+          isCustom: true,
+          title: title,
+          sku: 'CUSTOM',
+          listPrice: price,
+          price: price.toFixed(2),
+          qty: qty
+        });
+        renderLineItems();
+        updateTotals();
+      };
+
       // Form submit: validate
       document.getElementById('order-form').addEventListener('submit',function(e){
         if(!selectedCustomer||lineItems.length===0){ e.preventDefault(); updateSubmitBtn(); return; }
@@ -2887,13 +2911,24 @@ async function submitNewOrder(req, session) {
     const gidCustomer = shopifyCustomerGid(customer_id);
     const draftInput = {
       customerId: gidCustomer,
-      lineItems: lineItemsParsed.map(li => ({
-        variantId: `gid://shopify/ProductVariant/${li.variantId}`,
-        quantity: parseInt(li.qty, 10),
-        appliedDiscount: li.price && li.listPrice && li.price < li.listPrice
-          ? { value: parseFloat((((li.listPrice - li.price) / li.listPrice) * 100).toFixed(2)), valueType: 'PERCENTAGE' }
-          : undefined,
-      })),
+      lineItems: lineItemsParsed.map(li => {
+        if (li.isCustom || !li.variantId) {
+          return {
+            title: li.title || 'Custom item',
+            originalUnitPrice: String(li.price || 0),
+            quantity: parseInt(li.qty, 10),
+            taxable: false,
+            requiresShipping: true,
+          };
+        }
+        return {
+          variantId: `gid://shopify/ProductVariant/${li.variantId}`,
+          quantity: parseInt(li.qty, 10),
+          appliedDiscount: li.price && li.listPrice && li.price < li.listPrice
+            ? { value: parseFloat((((li.listPrice - li.price) / li.listPrice) * 100).toFixed(2)), valueType: 'PERCENTAGE' }
+            : undefined,
+        };
+      }),
       shippingAddress,
       note: orderNote || null,
       tags: ['b2b-portal', 'b2b-manual-order'],
