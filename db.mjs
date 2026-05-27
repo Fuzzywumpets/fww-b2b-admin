@@ -879,3 +879,75 @@ export function getPartialInvoicesAll({ limit = 200, offset = 0 } = {}) {
   `).all(limit, offset);
 }
 
+export function getReportsDataFromCache() {
+  // Phase 24F: SQL-side aggregation of last 12 months
+  const now = new Date();
+  const cutoff = new Date(now); cutoff.setMonth(now.getMonth() - 11); cutoff.setDate(1); cutoff.setHours(0,0,0,0);
+  const cutoffMs = cutoff.getTime();
+
+  const monthRows = db.prepare(`
+    SELECT strftime('%Y-%m', datetime(o.created_at/1000, 'unixepoch')) AS month,
+           ROUND(SUM(o.total_price), 2) AS revenue,
+           COUNT(*) AS orders
+    FROM orders_cache o JOIN customers_cache c ON o.customer_shopify_id = c.shopify_id
+    WHERE c.is_b2b = 1 AND o.cancelled_at IS NULL AND o.created_at >= ?
+    GROUP BY month ORDER BY month
+  `).all(cutoffMs);
+  const monthMap = new Map();
+  for (let i = 11; i >= 0; i--) {
+    const d = new Date(now); d.setDate(1); d.setMonth(d.getMonth() - i);
+    const key = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`;
+    monthMap.set(key, { month: key, revenue: 0, orders: 0 });
+  }
+  for (const r of monthRows) {
+    if (monthMap.has(r.month)) monthMap.set(r.month, { month: r.month, revenue: r.revenue, orders: r.orders });
+  }
+  const monthly = [...monthMap.values()];
+
+  const customerRows = db.prepare(`
+    SELECT c.shopify_id AS id,
+           COALESCE(NULLIF(TRIM(c.company), ''), c.display_name) AS name,
+           c.email AS email,
+           ROUND(SUM(o.total_price), 2) AS revenue,
+           COUNT(o.shopify_id) AS orders,
+           ROUND(AVG(o.total_price), 2) AS aov
+    FROM customers_cache c LEFT JOIN orders_cache o ON o.customer_shopify_id = c.shopify_id AND o.cancelled_at IS NULL
+    WHERE c.is_b2b = 1
+    GROUP BY c.shopify_id
+    HAVING revenue > 0
+    ORDER BY revenue DESC LIMIT 20
+  `).all();
+  const customers = customerRows.map(r => ({
+    id: r.id, name: r.name, email: r.email,
+    revenue: r.revenue || 0, orders: r.orders || 0, aov: Math.round(r.aov || 0),
+  }));
+
+  const productRows = db.prepare(`
+    SELECT li.title AS title, li.sku AS sku,
+           ROUND(SUM(li.price * li.quantity), 2) AS revenue,
+           SUM(li.quantity) AS units
+    FROM order_line_items_cache li
+    JOIN orders_cache o ON o.shopify_id = li.order_shopify_id
+    JOIN customers_cache c ON c.shopify_id = o.customer_shopify_id
+    WHERE c.is_b2b = 1 AND o.cancelled_at IS NULL
+    GROUP BY COALESCE(li.sku, li.title)
+    ORDER BY revenue DESC LIMIT 50
+  `).all();
+  const products = productRows.map(r => ({
+    title: r.title, sku: r.sku || '', revenue: r.revenue || 0, units: r.units || 0,
+  }));
+
+  const totalsRow = db.prepare(`
+    SELECT ROUND(SUM(o.total_price), 2) AS revenue, COUNT(*) AS orders
+    FROM orders_cache o JOIN customers_cache c ON c.shopify_id = o.customer_shopify_id
+    WHERE c.is_b2b = 1 AND o.cancelled_at IS NULL AND o.created_at >= ?
+  `).get(cutoffMs);
+
+  return {
+    monthly, customers, products,
+    totalRevenue: totalsRow?.revenue || 0,
+    totalOrders:  totalsRow?.orders  || 0,
+    aov: totalsRow?.orders ? Math.round(totalsRow.revenue / totalsRow.orders) : 0,
+    _fromCache: true,
+  };
+}
