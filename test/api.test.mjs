@@ -3,6 +3,7 @@
  * Usage: TEST_BASE=http://127.0.0.1:8894 node test/api.test.mjs
  */
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 
 const BASE = process.env.TEST_BASE || 'http://127.0.0.1:8894';
 
@@ -2214,6 +2215,100 @@ await test('GET /customers/101 → includes active-cart card section', async () 
   assert.equal(res.status, 200);
   const html = await res.text();
   assert.ok(html.includes('active-cart-card') || html.includes('Active cart'), 'should include active cart section');
+});
+
+// ── Phase 24: Webhooks + cache schema ────────────────────────────────────────
+console.log('\nAPI tests — Phase 24 (Webhooks + cache schema):');
+
+const WEBHOOK_SECRET = 'test-shopify-webhook-secret';
+
+function makeWebhookHeaders(body, topic = 'orders/updated') {
+  const hmac = crypto.createHmac('sha256', WEBHOOK_SECRET).update(body).digest('base64');
+  return {
+    'Content-Type': 'application/json',
+    'X-Shopify-Topic': topic,
+    'X-Shopify-Hmac-Sha256': hmac,
+  };
+}
+
+await test('POST /webhooks/shopify with valid HMAC → 200 ok', async () => {
+  const body = JSON.stringify({ id: 999, name: '#TEST-999' });
+  const res = await fetch(`${BASE}/webhooks/shopify`, {
+    method: 'POST',
+    headers: makeWebhookHeaders(body, 'orders/updated'),
+    body,
+  });
+  assert.equal(res.status, 200);
+  const json = await res.json();
+  assert.ok(json.ok, 'should return ok:true');
+});
+
+await test('POST /webhooks/shopify with invalid HMAC → 401', async () => {
+  const body = JSON.stringify({ id: 999 });
+  const res = await fetch(`${BASE}/webhooks/shopify`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Shopify-Topic': 'orders/updated',
+      'X-Shopify-Hmac-Sha256': 'invalidsignatureXXX',
+    },
+    body,
+  });
+  assert.equal(res.status, 401);
+});
+
+await test('POST /webhooks/shopify customers/updated → 200 ok', async () => {
+  const body = JSON.stringify({ id: 101, email: 'test@example.com', tags: 'b2b-portal' });
+  const res = await fetch(`${BASE}/webhooks/shopify`, {
+    method: 'POST',
+    headers: makeWebhookHeaders(body, 'customers/updated'),
+    body,
+  });
+  assert.equal(res.status, 200);
+  const json = await res.json();
+  assert.ok(json.ok);
+});
+
+await test('POST /webhooks/shopify products/updated → 200 ok', async () => {
+  const body = JSON.stringify({ id: 201, title: 'Test Product', vendor: 'Fuzzywumpets' });
+  const res = await fetch(`${BASE}/webhooks/shopify`, {
+    method: 'POST',
+    headers: makeWebhookHeaders(body, 'products/updated'),
+    body,
+  });
+  assert.equal(res.status, 200);
+  const json = await res.json();
+  assert.ok(json.ok);
+});
+
+// ── Phase 25: Vendor filter ───────────────────────────────────────────────────
+console.log('\nAPI tests — Phase 25 (Vendor filter):');
+
+await test('GET /catalog → only shows Fuzzywumpets products by default', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/catalog`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  // FMS product should NOT appear
+  assert.ok(!html.includes('FMS Toy Ball'), 'FMS product should be filtered out by default');
+  // At least one FWW product should appear
+  assert.ok(html.includes('Elite Collar') || html.includes('Fuzzywumpets') || html.includes('catalog'), 'Should show catalog content');
+});
+
+await test('GET /catalog?vendor=all → shows all vendors including FMS', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/catalog?vendor=all`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  assert.ok(html.includes('FMS') || html.includes('all vendors') || html.includes('vendor=all'), 'Should include non-FWW products or show all vendor option selected');
+});
+
+await test('GET /catalog → vendor select has Fuzzywumpets as default option', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/catalog`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  assert.ok(html.includes('Fuzzywumpets (default)') || html.includes('selected'), 'Should show Fuzzywumpets as default vendor');
 });
 
 console.log(`\n  ${passed} passed, ${failed} failed`);

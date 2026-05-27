@@ -822,6 +822,31 @@ await test('/customers/101 impersonate-btn opens modal', async (page, ctx) => {
   assert.equal(display, 'flex', 'Modal should be visible after button click');
 });
 
+// ── Phase 25: Vendor filter UI ────────────────────────────────────────────────
+console.log('\nUI tests — Phase 25 (Vendor filter):');
+
+await test('/catalog shows "Fuzzywumpets (default)" as selected vendor', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/catalog`);
+  const html = await page.content();
+  assert.ok(
+    html.includes('Fuzzywumpets (default)'),
+    'Catalog vendor select should show "Fuzzywumpets (default)"'
+  );
+});
+
+await test('/catalog?vendor=all shows All vendors option selected', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/catalog?vendor=all`);
+  const html = await page.content();
+  assert.ok(
+    html.includes('All vendors') || html.includes('value="all"'),
+    'Should show All vendors option when vendor=all'
+  );
+});
+
 await browser.close();
 
 console.log(`\n  ${passed} passed, ${failed} failed`);

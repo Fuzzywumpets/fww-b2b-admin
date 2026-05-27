@@ -191,6 +191,120 @@ db.exec(`
     created_by TEXT NOT NULL,
     sent_at INTEGER
   );
+
+  -- Phase 24A + 25A: local cache tables (Shopify mirror for fast queries)
+
+  CREATE TABLE IF NOT EXISTS customers_cache (
+    shopify_id TEXT PRIMARY KEY,
+    gid TEXT NOT NULL,
+    email TEXT,
+    first_name TEXT,
+    last_name TEXT,
+    display_name TEXT,
+    company TEXT,
+    tags TEXT,
+    is_b2b INTEGER,
+    amount_spent_total REAL,
+    orders_count INTEGER,
+    first_order_at INTEGER,
+    last_order_at INTEGER,
+    default_address_json TEXT,
+    created_at INTEGER,
+    updated_at INTEGER,
+    synced_at INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_customers_cache_b2b ON customers_cache(is_b2b, amount_spent_total DESC);
+  CREATE INDEX IF NOT EXISTS idx_customers_cache_email ON customers_cache(email);
+  CREATE INDEX IF NOT EXISTS idx_customers_cache_last_order ON customers_cache(last_order_at DESC);
+
+  CREATE TABLE IF NOT EXISTS orders_cache (
+    shopify_id TEXT PRIMARY KEY,
+    gid TEXT NOT NULL,
+    name TEXT,
+    customer_shopify_id TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER,
+    processed_at INTEGER,
+    cancelled_at INTEGER,
+    closed_at INTEGER,
+    financial_status TEXT,
+    fulfillment_status TEXT,
+    display_financial_status TEXT,
+    display_fulfillment_status TEXT,
+    total_price REAL,
+    subtotal_price REAL,
+    total_tax REAL,
+    total_shipping REAL,
+    total_discounts REAL,
+    total_refunded REAL,
+    currency TEXT,
+    tags TEXT,
+    source_name TEXT,
+    channel_name TEXT,
+    note TEXT,
+    shipping_address_json TEXT,
+    billing_address_json TEXT,
+    customer_email TEXT,
+    customer_phone TEXT,
+    fulfillments_json TEXT,
+    refunds_json TEXT,
+    metafields_json TEXT,
+    synced_at INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_orders_cache_customer ON orders_cache(customer_shopify_id, created_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_orders_cache_created ON orders_cache(created_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_orders_cache_status ON orders_cache(financial_status, fulfillment_status);
+  CREATE INDEX IF NOT EXISTS idx_orders_cache_source ON orders_cache(source_name);
+
+  CREATE TABLE IF NOT EXISTS order_line_items_cache (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_shopify_id TEXT NOT NULL,
+    line_id TEXT,
+    variant_shopify_id TEXT,
+    product_shopify_id TEXT,
+    sku TEXT,
+    title TEXT,
+    variant_title TEXT,
+    quantity INTEGER,
+    price REAL,
+    total_discount REAL,
+    taxable INTEGER,
+    vendor TEXT,
+    is_fww_vendor INTEGER,
+    synced_at INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_lineitems_cache_order ON order_line_items_cache(order_shopify_id);
+  CREATE INDEX IF NOT EXISTS idx_lineitems_cache_sku ON order_line_items_cache(sku);
+  CREATE INDEX IF NOT EXISTS idx_lineitems_cache_fww ON order_line_items_cache(is_fww_vendor);
+
+  CREATE TABLE IF NOT EXISTS sync_state (
+    resource TEXT PRIMARY KEY,
+    last_synced_at INTEGER NOT NULL,
+    last_cursor TEXT,
+    total_synced INTEGER,
+    last_error TEXT,
+    last_error_at INTEGER
+  );
+
+  CREATE TABLE IF NOT EXISTS products_cache (
+    shopify_id TEXT PRIMARY KEY,
+    gid TEXT NOT NULL,
+    handle TEXT,
+    title TEXT,
+    vendor TEXT,
+    product_type TEXT,
+    status TEXT,
+    tags TEXT,
+    publications_json TEXT,
+    variants_json TEXT,
+    images_json TEXT,
+    created_at INTEGER,
+    updated_at INTEGER,
+    synced_at INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_products_cache_vendor ON products_cache(vendor);
+  CREATE INDEX IF NOT EXISTS idx_products_cache_status ON products_cache(status);
+  CREATE INDEX IF NOT EXISTS idx_products_cache_handle ON products_cache(handle);
 `);
 
 export default db;
@@ -482,5 +596,176 @@ export function createPartialInvoice({ orderId, invoiceLetter, invoiceType, tota
 
 export function getPartialInvoices(orderId) {
   return db.prepare('SELECT * FROM partial_invoices WHERE order_id = ? ORDER BY created_at ASC').all(orderId);
+}
+
+// ── Phase 24: Cache helpers ────────────────────────────────────────────────────
+
+export function upsertCustomerCache(c) {
+  const tags = Array.isArray(c.tags) ? c.tags.join(',') : (c.tags || '');
+  db.prepare(`
+    INSERT OR REPLACE INTO customers_cache
+    (shopify_id, gid, email, first_name, last_name, display_name, company, tags, is_b2b,
+     amount_spent_total, orders_count, first_order_at, last_order_at, default_address_json,
+     created_at, updated_at, synced_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+  `).run(
+    c.shopify_id, c.gid, c.email || null, c.first_name || null, c.last_name || null,
+    c.display_name || null, c.company || null, tags,
+    tags.split(',').includes('b2b') ? 1 : 0,
+    c.amount_spent_total || 0, c.orders_count || 0,
+    c.first_order_at || null, c.last_order_at || null,
+    c.default_address_json ? JSON.stringify(c.default_address_json) : null,
+    c.created_at || null, c.updated_at || null, Date.now()
+  );
+}
+
+export function getCustomerFromCache(shopifyId) {
+  return db.prepare('SELECT * FROM customers_cache WHERE shopify_id = ?').get(shopifyId) || null;
+}
+
+export function getCustomersCountInCache() {
+  return db.prepare('SELECT COUNT(*) as n FROM customers_cache').get().n;
+}
+
+export function upsertOrderCache(o) {
+  db.prepare(`
+    INSERT OR REPLACE INTO orders_cache
+    (shopify_id, gid, name, customer_shopify_id, created_at, updated_at, processed_at,
+     cancelled_at, closed_at, financial_status, fulfillment_status, display_financial_status,
+     display_fulfillment_status, total_price, subtotal_price, total_tax, total_shipping,
+     total_discounts, total_refunded, currency, tags, source_name, channel_name, note,
+     shipping_address_json, billing_address_json, customer_email, customer_phone,
+     fulfillments_json, refunds_json, metafields_json, synced_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+  `).run(
+    o.shopify_id, o.gid, o.name || null, o.customer_shopify_id || null,
+    o.created_at || null, o.updated_at || null, o.processed_at || null,
+    o.cancelled_at || null, o.closed_at || null,
+    o.financial_status || null, o.fulfillment_status || null,
+    o.display_financial_status || null, o.display_fulfillment_status || null,
+    o.total_price || 0, o.subtotal_price || 0, o.total_tax || 0, o.total_shipping || 0,
+    o.total_discounts || 0, o.total_refunded || 0, o.currency || 'USD',
+    Array.isArray(o.tags) ? o.tags.join(',') : (o.tags || ''),
+    o.source_name || null, o.channel_name || null, o.note || null,
+    o.shipping_address_json ? JSON.stringify(o.shipping_address_json) : null,
+    o.billing_address_json ? JSON.stringify(o.billing_address_json) : null,
+    o.customer_email || null, o.customer_phone || null,
+    o.fulfillments_json ? JSON.stringify(o.fulfillments_json) : null,
+    o.refunds_json ? JSON.stringify(o.refunds_json) : null,
+    o.metafields_json ? JSON.stringify(o.metafields_json) : null,
+    Date.now()
+  );
+}
+
+export function upsertOrderLineItemsCache(orderShopifyId, lineItems) {
+  const stmt = db.prepare(`
+    INSERT OR REPLACE INTO order_line_items_cache
+    (order_shopify_id, line_id, variant_shopify_id, product_shopify_id, sku, title,
+     variant_title, quantity, price, total_discount, taxable, vendor, is_fww_vendor, synced_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+  `);
+  const now = Date.now();
+  for (const li of lineItems) {
+    stmt.run(
+      orderShopifyId, li.line_id || null, li.variant_shopify_id || null,
+      li.product_shopify_id || null, li.sku || null, li.title || null,
+      li.variant_title || null, li.quantity || 0, li.price || 0,
+      li.total_discount || 0, li.taxable ? 1 : 0, li.vendor || null,
+      li.vendor === 'Fuzzywumpets' ? 1 : 0, now
+    );
+  }
+}
+
+export function getOrdersFromCache({ customerId, from, to, limit = 250, offset = 0 } = {}) {
+  let where = '1=1';
+  const params = [];
+  if (customerId) { where += ' AND customer_shopify_id = ?'; params.push(customerId); }
+  if (from)       { where += ' AND created_at >= ?'; params.push(new Date(from).getTime()); }
+  if (to)         { where += ' AND created_at <= ?'; params.push(new Date(to).getTime()); }
+  return db.prepare(`SELECT * FROM orders_cache WHERE ${where} ORDER BY created_at DESC LIMIT ? OFFSET ?`)
+    .all(...params, limit, offset);
+}
+
+export function getOrderFromCache(shopifyId) {
+  return db.prepare('SELECT * FROM orders_cache WHERE shopify_id = ?').get(shopifyId) || null;
+}
+
+export function getOrderSpendFromCache(customerId, from, to) {
+  let where = 'customer_shopify_id = ? AND cancelled_at IS NULL';
+  const params = [customerId];
+  if (from) { where += ' AND created_at >= ?'; params.push(new Date(from).getTime()); }
+  if (to)   { where += ' AND created_at <= ?'; params.push(new Date(to).getTime()); }
+  return db.prepare(`
+    SELECT COUNT(*) as count, COALESCE(SUM(total_price), 0) as total
+    FROM orders_cache WHERE ${where}
+  `).get(...params) || { count: 0, total: 0 };
+}
+
+export function getOrdersCountInCache() {
+  return db.prepare('SELECT COUNT(*) as n FROM orders_cache').get().n;
+}
+
+export function upsertProductCache(p) {
+  db.prepare(`
+    INSERT OR REPLACE INTO products_cache
+    (shopify_id, gid, handle, title, vendor, product_type, status, tags,
+     publications_json, variants_json, images_json, created_at, updated_at, synced_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+  `).run(
+    p.shopify_id, p.gid, p.handle || null, p.title || null, p.vendor || null,
+    p.product_type || null, p.status || 'active',
+    Array.isArray(p.tags) ? p.tags.join(',') : (p.tags || ''),
+    p.publications_json ? JSON.stringify(p.publications_json) : null,
+    p.variants_json ? JSON.stringify(p.variants_json) : null,
+    p.images_json ? JSON.stringify(p.images_json) : null,
+    p.created_at || null, p.updated_at || null, Date.now()
+  );
+}
+
+export function getProductsCountInCache() {
+  return db.prepare('SELECT COUNT(*) as n FROM products_cache').get().n;
+}
+
+export function getSyncState(resource) {
+  return db.prepare('SELECT * FROM sync_state WHERE resource = ?').get(resource) || null;
+}
+
+export function setSyncState(resource, { lastSyncedAt, lastCursor, totalSynced, lastError } = {}) {
+  const now = Date.now();
+  db.prepare(`
+    INSERT INTO sync_state (resource, last_synced_at, last_cursor, total_synced, last_error, last_error_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(resource) DO UPDATE SET
+      last_synced_at = excluded.last_synced_at,
+      last_cursor = COALESCE(excluded.last_cursor, last_cursor),
+      total_synced = COALESCE(excluded.total_synced, total_synced),
+      last_error = excluded.last_error,
+      last_error_at = CASE WHEN excluded.last_error IS NOT NULL THEN ? ELSE last_error_at END
+  `).run(
+    resource, lastSyncedAt || now, lastCursor || null, totalSynced || null,
+    lastError || null, now
+  );
+}
+
+export function getAllInvoicesForList({ limit = 200, offset = 0 } = {}) {
+  return db.prepare(`
+    SELECT o.shopify_id, o.name, o.customer_shopify_id, o.customer_email,
+           o.created_at, o.total_price, o.financial_status, o.display_financial_status,
+           o.tags, 'shopify' as invoice_type, null as invoice_letter,
+           c.display_name as customer_name
+    FROM orders_cache o
+    LEFT JOIN customers_cache c ON o.customer_shopify_id = c.shopify_id
+    ORDER BY o.created_at DESC LIMIT ? OFFSET ?
+  `).all(limit, offset);
+}
+
+export function getPartialInvoicesAll({ limit = 200, offset = 0 } = {}) {
+  return db.prepare(`
+    SELECT pi.*, o.name as order_name, o.customer_email, c.display_name as customer_name
+    FROM partial_invoices pi
+    LEFT JOIN orders_cache o ON pi.order_id = ('gid://shopify/Order/' || o.shopify_id)
+    LEFT JOIN customers_cache c ON o.customer_shopify_id = c.shopify_id
+    ORDER BY pi.created_at DESC LIMIT ? OFFSET ?
+  `).all(limit, offset);
 }
 

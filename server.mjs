@@ -26,6 +26,10 @@ import {
   getXeroMap, setXeroMap, addXeroPending, getXeroPending, markXeroPendingDone, markXeroPendingFailed, getXeroPendingCount, getXeroInvoiceMaps,
   createImpersonationNonce, consumeImpersonationNonce, gcImpersonationNonces,
   createPartialInvoice, getPartialInvoices, getNextInvoiceLetter,
+  upsertCustomerCache, upsertOrderCache, upsertOrderLineItemsCache, upsertProductCache,
+  getOrdersFromCache, getOrderFromCache, getOrderSpendFromCache, getCustomerFromCache,
+  getCustomersCountInCache, getOrdersCountInCache, getProductsCountInCache,
+  getSyncState, setSyncState, getAllInvoicesForList, getPartialInvoicesAll,
 } from './db.mjs';
 import { generateInvoicePdf } from './pdf.mjs';
 import { renderLabelSheet, expandItems, TEMPLATES as LABEL_TEMPLATES, DEFAULT_FIELDS } from './labels.mjs';
@@ -50,6 +54,7 @@ const XERO_BRIDGE_URL       = 'https://fww-xero-bridge.alex-037.workers.dev/xero
 const XERO_BEARER           = process.env.XERO_BRIDGE_BEARER || '';
 const IMPERSONATION_SECRET  = process.env.B2B_IMPERSONATION_SECRET || (MOCK ? 'test-impersonation-secret-mock' : '');
 const PORTAL_BASE_URL       = MOCK ? `http://127.0.0.1:8793` : 'https://b2b.fuzzyreporting.com';
+const SHOPIFY_WEBHOOK_SECRET = process.env.SHOPIFY_WEBHOOK_SECRET || (MOCK ? 'test-shopify-webhook-secret' : '');
 
 const app = express();
 app.use(express.json());
@@ -706,6 +711,13 @@ const MOCK_CATALOG_PRODUCTS = [
     vendor: 'Fuzzywumpets', tags: ['Style_Simplicity'], publishedOnB2B: false, status: 'archived',
     variants: { edges: [
       { node: { id: 'gid://shopify/ProductVariant/313', sku: 'LSL-OLD-OS', title: 'One Size', inventoryQuantity: 0 } },
+    ]}
+  },
+  // Phase 25 test fixture: non-FWW vendor product (should be hidden by default vendor filter)
+  { id: 'gid://shopify/Product/210', title: 'FMS Toy Ball - Red', handle: 'fms-toy-ball-red',
+    vendor: 'FMS', tags: ['toy'], publishedOnB2B: false, status: 'active',
+    variants: { edges: [
+      { node: { id: 'gid://shopify/ProductVariant/320', sku: 'FMS-TB-R', title: 'Default Title', inventoryQuantity: 50 } },
     ]}
   },
 ];
@@ -3942,32 +3954,35 @@ function renderSparkline(values, opts = {}) {
 // ── Catalog ───────────────────────────────────────────────────────────────────
 
 async function getCatalogData({ vendor, style, stock, b2b, status = 'active', page = 1 }) {
+  // Phase 25B/F: default to Fuzzywumpets vendor; use vendor='all' to bypass
+  const effectiveVendor = (vendor === 'all') ? '' : (vendor || 'Fuzzywumpets');
+
   if (MOCK) {
     const allProds = MOCK_CATALOG_PRODUCTS.map(p => {
       const ov = mockCatalogOverrides.get(shopifyNumericId(p.id)) || {};
       return { ...p, publishedOnB2B: ov.publishedOnB2B !== undefined ? ov.publishedOnB2B : p.publishedOnB2B };
     });
+    const vendorProds = effectiveVendor ? allProds.filter(p => p.vendor === effectiveVendor) : allProds;
     const statusCounts = {
-      active:   allProds.filter(p => (p.status || 'active') === 'active').length,
-      draft:    allProds.filter(p => p.status === 'draft').length,
-      archived: allProds.filter(p => p.status === 'archived').length,
-      all:      allProds.length,
+      active:   vendorProds.filter(p => (p.status || 'active') === 'active').length,
+      draft:    vendorProds.filter(p => p.status === 'draft').length,
+      archived: vendorProds.filter(p => p.status === 'archived').length,
+      all:      vendorProds.length,
     };
-    let prods = status === 'all' ? allProds : allProds.filter(p => (p.status || 'active') === status);
-    if (vendor)      prods = prods.filter(p => p.vendor === vendor);
+    let prods = status === 'all' ? vendorProds : vendorProds.filter(p => (p.status || 'active') === status);
     if (style)       prods = prods.filter(p => (p.tags || []).includes(`Style_${style}`));
     if (b2b === '1') prods = prods.filter(p => p.publishedOnB2B);
     if (b2b === '0') prods = prods.filter(p => !p.publishedOnB2B);
     if (stock === 'low')  prods = prods.filter(p => { const t = (p.variants?.edges||[]).reduce((s,e) => s+(e.node.inventoryQuantity||0),0); return t > 0 && t < 10; });
     if (stock === 'out')  prods = prods.filter(p => { const t = (p.variants?.edges||[]).reduce((s,e) => s+(e.node.inventoryQuantity||0),0); return t === 0; });
     const vendors = [...new Set(allProds.map(p => p.vendor))];
-    const styles  = [...new Set(allProds.flatMap(p => (p.tags||[]).filter(t=>t.startsWith('Style_')).map(t=>t.slice(6))))];
-    return { products: prods, vendors, styles, total: prods.length, hasNextPage: false, statusCounts };
+    const styles  = [...new Set(vendorProds.flatMap(p => (p.tags||[]).filter(t=>t.startsWith('Style_')).map(t=>t.slice(6))))];
+    return { products: prods, vendors, styles, total: prods.length, hasNextPage: false, statusCounts, effectiveVendor };
   }
 
   try {
     const qParts = [];
-    if (vendor)           qParts.push(`vendor:"${vendor}"`);
+    if (effectiveVendor) qParts.push(`vendor:"${effectiveVendor}"`);
     if (status !== 'all') qParts.push(`status:${status}`);
     const result = await shopifyFetch(`
       query($q:String!,$after:String){
@@ -3991,15 +4006,15 @@ async function getCatalogData({ vendor, style, stock, b2b, status = 'active', pa
     if (stock === 'out')  prods = prods.filter(p => { const t=(p.variants?.edges||[]).reduce((s,e)=>s+(e.node.inventoryQuantity||0),0); return t===0; });
     const allVendors = [...new Set(result.data?.products?.edges?.map(e => e.node.vendor).filter(Boolean) || [])];
     const allStyles  = [...new Set((result.data?.products?.edges||[]).flatMap(e => (e.node.tags||[]).filter(t=>t.startsWith('Style_')).map(t=>t.slice(6))))];
-    return { products: prods, vendors: allVendors, styles: allStyles, total: prods.length, hasNextPage: result.data?.products?.pageInfo?.hasNextPage, statusCounts: null };
+    return { products: prods, vendors: allVendors, styles: allStyles, total: prods.length, hasNextPage: result.data?.products?.pageInfo?.hasNextPage, statusCounts: null, effectiveVendor };
   } catch (err) {
     console.error('getCatalogData error:', err.message);
-    return { products: [], vendors: [], styles: [], total: 0, hasNextPage: false, error: err.message, statusCounts: null };
+    return { products: [], vendors: [], styles: [], total: 0, hasNextPage: false, error: err.message, statusCounts: null, effectiveVendor };
   }
 }
 
 function renderCatalog(session, data, filters) {
-  const { products, vendors, styles, error, statusCounts } = data;
+  const { products, vendors, styles, error, statusCounts, effectiveVendor } = data;
 
   // Status filter chips (Phase 19E) — Active is the default
   const statusChips = [
@@ -4021,13 +4036,15 @@ function renderCatalog(session, data, filters) {
     return `<a href="${href}" class="filter-chip${active ? ' filter-chip-active' : ''}">${h(c.label)}${badge}</a>`;
   }).join('');
 
+  const vendorIsDefault = !filters.vendor || filters.vendor === 'Fuzzywumpets';
   const filterBar = `
     <div class="filter-chips" id="catalog-status-chips">${statusChips}</div>
     <form method="GET" action="/catalog" class="filter-bar">
       ${filters.status && filters.status !== 'active' ? `<input type="hidden" name="status" value="${h(filters.status)}">` : ''}
-      <select name="vendor" onchange="this.form.submit()">
-        <option value="">All vendors</option>
-        ${(vendors||[]).map(v => `<option value="${h(v)}"${filters.vendor===v?' selected':''}>${h(v)}</option>`).join('')}
+      <select name="vendor" onchange="this.form.submit()" title="Vendor filter — defaults to Fuzzywumpets">
+        <option value=""${vendorIsDefault ? ' selected' : ''}>Fuzzywumpets (default)</option>
+        <option value="all"${filters.vendor === 'all' ? ' selected' : ''}>All vendors</option>
+        ${(vendors||[]).filter(v => v && v !== 'Fuzzywumpets').map(v => `<option value="${h(v)}"${filters.vendor===v?' selected':''}>${h(v)}</option>`).join('')}
       </select>
       <select name="style" onchange="this.form.submit()">
         <option value="">All styles</option>
@@ -4300,8 +4317,13 @@ function renderProductDetail(session, product) {
 
   const shopifyEditUrl = `https://admin.shopify.com/store/fuzzywumpets/products/${numId}`;
 
+  const nonFwwBanner = (product.vendor && product.vendor !== 'Fuzzywumpets')
+    ? `<div class="alert alert-info" style="margin-bottom:16px">ℹ This product is from vendor <strong>${h(product.vendor)}</strong> (not Fuzzywumpets). Most catalog operations don't apply.</div>`
+    : '';
+
   return layout({ title: product.title, session, activePath: '/catalog', content: `
     <div class="breadcrumb-row"><a href="/catalog" class="breadcrumb">← Catalog</a></div>
+    ${nonFwwBanner}
     <div class="detail-header">
       <div class="detail-header-left">
         <h1>${h(product.title)}</h1>
@@ -6410,6 +6432,203 @@ app.get('/customers/:id/activity', requireAuth, async (req, res) => {
       });
     })();
     </script>
+  ` }));
+});
+
+// ── Phase 24C: Shopify webhook receiver ───────────────────────────────────────
+
+app.post('/webhooks/shopify', express.raw({ type: 'application/json' }), (req, res) => {
+  const rawBody = Buffer.isBuffer(req.body) ? req.body : Buffer.from(JSON.stringify(req.body));
+  const sig = req.headers['x-shopify-hmac-sha256'];
+  if (SHOPIFY_WEBHOOK_SECRET && sig) {
+    const expected = crypto.createHmac('sha256', SHOPIFY_WEBHOOK_SECRET).update(rawBody).digest('base64');
+    if (sig !== expected) return res.status(401).json({ error: 'HMAC mismatch' });
+  } else if (!MOCK) {
+    return res.status(401).json({ error: 'No webhook secret configured' });
+  }
+  const topic = req.headers['x-shopify-topic'] || '';
+  let payload;
+  try { payload = JSON.parse(rawBody.toString()); } catch { return res.status(400).json({ error: 'Invalid JSON' }); }
+
+  // Dispatch to cache upsert (non-blocking)
+  setImmediate(() => {
+    try {
+      if (topic.startsWith('customers/')) {
+        const c = payload;
+        const shopifyId = String(c.id);
+        const tags = Array.isArray(c.tags) ? c.tags : (c.tags || '').split(',').map(s => s.trim()).filter(Boolean);
+        upsertCustomerCache({
+          shopify_id: shopifyId,
+          gid: `gid://shopify/Customer/${shopifyId}`,
+          email: c.email, first_name: c.first_name, last_name: c.last_name,
+          display_name: c.first_name && c.last_name ? `${c.first_name} ${c.last_name}` : (c.email || shopifyId),
+          company: c.default_address?.company || null,
+          tags,
+          amount_spent_total: parseFloat(c.total_spent) || 0,
+          orders_count: c.orders_count || 0,
+          default_address_json: c.default_address || null,
+          created_at: c.created_at ? new Date(c.created_at).getTime() : null,
+          updated_at: c.updated_at ? new Date(c.updated_at).getTime() : null,
+        });
+      } else if (topic.startsWith('orders/')) {
+        const o = payload;
+        const shopifyId = String(o.id);
+        const custId = o.customer?.id ? String(o.customer.id) : null;
+        upsertOrderCache({
+          shopify_id: shopifyId,
+          gid: `gid://shopify/Order/${shopifyId}`,
+          name: o.name, customer_shopify_id: custId,
+          created_at: o.created_at ? new Date(o.created_at).getTime() : Date.now(),
+          updated_at: o.updated_at ? new Date(o.updated_at).getTime() : null,
+          processed_at: o.processed_at ? new Date(o.processed_at).getTime() : null,
+          cancelled_at: o.cancelled_at ? new Date(o.cancelled_at).getTime() : null,
+          financial_status: o.financial_status, fulfillment_status: o.fulfillment_status,
+          display_financial_status: o.financial_status?.toUpperCase(),
+          display_fulfillment_status: o.fulfillment_status?.toUpperCase(),
+          total_price: parseFloat(o.total_price) || 0,
+          subtotal_price: parseFloat(o.subtotal_price) || 0,
+          total_tax: parseFloat(o.total_tax) || 0,
+          total_shipping: parseFloat(o.total_shipping_price_set?.shop_money?.amount || o.total_shipping_price || 0),
+          total_discounts: parseFloat(o.total_discounts) || 0,
+          currency: o.currency || 'USD',
+          tags: Array.isArray(o.tags) ? o.tags : (o.tags || '').split(',').map(s => s.trim()).filter(Boolean),
+          source_name: o.source_name || null,
+          note: o.note || null,
+          customer_email: o.email || o.customer?.email || null,
+          customer_phone: o.phone || o.customer?.phone || null,
+        });
+        if (o.line_items?.length) {
+          upsertOrderLineItemsCache(shopifyId, o.line_items.map(li => ({
+            line_id: String(li.id),
+            variant_shopify_id: li.variant_id ? String(li.variant_id) : null,
+            product_shopify_id: li.product_id ? String(li.product_id) : null,
+            sku: li.sku, title: li.title, variant_title: li.variant_title,
+            quantity: li.quantity, price: parseFloat(li.price) || 0,
+            total_discount: parseFloat(li.total_discount) || 0,
+            taxable: li.taxable ? 1 : 0, vendor: li.vendor || null,
+          })));
+        }
+      } else if (topic === 'products/update' || topic === 'products/create') {
+        const p = payload;
+        const shopifyId = String(p.id);
+        upsertProductCache({
+          shopify_id: shopifyId, gid: `gid://shopify/Product/${shopifyId}`,
+          handle: p.handle, title: p.title, vendor: p.vendor,
+          product_type: p.product_type, status: p.status,
+          tags: Array.isArray(p.tags) ? p.tags : (p.tags || '').split(',').map(s => s.trim()).filter(Boolean),
+          variants_json: p.variants || [],
+          created_at: p.created_at ? new Date(p.created_at).getTime() : null,
+          updated_at: p.updated_at ? new Date(p.updated_at).getTime() : null,
+        });
+      }
+      auditLog('webhook', `webhook:${topic}`, String(payload.id || ''), null, null);
+    } catch (err) {
+      console.error('[webhook] cache upsert error:', err.message);
+    }
+  });
+
+  res.status(200).json({ ok: true, topic });
+});
+
+// ── Phase 24C: Background polling sync ────────────────────────────────────────
+
+async function syncRecentFromShopify() {
+  if (MOCK || !SHOPIFY_BEARER) return;
+  try {
+    const state = getSyncState('orders_recent');
+    const since = state?.last_synced_at
+      ? new Date(state.last_synced_at - 60000).toISOString()
+      : new Date(Date.now() - 6 * 60 * 1000).toISOString();
+    const result = await shopifyFetch(`
+      query($q:String!){
+        orders(first:50,query:$q,sortKey:UPDATED_AT,reverse:true){
+          edges{node{
+            id name processedAt updatedAt createdAt cancelledAt
+            displayFinancialStatus displayFulfillmentStatus financialStatus fulfillmentStatus
+            totalPriceSet{shopMoney{amount}}
+            subtotalPriceSet{shopMoney{amount}}
+            totalTaxSet{shopMoney{amount}}
+            customer{id email firstName lastName}
+            tags sourceName note
+          }}
+          pageInfo{hasNextPage}
+        }
+      }`, { q: `updated_at:>${since}` });
+    const edges = result.data?.orders?.edges || [];
+    for (const { node: o } of edges) {
+      const shopifyId = shopifyNumericId(o.id);
+      const custId = o.customer?.id ? shopifyNumericId(o.customer.id) : null;
+      upsertOrderCache({
+        shopify_id: shopifyId, gid: o.id, name: o.name,
+        customer_shopify_id: custId,
+        created_at: o.createdAt ? new Date(o.createdAt).getTime() : Date.now(),
+        updated_at: o.updatedAt ? new Date(o.updatedAt).getTime() : null,
+        processed_at: o.processedAt ? new Date(o.processedAt).getTime() : null,
+        cancelled_at: o.cancelledAt ? new Date(o.cancelledAt).getTime() : null,
+        financial_status: o.financialStatus?.toLowerCase(),
+        fulfillment_status: o.fulfillmentStatus?.toLowerCase(),
+        display_financial_status: o.displayFinancialStatus,
+        display_fulfillment_status: o.displayFulfillmentStatus,
+        total_price: parseFloat(o.totalPriceSet?.shopMoney?.amount) || 0,
+        subtotal_price: parseFloat(o.subtotalPriceSet?.shopMoney?.amount) || 0,
+        total_tax: parseFloat(o.totalTaxSet?.shopMoney?.amount) || 0,
+        currency: 'USD',
+        tags: o.tags || [], source_name: o.sourceName || null, note: o.note || null,
+        customer_email: o.customer?.email || null,
+      });
+    }
+    setSyncState('orders_recent', { lastSyncedAt: Date.now(), totalSynced: edges.length });
+  } catch (err) {
+    console.error('[sync] polling error:', err.message);
+    setSyncState('orders_recent', { lastSyncedAt: Date.now(), lastError: err.message });
+  }
+}
+
+// Start polling every 5 minutes (skips if MOCK or no bearer)
+if (!MOCK) {
+  setInterval(syncRecentFromShopify, 5 * 60 * 1000);
+}
+
+// ── Phase 24E: Unified invoices page ──────────────────────────────────────────
+
+app.get('/invoices', requireAuth, (req, res) => {
+  const partials  = getPartialInvoicesAll();
+  const xeroMaps  = getXeroInvoiceMaps();
+  const cacheOrds = getAllInvoicesForList();
+  const xeroSet   = new Set(xeroMaps.map(x => x.order_id));
+
+  const rows = cacheOrds.map(o => {
+    const ordNum     = o.shopify_id;
+    const hasXero    = xeroSet.has(`gid://shopify/Order/${ordNum}`);
+    const xero       = hasXero ? xeroMaps.find(x => x.order_id === `gid://shopify/Order/${ordNum}`) : null;
+    const partialInvs = partials.filter(p => p.order_id === `gid://shopify/Order/${ordNum}`);
+    return `<tr>
+      <td><a href="/orders/${h(ordNum)}" class="link">${h(o.name || `#${ordNum}`)}</a></td>
+      <td>${o.customer_name ? `<a href="/customers/${h(o.customer_shopify_id)}" class="link">${h(o.customer_name)}</a>` : h(o.customer_email || '—')}</td>
+      <td class="text-muted">${fmtDate(o.created_at ? new Date(o.created_at).toISOString() : null)}</td>
+      <td class="text-right mono">${fmtMoney(o.total_price)}</td>
+      <td><span class="badge badge-${(o.financial_status||'').toLowerCase()}">${h(o.display_financial_status||o.financial_status||'—')}</span></td>
+      <td>${hasXero ? `<span class="badge badge-success">Xero ✓</span> <small class="text-muted">${(xero?.xero_invoice_id||'').slice(0,8)}…</small>` : '<span class="badge badge-secondary">No Xero</span>'}</td>
+      <td>${partialInvs.length ? partialInvs.map(p => `<a href="/orders/${h(ordNum)}/invoice.pdf?letter=${p.invoice_letter}" class="link">#${ordNum}-${p.invoice_letter}</a>`).join(' ') : `<a href="/orders/${h(ordNum)}/invoice.pdf" class="link btn btn-ghost btn-xs">PDF</a>`}</td>
+    </tr>`;
+  });
+
+  const emptyState = cacheOrds.length === 0
+    ? '<tr><td colspan="7" class="empty-state">No invoices cached yet. Run the backfill script to import order history.</td></tr>'
+    : '';
+
+  res.send(layout({ title: 'Invoices', session: req.adminSession, activePath: '/invoices', content: `
+    <h1>Invoices</h1>
+    <p class="text-muted">Unified view across all orders, Xero invoices, and partial invoices.</p>
+    <div class="table-wrap">
+      <table class="data-table" id="invoices-table">
+        <thead><tr>
+          <th>Order</th><th>Customer</th><th>Date</th>
+          <th class="text-right">Total</th><th>Status</th><th>Xero</th><th>Invoice PDF</th>
+        </tr></thead>
+        <tbody>${rows.join('') || emptyState}</tbody>
+      </table>
+    </div>
   ` }));
 });
 

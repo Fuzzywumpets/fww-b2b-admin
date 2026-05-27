@@ -10,7 +10,7 @@ echo "======================================================"
 PORT=8894
 echo ""
 echo "Starting mock server (B2B_ADMIN_MOCK=1, port $PORT)..."
-PORT=$PORT B2B_ADMIN_MOCK=1 B2B_IMPERSONATION_SECRET=test-impersonation-secret-mock node server.mjs &
+PORT=$PORT B2B_ADMIN_MOCK=1 B2B_IMPERSONATION_SECRET=test-impersonation-secret-mock SHOPIFY_WEBHOOK_SECRET=test-shopify-webhook-secret node server.mjs &
 MOCK_PID=$!
 
 cleanup() { kill "$MOCK_PID" 2>/dev/null || true; }
