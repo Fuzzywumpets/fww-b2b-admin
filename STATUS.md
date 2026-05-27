@@ -1,24 +1,36 @@
 # fww-b2b-admin — overnight status
 STATE: IN_PROGRESS
-PHASE: 21 — Xero customer sync on B2B creation
-LAST_UPDATED: 2026-05-26T23:57:00Z
+PHASE: 22 — Admin "View portal as customer" impersonation
+LAST_UPDATED: 2026-05-27T01:30:00Z
 
 ## What shipped this session
-- Phase 21: Xero customer sync on B2B creation
-  — lib/xero-customer-sync.mjs: resolveXeroContact (mapping→live), syncCustomerToXero
-    (idempotent), isInsider (exclusion list), getXeroSyncStatus (4 states)
-  — GET /api/admin/customers/:id/xero-status — returns sync state JSON
-  — POST /api/admin/customers/:id/xero-sync — on-demand sync trigger
-  — /customers/:id sidebar: async-loading Xero card (synced/merged/insider/not_synced)
-    Merged contacts show "⚭ Merged contact" banner; insiders show gray "not applicable"
-  — Lead conversion → non-blocking Xero sync fires after Shopify customer creation
-  — b2b tag-add → non-blocking Xero sync fires when 'b2b' tag added
-  — ensureXeroContact (Phase 18) now uses resolveXeroContact first (avoids dup contacts)
-  — docs/XERO_CUSTOMER_SYNC.md: reference doc (mapping key, merged contacts, Pat Walsh TODO)
-  — 13 new API tests + 2 new UI tests (238 total, all green)
+- Phase 22: Admin "View portal as customer" impersonation
+  — B2B_IMPERSONATION_SECRET Doppler secret (64-char hex, generated + pushed)
+  — Admin db.mjs: impersonation_nonces table (nonce, customerId, adminEmail, readOnly, exp, used_at)
+    + createImpersonationNonce / consumeImpersonationNonce / gcImpersonationNonces helpers
+  — Admin server.mjs: makeImpersonationToken (HMAC-SHA256 signed, base64url encoded)
+    POST /api/admin/customers/:id/impersonate → 1-hr single-use token, audit-logged
+  — Customer detail /customers/:id: "View in Portal" button → modal with read-only toggle
+    (opens portal in new tab via fetch → token URL)
+  — Portal db.mjs: sessions.impersonation column (ALTER TABLE migration), used_impersonation_nonces table
+    + setImpersonationOnSession, isNonceUsed, markNonceUsed, gcUsedNonces
+  — Portal server.mjs: GET /__impersonate__?tok=<token>
+    → verifies HMAC sig + exp + single-use nonce → creates 1-hr portal session with impersonation flag
+    → requireMutable middleware blocks /api/cart/* and /api/checkout POST for read-only sessions
+    → /api/me now includes impersonation object {adminEmail, readOnly, startedAt, expiresAt}
+  — Portal app.js: sticky red banner "Viewing as <name> (read-only) [Exit impersonation]"
+    injected by boot() when session.impersonation is set
+  — Security: 1-hr TTL on token, single-use nonce (portal stores used nonces), HMAC-SHA256 sig
+  — Exit: portal's /auth/logout clears the impersonation session
+  — 4 new admin API tests + 2 new admin UI tests → 244 total (178 API + 66 UI), all green
+  — 6 new portal API tests → 155 total (116 API + 39 UI), all green
 
 ## What's working (URLs)
-- https://b2badmin.fuzzywumpets.com (all phases 1–21)
+- https://b2badmin.fuzzywumpets.com (all phases 1–22)
+- /customers/:id → "View in Portal" button → modal → opens portal as that customer
+- https://b2b.fuzzyreporting.com/__impersonate__?tok=... → validates + creates session
+- Red banner on portal pages when in impersonation mode
+- POST cart/checkout blocked in read-only mode
 - /accounting — Xero reconciliation view (synced orders, pending retries, counts)
 - /settings/xero — account code mapping + connection test button
 - /orders/:id — Xero sidebar card + "Sync to Xero" button in action bar
@@ -35,11 +47,11 @@ LAST_UPDATED: 2026-05-26T23:57:00Z
 - https://b2b.fuzzyreporting.com/account — stock alerts + tax cert + portal activity
 
 ## Test status
-- Admin API:  174/174
-- Admin UI:    64/64
-- Portal API: 114/114 (separate repo)
+- Admin API:  178/178
+- Admin UI:    66/66
+- Portal API: 116/116 (separate repo)
 - Portal UI:   39/39 (separate repo)
-- Total: 391 green
+- Total: 399 green
 
 ## Phases completed
 - Phase 0: Research + scaffold
@@ -55,18 +67,20 @@ LAST_UPDATED: 2026-05-26T23:57:00Z
 - Phase 14: Customer self-service additions (admin side: tax-exempt review, visible notes)
 - Phase 16: Admin order editing (edit lines, discount, partial fulfillment, backorder)
 - Phase 17: Wholesale leads CRM
-- Phase 18: Xero accounting integration ← NEW
+- Phase 18: Xero accounting integration
 - Phase 19A: Customer spend section on /customers/:id
 - Phase 19B: Universal hyperlinks (tag chips, audit log GID links, mailto)
 - Phase 19C: Product detail page /products/:id
 - Phase 19E: Catalog tab product status filter
 - Phase 20: Priority customer onboarding + Companies research
-- Phase 21: Xero customer sync on B2B creation ← NEW
+- Phase 21: Xero customer sync on B2B creation
+- Phase 22: Admin "View portal as customer" impersonation ← NEW
 
 ## Phases remaining (spec in HANDOFF.md, code not yet built)
 - Phase 15: Customer-specific catalogs (per-customer private tags) + multi-user team accounts
 - Phase 19D: Persistent cart (b2b portal cross-repo)
 - Phase 16E: Billing alignment with partial fulfillment (partial invoices with letter suffix)
+- Phase 23: Customer activity warehouse (90-day audit trail for dispute resolution)
 
 ## Xero integration details (for alexa)
 - Bridge: https://fww-xero-bridge.alex-037.workers.dev/xero (XERO_BRIDGE_BEARER in Doppler ✓)
@@ -76,21 +90,19 @@ LAST_UPDATED: 2026-05-26T23:57:00Z
 - Failures: queued in xero_pending_actions; retry at /accounting → "Retry pending actions"
 - Connection test: /settings/xero → "Test connection" button → shows account count
 
-## Next iteration's plan
-Phase 22 (Admin "View portal as customer" impersonation):
-  22A: B2B_IMPERSONATION_SECRET Doppler secret (generate + push if missing)
-  22B: POST /api/admin/customers/:id/impersonate → HMAC-signed token + URL
-       Modal: read-only (default) vs interactive mode
-  22C: Portal GET /__impersonate__?token=<tok> → validates + creates impersonation session
-  22D: Portal: sticky red banner "Viewing as <name>" on every page; read-only enforcement
-  22E: Exit impersonation (portal + audit log)
-  22G: Security: 1hr TTL, nonce single-use, insider block, full audit trail
+## Impersonation details (for alexa)
+- Admin side: /customers/:id → "View in Portal" button → modal → "Open Portal →"
+- Read-only (default): can browse catalog and orders, cart/checkout blocked
+- Interactive: full access as that customer (test checkout flows, etc.)
+- Token TTL: 1 hour, single-use
+- Exit: click "Exit impersonation" in the red banner → /auth/logout
 
-OR Phase 23 (Customer activity warehouse):
-  23A: customer_activity SQLite table in portal (90-day, IP hashed, events by type)
+## Next iteration's plan
+Phase 23 (Customer activity warehouse):
+  23A: customer_activity SQLite table in portal (90-day, events by type)
   23B: Express middleware auto-logs page_view + api_call on every authed request
   23E: Admin /customers/:id/activity viewer (date range filter, event type filter)
-  23F: Quick lookup "did customer place order on date X?"
+  23F: Quick lookup "did customer access portal on date X?"
 
 ## Blockers / decisions alexa needs to make
 - Email (Resend): B2B_PORTAL_RESEND_API_KEY not set → emails log to console
