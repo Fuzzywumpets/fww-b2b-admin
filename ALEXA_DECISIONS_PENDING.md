@@ -17,3 +17,9 @@
 - tmux session gone, no ITER 2 EXIT logged
 - Possible cause: tmux disconnect, claude -p crash post-commit, or OS-level kill
 - **Restarted** at 00:25 UTC; loop will continue from current STATE: IN_PROGRESS
+
+## 2026-05-27 01:00 UTC — Loop self-declared DONE but queue not exhausted
+- 17 phases shipped, 450 tests green
+- Agent set STATE: DONE after Iter 3 shipped 15B + 19D
+- I reset STATE: IN_PROGRESS with remaining queue (16D, 24, 25) since alexa standing instruction is "keep churning"
+- Restarted loop at 01:00 UTC
