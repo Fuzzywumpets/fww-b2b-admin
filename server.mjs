@@ -92,6 +92,60 @@ function getPendingTaxCertsFromPortal() {
   } catch (_) { return []; }
 }
 
+function getCustomerActivityFromPortal(numericCustomerId, { from, to, type, q, page = 1, limit = 50 } = {}) {
+  if (MOCK) {
+    const allRows = [
+      { id: 1, customerId: `gid://shopify/Customer/${numericCustomerId}`, sessionId: 'sess-1', eventType: 'page_view', eventSubtype: null, path: '/catalog', httpStatus: 200, durationMs: 120, ts: Date.now() - 5000 },
+      { id: 2, customerId: `gid://shopify/Customer/${numericCustomerId}`, sessionId: 'sess-1', eventType: 'api_call', eventSubtype: 'api/catalog', path: '/api/catalog', httpStatus: 200, durationMs: 45, ts: Date.now() - 6000 },
+      { id: 3, customerId: `gid://shopify/Customer/${numericCustomerId}`, sessionId: 'sess-1', eventType: 'auth', eventSubtype: 'login', path: '/auth/callback', httpStatus: 302, ts: Date.now() - 7000 },
+    ];
+    const filtered = (type && type !== 'all') ? allRows.filter(r => r.eventType === type) : allRows;
+    return {
+      rows: filtered,
+      total: filtered.length,
+      lastLogin: { ts: Date.now() - 7000 },
+      lastCart: null,
+      page: 1,
+      limit: 50,
+    };
+  }
+  const db = getPortalDb();
+  if (!db) return { rows: [], total: 0, lastLogin: null, lastCart: null, page: 1, limit: 50 };
+  try {
+    const customerId = `gid://shopify/Customer/${numericCustomerId}`;
+    let sql = 'SELECT * FROM customer_activity WHERE customer_id = ?';
+    const params = [customerId];
+    if (from) { sql += ' AND ts >= ?'; params.push(new Date(from).getTime()); }
+    if (to)   { sql += ' AND ts <= ?'; params.push(new Date(to).getTime() + 86400000); }
+    if (type && type !== 'all') { sql += ' AND event_type = ?'; params.push(type); }
+    if (q) {
+      sql += ' AND (path LIKE ? OR event_subtype LIKE ? OR event_data LIKE ?)';
+      const like = `%${q}%`;
+      params.push(like, like, like);
+    }
+    const countRow = db.prepare(sql.replace('SELECT *', 'SELECT COUNT(*) as cnt')).get(...params);
+    const total = countRow ? countRow.cnt : 0;
+    const lim = Math.min(Number(limit) || 50, 200);
+    const off = (Math.max(Number(page) || 1, 1) - 1) * lim;
+    sql += ' ORDER BY ts DESC LIMIT ? OFFSET ?';
+    params.push(lim, off);
+    const rows = db.prepare(sql).all(...params).map(r => ({
+      id: r.id, customerId: r.customer_id, sessionId: r.session_id,
+      eventType: r.event_type, eventSubtype: r.event_subtype,
+      eventData: r.event_data ? (() => { try { return JSON.parse(r.event_data); } catch(_) { return r.event_data; } })() : null,
+      path: r.path, referrer: r.referrer, userAgent: r.user_agent,
+      ipHash: r.ip_hash ? r.ip_hash.slice(0, 8) : null,
+      ipCountry: r.ip_country, httpStatus: r.http_status,
+      durationMs: r.duration_ms, impersonationAdmin: r.impersonation_admin, ts: r.ts,
+    }));
+    const lastLoginRow = db.prepare(`SELECT * FROM customer_activity WHERE customer_id = ? AND event_type = 'auth' AND event_subtype = 'login' ORDER BY ts DESC LIMIT 1`).get(customerId);
+    const lastCartRow  = db.prepare(`SELECT * FROM customer_activity WHERE customer_id = ? AND event_type = 'cart' ORDER BY ts DESC LIMIT 1`).get(customerId);
+    return { rows, total, page: Math.max(Number(page) || 1, 1), limit: lim,
+      lastLogin: lastLoginRow ? { ts: lastLoginRow.ts } : null,
+      lastCart:  lastCartRow  ? { ts: lastCartRow.ts  } : null };
+  } catch (e) { console.error('[activity] portal read failed:', e.message); return { rows: [], total: 0, lastLogin: null, lastCart: null, page: 1, limit: 50 }; }
+}
+
 async function callPortalInternal(method, path, body) {
   if (!PORTAL_INTERNAL_TOKEN) return { ok: false, error: 'no_internal_token' };
   try {
@@ -2088,6 +2142,7 @@ function renderCustomerDetail(session, customer, recentOrders, notes, _dropshipC
         <p class="text-muted">${h(customer.email)}${customer.phone ? ' · ' + h(customer.phone) : ''}</p>
       </div>
       <div class="detail-header-actions">
+        <a href="/customers/${h(numId)}/activity" class="btn btn-ghost btn-sm" title="View portal activity log">Activity log</a>
         <button class="btn btn-secondary" id="impersonate-btn" type="button" title="Open the B2B portal as this customer">View in Portal</button>
         <a href="/orders/new?customer=${h(numId)}" class="btn btn-primary">+ New Order</a>
       </div>
@@ -5873,6 +5928,224 @@ app.post('/api/admin/customers/:id/impersonate', requireAuth, async (req, res) =
   auditLog(session.email, 'impersonate:token_issued', customerId, null, { customerEmail, customerDisplayName, readOnly, exp: new Date(exp).toISOString() });
 
   res.json({ ok: true, url, customerDisplayName, readOnly });
+});
+
+// ── Phase 23: Customer activity warehouse viewer ──────────────────────────────
+
+app.get('/api/admin/customers/:id/activity', requireAuth, (req, res) => {
+  const data = getCustomerActivityFromPortal(req.params.id, req.query);
+  res.json({ ok: true, ...data });
+});
+
+app.get('/api/admin/customers/:id/activity/lookup', requireAuth, (req, res) => {
+  const { date } = req.query;
+  if (!date) return res.status(400).json({ error: 'date required (YYYY-MM-DD)' });
+  const dayStart = new Date(date + 'T00:00:00Z').getTime();
+  const dayEnd   = new Date(date + 'T23:59:59Z').getTime();
+  const data = getCustomerActivityFromPortal(req.params.id, {
+    from: new Date(date), to: new Date(date),
+    type: 'order',
+    limit: 10,
+  });
+  const placed = data.rows.filter(r => r.eventSubtype === 'placed' && r.ts >= dayStart && r.ts <= dayEnd);
+  if (placed.length > 0) {
+    return res.json({ ok: true, found: true, events: placed });
+  }
+  // Not found — return context (last login, last cart)
+  const context = getCustomerActivityFromPortal(req.params.id, { limit: 1 });
+  res.json({ ok: true, found: false, lastLogin: context.lastLogin, lastCart: context.lastCart, date });
+});
+
+app.get('/customers/:id/activity', requireAuth, async (req, res) => {
+  const numId = req.params.id;
+  let customerName = `Customer ${numId}`;
+  if (MOCK) {
+    customerName = 'Mock Customer';
+  } else {
+    try {
+      const r = await shopifyFetch(`query($id:ID!){customer(id:$id){displayName}}`, { id: `gid://shopify/Customer/${numId}` });
+      customerName = r.data?.customer?.displayName || customerName;
+    } catch (_) {}
+  }
+
+  const now = new Date();
+  const ymd = d => d.toISOString().split('T')[0];
+  const daysAgo = n => { const d = new Date(now); d.setDate(d.getDate() - n); return d; };
+
+  const fromParam = req.query.from || ymd(daysAgo(7));
+  const toParam   = req.query.to   || ymd(now);
+  const typeParam = req.query.type  || 'all';
+  const qParam    = req.query.q     || '';
+  const pageParam = Number(req.query.page) || 1;
+
+  const data = getCustomerActivityFromPortal(numId, {
+    from: fromParam, to: toParam, type: typeParam, q: qParam, page: pageParam, limit: 50,
+  });
+
+  function fmtTs(ts) {
+    return ts ? new Date(ts).toISOString().replace('T', ' ').slice(0, 19) : '—';
+  }
+  function eventBadge(type, subtype) {
+    const colors = { auth:'#2086ba', page_view:'#555', api_call:'#777', cart:'#9BBC0E',
+      checkout:'#e07b00', order:'#2086ba', account:'#555', error:'#c00', impersonation:'#900' };
+    const color = colors[type] || '#666';
+    const label = subtype ? `${type}.${subtype}` : type;
+    return `<span style="font-size:0.78rem;padding:2px 6px;border-radius:3px;background:${color}1a;color:${color};font-family:monospace">${h(label)}</span>`;
+  }
+
+  const typeOptions = ['all','page_view','api_call','auth','cart','checkout','order','account','error','impersonation'];
+  const datePresets = [
+    { label: 'Today',      from: ymd(now),        to: ymd(now) },
+    { label: 'Last 24h',   from: ymd(daysAgo(1)), to: ymd(now) },
+    { label: 'Last 7d',    from: ymd(daysAgo(7)), to: ymd(now) },
+    { label: 'Last 30d',   from: ymd(daysAgo(30)),to: ymd(now) },
+    { label: 'Last 90d',   from: ymd(daysAgo(90)),to: ymd(now) },
+  ];
+
+  const rows = data.rows.map(r => `
+    <tr class="activity-row" data-detail='${h(JSON.stringify({
+      eventData: r.eventData, ipHash: r.ipHash, ipCountry: r.ipCountry,
+      userAgent: r.userAgent, impersonationAdmin: r.impersonationAdmin,
+      sessionId: r.sessionId ? r.sessionId.slice(0, 12) : null,
+    }))}'>
+      <td class="text-muted mono" style="font-size:0.8rem;white-space:nowrap">${fmtTs(r.ts)}</td>
+      <td>${eventBadge(r.eventType, r.eventSubtype)}</td>
+      <td class="mono" style="font-size:0.85rem">${h(r.path || '—')}</td>
+      <td class="text-muted mono" style="font-size:0.8rem">${r.httpStatus || '—'}</td>
+      <td class="text-muted mono" style="font-size:0.8rem">${r.durationMs != null ? r.durationMs + 'ms' : '—'}</td>
+    </tr>
+    <tr class="activity-detail-row" style="display:none">
+      <td colspan="5" style="padding:0.5rem 1rem;background:#f8f9fa;font-size:0.82rem;border-top:none">
+        <span class="text-muted">Loading…</span>
+      </td>
+    </tr>`).join('');
+
+  const totalPages = Math.ceil(data.total / 50) || 1;
+  const pagination = totalPages > 1 ? `
+    <div style="display:flex;gap:0.5rem;align-items:center;margin-top:0.75rem">
+      ${pageParam > 1 ? `<a href="?from=${h(fromParam)}&to=${h(toParam)}&type=${h(typeParam)}&q=${h(qParam)}&page=${pageParam - 1}" class="btn btn-sm btn-secondary">← Prev</a>` : ''}
+      <span class="text-muted" style="font-size:0.85rem">Page ${pageParam} / ${totalPages}</span>
+      ${pageParam < totalPages ? `<a href="?from=${h(fromParam)}&to=${h(toParam)}&type=${h(typeParam)}&q=${h(qParam)}&page=${pageParam + 1}" class="btn btn-sm btn-secondary">Next →</a>` : ''}
+    </div>` : '';
+
+  res.send(layout({ title: `Activity — ${customerName}`, session: req.adminSession, activePath: '/customers',
+    extraHead: `<style>
+      .activity-row{cursor:pointer;transition:background 0.1s}
+      .activity-row:hover{background:#f0f4ff}
+      .activity-row.expanded + .activity-detail-row{display:table-row!important}
+      .activity-detail-row td{color:#333}
+      .quick-lookup-box{background:#f8f9fa;border:1px solid #e0e0e0;border-radius:8px;padding:1rem;margin-bottom:1rem}
+      .quick-lookup-result{margin-top:0.75rem;font-size:0.9rem}
+    </style>`,
+    content: `
+    <div class="breadcrumb-row">
+      <a href="/customers" class="breadcrumb">← Customers</a>
+      <span class="breadcrumb-sep"> / </span>
+      <a href="/customers/${h(numId)}" class="breadcrumb">${h(customerName)}</a>
+    </div>
+    <div class="page-header"><h1>Activity log — ${h(customerName)}</h1>
+      <a href="/customers/${h(numId)}" class="btn btn-secondary btn-sm">← Profile</a>
+    </div>
+
+    <!-- Quick lookup -->
+    <div class="quick-lookup-box">
+      <strong style="font-size:0.9rem">Quick lookup: did customer place an order on…</strong>
+      <div style="display:flex;gap:0.5rem;align-items:center;margin-top:0.5rem">
+        <input type="date" id="lookup-date" class="input input-sm" value="${ymd(daysAgo(1))}">
+        <button class="btn btn-secondary btn-sm" id="lookup-btn">Check</button>
+      </div>
+      <div id="lookup-result" class="quick-lookup-result"></div>
+    </div>
+
+    <!-- Filters -->
+    <div class="filter-bar" style="margin-bottom:1rem">
+      <form method="GET" style="display:flex;gap:0.5rem;flex-wrap:wrap;align-items:center">
+        <select name="from" class="input input-sm" title="From date" onchange="this.form.submit()">
+          ${datePresets.map(p => `<option value="${h(p.from)}"${p.from === fromParam && p.to === toParam ? ' selected' : ''}>${h(p.label)}</option>`).join('')}
+          <option value="${h(fromParam)}"${!datePresets.some(p => p.from === fromParam) ? ' selected' : ''}>Custom</option>
+        </select>
+        <input type="date" name="from" class="input input-sm" value="${h(fromParam)}" style="width:130px">
+        <span style="font-size:0.85rem;color:#666">to</span>
+        <input type="date" name="to"   class="input input-sm" value="${h(toParam)}"   style="width:130px">
+        <select name="type" class="input input-sm" onchange="this.form.submit()">
+          ${typeOptions.map(t => `<option${t === typeParam ? ' selected' : ''}>${t}</option>`).join('')}
+        </select>
+        <input type="text" name="q" class="input input-sm" placeholder="Search path…" value="${h(qParam)}" style="width:160px">
+        <button type="submit" class="btn btn-secondary btn-sm">Filter</button>
+        <a href="/customers/${h(numId)}/activity" class="btn btn-ghost btn-sm">Reset</a>
+      </form>
+      <!-- Canned views -->
+      <div style="display:flex;gap:0.5rem;margin-top:0.5rem;flex-wrap:wrap">
+        <a href="?type=order&from=${h(ymd(daysAgo(30)))}&to=${h(ymd(now))}" class="btn btn-ghost btn-sm">Orders placed</a>
+        <a href="?type=checkout&q=failed&from=${h(ymd(daysAgo(30)))}&to=${h(ymd(now))}" class="btn btn-ghost btn-sm">Failed checkouts</a>
+        <a href="?type=error&from=${h(ymd(daysAgo(30)))}&to=${h(ymd(now))}" class="btn btn-ghost btn-sm">Errors</a>
+        <a href="?type=auth&from=${h(ymd(daysAgo(30)))}&to=${h(ymd(now))}" class="btn btn-ghost btn-sm">Recent logins</a>
+      </div>
+    </div>
+
+    <div class="card" style="padding:0">
+      <div style="padding:0.75rem 1rem;border-bottom:1px solid #eee;font-size:0.85rem;color:#555">
+        Showing ${data.rows.length} of ${data.total} events
+        ${data.lastLogin ? `· Last login: ${fmtTs(data.lastLogin.ts)}` : ''}
+      </div>
+      <table class="data-table">
+        <thead><tr><th>Timestamp</th><th>Event</th><th>Path</th><th>Status</th><th>Duration</th></tr></thead>
+        <tbody>${rows || '<tr><td colspan="5" style="text-align:center;color:var(--muted);padding:2rem">No activity in this range.</td></tr>'}</tbody>
+      </table>
+      ${pagination}
+    </div>
+
+    <script>
+    (function(){
+      // Row expand/collapse
+      document.querySelectorAll('.activity-row').forEach(function(row){
+        row.addEventListener('click', function(){
+          row.classList.toggle('expanded');
+          var detail = row.nextElementSibling;
+          if (!detail) return;
+          if (row.classList.contains('expanded') && detail.querySelector('span.text-muted')) {
+            try {
+              var d = JSON.parse(row.dataset.detail || '{}');
+              var parts = [];
+              if (d.eventData) parts.push('<strong>Data:</strong> <code style="word-break:break-all">' + JSON.stringify(d.eventData) + '</code>');
+              if (d.ipHash)    parts.push('<strong>IP hash:</strong> <code>' + d.ipHash + '</code>');
+              if (d.ipCountry) parts.push('<strong>Country:</strong> ' + d.ipCountry);
+              if (d.userAgent) parts.push('<strong>UA:</strong> <span style="color:#666">' + d.userAgent.slice(0,100) + '</span>');
+              if (d.sessionId) parts.push('<strong>Session:</strong> <code>' + d.sessionId + '…</code>');
+              if (d.impersonationAdmin) parts.push('<strong style="color:#900">Impersonated by:</strong> ' + d.impersonationAdmin);
+              detail.querySelector('td').innerHTML = parts.length ? parts.join(' &nbsp;·&nbsp; ') : '<em>No extra data</em>';
+            } catch(e) { detail.querySelector('td').textContent = 'Parse error'; }
+          }
+        });
+      });
+
+      // Quick lookup
+      document.getElementById('lookup-btn').addEventListener('click', function(){
+        var date = document.getElementById('lookup-date').value;
+        var resultEl = document.getElementById('lookup-result');
+        if (!date) return;
+        resultEl.innerHTML = '<em>Checking…</em>';
+        fetch('/api/admin/customers/${h(numId)}/activity/lookup?date=' + encodeURIComponent(date))
+          .then(function(r){ return r.json(); })
+          .then(function(d){
+            if (d.found) {
+              resultEl.innerHTML = '<span style="color:#2a7;font-weight:600">✓ Order placed on ' + date + '</span>: ' +
+                d.events.map(function(e){ return '<a href="/orders/' + (e.eventData && e.eventData.order_id ? e.eventData.order_id : '') + '">' +
+                  (e.eventData && e.eventData.order_name ? e.eventData.order_name : 'Order') + '</a>' +
+                  ' at ' + new Date(e.ts).toISOString().replace('T',' ').slice(0,19);
+                }).join(', ');
+            } else {
+              var msg = '<span style="color:#b00">✗ No order placed on ' + date + '</span>';
+              if (d.lastLogin) msg += ' &nbsp;·&nbsp; Last login: ' + new Date(d.lastLogin.ts).toISOString().replace('T',' ').slice(0,16);
+              if (d.lastCart)  msg += ' &nbsp;·&nbsp; Last cart activity: ' + new Date(d.lastCart.ts).toISOString().replace('T',' ').slice(0,16);
+              resultEl.innerHTML = msg;
+            }
+          })
+          .catch(function(e){ resultEl.textContent = 'Error: ' + e.message; });
+      });
+    })();
+    </script>
+  ` }));
 });
 
 // Static

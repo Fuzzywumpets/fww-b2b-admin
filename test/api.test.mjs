@@ -1991,5 +1991,67 @@ await test('POST /api/admin/customers/999/impersonate → 404 for unknown custom
   assert.equal(res.status, 404);
 });
 
+console.log('\nAPI tests — Phase 23 (Activity viewer):');
+
+await test('GET /api/admin/customers/101/activity → requires auth', async () => {
+  const res = await fetch(`${BASE}/api/admin/customers/101/activity`);
+  assert.equal(res.status, 401);
+});
+
+await test('GET /api/admin/customers/101/activity → returns activity data', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/api/admin/customers/101/activity`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const json = await res.json();
+  assert.equal(json.ok, true);
+  assert.ok(Array.isArray(json.rows), 'Should return rows array');
+  assert.ok(typeof json.total === 'number', 'Should return total count');
+  assert.ok(typeof json.page === 'number', 'Should return page number');
+});
+
+await test('GET /api/admin/customers/101/activity with type filter → filters correctly', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/api/admin/customers/101/activity?type=page_view`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const json = await res.json();
+  assert.equal(json.ok, true);
+  assert.ok(json.rows.every(r => r.eventType === 'page_view'), 'Should only return page_view events');
+});
+
+await test('GET /api/admin/customers/101/activity/lookup → requires auth', async () => {
+  const res = await fetch(`${BASE}/api/admin/customers/101/activity/lookup?date=2026-05-26`);
+  assert.equal(res.status, 401);
+});
+
+await test('GET /api/admin/customers/101/activity/lookup → requires date param', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/api/admin/customers/101/activity/lookup`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 400);
+});
+
+await test('GET /api/admin/customers/101/activity/lookup with date → returns found or not-found', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/api/admin/customers/101/activity/lookup?date=2026-05-26`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const json = await res.json();
+  assert.equal(json.ok, true);
+  assert.ok(typeof json.found === 'boolean', 'Should return found boolean');
+});
+
+await test('GET /customers/101/activity → unauthenticated redirects', async () => {
+  const res = await fetch(`${BASE}/customers/101/activity`, { redirect: 'manual' });
+  assert.ok(res.status === 302 || res.status === 303, 'Unauthenticated should redirect');
+});
+
+await test('GET /customers/101/activity → renders activity page', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/customers/101/activity`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  assert.ok(html.includes('Activity log'), 'Should include activity log heading');
+  assert.ok(html.includes('Quick lookup'), 'Should include quick lookup section');
+  assert.ok(html.includes('data-table'), 'Should include data table');
+});
+
 console.log(`\n  ${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);
