@@ -17,7 +17,17 @@ echo "=================================================================" >> runs
 CONT="You are headless Claude on fww-vps-1, working on fww-b2b-admin. Read HANDOFF.md in full,
 then STATUS.md + SCRATCH.md + RESEARCH.md (if exists) + the last 20 git log entries. Then do
 the next concrete step, commit + push, update STATUS.md, and exit. Each iteration ships
-something. Do not start over — continue from current state."
+something. Do not start over — continue from current state.
+
+PARALLELIZE BY DEFAULT: send multiple independent tool calls in a SINGLE message rather than
+serializing. Examples: read 3 files at once, run tests + lint + typecheck simultaneously, run
+git status + git diff + git log together. Only serialize when step B genuinely needs step A's
+output. RAM upgraded specifically to support concurrent work — use it. When implementing
+multiple independent sub-features in one phase, write/edit files in parallel batches.
+
+WHEN TWO PHASES ARE INDEPENDENT (no shared files, no shared DB, no shared route), ship both
+in one iter via parallel work. e.g. Phase 15 (per-customer catalogs) + Phase 22 (impersonation)
+touch different files — do both."
 
 for i in $(seq 1 $MAX_ITERS); do
   if grep -qE "^STATE: (DONE|FAILED|BLOCKED)" STATUS.md 2>/dev/null; then
