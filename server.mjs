@@ -33,6 +33,7 @@ import {
   listCustomersFromCache,
   getCustomerCacheStats,
   listOrdersFromCache, getOrdersCacheStats, getCustomerOrdersFromCache,
+  getReportsDataFromCache,
 } from './db.mjs';
 import { generateInvoicePdf } from './pdf.mjs';
 import { renderLabelSheet, expandItems, TEMPLATES as LABEL_TEMPLATES, DEFAULT_FIELDS } from './labels.mjs';
@@ -805,6 +806,23 @@ function requireAuth(req, res, next) {
   next();
 }
 
+
+
+const US_STATE_CODES = {
+  'Alabama':'AL','Alaska':'AK','Arizona':'AZ','Arkansas':'AR','California':'CA','Colorado':'CO','Connecticut':'CT','Delaware':'DE',
+  'Florida':'FL','Georgia':'GA','Hawaii':'HI','Idaho':'ID','Illinois':'IL','Indiana':'IN','Iowa':'IA','Kansas':'KS',
+  'Kentucky':'KY','Louisiana':'LA','Maine':'ME','Maryland':'MD','Massachusetts':'MA','Michigan':'MI','Minnesota':'MN','Mississippi':'MS',
+  'Missouri':'MO','Montana':'MT','Nebraska':'NE','Nevada':'NV','New Hampshire':'NH','New Jersey':'NJ','New Mexico':'NM','New York':'NY',
+  'North Carolina':'NC','North Dakota':'ND','Ohio':'OH','Oklahoma':'OK','Oregon':'OR','Pennsylvania':'PA','Rhode Island':'RI','South Carolina':'SC',
+  'South Dakota':'SD','Tennessee':'TN','Texas':'TX','Utah':'UT','Vermont':'VT','Virginia':'VA','Washington':'WA','West Virginia':'WV',
+  'Wisconsin':'WI','Wyoming':'WY','District of Columbia':'DC','DC':'DC'
+};
+function toStateCode(s) {
+  if (!s) return s;
+  if (s.length === 2) return s.toUpperCase();
+  return US_STATE_CODES[s] || s;
+}
+
 // ── HTML helpers ──────────────────────────────────────────────────────────────
 function h(str) {
   if (str == null) return '';
@@ -1546,6 +1564,92 @@ function renderOrderDetail(session, order, flash, flashMsg) {
   function toggleCancelModal(show) {
     document.getElementById('cancel-modal').style.display = show ? 'flex' : 'none';
   }
+  function toggleShipModal(show) {
+    const m = document.getElementById('ship-modal');
+    m.style.display = show ? 'flex' : 'none';
+    if (show) {
+      // Reset state
+      document.getElementById('ship-rates-area').style.display = 'none';
+      document.getElementById('ship-label-area').style.display = 'none';
+      document.getElementById('ship-error').style.display = 'none';
+      document.getElementById('ship-buy-btn').style.display = 'none';
+      document.getElementById('ship-get-rates-btn').style.display = 'inline-flex';
+    }
+  }
+  let _selectedRateId = null;
+  async function shipGetRates() {
+    const btn = document.getElementById('ship-get-rates-btn');
+    const errEl = document.getElementById('ship-error');
+    errEl.style.display = 'none';
+    btn.disabled = true; btn.textContent = 'Fetching rates…';
+    const lis = [...document.querySelectorAll('#ship-modal input[name="ship_li[]"]:checked')].map(c => ({ id: c.value, quantity: parseInt(c.dataset.qty, 10) || 1 }));
+    const fromId = document.getElementById('ship-from').value;
+    const weight = parseFloat(document.getElementById('ship-weight').value) || 1;
+    try {
+      const r = await fetch(window.location.pathname + '/ship/rates', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ fromId, weight, lineItems: lis })
+      });
+      const j = await r.json();
+      if (!r.ok || j.error) throw new Error(j.error || 'rates failed');
+      const list = document.getElementById('ship-rates-list');
+      const rates = (j.rates || []).sort((a, b) => (a.shipping_amount?.amount || 9999) - (b.shipping_amount?.amount || 9999));
+      list.innerHTML = rates.length === 0 ? '<div class=\"text-muted\">No rates returned.</div>' :
+        rates.map(function(rt, i) {
+          var cost = (rt.shipping_amount && rt.shipping_amount.amount != null) ? rt.shipping_amount.amount.toFixed(2) : '?';
+          var days = (rt.delivery_days || rt.estimated_delivery_date) ? (rt.delivery_days ? rt.delivery_days + ' days' : '~' + rt.estimated_delivery_date) : '';
+          var checked = i === 0 ? 'checked' : '';
+          var carrier = rt.carrier_friendly_name || rt.carrier_code || '';
+          var service = rt.service_type || rt.service_code || '';
+          return '<label style=\"display:flex;align-items:center;gap:8px;padding:6px;border-bottom:1px solid #eee;font-size:13px;cursor:pointer\">' +
+            '<input type=\"radio\" name=\"ship_rate\" value=\"' + rt.rate_id + '\" ' + checked + ' onchange=\"_selectedRateId=this.value\">' +
+            '<strong style=\"flex:1\">' + service + '</strong>' +
+            '<span style=\"color:#888\">' + carrier + '</span>' +
+            '<span style=\"font-weight:600;min-width:60px;text-align:right\">$' + cost + '</span>' +
+            (days ? '<span style=\"color:#888;font-size:11px\">' + days + '</span>' : '') +
+            '</label>';
+        }).join('');
+      if (rates.length > 0) _selectedRateId = rates[0].rate_id;
+      document.getElementById('ship-rates-area').style.display = '';
+      document.getElementById('ship-buy-btn').style.display = 'inline-flex';
+      document.getElementById('ship-buy-btn').disabled = rates.length === 0;
+      btn.style.display = 'none';
+    } catch (e) {
+      errEl.textContent = 'Rates error: ' + e.message;
+      errEl.style.display = '';
+      btn.disabled = false; btn.textContent = 'Get rates';
+    }
+  }
+  async function shipBuyLabel() {
+    const btn = document.getElementById('ship-buy-btn');
+    const errEl = document.getElementById('ship-error');
+    errEl.style.display = 'none';
+    if (!_selectedRateId) { errEl.textContent = 'Pick a rate first'; errEl.style.display = ''; return; }
+    btn.disabled = true; btn.textContent = 'Buying label…';
+    const lis = [...document.querySelectorAll('#ship-modal input[name="ship_li[]"]:checked')].map(c => ({ id: c.value, quantity: parseInt(c.dataset.qty, 10) || 1 }));
+    try {
+      const r = await fetch(window.location.pathname + '/ship/label', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ rate_id: _selectedRateId, lineItems: lis })
+      });
+      const j = await r.json();
+      if (!r.ok || j.error) throw new Error(j.error || 'label failed');
+      const trackingEl = document.getElementById('ship-tracking-info');
+      var tUrl = j.tracking_url || '#';
+      var tNum = j.tracking_number || '(no number)';
+      var carrSeg = j.carrier_code ? ' &middot; ' + j.carrier_code : '';
+      var ffSeg = j.fulfillment_id ? ' &middot; Fulfilled in Shopify' : ' &middot; Shopify fulfill failed (see logs)';
+      trackingEl.innerHTML = 'Tracking: <a href=\"' + tUrl + '\" target=\"_blank\" rel=\"noopener\">' + tNum + '</a>' + carrSeg + ffSeg;
+      document.getElementById('ship-label-link').href = j.label_url;
+      document.getElementById('ship-label-area').style.display = '';
+      document.getElementById('ship-rates-area').style.display = 'none';
+      btn.style.display = 'none';
+    } catch (e) {
+      errEl.textContent = 'Buy label error: ' + e.message;
+      errEl.style.display = '';
+      btn.disabled = false; btn.textContent = 'Buy label + fulfill';
+    }
+  }
   document.addEventListener('keydown', e => {
     if (e.key === 'Escape') {
       document.getElementById('discount-modal').style.display = 'none';
@@ -1553,6 +1657,7 @@ function renderOrderDetail(session, order, flash, flashMsg) {
       document.getElementById('backorder-modal').style.display = 'none';
       document.getElementById('invoice-modal').style.display = 'none';
       const cm = document.getElementById('cancel-modal'); if (cm) cm.style.display = 'none';
+      const sm = document.getElementById('ship-modal'); if (sm) sm.style.display = 'none';
     }
   });
   </script>`;
@@ -1613,6 +1718,8 @@ function renderOrderDetail(session, order, flash, flashMsg) {
         ${!isPaid ? `<form method="POST" action="/orders/${h(numId)}/mark-paid" style="display:inline">
           <button class="btn btn-success" onclick="return confirm('Mark ${h(order.name)} as paid?')">Mark Paid</button>
         </form>` : ''}
+        ${order.cancelledAt || order.displayFulfillmentStatus === 'FULFILLED' ? '' : `
+        <button class="btn btn-primary" onclick="toggleShipModal(true)" title="Buy a shipping label and fulfill this order">📦 Ship order</button>`}
         <button id="edit-btn" class="btn btn-secondary" onclick="toggleEditMode(true)">Edit order</button>
         <button class="btn btn-secondary" onclick="toggleFulfillModal(true)">Fulfill items</button>
         <button class="btn btn-ghost" onclick="toggleDiscountModal(true)">Apply discount</button>
@@ -1768,6 +1875,55 @@ function renderOrderDetail(session, order, flash, flashMsg) {
                 <button type="submit" class="btn btn-danger" style="background:#c00;color:#fff">Cancel order</button>
               </div>
             </form>
+          </div>
+        </div>
+        ${/* Ship Order modal */''}<div id="ship-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center">
+          <div style="background:#fff;border-radius:8px;padding:24px;min-width:520px;max-width:640px;max-height:90vh;overflow-y:auto">
+            <h3 style="margin:0 0 16px;display:flex;align-items:center;gap:8px">📦 Ship order ${h(order.name)}</h3>
+            <div style="margin-bottom:14px">
+              <label style="display:block;font-size:13px;font-weight:500;margin-bottom:6px">Items to ship <span style="color:#999;font-weight:400;font-size:12px">(uncheck to split-ship later)</span></label>
+              <div style="border:1px solid #e5e5e5;border-radius:4px;padding:8px;max-height:160px;overflow-y:auto">
+                ${(order.lineItems?.edges || []).map(e => `
+                  <label style="display:flex;align-items:center;gap:8px;padding:4px 0;font-size:13px">
+                    <input type="checkbox" name="ship_li[]" value="${h(e.node.id || '')}" data-qty="${e.node.quantity || 1}" checked>
+                    <span style="flex:1">${h(e.node.title || '—')} × ${e.node.quantity || 0}</span>
+                    <span class="text-muted" style="font-size:11px">${h(e.node.variant?.sku || '')}</span>
+                  </label>`).join('')}
+              </div>
+            </div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:14px">
+              <div>
+                <label style="display:block;font-size:13px;font-weight:500;margin-bottom:4px">Ship from</label>
+                <select id="ship-from" class="filter-select" style="width:100%">
+                  <option value="fww-hp">Fuzzywumpets — Highland Park</option>
+                  <option value="beth-hastings">Beth Hastings — Fuzzy South</option>
+                </select>
+              </div>
+              <div>
+                <label style="display:block;font-size:13px;font-weight:500;margin-bottom:4px">Package weight (lbs)</label>
+                <input type="number" id="ship-weight" value="1" min="0.1" step="0.1" class="filter-input" style="width:100%">
+              </div>
+            </div>
+            <div id="ship-rates-area" style="margin-bottom:14px;display:none">
+              <label style="display:block;font-size:13px;font-weight:500;margin-bottom:6px">Pick a rate</label>
+              <div id="ship-rates-list" style="border:1px solid #e5e5e5;border-radius:4px;padding:8px;max-height:240px;overflow-y:auto"></div>
+            </div>
+            <div id="ship-label-area" style="margin-bottom:14px;display:none">
+              <div style="background:#f1f7da;border:1px solid #9BBC0E;border-radius:6px;padding:12px;display:flex;align-items:center;gap:12px">
+                <span style="font-size:24px">✓</span>
+                <div style="flex:1">
+                  <div style="font-weight:600">Label purchased + order fulfilled</div>
+                  <div style="font-size:12px;color:#555" id="ship-tracking-info"></div>
+                </div>
+                <a id="ship-label-link" href="#" target="_blank" rel="noopener" class="btn btn-primary">Print Label PDF ↗</a>
+              </div>
+            </div>
+            <div id="ship-error" style="display:none;color:#c00;font-size:13px;margin-bottom:10px"></div>
+            <div style="display:flex;gap:8px;justify-content:flex-end">
+              <button type="button" class="btn btn-ghost" onclick="toggleShipModal(false)">Close</button>
+              <button type="button" id="ship-get-rates-btn" class="btn btn-secondary" onclick="shipGetRates()">Get rates</button>
+              <button type="button" id="ship-buy-btn" class="btn btn-primary" onclick="shipBuyLabel()" disabled style="display:none">Buy label + fulfill</button>
+            </div>
           </div>
         </div>
         ${/* Generate Invoice modal */''}<div id="invoice-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center">
@@ -3623,6 +3779,129 @@ app.post('/orders/:id/discount', requireAuth, async (req, res) => {
   }
 });
 
+// Ship order — get rates via shipping bridge
+app.post('/orders/:id/ship/rates', requireAuth, async (req, res) => {
+  const numId = req.params.id;
+  const { fromId = 'fww-hp', weight = 1, lineItems = [] } = req.body || {};
+  try {
+    const order = await getOrderDetail(numId);
+    if (!order) return res.status(404).json({ error: 'order not found' });
+    const ship = order.shippingAddress || {};
+    // Bridge expects: fromId (pinned id) + to (flat address obj using bridge's addrToSS schema) + package
+    const body = {
+      fromId: fromId,  // 'fww-hp' or 'beth-hastings' — bridge resolves to warehouse
+      to: {
+        name: `${ship.firstName || ''} ${ship.lastName || ''}`.trim() || order.customer?.displayName || '—',
+        phone: ship.phone || order.customer?.phone || '',
+        street1: ship.address1 || '',
+        street2: ship.address2 || '',
+        city: ship.city || '',
+        state: toStateCode(ship.province) || '',
+        postalCode: ship.zip || '',
+        country: (ship.country || 'United States') === 'United States' ? 'US' : (ship.country || '').slice(0,2),
+        residential: true,  // most B2B-portal customers ship to homes/small businesses; safe default
+      },
+      package: { weight: { value: parseFloat(weight) || 1, units: 'pound' } },
+    };
+    const r = await fetch(`${process.env.SHIPPING_BRIDGE_URL}/rates`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${process.env.SHIPPING_BRIDGE_BEARER}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const j = await r.json();
+    if (!r.ok) return res.status(r.status).json({ error: j.error || j.message || 'rates failed', detail: j });
+    const rates = j.rate_response?.rates || j.rates || [];
+    const normalized = rates.filter(rt => (typeof rt.shipping_amount === 'number' ? rt.shipping_amount : rt.shipping_amount?.amount) > 0).map(rt => ({
+      ...rt,
+      shipping_amount: typeof rt.shipping_amount === 'number'
+        ? { amount: rt.shipping_amount, currency: 'usd' }
+        : rt.shipping_amount,
+    }));
+    res.json({ rates: normalized });
+  } catch (err) {
+    console.error('ship rates error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Ship order — buy label + auto-fulfill in Shopify
+app.post('/orders/:id/ship/label', requireAuth, async (req, res) => {
+  const numId = req.params.id;
+  const { rate_id, lineItems = [] } = req.body || {};
+  if (!rate_id) return res.status(400).json({ error: 'rate_id required' });
+  try {
+    // 1) Buy the label
+    const r = await fetch(`${process.env.SHIPPING_BRIDGE_URL}/label`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${process.env.SHIPPING_BRIDGE_BEARER}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ rate_id, label_format: 'pdf', label_layout: '4x6' }),
+    });
+    const j = await r.json();
+    if (!r.ok) return res.status(r.status).json({ error: j.error || j.message || 'label purchase failed', detail: j });
+    const label_url = j.label_download?.pdf || j.label_url || j.label_download?.href || '';
+    const tracking_number = j.tracking_number || '';
+    const carrier_code = j.carrier_code || '';
+    const tracking_url = j.tracking_url || (carrier_code === 'usps' ? `https://tools.usps.com/go/TrackConfirmAction?tLabels=${tracking_number}` : '');
+
+    auditLog(req.adminSession.email, 'ship_label_purchased', `gid://shopify/Order/${numId}`, null, { rate_id, tracking_number, carrier_code, cost: j.shipment_cost?.amount });
+
+    // 2) Auto-fulfill in Shopify with the tracking
+    let fulfillment_id = null;
+    try {
+      const orderId = `gid://shopify/Order/${numId}`;
+      const foRes = await shopifyFetch(`query($id:ID!){order(id:$id){
+        fulfillmentOrders(first:10){edges{node{
+          id status
+          lineItems(first:50){edges{node{id remainingQuantity lineItem{id title}}}}
+        }}}
+      }}`, { id: orderId });
+      const fos = foRes.data?.order?.fulfillmentOrders?.edges?.map(e => e.node) || [];
+      const liMap = {};
+      for (const fo of fos) {
+        if (fo.status !== 'OPEN' && fo.status !== 'IN_PROGRESS') continue;
+        for (const edge of fo.lineItems.edges) {
+          const foLi = edge.node;
+          const origId = foLi.lineItem?.id;
+          if (origId && foLi.remainingQuantity > 0) {
+            liMap[origId] = { foId: fo.id, foLiId: foLi.id, remaining: foLi.remainingQuantity };
+          }
+        }
+      }
+      const groupedByFo = {};
+      for (const li of lineItems) {
+        const mapping = liMap[li.id];
+        if (!mapping) continue;
+        const wantedQty = Math.min(li.quantity, mapping.remaining);
+        if (!groupedByFo[mapping.foId]) groupedByFo[mapping.foId] = [];
+        groupedByFo[mapping.foId].push({ id: mapping.foLiId, quantity: wantedQty });
+      }
+      const fulfillmentOrderInput = Object.entries(groupedByFo).map(([foId, items]) => ({ fulfillmentOrderId: foId, fulfillmentOrderLineItems: items }));
+      if (fulfillmentOrderInput.length > 0) {
+        const ffRes = await shopifyFetch(`mutation fulfill($f:FulfillmentInput!){
+          fulfillmentCreate(fulfillment:$f){fulfillment{id status} userErrors{field message}}
+        }`, { f: {
+          lineItemsByFulfillmentOrder: fulfillmentOrderInput,
+          trackingInfo: tracking_number ? { number: tracking_number, url: tracking_url, company: carrier_code === 'usps' ? 'USPS' : carrier_code === 'ups' ? 'UPS' : carrier_code === 'fedex' ? 'FedEx' : '' } : null,
+          notifyCustomer: true,
+        }});
+        const ffErrs = ffRes.data?.fulfillmentCreate?.userErrors || [];
+        if (ffErrs.length === 0) {
+          fulfillment_id = ffRes.data?.fulfillmentCreate?.fulfillment?.id;
+        } else {
+          console.error('ship label fulfill failed:', ffErrs.map(e => e.message).join(', '));
+        }
+      }
+    } catch (ffErr) {
+      console.error('ship label fulfill error:', ffErr.message);
+    }
+
+    res.json({ ok: true, label_url, tracking_number, tracking_url, carrier_code, fulfillment_id, cost: j.shipment_cost?.amount });
+  } catch (err) {
+    console.error('ship label error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Cancel order (calls Shopify orderCancel mutation)
 app.post('/orders/:id/cancel', requireAuth, async (req, res) => {
   const numId   = req.params.id;
@@ -4683,6 +4962,18 @@ app.get('/products/:id', requireAuth, async (req, res) => {
 // ── Reports ───────────────────────────────────────────────────────────────────
 
 async function getReportsData() {
+  // Phase 24F: read from cache first (SQL aggregation across 12mo of cached orders)
+  if (!MOCK) {
+    try {
+      const stats = getOrdersCacheStats();
+      if (stats && stats.total > 0) {
+        return getReportsDataFromCache();
+      }
+    } catch (e) {
+      console.error('reports cache read failed, falling back to live:', e.message);
+    }
+  }
+
   if (MOCK) {
     return {
       monthly:    MOCK_MONTHLY_REVENUE,
