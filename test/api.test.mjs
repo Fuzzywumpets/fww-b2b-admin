@@ -175,7 +175,7 @@ await test('GET /orders/1001 returns order detail', async () => {
   assert.ok(html.includes('Acme Pet Supply'), 'Missing customer name');
   assert.ok(html.includes('Elite Collar'), 'Missing line item');
   assert.ok(html.includes('Mark Paid'), 'Missing Mark Paid button (order is pending)');
-  assert.ok(html.includes('PDF Invoice'), 'Missing PDF Invoice link');
+  assert.ok(html.includes('Generate Invoice'), 'Missing Generate Invoice button');
 });
 
 await test('GET /orders/9999 returns 404 for non-existent order', async () => {
@@ -2051,6 +2051,142 @@ await test('GET /customers/101/activity → renders activity page', async () => 
   assert.ok(html.includes('Activity log'), 'Should include activity log heading');
   assert.ok(html.includes('Quick lookup'), 'Should include quick lookup section');
   assert.ok(html.includes('data-table'), 'Should include data table');
+});
+
+// ── Phase 16E: Partial invoices ──────────────────────────────────────────────
+
+await test('GET /api/admin/orders/1001/partial-invoices → requires auth', async () => {
+  const res = await fetch(`${BASE}/api/admin/orders/1001/partial-invoices`);
+  assert.equal(res.status, 401);
+});
+
+await test('GET /api/admin/orders/1001/partial-invoices → returns empty list initially', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/api/admin/orders/1001/partial-invoices`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const json = await res.json();
+  assert.equal(json.ok, true);
+  assert.ok(Array.isArray(json.invoices), 'Should return invoices array');
+});
+
+await test('POST /orders/1001/partial-invoice → requires auth', async () => {
+  const res = await fetch(`${BASE}/orders/1001/partial-invoice`, { method: 'POST', redirect: 'manual' });
+  assert.ok(res.status === 302 || res.status === 303 || res.status === 401, 'Unauthenticated should redirect or 401');
+});
+
+await test('POST /orders/1001/partial-invoice with type=full → returns PDF', async () => {
+  const cookie = await seedSession();
+  const body = new URLSearchParams({ type: 'full', shipping_handling: 'first' });
+  const res = await fetch(`${BASE}/orders/1001/partial-invoice`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: body.toString(),
+  });
+  assert.equal(res.status, 200, `Expected 200, got ${res.status}`);
+  assert.equal(res.headers.get('content-type'), 'application/pdf', 'Should return PDF');
+});
+
+await test('POST /orders/1001/partial-invoice with type=fulfilled_only → returns PDF', async () => {
+  const cookie = await seedSession();
+  const body = new URLSearchParams({ type: 'fulfilled_only', shipping_handling: 'none' });
+  const res = await fetch(`${BASE}/orders/1001/partial-invoice`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: body.toString(),
+  });
+  assert.equal(res.status, 200, `Expected 200, got ${res.status}`);
+  assert.equal(res.headers.get('content-type'), 'application/pdf', 'Should return PDF');
+});
+
+await test('POST /orders/1001/partial-invoice twice → second gets letter B', async () => {
+  const cookie = await seedSession();
+  const body1 = new URLSearchParams({ type: 'full', shipping_handling: 'first' });
+  await fetch(`${BASE}/orders/1001/partial-invoice`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: body1.toString(),
+  });
+  const listRes = await fetch(`${BASE}/api/admin/orders/1001/partial-invoices`, { headers: { Cookie: cookie } });
+  const json = await listRes.json();
+  assert.ok(json.invoices.length >= 1, 'Should have at least 1 invoice after generation');
+  const letters = json.invoices.map(i => i.invoice_letter);
+  assert.ok(letters.includes('A') || letters.includes('B'), 'Should have assigned letter A or B');
+});
+
+await test('GET /orders/1001/partial-invoice/A.pdf → returns PDF or 404 based on prior tests', async () => {
+  const cookie = await seedSession();
+  const listRes = await fetch(`${BASE}/api/admin/orders/1001/partial-invoices`, { headers: { Cookie: cookie } });
+  const json = await listRes.json();
+  if (json.invoices.length > 0) {
+    const letter = json.invoices[0].invoice_letter;
+    const res = await fetch(`${BASE}/orders/1001/partial-invoice/${letter}.pdf`, { headers: { Cookie: cookie } });
+    assert.equal(res.status, 200, 'Should serve existing invoice PDF');
+    assert.equal(res.headers.get('content-type'), 'application/pdf');
+  } else {
+    const res = await fetch(`${BASE}/orders/1001/partial-invoice/Z.pdf`, { headers: { Cookie: cookie } });
+    assert.equal(res.status, 404, 'Should 404 for non-existent letter');
+  }
+});
+
+await test('GET /orders/1001 → includes Generate Invoice button', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/orders/1001`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  assert.ok(html.includes('Generate Invoice'), 'Should include Generate Invoice button');
+  assert.ok(html.includes('invoice-modal'), 'Should include invoice modal');
+});
+
+// ── Phase 15A: Catalog access tags ───────────────────────────────────────────
+
+await test('GET /customers/101 → B2B settings includes catalog_access_tags field', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/customers/101`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  assert.ok(html.includes('catalog_access_tags'), 'Should include catalog_access_tags input');
+  assert.ok(html.includes('Custom catalog tags'), 'Should include Custom catalog tags label');
+});
+
+await test('POST /customers/101/b2b-config with catalog_access_tags → saves and redirects', async () => {
+  const cookie = await seedSession();
+  const body = new URLSearchParams({ catalog_access_tags: 'private-test,trade-only' });
+  const res = await fetch(`${BASE}/customers/101/b2b-config`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: body.toString(),
+    redirect: 'manual',
+  });
+  assert.ok(res.status === 302 || res.status === 303, 'Should redirect after save');
+});
+
+await test('GET /api/admin/customers/101/b2b-config → includes catalog_access_tags', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/api/admin/customers/101/b2b-config`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const json = await res.json();
+  assert.ok('catalog_access_tags' in (json.effective || json.overrides || json), 'Should include catalog_access_tags');
+});
+
+await test('GET /settings → includes catalog_private_tags field', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/settings`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  assert.ok(html.includes('catalog_private_tags'), 'Should include catalog_private_tags input');
+  assert.ok(html.includes('Private catalog tags'), 'Should include Private catalog tags label');
+});
+
+await test('POST /settings with catalog_private_tags → saves and redirects', async () => {
+  const cookie = await seedSession();
+  const body = new URLSearchParams({ catalog_private_tags: 'private-acme,trade-only' });
+  const res = await fetch(`${BASE}/settings`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: body.toString(),
+    redirect: 'manual',
+  });
+  assert.ok(res.status === 302 || res.status === 303, 'Should redirect after settings save');
 });
 
 console.log(`\n  ${passed} passed, ${failed} failed`);

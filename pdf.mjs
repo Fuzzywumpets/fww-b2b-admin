@@ -3,13 +3,20 @@ import PDFDocument from 'pdfkit';
 const LIME = '#9BBC0E';
 const DARK = '#1a1f2e';
 
-export async function generateInvoicePdf(order) {
+export async function generateInvoicePdf(order, opts = {}) {
+  // opts.lineItems: array of line item nodes (if partial/filtered)
+  // opts.invoiceSuffix: e.g. "A" → invoice shown as "#1001-A"
+  // opts.subtotal, opts.shipping, opts.total: override computed totals
   return new Promise((resolve, reject) => {
     const doc = new PDFDocument({ margin: 50, size: 'LETTER', autoFirstPage: true });
     const chunks = [];
     doc.on('data', c => chunks.push(c));
     doc.on('end', () => resolve(Buffer.concat(chunks)));
     doc.on('error', reject);
+
+    const invoiceName = opts.invoiceSuffix
+      ? `${order.name || '—'}-${opts.invoiceSuffix}`
+      : (order.name || '—');
 
     // Top accent bar
     doc.rect(0, 0, 612, 6).fill(LIME);
@@ -21,7 +28,7 @@ export async function generateInvoicePdf(order) {
     // Invoice meta (right)
     doc.fontSize(17).font('Helvetica-Bold').fillColor(DARK).text('INVOICE', 400, 28, { align: 'right', width: 162 });
     doc.fontSize(10).font('Helvetica').fillColor('#374151');
-    doc.text(`Order: ${order.name || '—'}`, 400, 52, { align: 'right', width: 162 });
+    doc.text(`Order: ${invoiceName}`, 400, 52, { align: 'right', width: 162 });
     doc.text(`Date: ${fmtDate(order.processedAt)}`, 400, 67, { align: 'right', width: 162 });
 
     // PAYMENT PENDING watermark
@@ -71,7 +78,7 @@ export async function generateInvoicePdf(order) {
     doc.text('TOTAL', 500, tableTop + 5, { width: 62, align: 'right' });
 
     let y = tableTop + 24;
-    const lineItems = order.lineItems?.edges?.map(e => e.node) || [];
+    const lineItems = opts.lineItems ?? (order.lineItems?.edges?.map(e => e.node) || []);
     doc.font('Helvetica').fillColor('#374151');
 
     for (const item of lineItems) {
@@ -96,9 +103,16 @@ export async function generateInvoicePdf(order) {
 
     // Totals
     y += 8;
-    const sub   = parseFloat(order.subtotalPriceSet?.presentmentMoney?.amount || 0);
-    const ship  = parseFloat(order.totalShippingPriceSet?.presentmentMoney?.amount || 0);
-    const total = parseFloat(order.totalPriceSet?.presentmentMoney?.amount || 0);
+    let sub, ship, total;
+    if (opts.subtotal !== undefined) {
+      sub   = parseFloat(opts.subtotal) || 0;
+      ship  = parseFloat(opts.shipping) || 0;
+      total = parseFloat(opts.total) || 0;
+    } else {
+      sub   = parseFloat(order.subtotalPriceSet?.presentmentMoney?.amount || 0);
+      ship  = parseFloat(order.totalShippingPriceSet?.presentmentMoney?.amount || 0);
+      total = parseFloat(order.totalPriceSet?.presentmentMoney?.amount || 0);
+    }
 
     doc.fontSize(9.5).font('Helvetica').fillColor('#374151');
     doc.text('Subtotal:', 400, y, { width: 100, align: 'right' });

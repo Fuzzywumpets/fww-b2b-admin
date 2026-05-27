@@ -11,3 +11,9 @@
 - ✅ Phase 18 (Xero accounting) SHIPPED before crash — 222 tests green
 - Remaining queue: 15 (catalogs+teams), 16D (backorder), 19D (persistent cart), 21 (Xero customer sync), 22 (impersonation), 23 (activity warehouse)
 - Phase 18 used mock ensureXeroContact; Phase 21 will add real customer sync — agent should reconcile when 21 ships
+
+## 2026-05-27 00:25 UTC — Loop died mid-iter 2 (after Phase 22 shipped)
+- Iter 2 commit Phase 22 cleanly (commits 1101431 + 8e3bfc7, 399 tests green)
+- tmux session gone, no ITER 2 EXIT logged
+- Possible cause: tmux disconnect, claude -p crash post-commit, or OS-level kill
+- **Restarted** at 00:25 UTC; loop will continue from current STATE: IN_PROGRESS

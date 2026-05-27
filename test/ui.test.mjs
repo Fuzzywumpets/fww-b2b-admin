@@ -156,7 +156,7 @@ await test('/orders/1001 shows order detail with timeline and line items', async
   assert.ok(html.includes('#1001'), 'Missing order number');
   assert.ok(html.includes('Elite Collar'), 'Missing line item');
   assert.ok(html.includes('Placed'), 'Missing timeline Placed step');
-  assert.ok(html.includes('PDF Invoice'), 'Missing PDF invoice link');
+  assert.ok(html.includes('Generate Invoice'), 'Missing Generate Invoice button');
 });
 
 await test('/orders/new shows customer and product search', async (page, ctx) => {

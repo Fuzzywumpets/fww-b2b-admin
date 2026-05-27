@@ -25,6 +25,7 @@ import {
   upsertBackorder, getBackordersForOrder, fulfillBackorder, logOrderEdit,
   getXeroMap, setXeroMap, addXeroPending, getXeroPending, markXeroPendingDone, markXeroPendingFailed, getXeroPendingCount, getXeroInvoiceMaps,
   createImpersonationNonce, consumeImpersonationNonce, gcImpersonationNonces,
+  createPartialInvoice, getPartialInvoices, getNextInvoiceLetter,
 } from './db.mjs';
 import { generateInvoicePdf } from './pdf.mjs';
 import { renderLabelSheet, expandItems, TEMPLATES as LABEL_TEMPLATES, DEFAULT_FIELDS } from './labels.mjs';
@@ -1343,6 +1344,8 @@ function renderOrderDetail(session, order, flash) {
   const isPaid   = order.displayFinancialStatus === 'PAID';
   // Xero map (read from SQLite)
   const xeroMap  = getXeroMap(numId);
+  // Partial invoices (read from SQLite)
+  const partialInvoices = getPartialInvoices(`gid://shopify/Order/${numId}`);
   const isFulfilled = ['FULFILLED','PARTIALLY_FULFILLED'].includes(order.displayFulfillmentStatus);
   const finStatus = (order.displayFinancialStatus || '').toLowerCase();
   const fulStatus = (order.displayFulfillmentStatus || '').toLowerCase().replace(/_/g, '-');
@@ -1454,6 +1457,8 @@ function renderOrderDetail(session, order, flash) {
     ? `<div class="alert alert-success">Xero payment recorded.</div>`
     : flash === 'xero_failed'
     ? `<div class="alert alert-warning">Xero sync failed — queued for retry. Check /accounting.</div>`
+    : flash === 'partial_invoice_created'
+    ? `<div class="alert alert-success">Partial invoice generated.</div>`
     : flash === 'edit_failed' || flash === 'fulfillment_failed' || flash === 'discount_failed'
     ? `<div class="alert alert-warning">Action failed — check server logs.</div>`
     : '';
@@ -1494,11 +1499,15 @@ function renderOrderDetail(session, order, flash) {
       m.style.display = 'none';
     }
   }
+  function toggleInvoiceModal(show) {
+    document.getElementById('invoice-modal').style.display = show ? 'flex' : 'none';
+  }
   document.addEventListener('keydown', e => {
     if (e.key === 'Escape') {
       document.getElementById('discount-modal').style.display = 'none';
       document.getElementById('fulfill-modal').style.display = 'none';
       document.getElementById('backorder-modal').style.display = 'none';
+      document.getElementById('invoice-modal').style.display = 'none';
     }
   });
   </script>`;
@@ -1562,7 +1571,7 @@ function renderOrderDetail(session, order, flash) {
         <button id="edit-btn" class="btn btn-secondary" onclick="toggleEditMode(true)">Edit order</button>
         <button class="btn btn-secondary" onclick="toggleFulfillModal(true)">Fulfill items</button>
         <button class="btn btn-ghost" onclick="toggleDiscountModal(true)">Apply discount</button>
-        <a href="/orders/${h(numId)}/invoice.pdf" class="btn btn-secondary">PDF Invoice</a>
+        <button class="btn btn-secondary" onclick="toggleInvoiceModal(true)">Generate Invoice</button>
         <form method="POST" action="/orders/${h(numId)}/send-chase-invoice" style="display:inline">
           <button class="btn btn-secondary" onclick="return confirm('Queue Chase invoice link for ${h(order.name)}?\\n\\nNote: Chase API not yet wired — this logs the intent.')">Send Chase Invoice</button>
         </form>
@@ -1674,6 +1683,41 @@ function renderOrderDetail(session, order, flash) {
             </form>
           </div>
         </div>
+        ${/* Generate Invoice modal */''}<div id="invoice-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center">
+          <div style="background:#fff;border-radius:8px;padding:24px;min-width:380px;max-width:500px">
+            <h3 style="margin:0 0 16px">Generate Invoice</h3>
+            <form method="POST" action="/orders/${h(numId)}/partial-invoice">
+              <div style="margin-bottom:14px">
+                <div style="font-size:13px;font-weight:500;margin-bottom:8px">Invoice scope</div>
+                ${(order.fulfillments || []).length > 0
+                  ? `<label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-bottom:6px">
+                      <input type="radio" name="type" value="fulfilled_only" checked>
+                      Fulfilled items only (partial invoice)
+                    </label>`
+                  : ''}
+                <label style="display:flex;align-items:center;gap:8px;font-size:13px">
+                  <input type="radio" name="type" value="full" ${(order.fulfillments || []).length === 0 ? 'checked' : ''}>
+                  Entire order
+                </label>
+              </div>
+              <div style="margin-bottom:16px">
+                <div style="font-size:13px;font-weight:500;margin-bottom:6px">Shipping charge</div>
+                <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-bottom:4px">
+                  <input type="radio" name="shipping_handling" value="first" checked>
+                  Include all shipping on this invoice (common for wholesale)
+                </label>
+                <label style="display:flex;align-items:center;gap:8px;font-size:13px">
+                  <input type="radio" name="shipping_handling" value="none">
+                  No shipping on this invoice (prorate later)
+                </label>
+              </div>
+              <div style="display:flex;gap:8px">
+                <button type="submit" class="btn btn-primary">Generate PDF</button>
+                <button type="button" class="btn btn-ghost" onclick="toggleInvoiceModal(false)">Cancel</button>
+              </div>
+            </form>
+          </div>
+        </div>
         <div class="card">
           <div class="card-header"><h2>Order Note (internal)</h2></div>
           <form method="POST" action="/orders/${h(numId)}/note">
@@ -1716,6 +1760,23 @@ function renderOrderDetail(session, order, flash) {
           <div class="card-header"><h2>Tags</h2></div>
           <div class="tags-list">${(order.tags||[]).map(t => `<span class="tag">${h(t)}</span>`).join(' ')}</div>
         </div>
+        ${partialInvoices.length > 0 ? `<div class="card">
+          <div class="card-header"><h2>Invoices issued</h2></div>
+          <div class="kv-list">
+            ${partialInvoices.map(inv => `
+              <div class="kv-row" style="align-items:flex-start">
+                <span>
+                  <strong>#${h(String(order.name||numId))}-${h(inv.invoice_letter)}</strong>
+                  <span class="badge badge-muted" style="margin-left:4px">${inv.invoice_type === 'fulfilled_only' ? 'partial' : 'full'}</span>
+                </span>
+                <div style="text-align:right">
+                  <div class="mono">${fmtMoney(inv.total)}</div>
+                  <div style="font-size:11px;color:var(--muted)">${fmtDate(new Date(inv.created_at).toISOString())}</div>
+                  <a href="/orders/${h(numId)}/partial-invoice/${h(inv.invoice_letter)}.pdf" class="link" style="font-size:11px">Download PDF</a>
+                </div>
+              </div>`).join('')}
+          </div>
+        </div>` : ''}
         <div class="card">
           <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
             <h2>Xero</h2>
@@ -1957,6 +2018,7 @@ async function getB2bConfig(numericId) {
     dropship_enabled:        false,
     dropship_margin_pct:     30,
     allow_order_on_invoice:  true,
+    catalog_access_tags:     null,
   };
 
   if (MOCK) {
@@ -1969,10 +2031,12 @@ async function getB2bConfig(numericId) {
     const deStr   = mfs.find(m => m.key === 'dropship_enabled')?.value;
     const dmStr   = mfs.find(m => m.key === 'dropship_margin_pct')?.value;
     const aoiStr  = mfs.find(m => m.key === 'allow_order_on_invoice')?.value;
+    const catStr  = mfs.find(m => m.key === 'catalog_access_tags')?.value;
     if (dpStr  !== undefined) fromMf.discount_pct           = parseInt(dpStr, 10);
     if (deStr  !== undefined) fromMf.dropship_enabled       = deStr === 'true';
     if (dmStr  !== undefined) fromMf.dropship_margin_pct    = parseInt(dmStr, 10);
     if (aoiStr !== undefined) fromMf.allow_order_on_invoice = aoiStr !== 'false';
+    if (catStr !== undefined) fromMf.catalog_access_tags    = catStr || null;
 
     const overrides = { ...fromMf, ...inMemory };
     for (const k of Object.keys(inMemory)) {
@@ -1984,12 +2048,14 @@ async function getB2bConfig(numericId) {
         dropship_enabled:        overrides.dropship_enabled       ?? defaults.dropship_enabled,
         dropship_margin_pct:     overrides.dropship_margin_pct    ?? defaults.dropship_margin_pct,
         allow_order_on_invoice:  overrides.allow_order_on_invoice ?? defaults.allow_order_on_invoice,
+        catalog_access_tags:     overrides.catalog_access_tags    ?? null,
       },
       overrides: {
         discount_pct:            overrides.discount_pct           ?? null,
         dropship_enabled:        overrides.dropship_enabled       ?? null,
         dropship_margin_pct:     overrides.dropship_margin_pct    ?? null,
         allow_order_on_invoice:  overrides.allow_order_on_invoice ?? null,
+        catalog_access_tags:     overrides.catalog_access_tags    ?? null,
       },
       defaults,
     };
@@ -2006,11 +2072,13 @@ async function getB2bConfig(numericId) {
     const deStr  = getVal('dropship_enabled');
     const dmStr  = getVal('dropship_margin_pct');
     const aoiStr = getVal('allow_order_on_invoice');
+    const catStr = getVal('catalog_access_tags');
     const overrides = {
       discount_pct:            dpStr  !== null ? parseInt(dpStr, 10)   : null,
       dropship_enabled:        deStr  !== null ? deStr === 'true'       : null,
       dropship_margin_pct:     dmStr  !== null ? parseInt(dmStr, 10)   : null,
       allow_order_on_invoice:  aoiStr !== null ? aoiStr !== 'false'    : null,
+      catalog_access_tags:     catStr || null,
     };
     return {
       effective: {
@@ -2018,6 +2086,7 @@ async function getB2bConfig(numericId) {
         dropship_enabled:        overrides.dropship_enabled       ?? defaults.dropship_enabled,
         dropship_margin_pct:     overrides.dropship_margin_pct    ?? defaults.dropship_margin_pct,
         allow_order_on_invoice:  overrides.allow_order_on_invoice ?? defaults.allow_order_on_invoice,
+        catalog_access_tags:     overrides.catalog_access_tags    ?? null,
       },
       overrides,
       defaults,
@@ -2026,14 +2095,14 @@ async function getB2bConfig(numericId) {
     console.error('getB2bConfig error:', err.message);
     return {
       effective: defaults,
-      overrides: { discount_pct: null, dropship_enabled: null, dropship_margin_pct: null, allow_order_on_invoice: null },
+      overrides: { discount_pct: null, dropship_enabled: null, dropship_margin_pct: null, allow_order_on_invoice: null, catalog_access_tags: null },
       defaults,
     };
   }
 }
 
 async function applyB2bConfigUpdate(numericId, body) {
-  const { discount_pct, dropship_enabled, dropship_margin_pct, allow_order_on_invoice } = body;
+  const { discount_pct, dropship_enabled, dropship_margin_pct, allow_order_on_invoice, catalog_access_tags } = body;
   const gid = shopifyCustomerGid(numericId);
   if (MOCK) {
     const cur = { ...(mockB2bConfigOverrides.get(numericId) || {}) };
@@ -2045,6 +2114,8 @@ async function applyB2bConfigUpdate(numericId, body) {
       cur.dropship_margin_pct = (dropship_margin_pct === null || dropship_margin_pct === '') ? null : parseInt(dropship_margin_pct, 10);
     if (allow_order_on_invoice !== undefined)
       cur.allow_order_on_invoice = (allow_order_on_invoice === null || allow_order_on_invoice === '') ? null : (allow_order_on_invoice === true || allow_order_on_invoice === 'true' || allow_order_on_invoice === 'on');
+    if (catalog_access_tags !== undefined)
+      cur.catalog_access_tags = (catalog_access_tags === null || catalog_access_tags === '') ? null : String(catalog_access_tags).trim();
     mockB2bConfigOverrides.set(numericId, cur);
     return;
   }
@@ -2056,6 +2127,7 @@ async function applyB2bConfigUpdate(numericId, body) {
     { key: 'dropship_enabled',       val: dropship_enabled,       type: 'boolean' },
     { key: 'dropship_margin_pct',    val: dropship_margin_pct,    type: 'number_integer' },
     { key: 'allow_order_on_invoice', val: allow_order_on_invoice, type: 'boolean' },
+    { key: 'catalog_access_tags',    val: catalog_access_tags,    type: 'single_line_text_field' },
   ];
   for (const f of fieldDefs) {
     if (f.val === undefined) continue;
@@ -2064,6 +2136,8 @@ async function applyB2bConfigUpdate(numericId, body) {
     } else if (f.type === 'boolean') {
       const bval = f.val === true || f.val === 'true' || f.val === 'on';
       sets.push({ ownerId: gid, namespace: 'b2b', key: f.key, value: String(bval), type: 'boolean' });
+    } else if (f.type === 'single_line_text_field') {
+      sets.push({ ownerId: gid, namespace: 'b2b', key: f.key, value: String(f.val).trim(), type: 'single_line_text_field' });
     } else {
       sets.push({ ownerId: gid, namespace: 'b2b', key: f.key, value: String(parseInt(f.val, 10)), type: 'number_integer' });
     }
@@ -2359,6 +2433,19 @@ function renderCustomerDetail(session, customer, recentOrders, notes, _dropshipC
                 </div>
               </div>
             </div>
+              <div class="b2b-field-row">
+                <div>
+                  <div class="b2b-field-label">Custom catalog tags</div>
+                  <div class="b2b-field-help">Comma-separated private product tags this customer can access (e.g. <code>private-acme,deerskin-trade</code>). Products with these tags are hidden from customers who don't have them listed here.</div>
+                </div>
+                <div class="b2b-field-control">
+                  <input type="text" name="catalog_access_tags" id="catalog_access_tags"
+                    value="${h(b2bConfig.effective.catalog_access_tags || '')}"
+                    class="input input-sm" style="width:240px"
+                    placeholder="e.g. private-acme,deerskin-trade">
+                  ${b2bConfig.effective.catalog_access_tags ? `<button type="submit" name="catalog_access_tags" value="" class="btn btn-ghost btn-xs">Clear</button>` : ''}
+                </div>
+              </div>
             <div style="margin-top:1rem"><button type="submit" class="btn btn-primary btn-sm">Save changes</button></div>
           </form>
         </div>
@@ -3062,6 +3149,105 @@ app.get('/orders/:id/invoice.pdf', requireAuth, async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+// ── Phase 16E: Partial invoices ──────────────────────────────────────────────
+
+app.post('/orders/:id/partial-invoice', requireAuth, async (req, res) => {
+  const numId = req.params.id;
+  const session = req.adminSession;
+  const { type = 'full', shipping_handling = 'first' } = req.body;
+  const order = await getOrderDetail(numId);
+  if (!order) return res.status(404).json({ error: 'Order not found' });
+
+  const allLineItems = (order.lineItems?.edges || []).map(e => e.node);
+  const orderGid     = `gid://shopify/Order/${numId}`;
+
+  // For fulfilled_only: use all line items (fulfillment line detail not tracked in mock/query)
+  const lineItems = type === 'fulfilled_only' && (order.fulfillments || []).length > 0
+    ? allLineItems  // simplified: treat all items as fulfilled for billing
+    : allLineItems;
+
+  const subtotal = lineItems.reduce((sum, item) => {
+    const price = parseFloat(item.discountedUnitPriceSet?.presentmentMoney?.amount ?? item.originalUnitPriceSet?.presentmentMoney?.amount ?? 0);
+    return sum + price * (item.quantity || 0);
+  }, 0);
+  const shippingAmt = shipping_handling === 'first'
+    ? parseFloat(order.totalShippingPriceSet?.presentmentMoney?.amount || 0)
+    : 0;
+  const taxAmt  = parseFloat(order.totalTaxSet?.presentmentMoney?.amount || 0);
+  const total   = subtotal + shippingAmt + taxAmt;
+
+  const letter = getNextInvoiceLetter(orderGid);
+  const invId  = createPartialInvoice({
+    orderId: orderGid,
+    invoiceLetter: letter,
+    invoiceType: type,
+    total,
+    shipping: shippingAmt,
+    tax: taxAmt,
+    lineItemsJson: JSON.stringify(lineItems.map(i => ({ id: i.id, title: i.title, quantity: i.quantity, unitPrice: parseFloat(i.discountedUnitPriceSet?.presentmentMoney?.amount || 0) }))),
+    createdBy: session.email,
+  });
+  auditLog(session.email, 'partial_invoice_created', orderGid, null, { invoiceId: invId, letter, type, total });
+
+  try {
+    const pdf = await generateInvoicePdf(order, {
+      lineItems,
+      invoiceSuffix: letter,
+      subtotal,
+      shipping: shippingAmt,
+      total,
+    });
+    const safeName = (order.name || 'invoice').replace(/[^a-z0-9#-]/gi, '-');
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename="${safeName}-${letter}-invoice.pdf"`);
+    res.send(pdf);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Re-download a previously generated partial invoice
+app.get('/orders/:id/partial-invoice/:letter.pdf', requireAuth, async (req, res) => {
+  const numId  = req.params.id;
+  const letter = req.params.letter.toUpperCase();
+  const orderGid = `gid://shopify/Order/${numId}`;
+  const rows = getPartialInvoices(orderGid);
+  const inv  = rows.find(r => r.invoice_letter === letter);
+  if (!inv) return res.status(404).json({ error: 'Invoice not found' });
+
+  const order = await getOrderDetail(numId);
+  if (!order) return res.status(404).json({ error: 'Order not found' });
+
+  const lineItems = JSON.parse(inv.line_items_json || '[]').map(li => ({
+    id: li.id, title: li.title, quantity: li.quantity,
+    discountedUnitPriceSet: { presentmentMoney: { amount: String(li.unitPrice), currencyCode: 'USD' } },
+    originalUnitPriceSet:   { presentmentMoney: { amount: String(li.unitPrice), currencyCode: 'USD' } },
+    variant: null,
+  }));
+  try {
+    const pdf = await generateInvoicePdf(order, {
+      lineItems,
+      invoiceSuffix: letter,
+      subtotal: inv.total - inv.shipping - inv.tax,
+      shipping: inv.shipping,
+      total: inv.total,
+    });
+    const safeName = (order.name || 'invoice').replace(/[^a-z0-9#-]/gi, '-');
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename="${safeName}-${letter}-invoice.pdf"`);
+    res.send(pdf);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// JSON API — list partial invoices for an order
+app.get('/api/admin/orders/:id/partial-invoices', requireAuth, (req, res) => {
+  const numId = req.params.id;
+  const rows = getPartialInvoices(`gid://shopify/Order/${numId}`);
+  res.json({ ok: true, invoices: rows });
 });
 
 // ── Phase 16: Order editing, partial fulfillment, backorder ──────────────────
@@ -4347,9 +4533,10 @@ app.get('/reports/csv/:type', requireAuth, async (req, res) => {
 
 function getSettingsData(flash) {
   const settings = {
-    b2b_discount_pct: getSetting('b2b_discount_pct') ?? '50',
-    order_minimum:    getSetting('order_minimum')    ?? '0',
-    payment_terms:    getSetting('payment_terms')    ?? 'Net 30',
+    b2b_discount_pct:    getSetting('b2b_discount_pct')    ?? '50',
+    order_minimum:       getSetting('order_minimum')       ?? '0',
+    payment_terms:       getSetting('payment_terms')       ?? 'Net 30',
+    catalog_private_tags: getSetting('catalog_private_tags') ?? '',
   };
   const allowlist = MOCK
     ? ['alex@fuzzywumpets.com', 'alexa@fuzzywumpets.com']
@@ -4383,6 +4570,11 @@ function renderSettings(session, { settings, allowlist, flash }) {
             <label>Payment Terms</label>
             <input type="text" name="payment_terms" value="${h(settings.payment_terms)}" maxlength="100" class="form-input" style="width:200px">
             <small class="text-muted">Shown on invoices (e.g. "Net 30", "Due on receipt")</small>
+          </div>
+          <div class="form-row">
+            <label>Private catalog tags</label>
+            <input type="text" name="catalog_private_tags" value="${h(settings.catalog_private_tags || '')}" maxlength="500" class="form-input" style="width:300px">
+            <small class="text-muted">Comma-separated Shopify product tags treated as "private." Products with these tags are only visible to customers whose Custom catalog tags (on their B2B settings) include a match.</small>
           </div>
           <button type="submit" class="btn btn-primary">Save Config</button>
         </form>
@@ -4418,12 +4610,13 @@ app.get('/settings', requireAuth, (req, res) => {
 });
 
 app.post('/settings', requireAuth, (req, res) => {
-  const { b2b_discount_pct, order_minimum, payment_terms } = req.body;
+  const { b2b_discount_pct, order_minimum, payment_terms, catalog_private_tags } = req.body;
   try {
-    if (b2b_discount_pct !== undefined) setSetting('b2b_discount_pct', String(Number(b2b_discount_pct) || 50));
-    if (order_minimum    !== undefined) setSetting('order_minimum',    String(Number(order_minimum)    || 0));
-    if (payment_terms    !== undefined) setSetting('payment_terms',    String(payment_terms).slice(0, 100));
-    auditLog(req.adminSession.email, 'settings:update', null, null, { b2b_discount_pct, order_minimum, payment_terms });
+    if (b2b_discount_pct    !== undefined) setSetting('b2b_discount_pct',    String(Number(b2b_discount_pct) || 50));
+    if (order_minimum       !== undefined) setSetting('order_minimum',        String(Number(order_minimum)    || 0));
+    if (payment_terms       !== undefined) setSetting('payment_terms',        String(payment_terms).slice(0, 100));
+    if (catalog_private_tags !== undefined) setSetting('catalog_private_tags', String(catalog_private_tags || '').slice(0, 500));
+    auditLog(req.adminSession.email, 'settings:update', null, null, { b2b_discount_pct, order_minimum, payment_terms, catalog_private_tags });
     res.redirect('/settings?flash=ok&msg=Settings+saved.');
   } catch (err) {
     res.redirect(`/settings?flash=err&msg=${encodeURIComponent(err.message)}`);

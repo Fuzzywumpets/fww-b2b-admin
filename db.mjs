@@ -177,6 +177,20 @@ db.exec(`
     used_at INTEGER,
     created_at INTEGER NOT NULL
   );
+
+  CREATE TABLE IF NOT EXISTS partial_invoices (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id TEXT NOT NULL,
+    invoice_letter TEXT NOT NULL,
+    invoice_type TEXT NOT NULL DEFAULT 'fulfilled_only',
+    total REAL NOT NULL DEFAULT 0,
+    shipping REAL NOT NULL DEFAULT 0,
+    tax REAL NOT NULL DEFAULT 0,
+    line_items_json TEXT NOT NULL DEFAULT '[]',
+    created_at INTEGER NOT NULL,
+    created_by TEXT NOT NULL,
+    sent_at INTEGER
+  );
 `);
 
 export default db;
@@ -445,5 +459,28 @@ export function consumeImpersonationNonce(nonce) {
 export function gcImpersonationNonces() {
   const cutoff = Date.now() - 2 * 60 * 60 * 1000; // 2h
   db.prepare('DELETE FROM impersonation_nonces WHERE created_at < ?').run(cutoff);
+}
+
+// ── Partial invoices ────────────────────────────────────────────────────────
+
+export function getNextInvoiceLetter(orderId) {
+  const rows = db.prepare('SELECT invoice_letter FROM partial_invoices WHERE order_id = ? ORDER BY created_at ASC').all(orderId);
+  const used = new Set(rows.map(r => r.invoice_letter));
+  for (let i = 0; i < 26; i++) {
+    const letter = String.fromCharCode(65 + i);
+    if (!used.has(letter)) return letter;
+  }
+  return 'Z';
+}
+
+export function createPartialInvoice({ orderId, invoiceLetter, invoiceType, total, shipping, tax, lineItemsJson, createdBy }) {
+  return db.prepare(`
+    INSERT INTO partial_invoices (order_id, invoice_letter, invoice_type, total, shipping, tax, line_items_json, created_at, created_by)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(orderId, invoiceLetter, invoiceType || 'fulfilled_only', total, shipping || 0, tax || 0, lineItemsJson || '[]', Date.now(), createdBy).lastInsertRowid;
+}
+
+export function getPartialInvoices(orderId) {
+  return db.prepare('SELECT * FROM partial_invoices WHERE order_id = ? ORDER BY created_at ASC').all(orderId);
 }
 
