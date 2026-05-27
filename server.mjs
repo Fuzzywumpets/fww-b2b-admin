@@ -3546,29 +3546,25 @@ app.post('/orders/:id/discount', requireAuth, async (req, res) => {
   // Real mode: delegate to /orders/:id/edit with discount fields only
   try {
     const orderId = `gid://shopify/Order/${numId}`;
-    const beginResult = await shopifyFetch(`mutation begin($id:ID!){orderEditBegin(id:$id){calculatedOrder{id}userErrors{field message}}}`, { id: orderId });
-    const calcId = beginResult.data?.orderEditBegin?.calculatedOrder?.id;
+    // Pull calcLineItems[0].id along with calcId to use as the discount target
+    const beginResult = await shopifyFetch(`mutation begin($id:ID!){orderEditBegin(id:$id){
+      calculatedOrder{id lineItems(first:5){edges{node{id title}}}}
+      userErrors{field message}
+    }}`, { id: orderId });
+    const calcOrder = beginResult.data?.orderEditBegin?.calculatedOrder;
+    const calcId = calcOrder?.id;
     if (!calcId) throw new Error('begin failed');
+    const firstCalcLi = calcOrder.lineItems?.edges?.[0]?.node;
+    if (!firstCalcLi) throw new Error('order has no line items for discount target');
     const totResult = await shopifyFetch(`query($id:ID!){order(id:$id){subtotalPriceSet{presentmentMoney{amount}}}}`, { id: orderId });
     const subTotal = parseFloat(totResult.data?.order?.subtotalPriceSet?.presentmentMoney?.amount || 0);
     const discAmt  = type === 'pct' ? subTotal * parseFloat(value) / 100 : parseFloat(value);
-    // Apply discount as a line-item discount on the first existing line (Shopify
-    // refuses negative-priced custom items). Discount value spread across all lines
-    // proportionally would be ideal; this simpler approach lumps it on line 1.
-    const orderLis = await shopifyFetch(`query($id:ID!){order(id:$id){lineItems(first:1){edges{node{id}}}}}`, { id: orderId });
-    const firstLiId = orderLis.data?.order?.lineItems?.edges?.[0]?.node?.id;
-    if (!firstLiId) throw new Error('order has no line items for discount target');
-    // Map original line id -> calculatedLineItem id (same approach as edit route)
-    const calcOrderRes = await shopifyFetch(`query($id:ID!){node(id:$id){... on CalculatedOrder{lineItems(first:50){edges{node{id title variant{id}}}}}}}`, { id: calcId });
-    // node() query may not work — fallback: just use the orderEditBegin response data if we had captured it.
-    // For simplicity, query the calculated order line items by re-running orderEditBegin to refresh.
-    // (orderEditBegin is idempotent per Shopify docs.)
-    // Actually we already have calcId — query its lineItems via direct GraphQL.
-    // Use a different approach: use orderEditAddVariant or just rely on calcId+old lineItemId
+    // Apply discount as a line-item discount on the first calc line item (Shopify
+    // refuses negative-priced custom items; addLineItemDiscount needs the CalculatedLineItem ID).
     const discRes = await shopifyFetch(`mutation discount($id:ID!,$li:ID!,$d:OrderEditAppliedDiscountInput!){
       orderEditAddLineItemDiscount(id:$id,lineItemId:$li,discount:$d){
         calculatedOrder{id} userErrors{field message}}}`,
-      { id: calcId, li: firstLiId, d: { description: `Order discount: ${reason}`, fixedValue: { amount: discAmt.toFixed(2), currencyCode: "USD" } } });
+      { id: calcId, li: firstCalcLi.id, d: { description: `Order discount: ${reason}`, fixedValue: { amount: discAmt.toFixed(2), currencyCode: "USD" } } });
     const dErrs = discRes.data?.orderEditAddLineItemDiscount?.userErrors || [];
     if (dErrs.length) throw new Error(dErrs.map(e => e.message).join(', '));
     await shopifyFetch(`mutation commit($id:ID!,$notify:Boolean!){orderEditCommit(id:$id,notifyCustomer:$notify){order{id}userErrors{field message}}}`,
@@ -3653,7 +3649,7 @@ app.post('/orders/:id/fulfill', requireAuth, async (req, res) => {
     }));
     if (fulfillmentOrderInput.length === 0) throw new Error('No matching open fulfillment orders');
 
-    const result = await shopifyFetch(`mutation fulfill($f:FulfillmentV2Input!){
+    const result = await shopifyFetch(`mutation fulfill($f:FulfillmentInput!){
       fulfillmentCreate(fulfillment:$f){fulfillment{id status} userErrors{field message}}
     }`, { f: { lineItemsByFulfillmentOrder: fulfillmentOrderInput, trackingInfo: trackInput, notifyCustomer: !!notifyCustomer } });
     const errs = result.data?.fulfillmentCreate?.userErrors || [];
