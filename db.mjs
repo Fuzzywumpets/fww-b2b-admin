@@ -623,6 +623,46 @@ export function getCustomerFromCache(shopifyId) {
   return db.prepare('SELECT * FROM customers_cache WHERE shopify_id = ?').get(shopifyId) || null;
 }
 
+export function listCustomersFromCache(filters = {}) {
+  const where = [];
+  const params = [];
+  if (filters.segment === 'b2b') where.push('is_b2b = 1');
+  else if (filters.segment === 'has_orders') where.push('orders_count > 0');
+  else if (filters.segment === 'no_orders') where.push('orders_count = 0');
+  if (filters.q) {
+    where.push('(LOWER(display_name) LIKE ? OR LOWER(email) LIKE ?)');
+    const q = '%' + filters.q.toLowerCase() + '%';
+    params.push(q, q);
+  }
+  if (filters.tag) {
+    where.push('tags LIKE ?');
+    params.push('%' + filters.tag + '%');
+  }
+  let orderBy = 'amount_spent_total DESC';
+  if (filters.sort === 'name_asc') orderBy = 'display_name ASC';
+  else if (filters.sort === 'orders_desc') orderBy = 'orders_count DESC';
+  const sql = `SELECT * FROM customers_cache ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY ${orderBy} LIMIT 100`;
+  const rows = db.prepare(sql).all(...params);
+  // Map to the shape getCustomersData returns (matching live Shopify GraphQL response)
+  return rows.map(r => ({
+    id: r.gid,
+    displayName: r.display_name,
+    email: r.email,
+    phone: null,
+    tags: (r.tags || '').split(',').filter(Boolean),
+    numberOfOrders: r.orders_count || 0,
+    amountSpent: { amount: String(r.amount_spent_total || 0), currencyCode: 'USD' },
+    defaultAddress: r.default_address_json ? JSON.parse(r.default_address_json) : null,
+    metafields: { edges: [] },
+    _fromCache: true,
+    _syncedAt: r.synced_at,
+  }));
+}
+
+export function getCustomerCacheStats() {
+  return db.prepare('SELECT COUNT(*) AS total, MAX(synced_at) AS latest FROM customers_cache').get();
+}
+
 export function getCustomersCountInCache() {
   return db.prepare('SELECT COUNT(*) as n FROM customers_cache').get().n;
 }
@@ -743,7 +783,7 @@ export function setSyncState(resource, { lastSyncedAt, lastCursor, totalSynced, 
       last_error_at = CASE WHEN excluded.last_error IS NOT NULL THEN ? ELSE last_error_at END
   `).run(
     resource, lastSyncedAt || now, lastCursor || null, totalSynced || null,
-    lastError || null, now
+    lastError || null, now, now
   );
 }
 

@@ -8,7 +8,7 @@
  * Flags:
  *   --resource=customers|orders|products    Import a single resource
  *   --all                                   Import all resources (default)
- *   --b2b-only                              Customers: filter tag:b2b-portal
+ *   --b2b-only                              Customers: filter tag:b2b
  *   --full                                  Full re-sync (ignore last cursor)
  *   --since=<ISO>                           Only records updated after ISO date
  *   --all-vendors                           Products: include non-FWW vendors
@@ -112,7 +112,7 @@ async function paginate({ resource, queryFn, transformFn, upsertFn, pageSize = 5
 // ── Customers ─────────────────────────────────────────────────────────────────
 function transformCustomer(node) {
   const tags = node.tags || [];
-  const isB2b = tags.includes('b2b-portal') ? 1 : 0;
+  const isB2b = tags.includes('b2b') ? 1 : 0;
   const shopifyId = node.id.replace('gid://shopify/Customer/', '');
   const addr = node.defaultAddress || null;
   return {
@@ -140,7 +140,7 @@ async function backfillCustomers() {
   console.log(`\nBackfilling customers (b2bOnly=${b2bOnly}, fullSync=${fullSync})...`);
 
   const queryParts = ['query:$q'];
-  const baseQ = b2bOnly ? 'tag:b2b-portal' : '';
+  const baseQ = b2bOnly ? 'tag:b2b' : '';
   const sinceQ = sinceDate ? `updated_at:>${sinceDate}` : '';
   const q = [baseQ, sinceQ].filter(Boolean).join(' ');
 
@@ -184,8 +184,8 @@ function transformOrder(node) {
     processed_at: node.processedAt ? new Date(node.processedAt).getTime() : null,
     cancelled_at: node.cancelledAt ? new Date(node.cancelledAt).getTime() : null,
     closed_at: node.closedAt ? new Date(node.closedAt).getTime() : null,
-    financial_status: node.financialStatus || null,
-    fulfillment_status: node.fulfillmentStatus || null,
+    financial_status: node.displayFinancialStatus || null,
+    fulfillment_status: node.displayFulfillmentStatus || null,
     display_financial_status: node.displayFinancialStatus || null,
     display_fulfillment_status: node.displayFulfillmentStatus || null,
     total_price: parseFloat(node.totalPriceSet?.presentmentMoney?.amount || 0),
@@ -236,7 +236,7 @@ function transformLineItems(orderShopifyId, lineItemsEdges) {
 async function backfillOrders() {
   console.log(`\nBackfilling orders (fullSync=${fullSync})...`);
 
-  const sinceQ = sinceDate ? `updated_at:>${sinceDate}` : 'tag:b2b-portal';
+  const sinceQ = sinceDate ? `updated_at:>${sinceDate}` : 'tag:b2b';
 
   const total = await paginate({
     resource: 'orders',
@@ -246,7 +246,7 @@ async function backfillOrders() {
           orders(first:$first,after:$after,query:$q,sortKey:UPDATED_AT,reverse:true){
             edges{node{
               id name createdAt updatedAt processedAt cancelledAt closedAt
-              financialStatus fulfillmentStatus displayFinancialStatus displayFulfillmentStatus
+              displayFinancialStatus displayFulfillmentStatus
               sourceName note tags
               totalPriceSet{presentmentMoney{amount currencyCode}}
               subtotalPriceSet{presentmentMoney{amount}}

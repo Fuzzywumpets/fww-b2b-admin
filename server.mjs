@@ -30,6 +30,8 @@ import {
   getOrdersFromCache, getOrderFromCache, getOrderSpendFromCache, getCustomerFromCache,
   getCustomersCountInCache, getOrdersCountInCache, getProductsCountInCache,
   getSyncState, setSyncState, getAllInvoicesForList, getPartialInvoicesAll,
+  listCustomersFromCache,
+  getCustomerCacheStats,
 } from './db.mjs';
 import { generateInvoicePdf } from './pdf.mjs';
 import { renderLabelSheet, expandItems, TEMPLATES as LABEL_TEMPLATES, DEFAULT_FIELDS } from './labels.mjs';
@@ -1840,6 +1842,20 @@ function renderOrderDetail(session, order, flash) {
 
 // ── Customers list ────────────────────────────────────────────────────────────
 async function getCustomersData(filters) {
+  // Phase 24D: try local cache first (populated by backfill); fall back to live Shopify
+  if (!MOCK) {
+    try {
+      const stats = getCustomerCacheStats();
+      if (stats && stats.total > 0) {
+        const cached = listCustomersFromCache(filters);
+        if (cached.length > 0) {
+          return { customers: cached, hasNextPage: false, total: cached.length, _fromCache: true, _syncedAt: stats.latest };
+        }
+      }
+    } catch (e) {
+      console.error('cache read failed, falling back to live Shopify:', e.message);
+    }
+  }
   if (MOCK) {
     let customers = [...MOCK_CUSTOMERS];
     if (filters.segment === 'b2b')         customers = customers.filter(c => (c.tags||[]).includes('b2b'));
