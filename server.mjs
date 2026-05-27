@@ -1380,7 +1380,7 @@ function renderVisibleNotesList(notes) {
     </div>`).join('');
 }
 
-function renderOrderDetail(session, order, flash) {
+function renderOrderDetail(session, order, flash, flashMsg) {
   const numId    = shopifyNumericId(order.id);
   const isPaid   = order.displayFinancialStatus === 'PAID';
   // Xero map (read from SQLite)
@@ -1500,7 +1500,7 @@ function renderOrderDetail(session, order, flash) {
     ? `<div class="alert alert-warning">Xero sync failed — queued for retry. Check /accounting.</div>`
     : flash === 'partial_invoice_created'
     ? `<div class="alert alert-success">Partial invoice generated.</div>`
-    : flash === 'order_canceled' ? `<div class="alert alert-success">Order canceled.</div>` : flash === 'cancel_failed' ? `<div class="alert alert-warning">Cancel failed — see logs.</div>` : flash === 'edit_failed' || flash === 'fulfillment_failed' || flash === 'discount_failed'
+    : flash === 'order_canceled' ? `<div class="alert alert-success">Order canceled.</div>` : flash === 'cancel_failed' ? `<div class="alert alert-warning">Cancel failed: ${h(flashMsg || 'see logs')}</div>` : flash === 'edit_failed' || flash === 'fulfillment_failed' || flash === 'discount_failed'
     ? `<div class="alert alert-warning">Action failed — check server logs.</div>`
     : '';
 
@@ -3249,7 +3249,7 @@ app.get('/orders/:id', requireAuth, async (req, res) => {
   // Attach visible notes from portal db (readonly)
   const shopifyId = order.id.startsWith('gid://') ? order.id : `gid://shopify/Order/${order.id}`;
   order.visibleNotes = getVisibleNotesForOrder(shopifyId);
-  res.send(renderOrderDetail(req.adminSession, order, req.query.success || ''));
+  res.send(renderOrderDetail(req.adminSession, order, req.query.success || req.query.error || '', req.query.msg || ''));
 });
 
 app.post('/orders/:id/mark-paid', requireAuth, async (req, res) => {
