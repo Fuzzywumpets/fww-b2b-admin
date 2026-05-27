@@ -500,6 +500,11 @@ export function getBackordersForOrder(orderId) {
     .all(orderId, 'pending');
 }
 
+export function getOpenBackorders() {
+  return db.prepare('SELECT * FROM backorders WHERE status = ? ORDER BY created_at ASC')
+    .all('pending');
+}
+
 export function fulfillBackorder(orderId, lineItemId) {
   db.prepare("UPDATE backorders SET status = 'fulfilled' WHERE order_id = ? AND line_item_id = ?")
     .run(orderId, lineItemId);

@@ -22,7 +22,7 @@ import {
   logLabelBatch, logExportBatch,
   createLead, getLeads, getLeadCounts, getLead, updateLead,
   addLeadNote, getLeadNotes, addLeadStatusHistory, getLeadStatusHistory,
-  upsertBackorder, getBackordersForOrder, fulfillBackorder, logOrderEdit,
+  upsertBackorder, getBackordersForOrder, getOpenBackorders, fulfillBackorder, logOrderEdit,
   getXeroMap, setXeroMap, addXeroPending, getXeroPending, markXeroPendingDone, markXeroPendingFailed, getXeroPendingCount, getXeroInvoiceMaps,
   createImpersonationNonce, consumeImpersonationNonce, gcImpersonationNonces,
   createPartialInvoice, getPartialInvoices, getNextInvoiceLetter,
@@ -871,7 +871,7 @@ function gfonts() {
 function layout({ title, session, activePath = '/', content, extraHead = '' }) {
   const navItems = [
     ['/', 'Dashboard'], ['/orders', 'Orders'], ['/customers', 'Customers'],
-    ['/leads', 'Leads'], ['/catalog', 'Catalog'], ['/reports', 'Reports'],
+    ['/leads', 'Leads'], ['/catalog', 'Catalog'], ['/backorders', 'Backorders'], ['/reports', 'Reports'],
     ['/labels', 'Labels'], ['/exports', 'Exports'],
     ['/tax-exempt', 'Tax Exempt'], ['/accounting', 'Accounting'],
     ['/settings', 'Settings'],
@@ -4487,6 +4487,57 @@ app.post('/orders/:id/backorder', requireAuth, (req, res) => {
 app.get('/api/orders/:id/backorders', requireAuth, (req, res) => {
   const orderId = `gid://shopify/Order/${req.params.id}`;
   res.json({ backorders: getBackordersForOrder(orderId) });
+});
+
+// API: get all open backorders
+app.get('/api/admin/backorders', requireAuth, (req, res) => {
+  res.json({ backorders: getOpenBackorders() });
+});
+
+// ── Task #45: Backorder queue page ──────────────────────────────────────────
+app.get('/backorders', requireAuth, (req, res) => {
+  const backorders = getOpenBackorders();
+  const rows = backorders.map(b => {
+    const numOrderId = b.order_id.replace('gid://shopify/Order/', '');
+    const etaDisplay = b.eta_date ? new Date(b.eta_date + 'T00:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : '—';
+    const age = Math.floor((Date.now() - b.created_at) / 86400000);
+    const ageLabel = age === 0 ? 'today' : age === 1 ? '1 day ago' : `${age} days ago`;
+    return `<tr>
+      <td><a href="/orders/${h(numOrderId)}" class="link">#${h(numOrderId)}</a></td>
+      <td>${h(b.line_item_title || '—')}</td>
+      <td>${h(String(b.quantity))}</td>
+      <td>${h(etaDisplay)}</td>
+      <td><span class="text-muted small-text">${h(ageLabel)}</span></td>
+      <td>${h(b.created_by || '—')}</td>
+    </tr>`;
+  }).join('');
+
+  const content = `
+    <div class="page-header">
+      <h1>Backorder Queue</h1>
+      <span class="badge">${backorders.length} pending</span>
+    </div>
+    ${backorders.length === 0
+      ? `<div class="card"><div class="card-body text-muted" style="padding:2rem;text-align:center">No pending backorders.</div></div>`
+      : `<div class="card">
+        <div class="table-wrap">
+          <table class="data-table" id="backorder-table">
+            <thead>
+              <tr>
+                <th>Order</th>
+                <th>Item</th>
+                <th>Qty</th>
+                <th>ETA</th>
+                <th>Flagged</th>
+                <th>By</th>
+              </tr>
+            </thead>
+            <tbody>${rows}</tbody>
+          </table>
+        </div>
+      </div>`
+    }`;
+  res.send(layout({ title: 'Backorder Queue', session: req.adminSession, activePath: '/backorders', content }));
 });
 
 // ── Phase 14D: Visible notes API (proxies to portal internal) ─────────────────

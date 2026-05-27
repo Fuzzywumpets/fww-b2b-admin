@@ -2312,4 +2312,23 @@ await test('GET /catalog → vendor select has Fuzzywumpets as default option', 
 });
 
 console.log(`\n  ${passed} passed, ${failed} failed`);
+
+// ── Task 45: Backorder queue API ─────────────────────────────────────────────
+console.log('\nAPI tests — Task 45 (Backorder queue):');
+
+{
+  const r = await fetch(`${BASE}/api/admin/backorders`);
+  assert.equal(r.status, 401, 'GET /api/admin/backorders: unauthenticated → 401');
+  console.log('  ✓ /api/admin/backorders: unauthenticated → 401');
+}
+
+{
+  const cookie = await seedSession();
+  const r = await fetch(`${BASE}/api/admin/backorders`, { headers: { Cookie: cookie } });
+  assert.equal(r.status, 200, 'GET /api/admin/backorders: authenticated → 200');
+  const body = await r.json();
+  assert.ok(Array.isArray(body.backorders), '/api/admin/backorders: body.backorders is array');
+  console.log('  ✓ /api/admin/backorders: authenticated → 200, returns backorders array');
+}
+
 if (failed > 0) process.exit(1);

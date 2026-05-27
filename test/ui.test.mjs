@@ -874,6 +874,24 @@ await test('/customers/101 shows activity card that loads on click', async (page
   assert.ok(bodyText && bodyText.length > 5, 'Activity body appears empty after load');
 });
 
+
+// ── Task 45: Backorder queue page ────────────────────────────────────────────
+console.log('\nUI tests — Task 45 (Backorder queue):');
+
+await test('/backorders page loads with table heading', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/backorders`);
+  // Page should have the "Backorder Queue" heading
+  const heading = await page.$('h1');
+  const headingText = heading ? await page.textContent('h1') : '';
+  assert.ok(headingText.includes('Backorder'), `h1 should contain "Backorder", got: "${headingText}"`);
+  // Should have either a table or a "No pending" message
+  const hasTable = await page.$('#backorder-table');
+  const hasEmpty = await page.$('.text-muted');
+  assert.ok(hasTable || hasEmpty, 'Page should have either #backorder-table or empty state message');
+});
+
 await browser.close();
 
 console.log(`\n  ${passed} passed, ${failed} failed`);
