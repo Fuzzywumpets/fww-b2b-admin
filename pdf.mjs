@@ -1,14 +1,40 @@
 import PDFDocument from 'pdfkit';
+import { readFileSync, existsSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 
-const LIME = '#9BBC0E';
-const DARK = '#1a1f2e';
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const ASSETS = join(__dirname, 'assets');
+const FONTS = join(ASSETS, 'fonts');
+
+// Brand palette — but text stays BLACK per alexa's spec
+const LIME = '#9BBC0E';          // accent only (top bar, divider)
+const BLACK = '#000000';          // all text
+const MUTED = '#000000';          // labels still black per spec — using opacity for hierarchy
+
+// Pre-load font + logo paths
+const FONT_PATHS = {
+  'Inter':         join(FONTS, 'Inter-Regular.ttf'),
+  'Inter-SemiBold':join(FONTS, 'Inter-SemiBold.ttf'),
+  'Inter-Bold':    join(FONTS, 'Inter-Bold.ttf'),
+  'Playfair':      join(FONTS, 'PlayfairDisplay-Regular.ttf'),
+  'Playfair-Bold': join(FONTS, 'PlayfairDisplay-Bold.ttf'),
+};
+const LOGO_PATH = join(ASSETS, 'logo.png');
+
+function registerBrandFonts(doc) {
+  for (const [name, path] of Object.entries(FONT_PATHS)) {
+    if (existsSync(path)) {
+      try { doc.registerFont(name, path); }
+      catch (e) { console.error(`Font ${name} register failed:`, e.message); }
+    }
+  }
+}
 
 export async function generateInvoicePdf(order, opts = {}) {
-  // opts.lineItems: array of line item nodes (if partial/filtered)
-  // opts.invoiceSuffix: e.g. "A" → invoice shown as "#1001-A"
-  // opts.subtotal, opts.shipping, opts.total: override computed totals
   return new Promise((resolve, reject) => {
     const doc = new PDFDocument({ margin: 50, size: 'LETTER', autoFirstPage: true });
+    registerBrandFonts(doc);
     const chunks = [];
     doc.on('data', c => chunks.push(c));
     doc.on('end', () => resolve(Buffer.concat(chunks)));
@@ -18,68 +44,113 @@ export async function generateInvoicePdf(order, opts = {}) {
       ? `${order.name || '—'}-${opts.invoiceSuffix}`
       : (order.name || '—');
 
-    // Top accent bar
+    // ─── Top lime accent bar ────────────────────────────────────────
     doc.rect(0, 0, 612, 6).fill(LIME);
 
-    // Company
-    doc.fontSize(20).font('Helvetica-Bold').fillColor(DARK).text('FUZZYWUMPETS', 50, 28);
-    doc.fontSize(9).font('Helvetica').fillColor('#6B7280').text('Part Two Enterprises, Inc. · fuzzywumpets.com', 50, 52);
+    // ─── Logo (left) ────────────────────────────────────────────────
+    if (existsSync(LOGO_PATH)) {
+      try { doc.image(LOGO_PATH, 50, 22, { width: 110 }); }
+      catch (e) {
+        // Fallback to wordmark
+        doc.fontSize(20).font('Inter-Bold').fillColor(BLACK).text('FUZZYWUMPETS', 50, 30);
+      }
+    } else {
+      doc.fontSize(20).font('Inter-Bold').fillColor(BLACK).text('FUZZYWUMPETS', 50, 30);
+    }
 
-    // Invoice meta (right)
-    doc.fontSize(17).font('Helvetica-Bold').fillColor(DARK).text('INVOICE', 400, 28, { align: 'right', width: 162 });
-    doc.fontSize(10).font('Helvetica').fillColor('#374151');
-    doc.text(`Order: ${invoiceName}`, 400, 52, { align: 'right', width: 162 });
-    doc.text(`Date: ${fmtDate(order.processedAt)}`, 400, 67, { align: 'right', width: 162 });
+    // Tagline under logo
+    doc.fontSize(8).font('Inter').fillColor(BLACK).text(
+      'Part Two Enterprises, Inc.  ·  fuzzywumpets.com',
+      50, 138
+    );
 
-    // PAYMENT PENDING watermark
+    // ─── Invoice headline (right) ───────────────────────────────────
+    doc.fontSize(24).font('Playfair-Bold').fillColor(BLACK).text('INVOICE', 400, 28, {
+      align: 'right',
+      width: 162,
+      characterSpacing: 1,
+    });
+    doc.fontSize(10).font('Inter').fillColor(BLACK);
+    doc.text(`Order: ${invoiceName}`, 400, 64, { align: 'right', width: 162 });
+    doc.text(`Date: ${fmtDate(order.processedAt)}`, 400, 79, { align: 'right', width: 162 });
+    if (order.customer?.email) {
+      doc.text(order.customer.email, 400, 94, { align: 'right', width: 162 });
+    }
+
+    // ─── PAYMENT PENDING watermark (only when unpaid) ──────────────
+    // lineBreak:false prevents pdfkit auto-pagination from rotated text
     const isPaid = order.displayFinancialStatus === 'PAID';
     if (!isPaid) {
       doc.save();
-      doc.rotate(-20, { origin: [306, 200] });
-      doc.fontSize(42).font('Helvetica-Bold').fillColor('#DC2626').opacity(0.12)
-        .text('PAYMENT PENDING', 56, 165, { width: 500, align: 'center' });
+      doc.rotate(-20, { origin: [306, 280] });
+      doc.fontSize(48).font('Playfair-Bold').fillColor(BLACK).opacity(0.08)
+        .text('PAYMENT PENDING', 56, 245, { width: 500, align: 'center', lineBreak: false });
       doc.restore();
       doc.opacity(1);
     }
 
-    // Divider
-    doc.moveTo(50, 78).lineTo(562, 78).lineWidth(1).strokeColor(LIME).stroke();
+    // ─── Lime divider ──────────────────────────────────────────────
+    doc.moveTo(50, 160).lineTo(562, 160).lineWidth(1.5).strokeColor(LIME).stroke();
 
-    // Bill To / Ship To
+    // ─── BILL TO / SHIP TO ─────────────────────────────────────────
     const cust = order.customer || {};
     const addr = order.shippingAddress || {};
     const billAddr = order.billingAddress || addr;
+    const billY = 178;
 
-    doc.fontSize(8).font('Helvetica-Bold').fillColor('#6B7280').text('BILL TO', 50, 92);
-    doc.fontSize(10).font('Helvetica-Bold').fillColor(DARK).text(cust.displayName || '—', 50, 104);
-    doc.fontSize(9).font('Helvetica').fillColor('#374151');
-    if (cust.email) doc.text(cust.email, 50, 118);
+    doc.fontSize(8).font('Inter-Bold').fillColor(BLACK).opacity(0.6).text('BILL TO', 50, billY);
+    doc.opacity(1);
+    doc.fontSize(11).font('Inter-Bold').fillColor(BLACK).text(
+      cust.company || cust.displayName || '—', 50, billY + 12
+    );
+    doc.fontSize(9).font('Inter').fillColor(BLACK);
+    let by = billY + 28;
+    if (cust.company && cust.displayName && cust.displayName !== cust.company) {
+      doc.text(`c/o ${cust.displayName}`, 50, by); by += 12;
+    }
+    if (cust.email) { doc.text(cust.email, 50, by); by += 12; }
     if (billAddr.address1) {
-      doc.text(`${billAddr.address1}${billAddr.address2 ? ', ' + billAddr.address2 : ''}`, 50, 132);
-      doc.text(`${billAddr.city || ''}, ${billAddr.province || ''} ${billAddr.zip || ''}`.trim(), 50, 146);
+      doc.text(`${billAddr.address1}${billAddr.address2 ? ', ' + billAddr.address2 : ''}`, 50, by); by += 12;
+      doc.text(`${billAddr.city || ''}, ${billAddr.province || ''} ${billAddr.zip || ''}`.trim(), 50, by); by += 12;
+      if (billAddr.country && billAddr.country !== 'United States') {
+        doc.text(billAddr.country, 50, by);
+      }
     }
 
-    doc.fontSize(8).font('Helvetica-Bold').fillColor('#6B7280').text('SHIP TO', 350, 92);
-    doc.fontSize(10).font('Helvetica-Bold').fillColor(DARK).text(cust.displayName || '—', 350, 104);
-    doc.fontSize(9).font('Helvetica').fillColor('#374151');
+    doc.fontSize(8).font('Inter-Bold').fillColor(BLACK).opacity(0.6).text('SHIP TO', 320, billY);
+    doc.opacity(1);
+    doc.fontSize(11).font('Inter-Bold').fillColor(BLACK).text(
+      addr.company || cust.displayName || '—', 320, billY + 12
+    );
+    doc.fontSize(9).font('Inter').fillColor(BLACK);
+    let sy = billY + 28;
     if (addr.address1) {
-      doc.text(`${addr.address1}${addr.address2 ? ', ' + addr.address2 : ''}`, 350, 118);
-      doc.text(`${addr.city || ''}, ${addr.province || ''} ${addr.zip || ''}`.trim(), 350, 132);
+      doc.text(`${addr.address1}${addr.address2 ? ', ' + addr.address2 : ''}`, 320, sy); sy += 12;
+      doc.text(`${addr.city || ''}, ${addr.province || ''} ${addr.zip || ''}`.trim(), 320, sy); sy += 12;
+      if (addr.country && addr.country !== 'United States') {
+        doc.text(addr.country, 320, sy);
+      }
     }
 
-    // Line items table header
-    const tableTop = 185;
-    doc.rect(50, tableTop, 512, 17).fill('#F3F4F6');
-    doc.fontSize(8).font('Helvetica-Bold').fillColor('#374151');
-    doc.text('ITEM', 56, tableTop + 5);
-    doc.text('SKU', 310, tableTop + 5);
-    doc.text('QTY', 385, tableTop + 5, { width: 40, align: 'right' });
-    doc.text('UNIT PRICE', 430, tableTop + 5, { width: 65, align: 'right' });
-    doc.text('TOTAL', 500, tableTop + 5, { width: 62, align: 'right' });
+    // ─── Line items table ──────────────────────────────────────────
+    const tableTop = 285;
+    doc.rect(50, tableTop, 512, 22).fill('#F8F8F8');
+    doc.fontSize(8).font('Inter-Bold').fillColor(BLACK);
+    doc.text('ITEM', 56, tableTop + 7);
+    doc.text('SKU', 310, tableTop + 7);
+    doc.text('QTY', 385, tableTop + 7, { width: 40, align: 'right' });
+    doc.text('UNIT PRICE', 430, tableTop + 7, { width: 65, align: 'right' });
+    doc.text('TOTAL', 500, tableTop + 7, { width: 62, align: 'right' });
 
-    let y = tableTop + 24;
+    let y = tableTop + 30;
     const lineItems = opts.lineItems ?? (order.lineItems?.edges?.map(e => e.node) || []);
-    doc.font('Helvetica').fillColor('#374151');
+    doc.font('Inter').fillColor(BLACK);
+
+    // Truncate-with-ellipsis helper that respects column width
+    function fitText(s, maxChars) {
+      s = String(s || '—');
+      return s.length > maxChars ? s.slice(0, maxChars - 1) + '…' : s;
+    }
 
     for (const item of lineItems) {
       if (y > 680) {
@@ -92,17 +163,19 @@ export async function generateInvoicePdf(order, opts = {}) {
         ?? 0
       );
       const rowTotal = unitPrice * (item.quantity || 0);
-      doc.fontSize(9.5).text(item.title || '—', 56, y, { width: 248, lineBreak: false });
-      doc.text(item.variant?.sku || '—', 310, y, { width: 70, lineBreak: false });
-      doc.text(String(item.quantity), 385, y, { width: 40, align: 'right', lineBreak: false });
-      doc.text(fmt(unitPrice), 430, y, { width: 65, align: 'right', lineBreak: false });
-      doc.text(fmt(rowTotal), 500, y, { width: 62, align: 'right', lineBreak: false });
-      doc.moveTo(50, y + 14).lineTo(562, y + 14).lineWidth(0.5).strokeColor('#E5E7EB').stroke();
-      y += 18;
+      // Use fixed height: 1 line per row, truncate overflow. height:14 + ellipsis prevents wrap.
+      doc.fontSize(9.5);
+      doc.text(fitText(item.title, 42), 56, y, { width: 248, height: 14, lineBreak: false, ellipsis: true });
+      doc.text(fitText(item.variant?.sku, 14), 310, y, { width: 70, height: 14, lineBreak: false, ellipsis: true });
+      doc.text(String(item.quantity || 0), 385, y, { width: 40, height: 14, align: 'right', lineBreak: false });
+      doc.text(fmt(unitPrice), 430, y, { width: 65, height: 14, align: 'right', lineBreak: false });
+      doc.text(fmt(rowTotal), 500, y, { width: 62, height: 14, align: 'right', lineBreak: false });
+      doc.moveTo(50, y + 16).lineTo(562, y + 16).lineWidth(0.5).strokeColor('#E5E5E5').stroke();
+      y += 20;
     }
 
-    // Totals
-    y += 8;
+    // ─── Totals ────────────────────────────────────────────────────
+    y += 12;
     let sub, ship, total;
     if (opts.subtotal !== undefined) {
       sub   = parseFloat(opts.subtotal) || 0;
@@ -114,35 +187,45 @@ export async function generateInvoicePdf(order, opts = {}) {
       total = parseFloat(order.totalPriceSet?.presentmentMoney?.amount || 0);
     }
 
-    doc.fontSize(9.5).font('Helvetica').fillColor('#374151');
-    doc.text('Subtotal:', 400, y, { width: 100, align: 'right' });
+    doc.fontSize(10).font('Inter').fillColor(BLACK);
+    doc.text('Subtotal', 400, y, { width: 100, align: 'right' });
     doc.text(fmt(sub), 500, y, { width: 62, align: 'right' });
     y += 16;
-    doc.text('Shipping:', 400, y, { width: 100, align: 'right' });
-    doc.text(fmt(ship), 500, y, { width: 62, align: 'right' });
-    y += 16;
-    doc.moveTo(400, y).lineTo(562, y).lineWidth(1).strokeColor('#E5E7EB').stroke();
-    y += 6;
-    doc.fontSize(11).font('Helvetica-Bold').fillColor(DARK);
-    doc.text('TOTAL:', 400, y, { width: 100, align: 'right' });
+    if (ship > 0) {
+      doc.text('Shipping', 400, y, { width: 100, align: 'right' });
+      doc.text(fmt(ship), 500, y, { width: 62, align: 'right' });
+      y += 16;
+    }
+    doc.moveTo(400, y + 2).lineTo(562, y + 2).lineWidth(1.5).strokeColor(LIME).stroke();
+    y += 10;
+    doc.fontSize(13).font('Inter-Bold').fillColor(BLACK);
+    doc.text('TOTAL', 400, y, { width: 100, align: 'right' });
     doc.text(fmt(total), 500, y, { width: 62, align: 'right' });
 
-    if (order.note) {
-      y += 32;
-      doc.fontSize(8).font('Helvetica-Bold').fillColor('#6B7280').text('ORDER NOTES', 50, y);
+    // ─── Payment terms (B2B-specific) ──────────────────────────────
+    if (opts.paymentTerms) {
+      y += 40;
+      doc.fontSize(8).font('Inter-Bold').fillColor(BLACK).opacity(0.6).text('PAYMENT TERMS', 50, y);
+      doc.opacity(1);
       y += 12;
-      doc.fontSize(9.5).font('Helvetica').fillColor('#374151').text(order.note, 50, y, { width: 512 });
+      doc.fontSize(10).font('Inter').fillColor(BLACK).text(opts.paymentTerms, 50, y, { width: 512 });
     }
 
-    // Footer
-    const total_pages = doc.bufferedPageRange().count;
-    for (let i = 0; i < total_pages; i++) {
-      doc.switchToPage(i);
-      doc.fontSize(8).font('Helvetica').fillColor('#9CA3AF').text(
-        'Thank you for your business! Questions? Contact alex@fuzzywumpets.com',
-        50, 742, { align: 'center', width: 512 }
-      );
+    // ─── Order notes ───────────────────────────────────────────────
+    if (order.note) {
+      y += 32;
+      doc.fontSize(8).font('Inter-Bold').fillColor(BLACK).opacity(0.6).text('NOTES', 50, y);
+      doc.opacity(1);
+      y += 12;
+      doc.fontSize(10).font('Inter').fillColor(BLACK).text(order.note, 50, y, { width: 512 });
     }
+
+    // ─── Footer — y=720 sits inside the default bottom margin (742) so no auto-page-break ──
+    doc.fontSize(8).font('Inter').fillColor(BLACK).opacity(0.6).text(
+      'Thank you for your business!  ·  Questions? alex@fuzzywumpets.com  ·  fuzzywumpets.com',
+      50, 720, { align: 'center', width: 512, lineBreak: false }
+    );
+    doc.opacity(1);
 
     doc.end();
   });
