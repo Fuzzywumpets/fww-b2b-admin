@@ -81,3 +81,11 @@
   1. Use Shopify Refund mechanism to credit back the discount amount (issues a partial refund as the order-level discount)
   2. Set the B2B discount via per-line price overrides instead of appliedDiscount at draft creation, leaving the order free for later discounts (refactor)
   3. Manual Shopify admin UI "Edit order" allows this in Shopify Plus only
+
+### Phase 16A Remove line — Shopify VOIDED order edge case
+- Remove-line mutation reaches Shopify (calc-id mapping correct, idMap finds match) and orderEditCommit succeeds
+- But the underlying order.lineItems STILL shows the removed item at qty 1 — the change is queued in calculatedOrder but never persists to the order
+- Order goes into VOIDED state after the commit attempt (a void transaction is added)
+- Hypothesis: orderEditCommit on a draft-completed PENDING order without payment behaves oddly — payment void instead of line item removal
+- Fix path: investigate Shopify behavior on unpaid draft-completed orders + maybe require Mark Paid before edit + remove line
+- Severity: low — qty changes still work fine; only line removal on unpaid orders is the issue

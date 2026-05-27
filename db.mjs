@@ -800,6 +800,13 @@ export function getOrderFromCache(shopifyId) {
   return db.prepare('SELECT * FROM orders_cache WHERE shopify_id = ?').get(shopifyId) || null;
 }
 
+export function getOrderByName(nameOrNumber) {
+  // Accepts '#37055' or '37055'
+  const withHash    = nameOrNumber.startsWith('#') ? nameOrNumber : '#' + nameOrNumber;
+  const withoutHash = nameOrNumber.startsWith('#') ? nameOrNumber.slice(1) : nameOrNumber;
+  return db.prepare('SELECT shopify_id FROM orders_cache WHERE name = ? OR name = ? LIMIT 1').get(withHash, withoutHash) || null;
+}
+
 export function getOrderSpendFromCache(customerId, from, to) {
   let where = 'customer_shopify_id = ? AND cancelled_at IS NULL';
   const params = [customerId];
@@ -969,5 +976,25 @@ export function getTopCustomersAllTime(limit = 5) {
     id: 'gid://shopify/Customer/' + r.id,
     name: r.name, email: r.email,
     spend: r.spend || 0, orders: r.orders || 0,
+  }));
+}
+
+export function listImpersonationsForCustomer(customerId, limit = 10) {
+  return db.prepare(`
+    SELECT nonce, customer_id, customer_email, admin_email,
+           read_only, expires_at, used_at, created_at
+    FROM impersonation_nonces
+    WHERE customer_id = ?
+    ORDER BY created_at DESC
+    LIMIT ?
+  `).all(String(customerId), limit).map(r => ({
+    nonce:        r.nonce,
+    customerId:   r.customer_id,
+    customerEmail:r.customer_email,
+    adminEmail:   r.admin_email,
+    readOnly:     !!r.read_only,
+    expiresAt:    r.expires_at,
+    usedAt:       r.used_at,
+    createdAt:    r.created_at,
   }));
 }

@@ -847,6 +847,33 @@ await test('/catalog?vendor=all shows All vendors option selected', async (page,
   );
 });
 
+
+// ── Task 43: Activity timeline card ──────────────────────────────────────────
+console.log('\nUI tests — Task 43 (Activity timeline):');
+
+await test('/customers/101 shows activity card that loads on click', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/customers/101`);
+  // Activity card should be present
+  const actCard = await page.$('#activity-card');
+  assert.ok(actCard, 'Activity card #activity-card not found on customer detail');
+  // Header should say "Portal Activity"
+  const html = await page.content();
+  assert.ok(html.includes('Portal Activity'), 'Activity card header text not found');
+  // Clicking loads activity data
+  await page.click('#activity-card .card-header');
+  // After click, wait for tbody or "No activity" state
+  await page.waitForFunction(() => {
+    const body = document.getElementById('activity-body');
+    if (!body) return false;
+    const text = body.textContent || '';
+    return !text.includes('Loading…') && text.length > 5;
+  }, { timeout: 8000 });
+  const bodyText = await page.textContent('#activity-body');
+  assert.ok(bodyText && bodyText.length > 5, 'Activity body appears empty after load');
+});
+
 await browser.close();
 
 console.log(`\n  ${passed} passed, ${failed} failed`);

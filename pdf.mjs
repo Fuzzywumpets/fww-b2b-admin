@@ -164,14 +164,20 @@ export async function generateInvoicePdf(order, opts = {}) {
       );
       const rowTotal = unitPrice * (item.quantity || 0);
       // Use fixed height: 1 line per row, truncate overflow. height:14 + ellipsis prevents wrap.
-      doc.fontSize(9.5);
+      const variantTitle = (item.variant?.title && item.variant.title !== 'Default Title') ? item.variant.title : null;
+      const rowH = variantTitle ? 32 : 20;
+      doc.fontSize(9.5).fillColor(BLACK);
       doc.text(fitText(item.title, 42), 56, y, { width: 248, height: 14, lineBreak: false, ellipsis: true });
+      if (variantTitle) {
+        doc.fontSize(8).fillColor('#555555').text(fitText(variantTitle, 50), 56, y + 13, { width: 248, height: 12, lineBreak: false, ellipsis: true });
+        doc.fontSize(9.5).fillColor(BLACK);
+      }
       doc.text(fitText(item.variant?.sku, 14), 310, y, { width: 70, height: 14, lineBreak: false, ellipsis: true });
       doc.text(String(item.quantity || 0), 385, y, { width: 40, height: 14, align: 'right', lineBreak: false });
       doc.text(fmt(unitPrice), 430, y, { width: 65, height: 14, align: 'right', lineBreak: false });
       doc.text(fmt(rowTotal), 500, y, { width: 62, height: 14, align: 'right', lineBreak: false });
-      doc.moveTo(50, y + 16).lineTo(562, y + 16).lineWidth(0.5).strokeColor('#E5E5E5').stroke();
-      y += 20;
+      doc.moveTo(50, y + rowH - 4).lineTo(562, y + rowH - 4).lineWidth(0.5).strokeColor('#E5E5E5').stroke();
+      y += rowH;
     }
 
     // ─── Totals ────────────────────────────────────────────────────

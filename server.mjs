@@ -35,6 +35,8 @@ import {
   listOrdersFromCache, getOrdersCacheStats, getCustomerOrdersFromCache,
   getReportsDataFromCache,
   getTopCustomersAllTime,
+  listImpersonationsForCustomer,
+  getOrderByName,
 } from './db.mjs';
 import { generateInvoicePdf } from './pdf.mjs';
 import { renderLabelSheet, expandItems, TEMPLATES as LABEL_TEMPLATES, DEFAULT_FIELDS } from './labels.mjs';
@@ -824,6 +826,18 @@ function toStateCode(s) {
   return US_STATE_CODES[s] || s;
 }
 
+
+function fmtSyncBadge(syncedAt) {
+  if (!syncedAt) return '';
+  const ms = Date.now() - syncedAt;
+  let label;
+  if (ms < 60000) label = 'just now';
+  else if (ms < 3600000) label = Math.floor(ms / 60000) + ' min ago';
+  else if (ms < 86400000) label = Math.floor(ms / 3600000) + ' hr ago';
+  else label = Math.floor(ms / 86400000) + 'd ago';
+  return `<span class="text-muted small-text" style="font-size:11px;margin-left:8px" title="Cache last refreshed ${new Date(syncedAt).toISOString()}">🔄 Synced ${label}</span>`;
+}
+
 // ── HTML helpers ──────────────────────────────────────────────────────────────
 function h(str) {
   if (str == null) return '';
@@ -948,6 +962,29 @@ function layout({ title, session, activePath = '/', content, extraHead = '' }) {
       }
     });
   })();
+  </script>
+  <script>
+  window.syncCacheNow = async function(btn) {
+    btn.disabled = true;
+    var orig = btn.innerHTML;
+    btn.innerHTML = '\u27F3 Syncing\u2026';
+    try {
+      var r = await fetch('/api/admin/sync-now', { method: 'POST', headers: { 'Content-Type': 'application/json' } });
+      var j = await r.json();
+      if (j && j.ok) {
+        btn.innerHTML = '\u2713 Synced';
+        setTimeout(function(){ window.location.reload(); }, 600);
+      } else {
+        btn.innerHTML = orig;
+        btn.disabled = false;
+        alert('Sync failed: ' + ((j && j.error) || 'unknown'));
+      }
+    } catch (e) {
+      btn.innerHTML = orig;
+      btn.disabled = false;
+      alert('Sync error: ' + e.message);
+    }
+  };
   </script>
 </body>
 </html>`;
@@ -1086,10 +1123,11 @@ async function getDashboardData() {
           lowStockItems.push({ productId: p.id, productTitle: p.title, variantTitle: v.title, sku: v.sku, qty: v.inventoryQuantity });
       }
     }
-    return { openOrdersCount: openOrders.length, openOrders: openOrders.slice(0, 5), weekOrdersCount: weekOrders.length, topCustomers, lowStockItems: lowStockItems.sort((a,b)=>a.qty-b.qty).slice(0,10) };
+    const pendingReview = getCustomersPendingXeroReview();
+    return { openOrdersCount: openOrders.length, openOrders: openOrders.slice(0, 5), weekOrdersCount: weekOrders.length, topCustomers, lowStockItems: lowStockItems.sort((a,b)=>a.qty-b.qty).slice(0,10), pendingReview };
   } catch (err) {
     console.error('getDashboardData error:', err.message);
-    return { error: err.message, openOrdersCount:0, openOrders:[], weekOrdersCount:0, topCustomers:[], lowStockItems:[] };
+    return { error: err.message, openOrdersCount:0, openOrders:[], weekOrdersCount:0, topCustomers:[], lowStockItems:[], pendingReview:[] };
   }
 }
 
@@ -1113,6 +1151,16 @@ function renderDashboard(session, data) {
         <td class="text-right"><a href="/orders?customer=${shopifyNumericId(c.id)}" class="link">${c.orders ?? '—'}</a></td>
       </tr>`).join('')}</tbody></table>`
     : '<p class="empty-state">No customer data</p>';
+
+  const pendingReviewTable = data.pendingReview?.length > 0
+    ? `<table class="data-table compact"><thead><tr><th>Customer</th><th class="text-right">Spend</th><th></th></tr></thead><tbody>
+      ${data.pendingReview.slice(0, 5).map(c => `<tr>
+        <td><a href="/customers/${h(c.id)}">${h(c.company || c.displayName)}</a><br><small class="text-muted">${h(c.email || '')}</small></td>
+        <td class="text-right">$${(c.spend||0).toLocaleString('en-US', {minimumFractionDigits: 0, maximumFractionDigits: 0})}</td>
+        <td class="text-right"><a href="/customers/${h(c.id)}" class="btn btn-ghost btn-sm">Review</a></td>
+      </tr>`).join('')}
+    </tbody></table>${data.pendingReview.length > 5 ? `<p class="text-muted small-text" style="margin-top:8px;font-size:11px">+${data.pendingReview.length - 5} more</p>` : ''}`
+    : '<p class="empty-state">All B2B customers synced to Xero ✓</p>';
 
   const lowStockTable = data.lowStockItems?.length > 0
     ? `<table class="mini-table"><thead><tr><th>Product / Variant</th><th>SKU</th><th>Qty</th></tr></thead><tbody>
@@ -1146,6 +1194,10 @@ function renderDashboard(session, data) {
       <div class="widget">
         <div class="widget-header"><h2>Low Stock (B2B)</h2><a href="/catalog?stock=low" class="widget-link">Catalog →</a></div>
         ${lowStockTable}
+      </div>
+      <div class="widget">
+        <div class="widget-header"><h2>Pending Review</h2><span class="widget-link text-muted" style="font-size:11px">B2B customers not yet in Xero</span></div>
+        ${pendingReviewTable}
       </div>
     </div>
   ` });
@@ -1308,8 +1360,11 @@ function renderOrdersList(session, data, filters) {
 
   return layout({ title: 'Orders', session, activePath: '/orders', content: `
     <div class="page-header-row">
-      <h1>Orders</h1>
-      <a href="/orders/new" class="btn btn-primary">+ New Order</a>
+      <h1>Orders ${fmtSyncBadge(data._syncedAt)}</h1>
+      <div style="display:flex;gap:8px;align-items:center">
+        ${data._fromCache ? '<button type="button" class="btn btn-ghost btn-sm" onclick="syncCacheNow(this)" title="Refresh cache from Shopify">🔄 Sync now</button>' : ''}
+        <a href="/orders/new" class="btn btn-primary">+ New Order</a>
+      </div>
     </div>
     ${flash}
     ${error ? `<div class="alert alert-warning">Shopify unavailable: ${h(error)}</div>` : ''}
@@ -1388,7 +1443,7 @@ async function getOrderDetail(numericId) {
         shippingAddress{firstName lastName address1 address2 city province zip country}
         billingAddress{firstName lastName address1 address2 city province zip country}
         lineItems(first:50){edges{node{id title quantity
-          variant{id sku price inventoryQuantity product{id title}}
+          variant{id title sku barcode selectedOptions{name value} price inventoryQuantity product{id title}}
           discountedUnitPriceSet{presentmentMoney{amount currencyCode}}
           originalUnitPriceSet{presentmentMoney{amount currencyCode}}
         }}}
@@ -1473,7 +1528,10 @@ function renderOrderDetail(session, order, flash, flashMsg) {
         <input type="number" name="qtys[${h(item.id)}]" value="${item.quantity}" min="0" class="edit-qty-input" style="display:none;width:60px">
         <button type="button" class="btn btn-ghost btn-xs edit-remove-btn" style="display:none;margin-left:4px" onclick="markRemove('${h(item.id)}',this)">✕</button>
       </td>
-      <td class="text-right">${fmtMoney(unitPrice)}</td>
+      <td class="text-right">
+        <span class="edit-price-static">${fmtMoney(unitPrice)}</span>
+        <input type="number" step="0.01" min="0" name="prices[${h(item.id)}]" value="${unitPrice.toFixed(2)}" class="edit-price-input" data-retail="${parseFloat(item.originalUnitPriceSet?.presentmentMoney?.amount ?? unitPrice).toFixed(2)}" style="display:none;width:72px">
+      </td>
       <td class="text-right">${fmtMoney(rowTotal)}</td>
     </tr>`;
   }).join('');
@@ -1541,9 +1599,14 @@ function renderOrderDetail(session, order, flash, flashMsg) {
   function toggleEditMode(enable) {
     document.getElementById('edit-mode-bar').style.display = enable ? 'block' : 'none';
     document.getElementById('edit-save-bar').style.display = enable ? 'block' : 'none';
+    var addBar = document.getElementById('edit-add-bar'); if (addBar) addBar.style.display = enable ? 'block' : 'none';
+    var discBar = document.getElementById('edit-discount-bar'); if (discBar) discBar.style.display = enable ? 'block' : 'none';
+    if (!enable) { document.querySelectorAll('tr.custom-line-new').forEach(function(r){ r.remove(); }); if (window.__newCustomLines) window.__newCustomLines = []; var db2 = document.getElementById('edit-discount-bar'); if (db2) db2.querySelectorAll('input').forEach(function(i){ i.value=''; }); }
     document.getElementById('edit-btn').style.display = enable ? 'none' : 'inline-flex';
     document.querySelectorAll('.edit-qty-input').forEach(el => { el.style.display = enable ? 'inline-block' : 'none'; el.disabled = !enable; });
     document.querySelectorAll('.edit-qty-static').forEach(el => { el.style.display = enable ? 'none' : 'inline'; });
+    document.querySelectorAll('.edit-price-input').forEach(el => { el.style.display = enable ? 'inline-block' : 'none'; el.disabled = !enable; });
+    document.querySelectorAll('.edit-price-static').forEach(el => { el.style.display = enable ? 'none' : 'inline'; });
     document.querySelectorAll('.edit-remove-btn').forEach(el => { el.style.display = enable ? 'inline-flex' : 'none'; });
     if (!enable) { document.querySelectorAll('tr[data-removed]').forEach(r => { r.dataset.removed = '0'; r.style.opacity = '1'; }); }
   }
@@ -1574,6 +1637,12 @@ function renderOrderDetail(session, order, flash, flashMsg) {
   }
   function toggleInvoiceModal(show) {
     document.getElementById('invoice-modal').style.display = show ? 'flex' : 'none';
+  }
+  function downloadInvoiceCsv(numId) {
+    var checks = document.querySelectorAll('#csv-cols input[type=checkbox]:checked');
+    var cols = Array.from(checks).map(function(c){ return c.value; }).join(',');
+    if (!cols) { alert('Select at least one column.'); return; }
+    window.location.href = '/orders/' + numId + '/invoice.csv?cols=' + encodeURIComponent(cols);
   }
   function toggleCancelModal(show) {
     document.getElementById('cancel-modal').style.display = show ? 'flex' : 'none';
@@ -1721,7 +1790,7 @@ function renderOrderDetail(session, order, flash, flashMsg) {
     ${flashHtml}
     <div class="detail-header">
       <div class="detail-header-left">
-        <h1><a href="https://admin.shopify.com/store/fuzzywumpets/orders/${h(numId)}" target="_blank" rel="noopener" class="link" title="Open ${h(order.name)} in Shopify admin">${h(order.name)} ↗</a> <span class="badge badge-${h(finStatus)}">${h(order.displayFinancialStatus)}</span>
+        <h1><a href="https://admin.shopify.com/store/parttwoenterprises/orders/${h(numId)}" target="_blank" rel="noopener" class="link" title="Open ${h(order.name)} in Shopify admin">${h(order.name)} ↗</a> <span class="badge badge-${h(finStatus)}">${h(order.displayFinancialStatus)}</span>
             <span class="badge badge-ff-${h(fulStatus)}">${h(order.displayFulfillmentStatus)}</span></h1>
         <p class="text-muted">
           ${order.customer ? `<a href="/customers/${shopifyNumericId(order.customer.id)}">${h(order.customer.displayName)}</a> · ` : ''}
@@ -1769,12 +1838,69 @@ function renderOrderDetail(session, order, flash, flashMsg) {
             <div class="totals-row"><span>Shipping</span><span>${ship}</span></div>
             <div class="totals-row totals-total"><span>Total</span><span>${total}</span></div>
           </div>
+          <div id="edit-add-bar" style="display:none;padding:8px 0">
+            <button type="button" class="btn btn-ghost btn-sm" onclick="addCustomLineRow()" title="Add a one-off line item to this order">+ Add custom line</button>
+          </div>
+          <input type="hidden" name="addCustomLines" id="addCustomLinesInput" value="[]">
+          <div id="edit-discount-bar" style="display:none;padding:12px 0;border-top:1px solid var(--border);margin-top:8px">
+            <div style="font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:8px">Order Discount (optional)</div>
+            <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+              <label style="display:flex;align-items:center;gap:4px;font-size:13px">
+                <input type="number" name="discountPct" placeholder="%" min="0" max="100" step="0.01" class="filter-input" style="width:64px" oninput="if(this.value)this.form.discountFixed.value=''">
+                <span style="color:var(--muted)">% off</span>
+              </label>
+              <span style="color:var(--muted);font-size:12px">or</span>
+              <label style="display:flex;align-items:center;gap:4px;font-size:13px">
+                <span style="color:var(--muted)">$</span>
+                <input type="number" name="discountFixed" placeholder="0.00" min="0" step="0.01" class="filter-input" style="width:80px" oninput="if(this.value)this.form.discountPct.value=''">
+              </label>
+              <input type="text" name="discountReason" placeholder="Reason (required for discount)" class="filter-input" style="width:220px">
+            </div>
+          </div>
           <div id="edit-save-bar" style="display:none;padding:12px 0;border-top:1px solid var(--border);margin-top:8px">
             <input type="text" name="staffNote" placeholder="Staff note (optional)" class="filter-input" style="width:60%;margin-right:8px">
-            <button type="submit" class="btn btn-primary">Save changes</button>
+            <button type="submit" class="btn btn-primary" onclick="serializeCustomLines()">Save changes</button>
             <button type="button" class="btn btn-ghost" onclick="toggleEditMode(false)" style="margin-left:4px">Cancel</button>
           </div>
           </form>
+          <script>
+            (function(){
+              // Track newly added custom-line rows so they can be serialized on submit
+              window.__newCustomLines = [];
+              window.addCustomLineRow = function() {
+                var tbody = document.querySelector('#edit-form table.data-table tbody');
+                if (!tbody) return;
+                var idx = window.__newCustomLines.length;
+                window.__newCustomLines.push({ title: '', qty: 1, price: 0 });
+                var tr = document.createElement('tr');
+                tr.className = 'custom-line-new';
+                tr.dataset.newIdx = idx;
+                tr.innerHTML =
+                  '<td><input type="text" class="filter-input ncl-title" placeholder="Custom item title" style="width:90%"></td>' +
+                  '<td><span class="text-muted">CUSTOM</span></td>' +
+                  '<td class="text-right"><input type="number" class="filter-input ncl-qty" value="1" min="1" step="1" style="width:60px;text-align:right"></td>' +
+                  '<td class="text-right"><input type="number" class="filter-input ncl-price" value="0.00" min="0" step="0.01" style="width:80px;text-align:right"></td>' +
+                  '<td class="text-right"><button type="button" class="btn btn-ghost btn-sm" onclick="removeCustomLineRow(this)" title="Remove this new line">\u00D7</button></td>';
+                tbody.appendChild(tr);
+                tr.querySelector('.ncl-title').focus();
+              };
+              window.removeCustomLineRow = function(btn) {
+                var tr = btn.closest('tr');
+                if (tr) tr.remove();
+              };
+              window.serializeCustomLines = function() {
+                var rows = document.querySelectorAll('tr.custom-line-new');
+                var out = [];
+                rows.forEach(function(r){
+                  var title = r.querySelector('.ncl-title')?.value?.trim();
+                  var qty   = parseInt(r.querySelector('.ncl-qty')?.value, 10);
+                  var price = parseFloat(r.querySelector('.ncl-price')?.value);
+                  if (title && qty > 0 && price >= 0) out.push({ title: title, qty: qty, price: price });
+                });
+                document.getElementById('addCustomLinesInput').value = JSON.stringify(out);
+              };
+            })();
+          </script>
         </div>
         ${/* Discount modal */''}<div id="discount-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center">
           <div style="background:#fff;border-radius:8px;padding:24px;min-width:340px;max-width:480px">
@@ -1973,6 +2099,21 @@ function renderOrderDetail(session, order, flash, flashMsg) {
                 <button type="button" class="btn btn-ghost" onclick="toggleInvoiceModal(false)">Cancel</button>
               </div>
             </form>
+            <hr style="border:none;border-top:1px solid var(--border);margin:16px 0">
+            <div style="font-size:13px;font-weight:600;margin-bottom:10px">Download as CSV</div>
+            <div id="csv-cols" style="display:grid;grid-template-columns:1fr 1fr;gap:6px 16px;font-size:13px;margin-bottom:14px">
+              <label><input type="checkbox" value="title" checked> Product title</label>
+              <label><input type="checkbox" value="variant1" checked> Variant (option 1)</label>
+              <label><input type="checkbox" value="variant2" checked> Variant 2 (option 2)</label>
+              <label><input type="checkbox" value="variant3"> Variant 3 (option 3)</label>
+              <label><input type="checkbox" value="upc"> UPC / Barcode</label>
+              <label><input type="checkbox" value="sku" checked> SKU</label>
+              <label><input type="checkbox" value="retail"> Retail price</label>
+              <label><input type="checkbox" value="wholesale" checked> Wholesale price</label>
+              <label><input type="checkbox" value="qty" checked> Qty</label>
+              <label><input type="checkbox" value="total" checked> Line total</label>
+            </div>
+            <button type="button" class="btn btn-secondary" onclick="downloadInvoiceCsv(${h(numId)})">Download CSV</button>
           </div>
         </div>
         <div class="card">
@@ -2208,7 +2349,10 @@ function renderCustomersList(session, data, filters) {
   const currentSort = filters.sort || 'lifetime_spend_desc';
 
   return layout({ title: 'Customers', session, activePath: '/customers', content: `
-    <div class="page-header-row"><h1>Customers</h1></div>
+    <div class="page-header-row" style="display:flex;align-items:center;justify-content:space-between;gap:8px">
+      <h1>Customers ${fmtSyncBadge(data._syncedAt)}</h1>
+      ${data._fromCache ? '<button type="button" class="btn btn-ghost btn-sm" onclick="syncCacheNow(this)" title="Refresh cache from Shopify">\u{1F504} Sync now</button>' : ''}
+    </div>
     ${error ? `<div class="alert alert-warning">Shopify unavailable: ${h(error)}</div>` : ''}
     <div class="filter-chips">${segmentChips}</div>
     <form class="filter-bar" method="GET" action="/customers">
@@ -2443,8 +2587,20 @@ async function applyB2bConfigUpdate(numericId, body) {
   }
 }
 
-function renderCustomerDetail(session, customer, recentOrders, notes, _dropshipCache, b2bConfig, flash) {
+function renderCustomerDetail(session, customer, recentOrders, notes, _dropshipCache, b2bConfig, flash, impHistory = []) {
   const numId      = shopifyNumericId(customer.id);
+
+  // Phase 22H: Impersonation history card
+  const impHistoryHtml = (impHistory && impHistory.length > 0)
+    ? `<table class="mini-table"><thead><tr><th>When</th><th>Admin</th><th class="text-center">Mode</th><th class="text-center">Used?</th></tr></thead><tbody>
+        ${impHistory.map(ev => `<tr>
+          <td><small>${fmtDate(new Date(ev.createdAt).toISOString())}</small></td>
+          <td><small>${h(ev.adminEmail)}</small></td>
+          <td class="text-center"><span class="badge ${ev.readOnly ? 'badge-secondary' : 'badge-warning'}">${ev.readOnly ? 'Read-only' : 'Full'}</span></td>
+          <td class="text-center">${ev.usedAt ? `<span class="badge badge-success">Yes</span>` : (ev.expiresAt < Date.now() ? `<span class="text-muted">Expired</span>` : `<span class="text-muted">Pending</span>`)}</td>
+        </tr>`).join('')}
+      </tbody></table>`
+    : '<p class="empty-state">No impersonation events yet.</p>';
 
   const flashHtml = flash === 'notes_saved'
     ? `<div class="alert alert-success">Notes saved.</div>`
@@ -2659,6 +2815,73 @@ function renderCustomerDetail(session, customer, recentOrders, notes, _dropshipC
           </div>
           ${recentOrdersHtml}
         </div>
+        <div class="card">
+          <div class="card-header"><h2>Impersonation History</h2><span class="text-muted small-text" style="font-size:11px">last 10</span></div>
+          ${impHistoryHtml}
+        </div>
+
+        <!-- Task 43: Portal Activity Timeline -->
+        <div class="card" id="activity-card">
+          <div class="card-header" style="cursor:pointer" onclick="loadActivity()">
+            <h2>Portal Activity</h2>
+            <span id="activity-header-action" class="btn btn-ghost btn-sm" style="pointer-events:none">Load</span>
+          </div>
+          <div id="activity-body">
+            <p class="text-muted small-text" style="padding:0.75rem 0">Click to load recent portal activity for this customer.</p>
+          </div>
+        </div>
+        <script>
+        (function(){
+          var custId = ${JSON.stringify(numId)};
+          var loaded = false;
+          window.loadActivity = function() {
+            if (loaded) return;
+            loaded = true;
+            var body = document.getElementById('activity-body');
+            var hdr  = document.getElementById('activity-header-action');
+            if (hdr) hdr.textContent = 'Loading…';
+            body.innerHTML = '<p class="text-muted small-text">Loading…</p>';
+            fetch('/api/admin/customers/' + custId + '/activity?limit=20')
+              .then(function(r){ return r.json(); })
+              .then(function(d){
+                if (hdr) { hdr.textContent = d.total + ' events'; }
+                if (!d.rows || !d.rows.length) {
+                  body.innerHTML = '<p class="text-muted small-text" style="padding:0.5rem 0">No activity yet.</p>';
+                  return;
+                }
+                var EVENT_ICONS = { page_view: '👁', cart: '🛒', order: '📦', auth: '🔑', search: '🔍', activity: '📊' };
+                function relTime(ts) {
+                  var diff = Date.now() - ts;
+                  if (diff < 60000) return 'just now';
+                  if (diff < 3600000) return Math.floor(diff/60000) + 'm ago';
+                  if (diff < 86400000) return Math.floor(diff/3600000) + 'h ago';
+                  return new Date(ts).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+                }
+                var rows = d.rows.map(function(r) {
+                  var icon = EVENT_ICONS[r.eventType] || '•';
+                  var label = r.eventSubtype ? r.eventType + ':' + r.eventSubtype : r.eventType;
+                  var path = r.path ? '<span style="color:#888;font-size:11px;margin-left:6px">' + r.path.slice(0,60) + '</span>' : '';
+                  var ua = '';
+                  if (r.eventData) { try { var ed = JSON.parse(r.eventData); if(ed.ua) ua = '<span style="color:#aaa;font-size:10px;margin-left:6px">' + ed.ua.slice(0,40) + '…</span>'; } catch(e){} }
+                  return '<tr>' +
+                    '<td style="font-size:16px;line-height:1;padding-right:8px">' + icon + '</td>' +
+                    '<td style="font-size:13px">' + label + path + ua + '</td>' +
+                    '<td style="font-size:12px;color:#888;white-space:nowrap;text-align:right">' + relTime(r.ts) + '</td>' +
+                  '</tr>';
+                }).join('');
+                body.innerHTML = '<table style="width:100%;border-collapse:collapse">' +
+                  '<thead><tr style="border-bottom:1px solid #eee"><th style="width:32px"></th><th style="font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.4px;color:#888;padding:0 0 6px">Event</th><th style="font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.4px;color:#888;padding:0 0 6px;text-align:right">When</th></tr></thead>' +
+                  '<tbody>' + rows + '</tbody></table>' +
+                  (d.total > 20 ? '<div style="margin-top:8px;text-align:right"><a href="/customers/' + custId + '/activity" class="link text-muted small-text">See all ' + d.total + ' events →</a></div>' : '');
+              })
+              .catch(function(e) {
+                body.innerHTML = '<p style="color:#c00;padding:0.5rem 0">Error loading activity: ' + e.message + '</p>';
+                if (hdr) hdr.textContent = 'Error';
+              });
+          };
+        })();
+        </script>
+
         <div class="card">
           <div class="card-header"><h2>Internal Notes</h2></div>
           <form method="POST" action="/customers/${h(numId)}/notes">
@@ -3029,7 +3252,7 @@ function renderNewOrderForm(session, prefillCustomer) {
       }
 
       setupAutocomplete('customer-search','customer-results','/api/customers/search',function(c){
-        selectedCustomer={id:c.id,name:c.label,email:c.sublabel};
+        selectedCustomer={id:c.id,name:c.label,email:c.sublabel,discountPct:c.discountPct||50};
         customerIdHidden.value=c.id;
         document.getElementById('customer-selected').hidden=false;
         document.getElementById('customer-selected').innerHTML=
@@ -3057,7 +3280,9 @@ function renderNewOrderForm(session, prefillCustomer) {
         var exists = lineItems.findIndex(function(l){ return l.variantId===p.variantId; });
         if(exists>=0){ lineItems[exists].qty++; }
         else {
-          lineItems.push({ variantId:p.variantId, title:p.label, sku:p.sku||'', listPrice:parseFloat(p.price||0), price:(parseFloat(p.price||0)*0.5).toFixed(2), qty:1 });
+          var disc = (selectedCustomer && selectedCustomer.discountPct != null) ? selectedCustomer.discountPct : 50;
+          var wsPrice = (parseFloat(p.price||0) * (1 - disc/100)).toFixed(2);
+          lineItems.push({ variantId:p.variantId, title:p.label, sku:p.sku||'', listPrice:parseFloat(p.price||0), price:wsPrice, qty:1 });
         }
         renderLineItems(); updateTotals();
       });
@@ -3140,8 +3365,10 @@ async function submitNewOrder(req, session) {
         return {
           variantId: `gid://shopify/ProductVariant/${li.variantId}`,
           quantity: parseInt(li.qty, 10),
-          appliedDiscount: li.price && li.listPrice && li.price < li.listPrice
-            ? { value: parseFloat((((li.listPrice - li.price) / li.listPrice) * 100).toFixed(2)), valueType: 'PERCENTAGE' }
+          // NOTE: Shopify ignores originalUnitPrice when variantId is present.
+          // Must use appliedDiscount to set wholesale price on variant-linked items.
+          appliedDiscount: li.price && li.listPrice && parseFloat(li.price) < parseFloat(li.listPrice)
+            ? { value: parseFloat((((parseFloat(li.listPrice) - parseFloat(li.price)) / parseFloat(li.listPrice)) * 100).toFixed(4)), valueType: 'PERCENTAGE' }
             : undefined,
         };
       }),
@@ -3166,11 +3393,62 @@ async function submitNewOrder(req, session) {
     const ue2 = completeRes.data?.draftOrderComplete?.userErrors || [];
     if (ue2.length) return { error: ue2.map(e => e.message).join('; ') };
     const order = completeRes.data?.draftOrderComplete?.draftOrder?.order;
+    const numId = shopifyNumericId(order?.id);
     auditLog(session.email, 'create_order', order?.id, null, { customer_id, lineItemCount: lineItemsParsed.length });
-    return { orderId: shopifyNumericId(order?.id), orderName: order?.name, ok: true };
+
+    // Phase 18: push to Xero as Authorised ACCREC invoice (fire-and-forget; queue on failure)
+    if (numId) {
+      if (isInsider(customer_id)) {
+        console.log('[xero] skipping invoice create for insider customer', customer_id, 'order', numId);
+      } else {
+        (async () => {
+          // brief delay so Shopify order is queryable + tag indexed before we fetch it
+          await new Promise(r => setTimeout(r, 800));
+          try {
+            const xeroInvoiceId = await syncOrderToXero(numId, session.email);
+            console.log('[xero] invoice created for order', numId, '→', xeroInvoiceId);
+          } catch (err) {
+            console.error('[xero] invoice create failed (queued via addXeroPending):', err.message);
+          }
+        })();
+      }
+    }
+
+    return { orderId: numId, orderName: order?.name, ok: true };
   } catch (err) {
     console.error('submitNewOrder error:', err.message);
     return { error: err.message };
+  }
+}
+
+function getCustomersPendingXeroReview() {
+  // B2B customers not yet mapped to a Xero contact (and not insiders).
+  // Helps surface manual-review queue on the dashboard.
+  try {
+    const INSIDERS = new Set(['4742401425601', '5163530813633']);
+    const mapPath = path.join(__dirname, 'data', 'shopify_to_xero_mapping.json');
+    let mapped = new Set();
+    try {
+      const m = JSON.parse(fs.readFileSync(mapPath, 'utf8'));
+      mapped = new Set(Object.keys(m.by_shopify_id || {}));
+    } catch (e) {
+      console.warn('[xero-review] map read failed:', e.message);
+    }
+    const list = listCustomersFromCache({ segment: 'b2b', limit: 999 });
+    return (Array.isArray(list) ? list : []).filter(c => {
+      const id = String(c.id || '').replace(/^gid:\/\/shopify\/Customer\//, '');
+      return id && !mapped.has(id) && !INSIDERS.has(id);
+    }).map(c => ({
+      id:          String(c.id || '').replace(/^gid:\/\/shopify\/Customer\//, ''),
+      displayName: c.displayName,
+      company:     c.company || null,
+      email:       c.email,
+      spend:       c.amountSpent || 0,
+      orders:      c.numberOfOrders || 0,
+    }));
+  } catch (err) {
+    console.error('[xero-review] error:', err.message);
+    return [];
   }
 }
 
@@ -3413,7 +3691,12 @@ app.get('/orders/export.csv', requireAuth, async (req, res) => {
 });
 
 app.get('/orders/:id', requireAuth, async (req, res) => {
-  const order = await getOrderDetail(req.params.id);
+  let order = await getOrderDetail(req.params.id);
+  if (!order) {
+    // Fallback: treat req.params.id as an order name/number (e.g. "37055" for "#37055")
+    const cached = getOrderByName(req.params.id);
+    if (cached) return res.redirect(`/orders/${cached.shopify_id}`);
+  }
   if (!order) return res.status(404).send(layout({ title: '404', session: req.adminSession, activePath: '/orders',
     content: '<div class="page-header"><h1>Order not found</h1></div><a href="/orders" class="btn btn-secondary">← Orders</a>' }));
   // Attach visible notes from portal db (readonly)
@@ -3508,6 +3791,61 @@ app.post('/orders/:id/send-chase-invoice', requireAuth, async (req, res) => {
     return res.json({ ok: true, status: 'stubbed', message: 'Chase invoice intent logged. Wire Chase API to send real link.' });
   }
   res.redirect(`/orders/${numId}?success=chase_invoice_queued`);
+});
+
+
+// ── Invoice CSV export ────────────────────────────────────────────────────────
+function buildInvoiceCsv(order, cols) {
+  const lineItems = order.lineItems?.edges?.map(e => e.node) || [];
+  // Discover option names from first item that has them
+  const optionNames = [];
+  for (const item of lineItems) {
+    (item.variant?.selectedOptions || []).forEach((o, i) => {
+      if (!optionNames[i]) optionNames[i] = o.name;
+    });
+    if (optionNames.length >= 3) break;
+  }
+  const headers = [];
+  if (cols.includes('title'))    headers.push('Product');
+  if (cols.includes('variant1')) headers.push(optionNames[0] || 'Variant 1');
+  if (cols.includes('variant2') && optionNames[1]) headers.push(optionNames[1]);
+  if (cols.includes('variant3') && optionNames[2]) headers.push(optionNames[2]);
+  if (cols.includes('upc'))      headers.push('UPC / Barcode');
+  if (cols.includes('sku'))      headers.push('SKU');
+  if (cols.includes('retail'))   headers.push('Retail Price');
+  if (cols.includes('wholesale'))headers.push('Wholesale Price');
+  if (cols.includes('qty'))      headers.push('Qty');
+  if (cols.includes('total'))    headers.push('Line Total');
+  const rows = [headers];
+  for (const item of lineItems) {
+    const wholesale = parseFloat(item.discountedUnitPriceSet?.presentmentMoney?.amount ?? item.originalUnitPriceSet?.presentmentMoney?.amount ?? 0);
+    const retail    = parseFloat(item.originalUnitPriceSet?.presentmentMoney?.amount ?? 0);
+    const opts = item.variant?.selectedOptions || [];
+    const row = [];
+    if (cols.includes('title'))    row.push(item.title || '');
+    if (cols.includes('variant1')) { const v = opts[0]?.value || ''; row.push(v === 'Default Title' ? '' : v); }
+    if (cols.includes('variant2') && optionNames[1]) row.push(opts[1]?.value || '');
+    if (cols.includes('variant3') && optionNames[2]) row.push(opts[2]?.value || '');
+    if (cols.includes('upc'))      row.push(item.variant?.barcode || '');
+    if (cols.includes('sku'))      row.push(item.variant?.sku || '');
+    if (cols.includes('retail'))   row.push(retail.toFixed(2));
+    if (cols.includes('wholesale'))row.push(wholesale.toFixed(2));
+    if (cols.includes('qty'))      row.push(String(item.quantity || 0));
+    if (cols.includes('total'))    row.push((wholesale * (item.quantity || 0)).toFixed(2));
+    rows.push(row);
+  }
+  return rows.map(r => r.map(v => `"${String(v).replace(/"/g, '""')}"`).join(',')).join('\r\n');
+}
+
+app.get('/orders/:id/invoice.csv', requireAuth, async (req, res) => {
+  const order = await getOrderDetail(req.params.id);
+  if (!order) return res.status(404).send('Order not found');
+  const cols = String(req.query.cols || 'title,variant1,variant2,sku,wholesale,qty,total').split(',').map(s => s.trim());
+  const csv = buildInvoiceCsv(order, cols);
+  const safeName = (order.name || req.params.id).replace(/[^a-z0-9\-_#]/gi, '-');
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename="${safeName}-invoice.csv"`);
+  res.send('﻿' + csv);  // BOM for Excel UTF-8 detection
 });
 
 app.get('/orders/:id/invoice.pdf', requireAuth, async (req, res) => {
@@ -3629,12 +3967,26 @@ app.get('/api/admin/orders/:id/partial-invoices', requireAuth, (req, res) => {
 app.post('/orders/:id/edit', requireAuth, async (req, res) => {
   const numId   = req.params.id;
   const session = req.adminSession;
-  const { qtys, removes, staffNote, discountPct, discountFixed, discountReason } = req.body;
+  const { qtys, removes, staffNote, discountPct, discountFixed, discountReason, addCustomLines, prices } = req.body;
   // qtys: { lineItemId: newQty, ... }   removes: [lineItemId, ...]
   const qtysMap   = Object.fromEntries(Object.entries(qtys || {}).map(([k,v]) => [k, parseInt(v,10) || 0]));
   const removeSet = new Set([removes || []].flat());
 
-  const changes = { qtys: qtysMap, removes: [...removeSet], discountPct, discountFixed, discountReason };
+  // Phase 16A: parse new custom-line additions
+  let newCustomLines = [];
+  try {
+    const raw = typeof addCustomLines === 'string' ? JSON.parse(addCustomLines || '[]') : (addCustomLines || []);
+    newCustomLines = (Array.isArray(raw) ? raw : []).filter(l => l && l.title && Number(l.qty) > 0 && Number(l.price) >= 0).map(l => ({
+      title: String(l.title).slice(0, 200),
+      qty:   parseInt(l.qty, 10),
+      price: parseFloat(l.price),
+    }));
+  } catch (e) {
+    console.warn('[order-edit] addCustomLines parse failed:', e.message);
+  }
+
+  const pricesMap = Object.fromEntries(Object.entries(prices || {}).map(([k,v]) => [k, parseFloat(v) || 0]));
+  const changes = { qtys: qtysMap, removes: [...removeSet], prices: pricesMap, discountPct, discountFixed, discountReason, addCustomLines: newCustomLines };
 
   if (MOCK) {
     const order = getMockOrder(numId);
@@ -3671,7 +4023,12 @@ app.post('/orders/:id/edit', requireAuth, async (req, res) => {
       mutation begin($id:ID!){orderEditBegin(id:$id){
         calculatedOrder{
           id
-          lineItems(first:100){edges{node{id title quantity variant{id}}}}
+          lineItems(first:100){edges{node{
+            id title quantity variant{id}
+            calculatedDiscountAllocations{
+              discountApplication{id targetType targetSelection}
+            }
+          }}}
         }
         userErrors{field message}
       }}
@@ -3683,7 +4040,7 @@ app.post('/orders/:id/edit', requireAuth, async (req, res) => {
       throw new Error(errs.map(e => e.message).join(', ') || 'orderEditBegin failed');
     }
     // Fetch original order line items to pair original IDs with variant/title
-    const origRes = await shopifyFetch(`query($id:ID!){order(id:$id){lineItems(first:100){edges{node{id title variant{id}}}}}}`, { id: orderId });
+    const origRes = await shopifyFetch(`query($id:ID!){order(id:$id){lineItems(first:100){edges{node{id title variant{id} originalUnitPriceSet{presentmentMoney{amount}} discountedUnitPriceSet{presentmentMoney{amount}}}}}}}`, { id: orderId });
     const origItems = origRes.data?.order?.lineItems?.edges?.map(e => e.node) || [];
     const calcItems = calcOrder.lineItems?.edges?.map(e => e.node) || [];
     // Map original_li_id -> calc_li_id
@@ -3695,6 +4052,23 @@ app.post('/orders/:id/edit', requireAuth, async (req, res) => {
       if (!match) match = calcItems.find(c => c.title === orig.title && !c.variant);
       if (!match) match = calcItems.find(c => c.title === orig.title);
       if (match) idMap[orig.id] = match.id;
+    }
+    // Build map: origLiId -> { discountAppId, retailPrice, wholesalePrice }
+    const discountIdMap = {};
+    for (const orig of origItems) {
+      const calcLiId = idMap[orig.id];
+      if (!calcLiId) continue;
+      const calcItem = calcItems.find(c => c.id === calcLiId);
+      // Prefer explicit per-line B2B discount over admin order-level discounts (targetSelection:ALL)
+      const discApp = calcItem?.calculatedDiscountAllocations
+        ?.map(a => a.discountApplication)
+        ?.find(da => da?.targetSelection === 'EXPLICIT')
+        || calcItem?.calculatedDiscountAllocations?.[0]?.discountApplication;
+      const retailPrice = parseFloat(orig.originalUnitPriceSet?.presentmentMoney?.amount || 0);
+      const wholesalePrice = parseFloat(orig.discountedUnitPriceSet?.presentmentMoney?.amount || retailPrice);
+      if (discApp?.id && retailPrice > 0) {
+        discountIdMap[orig.id] = { discountAppId: discApp.id, retailPrice, wholesalePrice };
+      }
     }
     // Apply qty changes and removes using calculated line item IDs
     for (const [origLiId, newQty] of Object.entries(qtysMap)) {
@@ -3714,6 +4088,41 @@ app.post('/orders/:id/edit', requireAuth, async (req, res) => {
           calculatedOrder{id} userErrors{field message}}}`,
         { id: calcId, li: calcLiId, qty: 0, r: true });
     }
+    // Apply per-line price changes: remove existing B2B discount + add new one at new %
+    // Note: orderEditUpdateDiscount stacks on commit — must remove+add instead.
+    for (const [origLiId, newPrice] of Object.entries(pricesMap)) {
+      const info = discountIdMap[origLiId];
+      if (!info) continue;  // no B2B discount on this line (custom item or no discount)
+      const calcLiId = idMap[origLiId];
+      if (!calcLiId) continue;
+      const currentPrice = info.wholesalePrice;
+      if (Math.abs(newPrice - currentPrice) < 0.005) continue;  // no change
+      const newPct = ((info.retailPrice - newPrice) / info.retailPrice) * 100;
+      if (newPct < 0 || newPct > 100) { console.warn('[order-edit] price out of range — skipping', origLiId); continue; }
+      // Step 1: remove existing per-line B2B discount
+      const remRes = await shopifyFetch(
+        `mutation rem($id:ID!,$did:ID!){
+          orderEditRemoveDiscount(id:$id,discountApplicationId:$did){
+            calculatedOrder{id} userErrors{field message}
+          }
+        }`,
+        { id: calcId, did: info.discountAppId }
+      );
+      const remErrs = remRes.data?.orderEditRemoveDiscount?.userErrors || [];
+      if (remErrs.length) { console.error('[order-edit] remove discount failed:', JSON.stringify(remErrs)); continue; }
+      // Step 2: add new discount at adjusted percentage
+      const addRes = await shopifyFetch(
+        `mutation add($id:ID!,$li:ID!,$d:OrderEditAppliedDiscountInput!){
+          orderEditAddLineItemDiscount(id:$id,lineItemId:$li,discount:$d){
+            addedDiscountStagedChange{id} calculatedOrder{id} userErrors{field message}
+          }
+        }`,
+        { id: calcId, li: calcLiId, d: { percentValue: parseFloat(newPct.toFixed(4)), description: 'B2B price adj' } }
+      );
+      const addErrs = addRes.data?.orderEditAddLineItemDiscount?.userErrors || [];
+      if (addErrs.length) console.error('[order-edit] add discount failed:', JSON.stringify(addErrs));
+      else console.log('[order-edit] price updated:', origLiId, currentPrice, '->', newPrice, `(${newPct.toFixed(2)}%)`);
+    }
     // Apply order-level discount as a custom item
     if ((discountPct || discountFixed) && discountReason) {
       // Fetch current order total to compute discount amount
@@ -3725,6 +4134,19 @@ app.post('/orders/:id/edit', requireAuth, async (req, res) => {
           calculatedOrder{id} userErrors{field message}}}`,
         { id: calcId, title: `Order discount: ${discountReason}`, price: { amount: `-${discAmt.toFixed(2)}`, currencyCode: "USD" }, qty: 1 });
     }
+    // Phase 16A: add new custom items before commit
+    for (const line of newCustomLines) {
+      const addRes = await shopifyFetch(`mutation addItem($id:ID!,$title:String!,$price:MoneyInput!,$qty:Int!){
+        orderEditAddCustomItem(id:$id,title:$title,price:$price,quantity:$qty,taxable:false,requiresShipping:true){
+          calculatedOrder{id} userErrors{field message}}}`,
+        { id: calcId, title: line.title, price: { amount: line.price.toFixed(2), currencyCode: 'USD' }, qty: line.qty });
+      const addErrs = addRes.data?.orderEditAddCustomItem?.userErrors || [];
+      if (addErrs.length) {
+        console.error('[order-edit] addCustomItem failed:', JSON.stringify(addErrs));
+        // continue with remaining lines; soft-fail
+      }
+    }
+
     // Commit
     await shopifyFetch(`mutation commit($id:ID!,$notify:Boolean!,$note:String){
       orderEditCommit(id:$id,notifyCustomer:$notify,staffNote:$note){
@@ -4202,7 +4624,8 @@ app.get('/customers/:id', requireAuth, async (req, res) => {
     content: '<div class="page-header"><h1>Customer not found</h1></div><a href="/customers" class="btn btn-secondary">← Customers</a>' }));
   const notes    = getCustomerNotes(shopifyCustomerGid(req.params.id));
   const dropship = getDropshipCache(shopifyCustomerGid(req.params.id));
-  res.send(renderCustomerDetail(req.adminSession, customer, recentOrders, notes, dropship, b2bConfig, req.query.success || ''));
+  const impHistory = listImpersonationsForCustomer(shopifyCustomerGid(req.params.id), 10);
+  res.send(renderCustomerDetail(req.adminSession, customer, recentOrders, notes, dropship, b2bConfig, req.query.success || '', impHistory));
 });
 
 app.post('/customers/:id/notes', requireAuth, (req, res) => {
@@ -4299,6 +4722,19 @@ app.put('/api/admin/customers/:id/b2b-config', requireAuth, async (req, res) => 
 });
 
 // ── 19A: Customer spend API ──
+
+// Manual cache refresh endpoint
+app.post('/api/admin/sync-now', requireAuth, async (req, res) => {
+  try {
+    if (typeof syncRecentFromShopify === 'function') {
+      await syncRecentFromShopify();
+    }
+    res.json({ ok: true, syncedAt: Date.now() });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/api/admin/customers/:id/spend', requireAuth, async (req, res) => {
   const numId  = req.params.id;
   const fromTs = req.query.from ? new Date(req.query.from).getTime() : 0;
@@ -4412,12 +4848,22 @@ app.get('/api/customers/search', requireAuth, async (req, res) => {
           return r.data?.customers?.edges?.map(e => e.node) || [];
         } catch { return []; }
       })();
-  res.json(customers.slice(0, 10).map(c => ({
-    id:       shopifyNumericId(c.id),
-    label:    c.displayName,
-    sublabel: c.email,
-    address:  c.defaultAddress || null,
-  })));
+  const discountDefault = parseInt(getSetting('b2b_discount_pct') ?? '50', 10);
+  res.json(customers.slice(0, 10).map(c => {
+    const numId = shopifyNumericId(c.id);
+    let discountPct = discountDefault;
+    try {
+      const cfg = getB2bConfigFromCache ? getB2bConfigFromCache(numId) : null;
+      if (cfg?.discount_pct != null) discountPct = parseInt(cfg.discount_pct, 10);
+    } catch (e) { /* ignore */ }
+    return {
+      id:          numId,
+      label:       c.displayName,
+      sublabel:    c.email,
+      address:     c.defaultAddress || null,
+      discountPct: discountPct,
+    };
+  }));
 });
 
 app.get('/api/products/search', requireAuth, async (req, res) => {
@@ -4873,7 +5319,7 @@ function renderProductDetail(session, product) {
     </tr>`;
   }).join('');
 
-  const shopifyEditUrl = `https://admin.shopify.com/store/fuzzywumpets/products/${numId}`;
+  const shopifyEditUrl = `https://admin.shopify.com/store/parttwoenterprises/products/${numId}`;
 
   const nonFwwBanner = (product.vendor && product.vendor !== 'Fuzzywumpets')
     ? `<div class="alert alert-info" style="margin-bottom:16px">ℹ This product is from vendor <strong>${h(product.vendor)}</strong> (not Fuzzywumpets). Most catalog operations don't apply.</div>`
@@ -7157,6 +7603,8 @@ async function syncRecentFromShopify() {
 // Start polling every 5 minutes (skips if MOCK or no bearer)
 if (!MOCK) {
   setInterval(syncRecentFromShopify, 5 * 60 * 1000);
+  // Daily GC for expired impersonation nonces
+  setInterval(() => gcImpersonationNonces(), 24 * 60 * 60 * 1000);
 }
 
 // ── Phase 24E: Unified invoices page ──────────────────────────────────────────
