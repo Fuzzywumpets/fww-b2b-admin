@@ -3145,3 +3145,255 @@ purge, or move to a TSDB.
 - 90-day retention enforced via daily purge
 - All raw IPs hashed; only country code preserved
 - All tests green
+
+## Phase 24 — Real customer + order + invoice history import & sync
+
+alexa's directive 2026-05-26: import real Shopify data (customers, orders, invoices) into the
+admin's local SQLite so the tool isn't constantly round-tripping to Shopify GraphQL. Faster
+queries, better reporting, offline resilience, historical preservation.
+
+### Why
+
+Right now (Phases 9, 19A, 20) admin pulls data LIVE from Shopify via shopify-bridge on every
+page load. Pain points:
+- Mia Wagner's customer detail = 254 order GraphQL query → 1.5-3 sec per load
+- Cross-customer aggregations require N+1 queries
+- If Shopify is rate-limited or down, admin breaks
+- Can't filter/sort across the full history fast (e.g., "all orders > $500 in last 90 days")
+- Lead conversion + Xero sync produce orphan local rows with no Shopify counterpart cached
+- Phase 17 wholesale leads + Phase 19A spend would benefit enormously from local indexing
+
+### 24A — Local SQLite schema (admin side)
+
+Tables (add to existing admin db):
+
+```sql
+-- Customer mirror (Shopify is source of truth; we cache + index)
+CREATE TABLE customers_cache (
+  shopify_id TEXT PRIMARY KEY,              -- numeric ID
+  gid TEXT NOT NULL,                         -- full GID for API calls
+  email TEXT,
+  first_name TEXT,
+  last_name TEXT,
+  display_name TEXT,
+  company TEXT,                              -- from defaultAddress.company
+  tags TEXT,                                 -- comma-separated
+  is_b2b INTEGER,                            -- derived: has 'b2b' tag
+  amount_spent_total REAL,                   -- from amountSpent.amount
+  orders_count INTEGER,                      -- numberOfOrders
+  first_order_at INTEGER,                    -- epoch ms
+  last_order_at INTEGER,
+  default_address_json TEXT,                 -- JSON blob: {address1, city, region, zip, country, phone}
+  created_at INTEGER,
+  updated_at INTEGER,                        -- Shopify's updatedAt
+  synced_at INTEGER NOT NULL                 -- our local sync timestamp
+);
+CREATE INDEX idx_customers_b2b ON customers_cache(is_b2b, amount_spent_total DESC);
+CREATE INDEX idx_customers_email ON customers_cache(email);
+CREATE INDEX idx_customers_last_order ON customers_cache(last_order_at DESC);
+
+-- Order mirror
+CREATE TABLE orders_cache (
+  shopify_id TEXT PRIMARY KEY,               -- numeric ID
+  gid TEXT NOT NULL,
+  name TEXT,                                  -- e.g. "#1234"
+  customer_shopify_id TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER,
+  processed_at INTEGER,
+  cancelled_at INTEGER,
+  closed_at INTEGER,
+  financial_status TEXT,                      -- paid, pending, refunded, partially_paid, voided
+  fulfillment_status TEXT,                    -- unfulfilled, partial, fulfilled
+  display_financial_status TEXT,
+  display_fulfillment_status TEXT,
+  total_price REAL,
+  subtotal_price REAL,
+  total_tax REAL,
+  total_shipping REAL,
+  total_discounts REAL,
+  total_refunded REAL,
+  currency TEXT,
+  tags TEXT,
+  source_name TEXT,                           -- pos, web, sparklayer, etc
+  channel_name TEXT,                          -- Online Store / POS / B2B Portal / Manual
+  note TEXT,
+  shipping_address_json TEXT,
+  billing_address_json TEXT,
+  customer_email TEXT,
+  customer_phone TEXT,
+  fulfillments_json TEXT,                     -- JSON array of fulfillments
+  refunds_json TEXT,                          -- JSON array of refunds
+  metafields_json TEXT,                       -- JSON of b2b.* metafields
+  synced_at INTEGER NOT NULL,
+  FOREIGN KEY (customer_shopify_id) REFERENCES customers_cache(shopify_id)
+);
+CREATE INDEX idx_orders_customer ON orders_cache(customer_shopify_id, created_at DESC);
+CREATE INDEX idx_orders_created ON orders_cache(created_at DESC);
+CREATE INDEX idx_orders_status ON orders_cache(financial_status, fulfillment_status);
+CREATE INDEX idx_orders_source ON orders_cache(source_name);
+
+-- Order line items (denormalized for fast product-based queries)
+CREATE TABLE order_line_items_cache (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  order_shopify_id TEXT NOT NULL,
+  line_id TEXT,                               -- Shopify line item ID
+  variant_shopify_id TEXT,
+  product_shopify_id TEXT,
+  sku TEXT,
+  title TEXT,                                 -- product title
+  variant_title TEXT,
+  quantity INTEGER,
+  price REAL,                                 -- unit
+  total_discount REAL,
+  taxable INTEGER,
+  vendor TEXT,
+  synced_at INTEGER NOT NULL,
+  FOREIGN KEY (order_shopify_id) REFERENCES orders_cache(shopify_id)
+);
+CREATE INDEX idx_lineitems_order ON order_line_items_cache(order_shopify_id);
+CREATE INDEX idx_lineitems_variant ON order_line_items_cache(variant_shopify_id);
+CREATE INDEX idx_lineitems_sku ON order_line_items_cache(sku);
+
+-- Sync state tracker
+CREATE TABLE sync_state (
+  resource TEXT PRIMARY KEY,                  -- 'customers', 'orders', 'orders_recent'
+  last_synced_at INTEGER NOT NULL,
+  last_cursor TEXT,                           -- Shopify GraphQL cursor for resumable pagination
+  total_synced INTEGER,
+  last_error TEXT,
+  last_error_at INTEGER
+);
+```
+
+### 24B — Backfill script (one-shot)
+
+`scripts/backfill-shopify.mjs` runs a complete history pull:
+
+```
+node scripts/backfill-shopify.mjs --resource=customers [--full | --b2b-only] [--since=ISO]
+node scripts/backfill-shopify.mjs --resource=orders [--full | --since=ISO]
+node scripts/backfill-shopify.mjs --resource=line-items
+node scripts/backfill-shopify.mjs --all
+```
+
+**Customer backfill**:
+- Paginate Shopify GraphQL `customers(first: 250, after: cursor)` until done
+- For each: upsert into `customers_cache` (INSERT OR REPLACE on shopify_id)
+- Default: `--b2b-only` (tag:b2b query filter) — fast first pass for the ~45 B2B customers
+- `--full`: pull every customer (~5K+ for FWW — runs in background, takes ~5-15 min)
+- Progress log to stdout + `runs/backfill-customers.log`
+
+**Order backfill**:
+- For each B2B customer, paginate `customer.orders(first: 250, after: cursor)` until done
+- Upsert into `orders_cache` + line items into `order_line_items_cache`
+- `--since=YYYY-MM-DD`: only pull orders newer than that date
+- `--full` (default for first run): all-time history
+- Parallel: 5 concurrent customer-orders fetches (respect Shopify 2 req/s REST + GraphQL bucket)
+- Estimate: 45 B2B customers × avg 30 orders = ~1,400 orders to pull. With pagination + concurrency ~3-5 min
+
+**Run on first deploy** + commit results to verify:
+```
+node scripts/backfill-shopify.mjs --all 2>&1 | tee runs/backfill-$(date +%s).log
+```
+
+### 24C — Incremental sync (ongoing)
+
+**Two paths:**
+
+1. **Webhook-driven (preferred)** — Shopify webhooks:
+   - `customers/create`, `customers/update`, `customers/delete`
+   - `orders/create`, `orders/updated`, `orders/cancelled`, `orders/fulfilled`, `orders/paid`,
+     `orders/partially_fulfilled`, `refunds/create`
+   - New endpoint `POST /webhooks/shopify` with HMAC verification + topic dispatcher
+   - On webhook fire: upsert the affected row immediately
+
+2. **Polling fallback** (every 5 min):
+   - `setInterval(syncRecent, 5 * 60 * 1000)` queries `customers(updatedAt>:lastSync)` +
+     `orders(updatedAt>:lastSync)` → upsert
+   - Catches anything webhooks missed (delivery failures, replays)
+
+**Webhook registration**: one-time on admin startup, idempotent via Shopify Admin API
+`webhookSubscriptionCreate`. Topics + callback URL stored in `~/.config/fww-b2b-admin/`.
+
+### 24D — Switch admin routes to read from cache
+
+Replace live-Shopify reads with local cache reads in:
+- `/api/admin/customers` list → query `customers_cache` (instant)
+- `/api/admin/customers/:id` detail → query `customers_cache` + `orders_cache` for that customer
+- `/api/admin/customers/:id/spend` (Phase 19A) → SQL aggregate on `orders_cache` (sub-100ms vs 2-3s)
+- `/api/admin/orders` list + filters → query `orders_cache`
+- `/api/admin/orders/:id` detail → query `orders_cache` + line items + JOIN to `customers_cache`
+
+For mutations (order edit, fulfill, discount), STILL go through Shopify Admin API (source of
+truth), then refresh the local cache row after success.
+
+**Cache freshness badge** on every detail page:
+- Header shows "Last synced: 2 min ago · [Sync now]" with manual refresh button
+- Button triggers immediate single-resource refresh (no full backfill)
+
+### 24E — Invoices
+
+"Invoice history" is a hybrid:
+- **Shopify-generated invoices** (PDFs from existing /orders/:id/invoice route): nothing new
+  needed, render on-demand from `orders_cache`
+- **Phase 18 Xero invoices**: already tracked in `xero_invoice_map` SQLite table
+- **Partial invoices** (Phase 16E): already in `partial_invoices` table
+
+New page `/admin/invoices` (NEW, not previously specced):
+- Unified list of all generated invoices across all customers
+- Filter: customer / date range / type (Shopify PDF / Xero / partial) / status (paid / pending)
+- Columns: invoice number · customer · order # · date · amount · type · status · download
+- Click row → opens PDF in new tab
+
+Data sources:
+- `orders_cache` for Shopify-generated invoices (every paid order has an implicit invoice)
+- `xero_invoice_map` for Xero
+- `partial_invoices` for Phase 16E partials
+
+### 24F — Reporting unlocked by local cache
+
+New `/admin/reports` page (NEW) leveraging the cache:
+- **Sales by customer** — top N by month/quarter/year
+- **Sales by product/SKU** — bestsellers, slow movers
+- **Sales by source** — Online Store / POS / B2B Portal / SparkLayer / Manual
+- **Cohort analysis** — first-order-month buckets, retention by quarter
+- **Outstanding A/R** — unpaid orders aged 30/60/90+ days (cross-references credit limit Phase 11/Tier-A)
+- **B2B vs retail** — segment comparison
+
+All SQL queries on local cache → sub-second response. CSV/PDF export per report.
+
+### 24G — Phase ordering + dependencies
+
+Phase 24 should ship **BEFORE** Phase 19A's spend section gets heavy use, since spend depends
+on order history. The agent already shipped 19A using live queries — that's fine for the 45
+B2B customers, but will get slow as we onboard more. Phase 24 makes it sustainable.
+
+Phase 24 also DEPENDS on:
+- Phase 21 (Xero customer sync) — Xero contact lookups remain live for now, no cache needed yet
+- Phase 9 (real data scope) — DONE, this just adds local mirror
+
+### Tests
+
+- 24A: schema creates without errors; foreign keys enforced
+- 24B: backfill customers --b2b-only inserts 45 rows; idempotent on re-run
+- 24B: backfill orders fetches all orders for Mia Wagner (254 rows)
+- 24C: webhook POST /webhooks/shopify with valid HMAC updates orders_cache row
+- 24C: webhook with bad HMAC returns 401
+- 24C: polling sync catches an order updated outside webhook
+- 24D: GET /api/admin/customers/:id reads from cache (verify with mock cache row)
+- 24D: GET /api/admin/customers/:id/spend uses SQL aggregate (no Shopify call)
+- 24E: /admin/invoices renders unified list across Shopify + Xero + partial sources
+- 24F: at least one report query (top customers by month) returns correct totals
+
+### Acceptance for Phase 24
+
+- All ~45 B2B customers + their full order history (~1,400 orders + line items) imported into
+  local SQLite
+- Admin pages render in <200ms instead of 1.5-3s
+- Shopify webhooks registered; incremental updates land within seconds
+- 5-min polling fallback catches missed webhook deliveries
+- /admin/invoices unified view across Shopify, Xero, and partial invoices
+- /admin/reports page with at least 4 canned reports
+- Cache freshness badge + manual sync button on every detail page
+- All tests green
