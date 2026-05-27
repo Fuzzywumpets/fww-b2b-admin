@@ -24,6 +24,7 @@ import {
   addLeadNote, getLeadNotes, addLeadStatusHistory, getLeadStatusHistory,
   upsertBackorder, getBackordersForOrder, fulfillBackorder, logOrderEdit,
   getXeroMap, setXeroMap, addXeroPending, getXeroPending, markXeroPendingDone, markXeroPendingFailed, getXeroPendingCount, getXeroInvoiceMaps,
+  createImpersonationNonce, consumeImpersonationNonce, gcImpersonationNonces,
 } from './db.mjs';
 import { generateInvoicePdf } from './pdf.mjs';
 import { renderLabelSheet, expandItems, TEMPLATES as LABEL_TEMPLATES, DEFAULT_FIELDS } from './labels.mjs';
@@ -46,6 +47,8 @@ const PORTAL_INTERNAL_TOKEN = process.env.B2B_PORTAL_INTERNAL_TOKEN || '';
 const PORTAL_INTERNAL_URL   = process.env.B2B_PORTAL_INTERNAL_URL || 'http://127.0.0.1:8793';
 const XERO_BRIDGE_URL       = 'https://fww-xero-bridge.alex-037.workers.dev/xero';
 const XERO_BEARER           = process.env.XERO_BRIDGE_BEARER || '';
+const IMPERSONATION_SECRET  = process.env.B2B_IMPERSONATION_SECRET || (MOCK ? 'test-impersonation-secret-mock' : '');
+const PORTAL_BASE_URL       = MOCK ? `http://127.0.0.1:8793` : 'https://b2b.fuzzyreporting.com';
 
 const app = express();
 app.use(express.json());
@@ -2085,9 +2088,60 @@ function renderCustomerDetail(session, customer, recentOrders, notes, _dropshipC
         <p class="text-muted">${h(customer.email)}${customer.phone ? ' · ' + h(customer.phone) : ''}</p>
       </div>
       <div class="detail-header-actions">
+        <button class="btn btn-secondary" id="impersonate-btn" type="button" title="Open the B2B portal as this customer">View in Portal</button>
         <a href="/orders/new?customer=${h(numId)}" class="btn btn-primary">+ New Order</a>
       </div>
     </div>
+
+    <!-- Impersonation modal -->
+    <div id="impersonate-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.45);z-index:1000;align-items:center;justify-content:center">
+      <div style="background:#fff;border-radius:10px;padding:1.5rem;max-width:420px;width:90%;box-shadow:0 8px 32px rgba(0,0,0,0.18)">
+        <h2 style="margin:0 0 0.5rem">View portal as customer</h2>
+        <p style="color:#555;margin:0 0 1rem">Open the B2B portal as <strong>${h(customer.displayName)}</strong> (${h(customer.email)}). This generates a one-time link valid for 1 hour.</p>
+        <label style="display:flex;align-items:center;gap:0.5rem;margin-bottom:1rem;cursor:pointer">
+          <input type="checkbox" id="impersonate-readonly" checked style="width:16px;height:16px">
+          <span>Read-only mode <span style="color:#888;font-size:0.85em">(prevents placing orders or modifying cart)</span></span>
+        </label>
+        <div id="impersonate-error" style="display:none;color:#b00;margin-bottom:0.75rem;font-size:0.9em"></div>
+        <div style="display:flex;gap:0.75rem;justify-content:flex-end">
+          <button class="btn btn-ghost" id="impersonate-cancel" type="button">Cancel</button>
+          <button class="btn btn-primary" id="impersonate-open" type="button">Open Portal →</button>
+        </div>
+      </div>
+    </div>
+    <script>
+    (function(){
+      var modal = document.getElementById('impersonate-modal');
+      var openBtn = document.getElementById('impersonate-btn');
+      var cancelBtn = document.getElementById('impersonate-cancel');
+      var doOpenBtn = document.getElementById('impersonate-open');
+      var roCheck = document.getElementById('impersonate-readonly');
+      var errEl = document.getElementById('impersonate-error');
+      openBtn.addEventListener('click', function(){ modal.style.display = 'flex'; errEl.style.display = 'none'; });
+      cancelBtn.addEventListener('click', function(){ modal.style.display = 'none'; });
+      modal.addEventListener('click', function(e){ if(e.target === modal) modal.style.display = 'none'; });
+      document.addEventListener('keydown', function(e){ if(e.key === 'Escape') modal.style.display = 'none'; });
+      doOpenBtn.addEventListener('click', function(){
+        doOpenBtn.disabled = true;
+        doOpenBtn.textContent = 'Opening…';
+        errEl.style.display = 'none';
+        fetch('/api/admin/customers/${h(numId)}/impersonate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ read_only: roCheck.checked })
+        })
+        .then(function(r){ return r.json(); })
+        .then(function(d){
+          if(!d.ok){ errEl.textContent = d.error || 'Error'; errEl.style.display = ''; doOpenBtn.disabled = false; doOpenBtn.textContent = 'Open Portal →'; return; }
+          window.open(d.url, '_blank');
+          modal.style.display = 'none';
+          doOpenBtn.disabled = false;
+          doOpenBtn.textContent = 'Open Portal →';
+        })
+        .catch(function(e){ errEl.textContent = e.message; errEl.style.display = ''; doOpenBtn.disabled = false; doOpenBtn.textContent = 'Open Portal →'; });
+      });
+    })();
+    </script>
     <div class="detail-grid">
       <div class="detail-main">
 
@@ -5768,6 +5822,57 @@ app.post('/api/admin/customers/:id/xero-sync', requireAuth, async (req, res) => 
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
+});
+
+// ── Impersonation ─────────────────────────────────────────────────────────────
+
+function makeImpersonationToken({ nonce, customerId, customerEmail, customerDisplayName, adminEmail, readOnly, exp }) {
+  const payload = Buffer.from(JSON.stringify({ v: 1, nonce, cid: customerId, email: customerEmail, name: customerDisplayName, ae: adminEmail, ro: readOnly ? 1 : 0, exp })).toString('base64url');
+  const sig = crypto.createHmac('sha256', IMPERSONATION_SECRET).update(payload).digest('hex');
+  return `${payload}.${sig}`;
+}
+
+app.post('/api/admin/customers/:id/impersonate', requireAuth, async (req, res) => {
+  if (!IMPERSONATION_SECRET) return res.status(503).json({ ok: false, error: 'B2B_IMPERSONATION_SECRET not configured' });
+  const numId = req.params.id;
+  const readOnly = req.body.read_only !== 'false' && req.body.read_only !== false;
+  const session = req.adminSession;
+
+  let customerEmail = '';
+  let customerDisplayName = '';
+  if (MOCK) {
+    const mc = MOCK_CUSTOMERS.find(c => shopifyNumericId(c.id) === numId);
+    if (!mc) return res.status(404).json({ ok: false, error: 'Customer not found' });
+    customerEmail = mc.email || '';
+    customerDisplayName = mc.displayName || '';
+  } else {
+    try {
+      const r = await shopifyFetch('query($id:ID!){customer(id:$id){id displayName email tags}}', { id: shopifyCustomerGid(numId) });
+      const c = r.data?.customer;
+      if (!c) return res.status(404).json({ ok: false, error: 'Customer not found' });
+      if ((c.tags || []).some(t => ALLOWED_EMAILS.includes(t))) {
+        return res.status(403).json({ ok: false, error: 'Cannot impersonate insider accounts' });
+      }
+      customerEmail = c.email || '';
+      customerDisplayName = c.displayName || '';
+    } catch (e) {
+      return res.status(500).json({ ok: false, error: e.message });
+    }
+  }
+
+  const nonce = crypto.randomBytes(20).toString('hex');
+  const exp = Date.now() + 60 * 60 * 1000; // 1 hour
+  const customerId = shopifyCustomerGid(numId);
+
+  createImpersonationNonce({ nonce, customerId, customerEmail, customerDisplayName, adminEmail: session.email, readOnly, expiresAt: exp });
+  gcImpersonationNonces();
+
+  const token = makeImpersonationToken({ nonce, customerId, customerEmail, customerDisplayName, adminEmail: session.email, readOnly, exp });
+  const url = `${PORTAL_BASE_URL}/__impersonate__?tok=${encodeURIComponent(token)}`;
+
+  auditLog(session.email, 'impersonate:token_issued', customerId, null, { customerEmail, customerDisplayName, readOnly, exp: new Date(exp).toISOString() });
+
+  res.json({ ok: true, url, customerDisplayName, readOnly });
 });
 
 // Static

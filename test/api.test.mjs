@@ -1943,5 +1943,53 @@ await test('GET /api/admin/customers/6909696999659/xero-status → merged', asyn
   assert.equal(json.xeroName, 'Pro-Mohs Canine Supply');
 });
 
+console.log('\nAPI tests — Phase 22 (Impersonation):');
+
+await test('POST /api/admin/customers/101/impersonate → requires auth', async () => {
+  const res = await fetch(`${BASE}/api/admin/customers/101/impersonate`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+  });
+  assert.equal(res.status, 401);
+});
+
+await test('POST /api/admin/customers/101/impersonate → returns url in mock mode', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/api/admin/customers/101/impersonate`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ read_only: true }),
+  });
+  assert.equal(res.status, 200);
+  const json = await res.json();
+  assert.equal(json.ok, true);
+  assert.ok(json.url, 'Should return a URL');
+  assert.ok(json.url.includes('__impersonate__'), 'URL should point to impersonation endpoint');
+  assert.ok(json.url.includes('tok='), 'URL should contain token');
+  assert.equal(json.readOnly, true);
+});
+
+await test('POST /api/admin/customers/101/impersonate read_only=false → interactive mode', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/api/admin/customers/101/impersonate`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ read_only: false }),
+  });
+  assert.equal(res.status, 200);
+  const json = await res.json();
+  assert.equal(json.ok, true);
+  assert.equal(json.readOnly, false);
+});
+
+await test('POST /api/admin/customers/999/impersonate → 404 for unknown customer', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/api/admin/customers/999/impersonate`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+    body: '{}',
+  });
+  assert.equal(res.status, 404);
+});
+
 console.log(`\n  ${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);

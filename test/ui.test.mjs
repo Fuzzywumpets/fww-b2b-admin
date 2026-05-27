@@ -802,6 +802,26 @@ await test('/customers/101 Xero card loads status via fetch (not_synced for mock
   );
 });
 
+console.log('\nUI tests — Phase 22 (Impersonation):');
+
+await test('/customers/101 shows "View in Portal" button', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/customers/101`);
+  const html = await page.content();
+  assert.ok(html.includes('View in Portal') || html.includes('impersonate'), 'Should show impersonation button');
+});
+
+await test('/customers/101 impersonate-btn opens modal', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/customers/101`);
+  await page.click('#impersonate-btn');
+  const modal = await page.$('#impersonate-modal');
+  const display = await modal.evaluate(el => el.style.display);
+  assert.equal(display, 'flex', 'Modal should be visible after button click');
+});
+
 await browser.close();
 
 console.log(`\n  ${passed} passed, ${failed} failed`);

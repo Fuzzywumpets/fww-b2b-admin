@@ -165,6 +165,18 @@ db.exec(`
     last_attempt_at INTEGER,
     error_text TEXT
   );
+
+  CREATE TABLE IF NOT EXISTS impersonation_nonces (
+    nonce TEXT PRIMARY KEY,
+    customer_id TEXT NOT NULL,
+    customer_email TEXT,
+    customer_display_name TEXT,
+    admin_email TEXT NOT NULL,
+    read_only INTEGER NOT NULL DEFAULT 1,
+    expires_at INTEGER NOT NULL,
+    used_at INTEGER,
+    created_at INTEGER NOT NULL
+  );
 `);
 
 export default db;
@@ -411,3 +423,27 @@ export function getXeroPendingCount() {
 export function getXeroInvoiceMaps({ limit = 200 } = {}) {
   return db.prepare('SELECT * FROM xero_invoice_map ORDER BY synced_at DESC LIMIT ?').all(limit);
 }
+
+// ── Impersonation nonces ────────────────────────────────────────────────────────
+
+export function createImpersonationNonce({ nonce, customerId, customerEmail, customerDisplayName, adminEmail, readOnly, expiresAt }) {
+  db.prepare(`
+    INSERT INTO impersonation_nonces (nonce, customer_id, customer_email, customer_display_name, admin_email, read_only, expires_at, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(nonce, customerId, customerEmail || null, customerDisplayName || null, adminEmail, readOnly ? 1 : 0, expiresAt, Date.now());
+}
+
+export function consumeImpersonationNonce(nonce) {
+  const row = db.prepare('SELECT * FROM impersonation_nonces WHERE nonce = ?').get(nonce);
+  if (!row) return null;
+  if (row.used_at) return null;
+  if (row.expires_at < Date.now()) return null;
+  db.prepare('UPDATE impersonation_nonces SET used_at = ? WHERE nonce = ?').run(Date.now(), nonce);
+  return row;
+}
+
+export function gcImpersonationNonces() {
+  const cutoff = Date.now() - 2 * 60 * 60 * 1000; // 2h
+  db.prepare('DELETE FROM impersonation_nonces WHERE created_at < ?').run(cutoff);
+}
+
