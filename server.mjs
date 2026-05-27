@@ -3444,28 +3444,54 @@ app.post('/orders/:id/edit', requireAuth, async (req, res) => {
   // Real mode: use Shopify orderEdit* mutation suite
   try {
     const orderId = `gid://shopify/Order/${numId}`;
+    // orderEditBegin + fetch CalculatedLineItem IDs in one round-trip.
+    // Build map original_li_id -> calc_li_id by matching variant + title.
     const beginResult = await shopifyFetch(`
-      mutation begin($id:ID!){orderEditBegin(id:$id){calculatedOrder{id}userErrors{field message}}}
+      mutation begin($id:ID!){orderEditBegin(id:$id){
+        calculatedOrder{
+          id
+          lineItems(first:100){edges{node{id title quantity variant{id}}}}
+        }
+        userErrors{field message}
+      }}
     `, { id: orderId });
-    const calcId = beginResult.data?.orderEditBegin?.calculatedOrder?.id;
+    const calcOrder = beginResult.data?.orderEditBegin?.calculatedOrder;
+    const calcId = calcOrder?.id;
     if (!calcId) {
       const errs = beginResult.data?.orderEditBegin?.userErrors || [];
       throw new Error(errs.map(e => e.message).join(', ') || 'orderEditBegin failed');
     }
-    // Apply qty changes and removes
-    for (const [liId, newQty] of Object.entries(qtysMap)) {
-      if (!removeSet.has(liId)) {
-        await shopifyFetch(`mutation setQty($id:ID!,$li:ID!,$qty:Int!,$r:Boolean!){
-          orderEditSetQuantity(id:$id,lineItemId:$li,quantity:$qty,restock:$r){
-            calculatedOrder{id} userErrors{field message}}}`,
-          { id: calcId, li: liId, qty: newQty, r: false });
-      }
+    // Fetch original order line items to pair original IDs with variant/title
+    const origRes = await shopifyFetch(`query($id:ID!){order(id:$id){lineItems(first:100){edges{node{id title variant{id}}}}}}`, { id: orderId });
+    const origItems = origRes.data?.order?.lineItems?.edges?.map(e => e.node) || [];
+    const calcItems = calcOrder.lineItems?.edges?.map(e => e.node) || [];
+    // Map original_li_id -> calc_li_id
+    const idMap = {};
+    for (const orig of origItems) {
+      // Match by variant id first (works for catalog items)
+      let match = orig.variant?.id ? calcItems.find(c => c.variant?.id === orig.variant.id && c.title === orig.title) : null;
+      // Fallback: match by title alone (custom items, no variant)
+      if (!match) match = calcItems.find(c => c.title === orig.title && !c.variant);
+      if (!match) match = calcItems.find(c => c.title === orig.title);
+      if (match) idMap[orig.id] = match.id;
     }
-    for (const liId of removeSet) {
+    // Apply qty changes and removes using calculated line item IDs
+    for (const [origLiId, newQty] of Object.entries(qtysMap)) {
+      if (removeSet.has(origLiId)) continue;
+      const calcLiId = idMap[origLiId];
+      if (!calcLiId) { console.warn('[order-edit] no calc map for', origLiId); continue; }
       await shopifyFetch(`mutation setQty($id:ID!,$li:ID!,$qty:Int!,$r:Boolean!){
         orderEditSetQuantity(id:$id,lineItemId:$li,quantity:$qty,restock:$r){
           calculatedOrder{id} userErrors{field message}}}`,
-        { id: calcId, li: liId, qty: 0, r: true });
+        { id: calcId, li: calcLiId, qty: newQty, r: false });
+    }
+    for (const origLiId of removeSet) {
+      const calcLiId = idMap[origLiId];
+      if (!calcLiId) { console.warn('[order-edit] no calc map for remove', origLiId); continue; }
+      await shopifyFetch(`mutation setQty($id:ID!,$li:ID!,$qty:Int!,$r:Boolean!){
+        orderEditSetQuantity(id:$id,lineItemId:$li,quantity:$qty,restock:$r){
+          calculatedOrder{id} userErrors{field message}}}`,
+        { id: calcId, li: calcLiId, qty: 0, r: true });
     }
     // Apply order-level discount as a custom item
     if ((discountPct || discountFixed) && discountReason) {
