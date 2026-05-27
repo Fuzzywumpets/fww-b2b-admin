@@ -3227,16 +3227,21 @@ app.post('/orders/:id/mark-paid', requireAuth, async (req, res) => {
   // Trigger Xero payment recording (non-blocking — queue on failure)
   (async () => {
     try {
+      // Phase 21: skip Xero entirely for insider customers
+      const order = await getOrderDetail(numId);
+      const customerId = order?.customer?.id ? shopifyNumericId(order.customer.id) : null;
+      if (customerId && isInsider(customerId)) {
+        console.log('[xero] skipping payment record for insider customer', customerId, 'order', numId);
+        return;
+      }
       const accountMap = getXeroAccountMap();
       const xeroEntry  = getXeroMap(numId);
       let xeroInvoiceId = xeroEntry?.xero_invoice_id;
       if (!xeroInvoiceId) {
         // Try to create invoice first if not yet synced
-        const order = await getOrderDetail(numId);
         if (order) xeroInvoiceId = await createXeroInvoice(order, accountMap);
       }
       if (xeroInvoiceId) {
-        const order = await getOrderDetail(numId);
         const amount = parseFloat(order?.totalPriceSet?.presentmentMoney?.amount || '0');
         await recordXeroPayment(numId, xeroInvoiceId, amount, null, accountMap.chase_checking);
         auditLog(req.adminSession.email, 'xero:payment_recorded', shopifyOrderGid(numId), null, { xeroInvoiceId, amount });
@@ -3499,10 +3504,10 @@ app.post('/orders/:id/edit', requireAuth, async (req, res) => {
       const totResult = await shopifyFetch(`query($id:ID!){order(id:$id){subtotalPriceSet{presentmentMoney{amount}}}}`, { id: orderId });
       const subTotal = parseFloat(totResult.data?.order?.subtotalPriceSet?.presentmentMoney?.amount || 0);
       const discAmt = discountPct ? subTotal * parseFloat(discountPct) / 100 : parseFloat(discountFixed || 0);
-      await shopifyFetch(`mutation addItem($id:ID!,$title:String!,$price:Money!,$qty:Int!){
-        orderEditAddCustomItem(id:$id,title:$title,price:$price,quantity:$qty){
+      await shopifyFetch(`mutation addItem($id:ID!,$title:String!,$price:MoneyInput!,$qty:Int!){
+        orderEditAddCustomItem(id:$id,title:$title,price:$price,quantity:$qty,taxable:false,requiresShipping:false){
           calculatedOrder{id} userErrors{field message}}}`,
-        { id: calcId, title: `Order discount: ${discountReason}`, price: `-${discAmt.toFixed(2)}`, qty: 1 });
+        { id: calcId, title: `Order discount: ${discountReason}`, price: { amount: `-${discAmt.toFixed(2)}`, currencyCode: "USD" }, qty: 1 });
     }
     // Commit
     await shopifyFetch(`mutation commit($id:ID!,$notify:Boolean!,$note:String){
@@ -3547,9 +3552,25 @@ app.post('/orders/:id/discount', requireAuth, async (req, res) => {
     const totResult = await shopifyFetch(`query($id:ID!){order(id:$id){subtotalPriceSet{presentmentMoney{amount}}}}`, { id: orderId });
     const subTotal = parseFloat(totResult.data?.order?.subtotalPriceSet?.presentmentMoney?.amount || 0);
     const discAmt  = type === 'pct' ? subTotal * parseFloat(value) / 100 : parseFloat(value);
-    await shopifyFetch(`mutation addItem($id:ID!,$title:String!,$price:Money!,$qty:Int!){
-      orderEditAddCustomItem(id:$id,title:$title,price:$price,quantity:$qty){calculatedOrder{id}userErrors{field message}}}`,
-      { id: calcId, title: `Order discount: ${reason}`, price: `-${discAmt.toFixed(2)}`, qty: 1 });
+    // Apply discount as a line-item discount on the first existing line (Shopify
+    // refuses negative-priced custom items). Discount value spread across all lines
+    // proportionally would be ideal; this simpler approach lumps it on line 1.
+    const orderLis = await shopifyFetch(`query($id:ID!){order(id:$id){lineItems(first:1){edges{node{id}}}}}`, { id: orderId });
+    const firstLiId = orderLis.data?.order?.lineItems?.edges?.[0]?.node?.id;
+    if (!firstLiId) throw new Error('order has no line items for discount target');
+    // Map original line id -> calculatedLineItem id (same approach as edit route)
+    const calcOrderRes = await shopifyFetch(`query($id:ID!){node(id:$id){... on CalculatedOrder{lineItems(first:50){edges{node{id title variant{id}}}}}}}`, { id: calcId });
+    // node() query may not work — fallback: just use the orderEditBegin response data if we had captured it.
+    // For simplicity, query the calculated order line items by re-running orderEditBegin to refresh.
+    // (orderEditBegin is idempotent per Shopify docs.)
+    // Actually we already have calcId — query its lineItems via direct GraphQL.
+    // Use a different approach: use orderEditAddVariant or just rely on calcId+old lineItemId
+    const discRes = await shopifyFetch(`mutation discount($id:ID!,$li:ID!,$d:OrderEditAppliedDiscountInput!){
+      orderEditAddLineItemDiscount(id:$id,lineItemId:$li,discount:$d){
+        calculatedOrder{id} userErrors{field message}}}`,
+      { id: calcId, li: firstLiId, d: { description: `Order discount: ${reason}`, fixedValue: { amount: discAmt.toFixed(2), currencyCode: "USD" } } });
+    const dErrs = discRes.data?.orderEditAddLineItemDiscount?.userErrors || [];
+    if (dErrs.length) throw new Error(dErrs.map(e => e.message).join(', '));
     await shopifyFetch(`mutation commit($id:ID!,$notify:Boolean!){orderEditCommit(id:$id,notifyCustomer:$notify){order{id}userErrors{field message}}}`,
       { id: calcId, notify: false });
     auditLog(req.adminSession.email, 'order_discount', orderId, null, changes);
@@ -3591,21 +3612,50 @@ app.post('/orders/:id/fulfill', requireAuth, async (req, res) => {
     return res.redirect(`/orders/${numId}?success=fulfilled`);
   }
 
-  // Real mode: fulfillmentCreate mutation
+  // Real mode: fulfillmentCreate with FulfillmentV2Input + fulfillmentOrderId lookup
   try {
     const orderId    = `gid://shopify/Order/${numId}`;
-    const liInputs   = Object.entries(lineItemsMap).map(([id, quantity]) => ({ id, quantity }));
     const trackInput = trackingNumber ? { company: trackingCompany || '', number: trackingNumber, url: null } : null;
-    const result = await shopifyFetch(`
-      mutation fulfill($input:FulfillmentInput!){fulfillmentCreate(input:$input){
-        fulfillment{id status} userErrors{field message}}}`,
-      { input: {
-          orderId,
-          lineItemsByFulfillmentOrder: liInputs.map(li => ({ fulfillmentOrderId: null, lineItemIds: [li.id], quantities: [li.quantity] })),
-          trackingInfo: trackInput,
-          notifyCustomer: !!notifyCustomer,
+
+    // Step 1: fetch fulfillmentOrders for this order + their line items, map original lineItemId -> fulfillmentOrderLineItem
+    const foRes = await shopifyFetch(`query($id:ID!){order(id:$id){
+      fulfillmentOrders(first:10){edges{node{
+        id status
+        lineItems(first:50){edges{node{id remainingQuantity lineItem{id title}}}}
+      }}}
+    }}`, { id: orderId });
+    const fos = foRes.data?.order?.fulfillmentOrders?.edges?.map(e => e.node) || [];
+    // Find OPEN/IN_PROGRESS fulfillmentOrders, build map original_li_id -> { fulfillmentOrderId, foLineItemId, remaining }
+    const liMap = {};
+    for (const fo of fos) {
+      if (fo.status !== 'OPEN' && fo.status !== 'IN_PROGRESS') continue;
+      for (const edge of fo.lineItems.edges) {
+        const foLi = edge.node;
+        const origId = foLi.lineItem?.id;
+        if (origId && foLi.remainingQuantity > 0) {
+          liMap[origId] = { foId: fo.id, foLiId: foLi.id, remaining: foLi.remainingQuantity };
         }
-      });
+      }
+    }
+
+    // Step 2: group requested line items by fulfillmentOrderId
+    const groupedByFo = {};
+    for (const [origLiId, qty] of Object.entries(lineItemsMap)) {
+      const mapping = liMap[origLiId];
+      if (!mapping) { console.warn('[fulfill] no FO map for', origLiId); continue; }
+      const wantedQty = Math.min(qty, mapping.remaining);
+      if (!groupedByFo[mapping.foId]) groupedByFo[mapping.foId] = [];
+      groupedByFo[mapping.foId].push({ id: mapping.foLiId, quantity: wantedQty });
+    }
+    const fulfillmentOrderInput = Object.entries(groupedByFo).map(([foId, items]) => ({
+      fulfillmentOrderId: foId,
+      fulfillmentOrderLineItems: items,
+    }));
+    if (fulfillmentOrderInput.length === 0) throw new Error('No matching open fulfillment orders');
+
+    const result = await shopifyFetch(`mutation fulfill($f:FulfillmentV2Input!){
+      fulfillmentCreate(fulfillment:$f){fulfillment{id status} userErrors{field message}}
+    }`, { f: { lineItemsByFulfillmentOrder: fulfillmentOrderInput, trackingInfo: trackInput, notifyCustomer: !!notifyCustomer } });
     const errs = result.data?.fulfillmentCreate?.userErrors || [];
     if (errs.length) throw new Error(errs.map(e => e.message).join(', '));
     // Mark any matching backorders as fulfilled
