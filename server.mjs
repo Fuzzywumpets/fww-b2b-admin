@@ -3792,6 +3792,35 @@ app.get('/api/admin/customers/:id/spend', requireAuth, async (req, res) => {
   const fromTs = req.query.from ? new Date(req.query.from).getTime() : 0;
   const toTs   = req.query.to   ? new Date(req.query.to).getTime()   : Date.now() + 86400000;
 
+  // Phase 24D: try cache first
+  if (!MOCK) {
+    try {
+      const cust = getCustomerFromCache(numId);
+      const stats = getOrdersCacheStats();
+      if (cust && stats && stats.total > 0) {
+        const allOrders = getCustomerOrdersFromCache(numId);
+        const rangeOrders = allOrders.filter(o => o.created_at >= fromTs && o.created_at <= toTs);
+        const rangeTotal = rangeOrders.reduce((s, o) => s + (o.total_price || 0), 0);
+        return res.json({
+          lifetimeTotal: String(cust.amount_spent_total || 0),
+          lifetimeCount: cust.orders_count || 0,
+          rangeTotal: rangeTotal.toFixed(2),
+          rangeCount: rangeOrders.length,
+          orders: rangeOrders.map(o => ({
+            id: o.shopify_id,
+            name: o.name,
+            processedAt: new Date(o.processed_at || o.created_at).toISOString(),
+            total: String(o.total_price || 0),
+            financialStatus: o.financial_status || o.display_financial_status,
+            fulfillmentStatus: o.fulfillment_status || o.display_fulfillment_status,
+          })),
+          _fromCache: true,
+        });
+      }
+    } catch (e) {
+      console.error('spend cache read failed, falling back to live Shopify:', e.message);
+    }
+  }
   if (MOCK) {
     const gid = shopifyCustomerGid(numId);
     const all = MOCK_ORDERS.filter(o => o.customer?.id === gid);
