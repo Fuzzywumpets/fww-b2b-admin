@@ -500,6 +500,13 @@ export function getBackordersForOrder(orderId) {
     .all(orderId, 'pending');
 }
 
+export function getOutstandingBalanceForCustomer(customerId) {
+  const rows = db.prepare(
+    'SELECT ROUND(SUM(total_price), 2) AS total, COUNT(*) AS count FROM orders_cache WHERE customer_shopify_id = ? AND cancelled_at IS NULL AND financial_status IN (\'PENDING\',\'PARTIALLY_PAID\',\'UNPAID\')'
+  ).get(customerId);
+  return { total: rows?.total || 0, count: rows?.count || 0 };
+}
+
 export function getOpenBackorders() {
   return db.prepare('SELECT * FROM backorders WHERE status = ? ORDER BY created_at ASC')
     .all('pending');

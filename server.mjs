@@ -23,6 +23,7 @@ import {
   createLead, getLeads, getLeadCounts, getLead, updateLead,
   addLeadNote, getLeadNotes, addLeadStatusHistory, getLeadStatusHistory,
   upsertBackorder, getBackordersForOrder, getOpenBackorders, fulfillBackorder, logOrderEdit,
+  getOutstandingBalanceForCustomer,
   getXeroMap, setXeroMap, addXeroPending, getXeroPending, markXeroPendingDone, markXeroPendingFailed, getXeroPendingCount, getXeroInvoiceMaps,
   createImpersonationNonce, consumeImpersonationNonce, gcImpersonationNonces,
   createPartialInvoice, getPartialInvoices, getNextInvoiceLetter,
@@ -1073,6 +1074,7 @@ async function getDashboardData() {
         { productId: 'gid://shopify/Product/203', productTitle: 'Simplicity Collar', variantTitle: 'Medium / Red', sku: 'SC-002-M-RD', qty: 7 },
         { productId: 'gid://shopify/Product/204', productTitle: 'Everyday Collar Bundle', variantTitle: 'XL', sku: 'ECB-010-XL', qty: 8 },
       ],
+      monthly: MOCK_MONTHLY_REVENUE,
     };
   }
   try {
@@ -1124,7 +1126,9 @@ async function getDashboardData() {
       }
     }
     const pendingReview = getCustomersPendingXeroReview();
-    return { openOrdersCount: openOrders.length, openOrders: openOrders.slice(0, 5), weekOrdersCount: weekOrders.length, topCustomers, lowStockItems: lowStockItems.sort((a,b)=>a.qty-b.qty).slice(0,10), pendingReview };
+    let monthly = [];
+    try { const rd = getReportsDataFromCache(); monthly = rd.monthly || []; } catch(e) {}
+    return { openOrdersCount: openOrders.length, openOrders: openOrders.slice(0, 5), weekOrdersCount: weekOrders.length, topCustomers, lowStockItems: lowStockItems.sort((a,b)=>a.qty-b.qty).slice(0,10), pendingReview, monthly };
   } catch (err) {
     console.error('getDashboardData error:', err.message);
     return { error: err.message, openOrdersCount:0, openOrders:[], weekOrdersCount:0, topCustomers:[], lowStockItems:[], pendingReview:[] };
@@ -1162,6 +1166,15 @@ function renderDashboard(session, data) {
     </tbody></table>${data.pendingReview.length > 5 ? `<p class="text-muted small-text" style="margin-top:8px;font-size:11px">+${data.pendingReview.length - 5} more</p>` : ''}`
     : '<p class="empty-state">All B2B customers synced to Xero ✓</p>';
 
+  // Revenue chart
+  const _monthly = data.monthly || [];
+  const _chartData = _monthly.map(d => ({ label: d.month.slice(5), value: d.revenue || 0 }));
+  const _revenueChart = _chartData.length
+    ? renderBarChart(_chartData, { width: 540, height: 100 })
+    : '<p class="empty-state">No cached revenue data yet.</p>';
+  const _totalRev12m = _monthly.reduce((s, d) => s + (d.revenue || 0), 0);
+  const revenueWidget = `${_revenueChart}<div style="font-size:12px;color:var(--muted);margin-top:6px">12-month total: <strong>$${_totalRev12m.toLocaleString('en-US',{minimumFractionDigits:0,maximumFractionDigits:0})}</strong></div>`;
+
   const lowStockTable = data.lowStockItems?.length > 0
     ? `<table class="mini-table"><thead><tr><th>Product / Variant</th><th>SKU</th><th>Qty</th></tr></thead><tbody>
       ${data.lowStockItems.map(item => `<tr class="${item.qty===0?'row-critical':item.qty<=3?'row-warning':''}">
@@ -1190,6 +1203,10 @@ function renderDashboard(session, data) {
       <div class="widget">
         <div class="widget-header"><h2>Top Customers</h2><a href="/customers" class="widget-link">View all →</a></div>
         ${topCustomersTable}
+      </div>
+      <div class="widget">
+        <div class="widget-header"><h2>Revenue (12 months)</h2><a href="/reports" class="widget-link">Full report →</a></div>
+        ${revenueWidget}
       </div>
       <div class="widget">
         <div class="widget-header"><h2>Low Stock (B2B)</h2><a href="/catalog?stock=low" class="widget-link">Catalog →</a></div>
@@ -2589,6 +2606,7 @@ async function applyB2bConfigUpdate(numericId, body) {
 
 function renderCustomerDetail(session, customer, recentOrders, notes, _dropshipCache, b2bConfig, flash, impHistory = []) {
   const numId      = shopifyNumericId(customer.id);
+  const outstanding = (() => { try { return getOutstandingBalanceForCustomer(customer.id); } catch(e) { return { total: 0, count: 0 }; } })();
 
   // Phase 22H: Impersonation history card
   const impHistoryHtml = (impHistory && impHistory.length > 0)
@@ -2891,7 +2909,10 @@ function renderCustomerDetail(session, customer, recentOrders, notes, _dropshipC
           </form>
         </div>
         <div class="card" id="b2b-settings-card">
-          <div class="card-header"><h2>B2B Customer Settings</h2></div>
+          <div class="card-header">
+            <h2>B2B Customer Settings</h2>
+            ${outstanding.count > 0 ? `<span class="badge badge-warning" title="${outstanding.count} unpaid order(s)">Outstanding: $$${outstanding.total.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})}</span>` : ''}
+          </div>
           <form method="POST" action="/customers/${h(numId)}/b2b-config" id="b2b-settings-form">
             <div class="b2b-settings-grid">
               <div class="b2b-field-row">

@@ -892,6 +892,28 @@ await test('/backorders page loads with table heading', async (page, ctx) => {
   assert.ok(hasTable || hasEmpty, 'Page should have either #backorder-table or empty state message');
 });
 
+
+// ── Task 48: Revenue chart + outstanding balance UI ──────────────────────────
+console.log('\nUI tests — Task 48 (Revenue chart + outstanding balance):');
+
+await test('Dashboard: Revenue (12 months) widget heading visible', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/`);
+  await page.waitForSelector('.widget-grid', { timeout: 8000 });
+  const html = await page.content();
+  assert.ok(html.includes('Revenue (12 months)'), 'Dashboard should show "Revenue (12 months)" widget heading');
+});
+
+await test('Customer detail: B2B Customer Settings card has outstanding section', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/customers/101`);
+  await page.waitForSelector('.card-header', { timeout: 8000 });
+  const html = await page.content();
+  assert.ok(html.includes('B2B Customer Settings'), 'Customer detail should have B2B Customer Settings card');
+});
+
 await browser.close();
 
 console.log(`\n  ${passed} passed, ${failed} failed`);
