@@ -2189,5 +2189,32 @@ await test('POST /settings with catalog_private_tags → saves and redirects', a
   assert.ok(res.status === 302 || res.status === 303, 'Should redirect after settings save');
 });
 
+// ── Phase 19D: Active cart API ────────────────────────────────────────────────
+console.log('\nAPI tests — Phase 19D (Active cart):');
+
+await test('GET /api/admin/customers/:id/active-cart → returns cart object', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/api/admin/customers/101/active-cart`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const json = await res.json();
+  assert.ok(json.ok, 'should return ok');
+  assert.ok(Array.isArray(json.items), 'items should be array');
+  assert.ok(typeof json.subtotal === 'number', 'subtotal should be number');
+  assert.ok(typeof json.itemCount === 'number', 'itemCount should be number');
+});
+
+await test('GET /api/admin/customers/:id/active-cart without auth → 401', async () => {
+  const res = await fetch(`${BASE}/api/admin/customers/101/active-cart`);
+  assert.equal(res.status, 401);
+});
+
+await test('GET /customers/101 → includes active-cart card section', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/customers/101`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  assert.ok(html.includes('active-cart-card') || html.includes('Active cart'), 'should include active cart section');
+});
+
 console.log(`\n  ${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);

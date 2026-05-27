@@ -147,6 +147,32 @@ function getCustomerActivityFromPortal(numericCustomerId, { from, to, type, q, p
   } catch (e) { console.error('[activity] portal read failed:', e.message); return { rows: [], total: 0, lastLogin: null, lastCart: null, page: 1, limit: 50 }; }
 }
 
+function getActiveCartFromPortal(numericCustomerId) {
+  const customerId = `gid://shopify/Customer/${numericCustomerId}`;
+  if (MOCK) {
+    return { items: [], subtotal: 0, itemCount: 0, updatedAt: null };
+  }
+  const db = getPortalDb();
+  if (!db) return { items: [], subtotal: 0, itemCount: 0, updatedAt: null };
+  try {
+    const cart = db.prepare('SELECT * FROM carts WHERE customer_id = ?').get(customerId);
+    if (!cart) return { items: [], subtotal: 0, itemCount: 0, updatedAt: null };
+    const rows = db.prepare('SELECT * FROM cart_items WHERE cart_id = ? ORDER BY added_at').all(cart.cart_id);
+    const items = rows.map(r => ({
+      variantId:    r.variant_id,
+      productId:    r.product_id,
+      productTitle: r.product_title,
+      variantTitle: r.variant_title,
+      sku:          r.sku,
+      quantity:     r.quantity,
+      b2bPrice:     r.b2b_price,
+      lineTotal:    Math.round(r.b2b_price * r.quantity * 100) / 100,
+    }));
+    const subtotal = items.reduce((s, i) => s + i.lineTotal, 0);
+    return { items, subtotal: Math.round(subtotal * 100) / 100, itemCount: rows.length, updatedAt: cart.updated_at };
+  } catch (e) { console.error('[active-cart] portal read failed:', e.message); return { items: [], subtotal: 0, itemCount: 0, updatedAt: null }; }
+}
+
 async function callPortalInternal(method, path, body) {
   if (!PORTAL_INTERNAL_TOKEN) return { ok: false, error: 'no_internal_token' };
   try {
@@ -2482,6 +2508,47 @@ function renderCustomerDetail(session, customer, recentOrders, notes, _dropshipC
             var btn  = document.getElementById('tag-add-btn');
             var form = document.getElementById('tag-add-form');
             if(btn && form){ btn.addEventListener('click',function(){ form.hidden=false; form.querySelector('input').focus(); }); }
+          })();
+          </script>
+        </div>
+        <!-- Phase 19D: Active cart card -->
+        <div class="card" id="active-cart-card">
+          <div class="card-header"><h2>Active cart</h2></div>
+          <div id="active-cart-body"><span class="text-muted small-text">Loading…</span></div>
+          <script>
+          (function(){
+            var el = document.getElementById('active-cart-body');
+            fetch('/api/admin/customers/${h(numId)}/active-cart')
+              .then(function(r){ return r.json(); })
+              .then(function(d){
+                if(!d.items || d.items.length === 0){
+                  el.innerHTML = '<span class="text-muted small-text">No active cart</span>';
+                  return;
+                }
+                var itemsHtml = d.items.map(function(i){
+                  return '<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:4px;font-size:13px">' +
+                    '<span>' + (i.productTitle||'').replace(/</g,'&lt;') + (i.variantTitle ? ' — ' + i.variantTitle.replace(/</g,'&lt;') : '') + ' × ' + i.quantity + '</span>' +
+                    '<span style="font-weight:600;white-space:nowrap;margin-left:8px">$' + (i.lineTotal||0).toFixed(2) + '</span>' +
+                    '</div>';
+                }).join('');
+                var updatedAgo = d.updatedAt ? (function(ts){
+                  var m = Math.floor((Date.now()-ts)/60000);
+                  if(m < 1) return 'just now';
+                  if(m < 60) return m + 'm ago';
+                  var h = Math.floor(m/60);
+                  if(h < 24) return h + 'h ago';
+                  return Math.floor(h/24) + 'd ago';
+                })(d.updatedAt) : '';
+                el.innerHTML = itemsHtml +
+                  '<div style="margin-top:8px;padding-top:8px;border-top:1px solid var(--line);display:flex;justify-content:space-between">' +
+                    '<span class="text-muted small-text">' + d.items.length + ' item' + (d.items.length!==1?'s':'') + (updatedAgo ? ' · ' + updatedAgo : '') + '</span>' +
+                    '<strong>$' + (d.subtotal||0).toFixed(2) + '</strong>' +
+                  '</div>' +
+                  '<div style="margin-top:8px;display:flex;gap:6px">' +
+                    '<a href="/orders/new?customer=${h(numId)}" class="btn btn-ghost btn-xs" title="Pre-populate new order from cart">Convert to order…</a>' +
+                  '</div>';
+              })
+              .catch(function(){ el.innerHTML = '<span class="text-muted small-text">Unavailable</span>'; });
           })();
           </script>
         </div>
@@ -6147,6 +6214,11 @@ app.get('/api/admin/customers/:id/activity/lookup', requireAuth, (req, res) => {
   // Not found — return context (last login, last cart)
   const context = getCustomerActivityFromPortal(req.params.id, { limit: 1 });
   res.json({ ok: true, found: false, lastLogin: context.lastLogin, lastCart: context.lastCart, date });
+});
+
+app.get('/api/admin/customers/:id/active-cart', requireAuth, (req, res) => {
+  const cart = getActiveCartFromPortal(req.params.id);
+  res.json({ ok: true, ...cart });
 });
 
 app.get('/customers/:id/activity', requireAuth, async (req, res) => {
