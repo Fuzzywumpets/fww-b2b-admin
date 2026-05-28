@@ -49,3 +49,16 @@ fww-b2b-admin queries the Shopify Customer Account API (via shopify-bridge) to f
 2. If not, request access at https://shopify.dev/docs/api/admin-rest/latest/resources/customer#protected-customer-data or migrate to Admin REST API (customers endpoint).
 3. Test backfill-orders-per-customer.mjs and backfill-shopify.mjs against production Shopify to confirm access is granted.
 ```
+
+# apiwatch impact report
+
+Entry: 783  
+Severity: **high**
+
+## Summary
+Shopify GraphQL Admin API v2024-07 removes several ProductVariant fields (fulfillmentService, harmonizedSystemCode, inventoryManagement, requiresShipping, weight, weightUnit) and modifies input types. The fww-b2b-admin codebase fetches product data via Shopify GraphQL but excerpts do not show explicit queries for the removed fields—however, the backfill scripts query broad variant/product data that may implicitly depend on these fields if the bridge layer returns them.
+
+## Suggested fix
+```
+Audit backfill-shopify.mjs and backfill-orders-per-customer.mjs to confirm neither queries fulfillmentService, harmonizedSystemCode, inventoryManagement, requiresShipping, weight, or weightUnit directly. If they do, remove those fields from GraphQL queries and update any downstream code that processes them. Verify the Shopify Bridge (shopify-bridge.alex-037.workers.dev) is updated to target API v2024-07 or later.
+```
