@@ -34,3 +34,18 @@ const res = await fetch(BRIDGE, {
 ```
 Search for all `fetch(BRIDGE` calls and ensure the header is set.
 ```
+
+# apiwatch impact report
+
+Entry: 702  
+Severity: **high**
+
+## Summary
+fww-b2b-admin queries the Shopify Customer Account API (via shopify-bridge) to fetch customer orders and details. Starting 2024-08-26, this API now requires Level 1 Protected Customer Data access. If the bridge does not hold this certification, queries will fail and break the backfill and dashboard order-fetching workflows.
+
+## Suggested fix
+```
+1. Verify shopify-bridge backend holds Level 1 Protected Customer Data certification with Shopify.
+2. If not, request access at https://shopify.dev/docs/api/admin-rest/latest/resources/customer#protected-customer-data or migrate to Admin REST API (customers endpoint).
+3. Test backfill-orders-per-customer.mjs and backfill-shopify.mjs against production Shopify to confirm access is granted.
+```
