@@ -1798,6 +1798,24 @@ function renderOrderDetail(session, order, flash, flashMsg) {
         btn.disabled = false;
       }
     }
+    function mbody(m){ return String((m && m.body !== undefined) ? m.body : (m || '')).replace(/</g,'&lt;'); }
+    async function loadCustomerReplies(orderId) {
+      const el = document.getElementById('customer-replies-list');
+      if (!el) return;
+      try {
+        const r = await fetch('/api/orders/' + orderId + '/customer-messages');
+        const j = await r.json();
+        const threads = j.threads || [];
+        if (!threads.length) { el.innerHTML = '<p class="text-muted small-text">No customer replies yet. Replies to notes will appear here.</p>'; return; }
+        el.innerHTML = threads.map(function(t){ return '<div style="border-left:3px solid var(--lime,#9BBC0E);padding:8px 12px;margin-bottom:8px;background:#f9fdf0;border-radius:0 4px 4px 0">'
+          + '<div style="font-weight:600;font-size:13px">' + String(t.subject||'(no subject)').replace(/</g,'&lt;') + '</div>'
+          + (t.lastCustomerMessage ? '<div style="font-size:13px;margin-top:4px"><b>Customer:</b> ' + mbody(t.lastCustomerMessage).slice(0,300) + '</div>' : '')
+          + (t.lastStaffMessage ? '<div style="font-size:12px;color:#777;margin-top:2px"><b>Us:</b> ' + mbody(t.lastStaffMessage).slice(0,200) + '</div>' : '')
+          + (t.permaUrl ? '<a href="' + t.permaUrl + '" target="_blank" rel="noopener" style="font-size:11px">Open in Re:amaze</a>' : '')
+          + '</div>'; }).join('');
+      } catch(e) { el.innerHTML = '<p class="text-muted small-text">Could not load replies.</p>'; }
+    }
+    document.addEventListener('DOMContentLoaded', function(){ loadCustomerReplies(location.pathname.split('/').pop()); });
     </script>`;
 
   return layout({ title: order.name || 'Order', session, activePath: '/orders', content: `
@@ -2150,6 +2168,10 @@ function renderOrderDetail(session, order, flash, flashMsg) {
               <span id="visible-note-status" style="font-size:12px;color:var(--muted)"></span>
             </div>
           </form>
+        </div>
+        <div class="card" id="customer-replies-card">
+          <div class="card-header"><h2>Customer replies (Re:amaze)</h2></div>
+          <div id="customer-replies-list"><p class="text-muted small-text">Loading…</p></div>
         </div>
         <div class="card">
           <div class="card-header"><h2>Fulfillments</h2></div>
@@ -4582,6 +4604,14 @@ app.post('/api/orders/:id/visible-note', requireAuth, async (req, res) => {
 app.get('/api/orders/:id/visible-notes', requireAuth, (req, res) => {
   const shopifyId = `gid://shopify/Order/${req.params.id}`;
   res.json({ notes: getVisibleNotesForOrder(shopifyId) });
+});
+
+app.get('/api/orders/:id/customer-messages', requireAuth, async (req, res) => {
+  const shopifyId = `gid://shopify/Order/${req.params.id}`;
+  if (MOCK) return res.json({ threads: [], customerEmail: null, mock: true });
+  const result = await callPortalInternal('POST', '/__internal__/customer-messages', { orderId: shopifyId });
+  if (!result.ok) return res.status(500).json({ error: result.error || 'failed' });
+  res.json({ threads: result.threads || [], customerEmail: result.customerEmail || null });
 });
 
 // ── Phase 14C: Tax exempt admin review page ───────────────────────────────────
