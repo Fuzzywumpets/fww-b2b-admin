@@ -3389,7 +3389,7 @@ async function submitNewOrder(req, session) {
           // NOTE: Shopify ignores originalUnitPrice when variantId is present.
           // Must use appliedDiscount to set wholesale price on variant-linked items.
           appliedDiscount: li.price && li.listPrice && parseFloat(li.price) < parseFloat(li.listPrice)
-            ? { value: parseFloat((((parseFloat(li.listPrice) - parseFloat(li.price)) / parseFloat(li.listPrice)) * 100).toFixed(4)), valueType: 'PERCENTAGE' }
+            ? { value: parseFloat((((parseFloat(li.listPrice) - parseFloat(li.price)) / parseFloat(li.listPrice)) * 100).toFixed(2)), valueType: 'PERCENTAGE' }
             : undefined,
         };
       }),
@@ -3539,7 +3539,7 @@ app.get('/manifest.json', (_req, res) => {
 
 // Mock: seed session
 app.get('/__test__/session', (req, res) => {
-  if (!MOCK) return res.status(404).json({ error: 'not found' });
+  if (!MOCK && process.env.B2B_ADMIN_ALLOW_TEST_SESSION !== '1') return res.status(404).json({ error: 'not found' });
   const email = req.query.email || 'alex@fuzzywumpets.com';
   const displayName = req.query.name || 'Alex (Test)';
   const sid = crypto.randomBytes(32).toString('hex');
