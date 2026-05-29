@@ -683,7 +683,9 @@ export function listOrdersFromCache(filters = {}) {
     params.push('%' + filters.q + '%', q, q, q);
   }
   if (filters.status === 'open') {
-    where.push("(o.financial_status IN ('PENDING','PARTIALLY_PAID','UNPAID') OR o.financial_status IS NULL)");
+    where.push("(o.financial_status IN ('PENDING','AUTHORIZED','PARTIALLY_PAID','UNPAID') OR o.financial_status IS NULL)");
+  } else if (filters.status === 'pending') {
+    where.push("o.financial_status IN ('PENDING','AUTHORIZED')");
   } else if (filters.status === 'paid') {
     where.push("o.financial_status = 'PAID'");
   } else if (filters.status === 'refunded') {

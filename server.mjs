@@ -1236,9 +1236,9 @@ const ORDER_SOURCE_COLORS = { 'b2b-portal': 'lime', sparklayer: 'blue', pos: 'or
 
 const FINANCIAL_STATUS_FILTER = {
   pending: ['PENDING','AUTHORIZED'],
-  paid:    ['PAID','PARTIALLY_PAID'],
-  open:    ['PENDING','AUTHORIZED','PARTIALLY_PAID'],
-  refunded: ['REFUNDED'],
+  paid:    ['PAID'],
+  open:    ['PENDING','AUTHORIZED','PARTIALLY_PAID','UNPAID'],
+  refunded: ['REFUNDED','PARTIALLY_REFUNDED'],
   voided:   ['VOIDED'],
 };
 
@@ -1389,14 +1389,15 @@ function renderOrdersList(session, data, filters) {
     <form class="filter-bar" method="GET" action="/orders">
       ${filters.source ? `<input type="hidden" name="source" value="${h(filters.source)}">` : ''}
       <input type="search" name="q" value="${h(filters.q||'')}" placeholder="Order #, customer, SKU…" class="filter-input search-input">
-      <select name="status" class="filter-select">
+      <select name="status" class="filter-select" onchange="this.form.submit()">
         <option value="">All statuses</option>
         <option value="open"    ${filters.status==='open'?'selected':''}>Open (unpaid)</option>
         <option value="pending" ${filters.status==='pending'?'selected':''}>Pending</option>
         <option value="paid"    ${filters.status==='paid'?'selected':''}>Paid</option>
         <option value="refunded" ${filters.status==='refunded'?'selected':''}>Refunded</option>
+        <option value="voided"  ${filters.status==='voided'?'selected':''}>Voided</option>
       </select>
-      <select name="date" class="filter-select">
+      <select name="date" class="filter-select" onchange="this.form.submit()">
         <option value="">All time</option>
         <option value="7d"  ${filters.date==='7d'?'selected':''}>Last 7 days</option>
         <option value="30d" ${filters.date==='30d'?'selected':''}>Last 30 days</option>
