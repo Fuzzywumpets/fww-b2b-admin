@@ -45,6 +45,13 @@ import { isInsider, resolveXeroContact, syncCustomerToXero, getXeroSyncStatus } 
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const MOCK  = process.env.B2B_ADMIN_MOCK === '1';
+
+// Activity-gated Shopify polling (added 2026-05-30 — shopify-bridge perf fix):
+// only sync while the dashboard is in active use, so data stays fresh when someone
+// is looking but Shopify isn't polled around the clock.
+let lastDashboardActivity = 0;
+const ACTIVE_WINDOW_MS = 20 * 60 * 1000; // treat as "in use" for 20 min after last request
+const dashboardActive = () => (Date.now() - lastDashboardActivity) < ACTIVE_WINDOW_MS;
 const PORT  = Number(process.env.PORT || 8794);
 
 const GOOGLE_CLIENT_ID     = process.env.B2B_ADMIN_GOOGLE_CLIENT_ID     || '';
@@ -801,6 +808,7 @@ function sessionCookie(sid, expire = false) {
 
 // ── Auth middleware ───────────────────────────────────────────────────────────
 function requireAuth(req, res, next) {
+  lastDashboardActivity = Date.now();
   const session = getSession(getCookie(req, COOKIE_NAME));
   if (!session) {
     if (req.path.startsWith('/api/')) return res.status(401).json({ error: 'not authenticated' });
@@ -7703,9 +7711,19 @@ async function syncRecentFromShopify() {
   }
 }
 
-// Start polling every 5 minutes (skips if MOCK or no bearer)
+// Activity-gated polling (was a flat 5-min interval). Syncs every ~3 min WHILE the
+// dashboard is being used (fresher than before); zero Shopify calls when idle, and
+// refreshes within ~60s when someone returns after an idle period.
 if (!MOCK) {
-  setInterval(syncRecentFromShopify, 5 * 60 * 1000);
+  const FRESH_TARGET_MS = 3 * 60 * 1000;
+  let _syncing = false, _lastSyncAt = 0;
+  setInterval(async () => {
+    if (!dashboardActive()) return;            // quiet when nobody is looking
+    if (_syncing || (Date.now() - _lastSyncAt) < FRESH_TARGET_MS) return;
+    _syncing = true;
+    try { await syncRecentFromShopify(); _lastSyncAt = Date.now(); }
+    catch {} finally { _syncing = false; }
+  }, 60 * 1000);
   // Daily GC for expired impersonation nonces
   setInterval(() => gcImpersonationNonces(), 24 * 60 * 60 * 1000);
 }
