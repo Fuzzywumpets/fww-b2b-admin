@@ -80,6 +80,9 @@ app.use(express.urlencoded({ extended: true }));
 import Database from 'better-sqlite3';
 
 let portalDb = null;
+// WHAT: lazily opens the SIBLING fww-b2b-portal SQLite (read-only) at a HARDCODED abs path and memoizes the handle in module-level `portalDb`.
+// CHANGE-GUARD: if the portal's data dir moves or the file is missing, the open throws and is swallowed (empty catch) — every portal-backed feature (visible notes, tax certs, activity, carts) silently degrades to empty. Re-test by deleting/renaming the db and confirming pages still render.
+// INVARIANT(S): MUST stay { readonly:true } — this process must never write the portal db; path is cross-repo (`/home/alexa/projects/fww-b2b-portal/data/portal.db`) so it only works when both repos are co-located on the VPS; MOCK short-circuits to null.
 function getPortalDb() {
   if (MOCK) return null;
   if (!portalDb) {
@@ -89,6 +92,9 @@ function getPortalDb() {
   return portalDb;
 }
 
+// WHAT: reads visible_notes rows the portal exposes to the customer for one Shopify order id, newest-first.
+// CHANGE-GUARD: the catch swallows ALL errors to [] — a schema rename of visible_notes silently hides notes with no log. Re-test the order-detail Visible Notes panel after any portal migration.
+// INVARIANT(S): order_id here is the numeric/string Shopify order id stored by the portal, NOT a gid; field mapping (added_at→addedAt, added_by→addedBy) must mirror the portal writer.
 function getVisibleNotesForOrder(shopifyOrderId) {
   if (MOCK) return [];
   const db = getPortalDb();
@@ -101,6 +107,9 @@ function getVisibleNotesForOrder(shopifyOrderId) {
   } catch (_) { return []; }
 }
 
+// WHAT: lists tax_exempt_certs rows with status='pending' from the portal db, oldest upload first (review queue order).
+// CHANGE-GUARD: feeds the /tax-exempt review queue; the SQL string-literal status filter must match the portal's enum exactly ('pending'). Errors swallowed to [].
+// INVARIANT(S): read-only; approval/rejection happens via callPortalInternal, NOT by writing this db.
 function getPendingTaxCertsFromPortal() {
   if (MOCK) return [];
   const db = getPortalDb();
@@ -113,6 +122,9 @@ function getPendingTaxCertsFromPortal() {
   } catch (_) { return []; }
 }
 
+// WHAT: paginated activity-log reader for one customer; builds a dynamic WHERE over customer_activity with optional from/to/type/q, returns rows + total + lastLogin + lastCart.
+// CHANGE-GUARD: count query is derived by string-replacing 'SELECT *'→'SELECT COUNT(*)'; if the base SELECT shape ever changes that replace breaks the count silently. Re-test pager totals after any query edit.
+// INVARIANT(S): all user-controlled filters bind via ? placeholders (no SQL injection); `to` adds +86400000ms to make the upper bound inclusive of the whole day; limit is clamped to max 200; page is 1-based and offset = (page-1)*lim.
 function getCustomerActivityFromPortal(numericCustomerId, { from, to, type, q, page = 1, limit = 50 } = {}) {
   if (MOCK) {
     const allRows = [
@@ -167,6 +179,9 @@ function getCustomerActivityFromPortal(numericCustomerId, { from, to, type, q, p
   } catch (e) { console.error('[activity] portal read failed:', e.message); return { rows: [], total: 0, lastLogin: null, lastCart: null, page: 1, limit: 50 }; }
 }
 
+// WHAT: reads the customer's current cart + cart_items from the portal db and recomputes a subtotal in JS.
+// CHANGE-GUARD: lineTotal/subtotal are recomputed here as round(b2b_price*qty*100)/100 — they do NOT trust a stored total; if the portal ever stores authoritative totals, reconcile to avoid drift. Errors swallowed to an empty cart.
+// INVARIANT(S): money is rounded to cents via *100/round/÷100 (float-safe-ish); customer_id is the gid form `gid://shopify/Customer/<id>`, unlike visible_notes which uses the numeric id.
 function getActiveCartFromPortal(numericCustomerId) {
   const customerId = `gid://shopify/Customer/${numericCustomerId}`;
   if (MOCK) {
@@ -193,6 +208,9 @@ function getActiveCartFromPortal(numericCustomerId) {
   } catch (e) { console.error('[active-cart] portal read failed:', e.message); return { items: [], subtotal: 0, itemCount: 0, updatedAt: null }; }
 }
 
+// WHAT: server-to-server call into the portal's internal API (PORTAL_INTERNAL_URL, default 127.0.0.1:8793) with a Bearer PORTAL_INTERNAL_TOKEN; the ONLY write path into the portal (vs read-only SQLite above).
+// CHANGE-GUARD: returns { ok:false, error:'no_internal_token' } when the token env is unset — callers must check .ok, not assume success. Network errors are caught and returned as ok:false (never throws).
+// INVARIANT(S): token must match the portal's expected internal secret; on localhost only — do NOT point PORTAL_INTERNAL_URL at a public host without TLS since the bearer is sent in cleartext otherwise.
 async function callPortalInternal(method, path, body) {
   if (!PORTAL_INTERNAL_TOKEN) return { ok: false, error: 'no_internal_token' };
   try {
@@ -213,6 +231,9 @@ async function callPortalInternal(method, path, body) {
 
 // ── Xero accounting integration ───────────────────────────────────────────────
 
+// WHAT: deterministic fake Xero bridge responses keyed by URL fragment + method, used in MOCK or when XERO_BEARER is absent.
+// CHANGE-GUARD: branch ORDER matters — the GET-Contacts-with-where check sits before the generic /Contacts branch so a live-lookup returns [] (forcing create) in mock; reordering changes dedupe behavior. Account codes here (200/610/1110/1120/6100/400) must match getXeroAccountMap defaults.
+// INVARIANT(S): the where=-Contacts case MUST return empty Contacts so syncCustomerToXero treats mock as 'not found' and exercises the create path.
 function xeroMockResponse(method, xeroPath, body) {
   if (xeroPath.includes('/ContactGroups')) {
     return { ContactGroups: [{ ContactGroupID: 'c5afb0f1-8a59-4db8-be57-83548c361669', Name: 'B2B Customers', Contacts: [] }] };
@@ -239,6 +260,9 @@ function xeroMockResponse(method, xeroPath, body) {
   return {};
 }
 
+// WHAT: single choke-point for all Xero traffic; proxies to the fww-xero-bridge worker with Bearer XERO_BRIDGE_BEARER, else returns mock.
+// CHANGE-GUARD: DANGER — `MOCK || !XERO_BEARER` means a PROD run with a missing/empty bearer silently returns fabricated mock success instead of erroring; accounting would appear to sync while nothing reaches Xero. Re-test that prod with no bearer fails loudly, not silently.
+// INVARIANT(S): throws on !resp.ok AND on json.ok===false so callers can try/catch; the bridge contract is POST { method, path, body } → { ok, body }.
 async function xeroRequest(method, xeroPath, body = null) {
   if (MOCK || !XERO_BEARER) {
     return { ok: true, body: xeroMockResponse(method, xeroPath, body) };
@@ -259,6 +283,9 @@ async function xeroRequest(method, xeroPath, body = null) {
   return json;
 }
 
+// WHAT: resolves the chart-of-accounts codes + payment terms from SQLite settings, with hardcoded fallbacks (sales 200, AR 610, Chase 1110, Stripe 1120, fees 6100, discounts 400, NET-30).
+// CHANGE-GUARD: these fallbacks must stay aligned with both xeroMockResponse's Accounts list and the real Xero chart; a wrong code posts revenue to the wrong ledger. payment_terms_days is Number()-coerced — a non-numeric setting yields NaN dates downstream.
+// INVARIANT(S): every getSetting key here ('xero_*') must exist in the Settings UI or silently fall back.
 function getXeroAccountMap() {
   return {
     sales_revenue:        getSetting('xero_sales_revenue')        || '200',
@@ -282,6 +309,9 @@ function addDays(isoString, days) {
   return d.toISOString().slice(0, 10);
 }
 
+// WHAT: idempotent Xero contact resolver — first tries resolveXeroContact(numId) (mapping/live lookup) to avoid duplicates, only PUTs a new Contact if unresolved.
+// CHANGE-GUARD: AccountNumber is set to the Shopify numeric customer id and is the dedupe key on the Xero side; changing what you pass as AccountNumber breaks future resolveXeroContact matches. Re-test that re-syncing the same customer does NOT create a 2nd contact.
+// INVARIANT(S): customer.id is a gid; numId derived via shopifyNumericId; throws if the create returns no ContactID.
 async function ensureXeroContact(customer) {
   // customer: { id (GID), displayName, email }
   // Phase 21G: resolve from mapping / live before creating to avoid duplicates
@@ -300,6 +330,9 @@ async function ensureXeroContact(customer) {
   return contact.ContactID;
 }
 
+// WHAT: builds and PUTs an ACCREC Xero invoice from a Shopify order; short-circuits if getXeroMap already shows status==='synced'.
+// CHANGE-GUARD: line-item UnitAmount prefers originalUnitPriceSet then discountedUnitPriceSet (NOTE: original first) — verify this matches intended B2B pricing, since B2B discounts live in the discounted set. Order-level discounts are appended as negative lines to accountMap.discounts. TaxType hardcoded 'NONE' (B2B tax-exempt assumption).
+// INVARIANT(S): writes setXeroMap(orderId, InvoiceID, contactId, 'synced') on success — the get/set around this is NOT atomic, so two concurrent syncs of the same order can each pass the 'synced' check and create duplicate invoices; InvoiceNumber = order.name (e.g. #1001) must be unique in Xero.
 async function createXeroInvoice(order, accountMap) {
   // order: Shopify order object with lineItems, customer, etc.
   const orderId   = shopifyNumericId(order.id);
@@ -354,6 +387,9 @@ async function createXeroInvoice(order, accountMap) {
   return inv.InvoiceID;
 }
 
+// WHAT: PUTs a Payment against an existing Xero invoice for the given amount/date/bank-account code.
+// CHANGE-GUARD: there is NO idempotency key — calling this twice (e.g. retry queue + manual) records TWO payments and over-allocates the invoice. Re-test the retry path does not double-pay.
+// INVARIANT(S): amount is presentment currency major units (dollars), accountCode is a BANK account code (chase_checking/stripe_clearing), date defaults to today if absent; throws if no PaymentID returned.
 async function recordXeroPayment(orderId, xeroInvoiceId, amount, date, accountCode) {
   const payDate = date ? toXeroDate(date) : new Date().toISOString().slice(0, 10);
   const res = await xeroRequest('PUT', '/api.xro/2.0/Payments', {
@@ -369,6 +405,9 @@ async function recordXeroPayment(orderId, xeroInvoiceId, amount, date, accountCo
   return pay.PaymentID;
 }
 
+// WHAT: top-level 'sync this order to Xero' used by the order-detail button; loads the order, creates the invoice, audit-logs success; on failure enqueues an xero_pending action + marks the map 'pending_retry'.
+// CHANGE-GUARD: re-throws after queuing, so the HTTP handler must catch and render the 'xero_failed' flash. actorEmail must come from req.adminSession.email (never client input) for a trustworthy audit trail.
+// INVARIANT(S): every outcome is audit-logged (xero:invoice_synced / xero:invoice_failed) keyed by the order gid; failures are durably retryable via addXeroPending.
 async function syncOrderToXero(numId, actorEmail) {
   const order = await getOrderDetail(numId);
   if (!order) throw new Error('Order not found: ' + numId);
@@ -385,6 +424,9 @@ async function syncOrderToXero(numId, actorEmail) {
   }
 }
 
+// WHAT: drains the xero_pending queue (create_invoice / record_payment), capped at 3 retries per action; returns {done,failed,skipped}.
+// CHANGE-GUARD: SERIAL by design (await in a for-of) — do not parallelize, since concurrent create_invoice for the same order would race the non-atomic getXeroMap/setXeroMap and duplicate invoices. retries>=3 → skipped (NOT failed), so a poison action lingers in the queue forever; verify a sweep/alert exists.
+// INVARIANT(S): payload_json is the persisted action args; unknown action_type is marked failed; markXeroPendingDone/Failed must be called exactly once per processed action.
 async function retryXeroPending() {
   const pending = getXeroPending('pending');
   const accountMap = getXeroAccountMap();
@@ -543,6 +585,9 @@ const MOCK_ORDERS = [
 // In-memory overrides for mock mutations (mark paid, note changes)
 const mockOrderOverrides = new Map(); // numericId → { displayFinancialStatus?, note? }
 
+// WHAT: MOCK-only order fetch — finds the MOCK_ORDERS fixture by gid and layers in any in-memory mockOrderOverrides (mark-paid / note edits).
+// CHANGE-GUARD: overrides are keyed by the NUMERIC id string; any mock mutation route must write the same key shape or the override won't apply. Returns null for unknown ids (callers 404).
+// INVARIANT(S): pure read of process-memory fixtures — resets on restart; never used when MOCK is off.
 function getMockOrder(numericId) {
   const gid = `gid://shopify/Order/${numericId}`;
   const order = MOCK_ORDERS.find(o => o.id === gid);
@@ -763,6 +808,9 @@ const MOCK_CUSTOMER_REVENUE = [
 
 // Build variant → product lookup from MOCK_PRODUCTS (mock mode only)
 const MOCK_VARIANT_PRODUCT = new Map(); // variantId (short like 'v301') → productNumericId
+// WHAT: builds MOCK_VARIANT_PRODUCT, a variant→product reverse index used by order-detail to link line items back to a product page in mock mode.
+// CHANGE-GUARD: stores BOTH `v<num>` and bare `<num>` keys because mock line items reference variants as short ids ('v301') while live data uses numeric ids; order-detail lookup tries both forms, so keep both inserts.
+// INVARIANT(S): only meaningful in MOCK; relies on shopifyNumericId to strip gids consistently.
 for (const p of MOCK_PRODUCTS) {
   const pNum = shopifyNumericId(p.id);
   for (const { node: v } of (p.variants?.edges || [])) {
@@ -788,6 +836,9 @@ const MOCK_SPARKLAYER_CUSTOMERS = [
 const mockSparkLayerMigrated = new Set(['203']); // id 203 already has b2b
 
 // ── Cookie helpers ────────────────────────────────────────────────────────────
+// WHAT: minimal cookie parser (no cookie-parser dep) — splits the Cookie header on ';', URL-decodes the value of the named cookie.
+// CHANGE-GUARD: only consumer is the session lookup (COOKIE_NAME); if you add signed cookies, do it here. Returns null when absent so requireAuth treats it as unauthenticated.
+// INVARIANT(S): trims keys/values; first '=' splits k/v so values may contain '='; does not handle quoted-string cookie values.
 function getCookie(req, name) {
   const header = req.headers.cookie || '';
   for (const part of header.split(';')) {
@@ -799,6 +850,9 @@ function getCookie(req, name) {
   return null;
 }
 
+// WHAT: serializes the Set-Cookie header for the admin session — HttpOnly, SameSite=Lax, 7-day Max-Age (604800s), +Secure outside MOCK.
+// CHANGE-GUARD: dropping Secure/HttpOnly/SameSite weakens session security; the expire=true variant (Max-Age=0, empty value) is the logout path — keep both in sync with COOKIE_NAME.
+// INVARIANT(S): SameSite=Lax + no CSRF token means state-changing POSTs rely on Lax to block cross-site form posts; any route changed to accept simple cross-site requests needs a CSRF defense.
 function sessionCookie(sid, expire = false) {
   const val    = expire ? '' : encodeURIComponent(sid);
   const maxAge = expire ? 0 : 604800;
@@ -810,6 +864,9 @@ function sessionCookie(sid, expire = false) {
 // WHAT: Express middleware gating every page/API behind a valid admin_sessions cookie; also stamps lastDashboardActivity to drive the activity-gated Shopify poller.
 // CHANGE-GUARD: re-test that /api/* returns 401 JSON (not an HTML redirect) and that browser routes redirect to /login; touching lastDashboardActivity here changes when syncRecentFromShopify fires.
 // INVARIANT(S): this is the ONLY auth gate — every mutating route must mount it; session lookup must reject expired/missing sids; no route may trust req.params/body for identity.
+// WHAT: THE auth gate for every page/API — stamps lastDashboardActivity, looks up the session by cookie, attaches req.adminSession, else 401-JSON for /api/* or redirect to /login.
+// CHANGE-GUARD: every mutating route MUST be mounted behind this; the /api/* vs HTML split must stay so XHR callers get JSON 401 not an HTML redirect. Re-test an expired sid returns 401 on /api and /login redirect on pages.
+// INVARIANT(S): identity comes ONLY from getSession(cookie) — never trust req.params/body for who the actor is; NOTE it stamps lastDashboardActivity BEFORE the auth check, so even unauthenticated hits keep the Shopify poller 'active'.
 function requireAuth(req, res, next) {
   lastDashboardActivity = Date.now();
   const session = getSession(getCookie(req, COOKIE_NAME));
@@ -832,6 +889,9 @@ const US_STATE_CODES = {
   'South Dakota':'SD','Tennessee':'TN','Texas':'TX','Utah':'UT','Vermont':'VT','Virginia':'VA','Washington':'WA','West Virginia':'WV',
   'Wisconsin':'WI','Wyoming':'WY','District of Columbia':'DC','DC':'DC'
 };
+// WHAT: normalizes a US state to its 2-letter code (passes through already-2-char inputs upcased, maps full names via US_STATE_CODES, else returns input unchanged).
+// CHANGE-GUARD: used for address normalization feeding shipping/Xero; an unknown full name passes through verbatim (no throw), so downstream must tolerate non-codes. Keep US_STATE_CODES (incl. DC) in sync with carrier expectations.
+// INVARIANT(S): idempotent — toStateCode(toStateCode(x))===toStateCode(x); 2-char fast-path assumes any 2-char string is already a code.
 function toStateCode(s) {
   if (!s) return s;
   if (s.length === 2) return s.toUpperCase();
@@ -839,6 +899,9 @@ function toStateCode(s) {
 }
 
 
+// WHAT: renders the '🔄 Synced N min/hr/d ago' relative-time badge from a ms epoch, with the exact ISO timestamp in the title attr.
+// CHANGE-GUARD: thresholds are 60s/3600s/86400000ms — purely cosmetic; returns '' when syncedAt is falsy so list headers omit the badge cleanly.
+// INVARIANT(S): syncedAt is epoch MILLISECONDS (Date.now() form), not seconds — passing seconds yields nonsense durations.
 function fmtSyncBadge(syncedAt) {
   if (!syncedAt) return '';
   const ms = Date.now() - syncedAt;
@@ -851,6 +914,9 @@ function fmtSyncBadge(syncedAt) {
 }
 
 // ── HTML helpers ──────────────────────────────────────────────────────────────
+// WHAT: THE HTML-escape helper — escapes & < > " ' for safe interpolation into server-rendered template strings.
+// CHANGE-GUARD: this is the project's primary XSS defense in the string-templated HTML; any new dynamic value injected into markup MUST pass through h(). Order matters: & is escaped first so later entities aren't double-escaped. Re-test with a value containing <script> and a quote.
+// INVARIANT(S): null/undefined → '' ; does NOT escape for attribute-less JS contexts (inline onclick handlers build strings separately and need their own escaping).
 function h(str) {
   if (str == null) return '';
   return String(str)
@@ -867,10 +933,16 @@ function fmtDate(iso) {
   return new Date(iso).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
 }
 
+// WHAT: extracts the trailing numeric id from a Shopify gid (gid://shopify/Order/1001 → '1001') by taking the last '/'-segment.
+// CHANGE-GUARD: used everywhere to bridge gid↔numeric (routes, cache keys, mock lookups); returns null for falsy input. If Shopify ever changes gid format this single function localizes the fix.
+// INVARIANT(S): returns a STRING, not a number; passing an already-numeric id returns it unchanged (no '/').
 function shopifyNumericId(gid) {
   return gid ? String(gid).split('/').pop() : null;
 }
 
+// WHAT: inverse of shopifyNumericId for orders/customers — rebuilds the canonical gid from a numeric id for GraphQL queries and Xero/audit keys.
+// CHANGE-GUARD: the gid string here is used as a primary KEY in getXeroMap/audit/backorders — it must byte-match the form Shopify returns; a trailing-space or case change orphans existing rows.
+// INVARIANT(S): numId should be the bare numeric (no gid); do not double-wrap an already-gid value.
 function shopifyOrderGid(numId)    { return `gid://shopify/Order/${numId}`; }
 function shopifyCustomerGid(numId) { return `gid://shopify/Customer/${numId}`; }
 
@@ -880,6 +952,9 @@ function gfonts() {
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Playfair+Display:wght@600;700&display=swap" rel="stylesheet">`;
 }
 
+// WHAT: master page shell — renders header/nav/user-email + injects content; also ships the global keyboard-shortcut handler and syncCacheNow() helper inline.
+// CHANGE-GUARD: navItems is the single source of the top-nav; the keyboard 'g+<key>' map in the inline script must mirror these hrefs or shortcuts dead-link. title is escaped via h() but `content` is injected RAW — callers are responsible for escaping their own dynamic values before passing them in.
+// INVARIANT(S): activePath drives the .active nav class via exact-equality match; session?.email is the only user-identity shown and is h()-escaped.
 function layout({ title, session, activePath = '/', content, extraHead = '' }) {
   const navItems = [
     ['/', 'Dashboard'], ['/orders', 'Orders'], ['/customers', 'Customers'],
@@ -976,6 +1051,9 @@ function layout({ title, session, activePath = '/', content, extraHead = '' }) {
   })();
   </script>
   <script>
+// WHAT: client helper POSTing /api/admin/sync-now to force a Shopify→cache refresh, with button busy/disabled state and reload-on-success.
+// CHANGE-GUARD: relies on the server returning { ok:true } JSON; if the route path or response shape changes, the 'Sync now' buttons on Orders/Customers break. Re-test the busy→synced→reload flow and the failure alert.
+// INVARIANT(S): it disables the button to prevent double-submits but does NOT debounce across page instances; server route must be idempotent under rapid clicks.
   window.syncCacheNow = async function(btn) {
     btn.disabled = true;
     var orig = btn.innerHTML;
@@ -1059,6 +1137,9 @@ function renderComingSoon(session, label, activePath) {
 // WHAT: single choke-point for all live Shopify GraphQL, proxied through the shopify-bridge Cloudflare worker with SHOPIFY_BRIDGE_BEARER.
 // CHANGE-GUARD: if the bridge URL, bearer env name, or error-shape handling changes, every order/customer/product/catalog feature breaks at once; re-test one read and one mutation.
 // INVARIANT(S): throws on res.!ok and on json.errors[] so callers can try/catch; callers must inspect per-mutation userErrors separately (this only catches transport/top-level errors, NOT mutation userErrors).
+// WHAT: single choke-point for all live Shopify GraphQL via the shopify-bridge worker with Bearer SHOPIFY_BRIDGE_BEARER.
+// CHANGE-GUARD: hardcoded worker URL (shopify-bridge.alex-037.workers.dev/api/graphql) — if the bridge host or bearer env name changes, EVERY order/customer/product/catalog read+mutation breaks at once; re-test one read and one mutation.
+// INVARIANT(S): throws on !res.ok and on json.errors[] (transport/top-level), but does NOT inspect per-mutation userErrors — callers running mutations must check userErrors themselves; bearer is empty-string default so a missing env yields 401s from the bridge, not a local throw.
 async function shopifyFetch(query, variables = {}) {
   const res = await fetch('https://shopify-bridge.alex-037.workers.dev/api/graphql', {
     method: 'POST',
@@ -1072,6 +1153,9 @@ async function shopifyFetch(query, variables = {}) {
 }
 
 // ── Dashboard ─────────────────────────────────────────────────────────────────
+// WHAT: assembles the dashboard model — open orders, week count, top customers, low-stock B2B variants, 12-mo revenue, pending-Xero-review list.
+// CHANGE-GUARD: live path issues TWO parallel shopifyFetch calls (orders tag:b2b-portal last 90d, products published) via Promise.all; the orders query is capped at first:50 with NO pagination, so >50 recent B2B orders silently truncate the open/week counts. Re-verify counts when volume grows.
+// INVARIANT(S): top customers prefer the all-time cache (getTopCustomersAllTime) and only fall back to the 90-day live spend map when the cache is empty; low-stock threshold is inventoryQuantity<10 and only for variants on the B2B publication; whole function is wrapped so any error returns a safe zeroed shape with .error set.
 async function getDashboardData() {
   if (MOCK) {
     return {
@@ -1099,6 +1183,9 @@ async function getDashboardData() {
         edges{node{id name processedAt customer{id displayName email} displayFinancialStatus
           totalPriceSet{presentmentMoney{amount currencyCode}} tags}}
         pageInfo{hasNextPage}}}`, { q: `tag:b2b-portal created_at:>${ninetyDaysAgo}` }),
+// WHAT: low-stock source query — pulls first:100 published products with publishedOnPublication(B2B_PUB_ID) and first:10 variants each.
+// CHANGE-GUARD: DOUBLE truncation risk — first:100 products AND first:10 variants/product with no paging; a catalog beyond those caps drops products/variants from the low-stock widget silently. B2B_PUB_ID is the hardcoded publication gid (199709720811) gating B2B visibility.
+// INVARIANT(S): only variants on the B2B publication count (p.publishedOnPublication guard); inventoryQuantity must be a number to be considered.
       shopifyFetch(`query{ products(first:100,query:"published_status:published"){
         edges{node{id title publishedOnPublication(publicationId:"${B2B_PUB_ID}")
           variants(first:10){edges{node{sku title inventoryQuantity}}}}}}}`)
@@ -1149,6 +1236,9 @@ async function getDashboardData() {
   }
 }
 
+// WHAT: pure HTML renderer for the dashboard widgets (open orders, week, top customers, revenue chart, low stock, pending Xero review).
+// CHANGE-GUARD: assumes the getDashboardData shape; data.error renders a non-fatal warning banner rather than failing. Revenue chart calls renderBarChart (defined later, ~line 5060) — keep its data contract {label,value} stable.
+// INVARIANT(S): every dynamic customer/order field is h()-escaped; row-critical/qty-zero CSS classes are driven by qty===0 / qty<=3 thresholds and must agree with the data's low-stock cutoff.
 function renderDashboard(session, data) {
   const today = new Date().toLocaleDateString('en-US', { weekday:'long', year:'numeric', month:'long', day:'numeric' });
   const openOrdersTable = data.openOrders?.length > 0
@@ -1235,6 +1325,9 @@ function renderDashboard(session, data) {
 }
 
 // ── Orders list ───────────────────────────────────────────────────────────────
+// WHAT: classifies an order's channel from tags+sourceName into one of sparklayer/pos/manual/b2b-portal/online (checked in that PRIORITY order).
+// CHANGE-GUARD: order of checks is the precedence — sparklayer tag wins over POS wins over draft_order wins over b2b-portal tag; reordering re-labels historical orders. Drives ORDER_SOURCE_LABELS/COLORS badges.
+// INVARIANT(S): any 'sparklayer*' prefixed tag (case-insensitive) classifies as sparklayer; 'draft_order' sourceName means a manually-created order.
 function deriveOrderSource(order) {
   const tags = order.tags || [];
   const sn   = order.sourceName || '';
@@ -1256,6 +1349,9 @@ const FINANCIAL_STATUS_FILTER = {
   voided:   ['VOIDED'],
 };
 
+// WHAT: orders-list data source — prefers the local orders_cache (B2B-only, joined on customers_cache.is_b2b) and falls back to live Shopify; also handles the MOCK fixture path.
+// CHANGE-GUARD: the cache branch returns hasNextPage:false and the FULL filtered set with no real pagination, while the live branch pages 50 at a time via after-cursor — these two paths have DIFFERENT pagination semantics, so UI 'Next 50' only works on the live path. Re-test list parity cache-vs-live after filter changes.
+// INVARIANT(S): cache is authoritative only when getOrdersCacheStats().total>0; live query string is assembled from qParts and user q is passed THROUGH to Shopify's query DSL (Shopify-side escaping, not SQL) — keep filters server-derived where possible; financial_status filter expands via FINANCIAL_STATUS_FILTER.
 async function getOrdersData(filters) {
   // Phase 24D: try cache first (B2B-only by definition — joined to customers_cache where is_b2b=1)
   if (!MOCK) {
@@ -1346,6 +1442,9 @@ async function getOrdersData(filters) {
   }
 }
 
+// WHAT: renders the orders table + filter bar + bulk-select form (mark-paid) + pagination.
+// CHANGE-GUARD: the bulk form POSTs /orders/bulk with checked `ids`; the inline select-all/upd() script wires the bulk bar — keep input name="ids" stable. 'Sync now' button only shows when data._fromCache. Re-test bulk mark-paid after table column changes.
+// INVARIANT(S): all order/customer fields h()-escaped; pagination 'Next 50' uses endCursor copied into the after param and only renders when hasNextPage (live path only); colspan on the empty row (10) must match the header column count.
 function renderOrdersList(session, data, filters) {
   const { orders, hasNextPage, endCursor, error } = data;
 
@@ -1459,6 +1558,9 @@ function renderOrdersList(session, data, filters) {
 }
 
 // ── Order detail ──────────────────────────────────────────────────────────────
+// WHAT: fetches one order's full detail (customer, line items w/ variant+barcode, addresses, fulfillments, transactions) for the detail page and Xero sync.
+// CHANGE-GUARD: lineItems first:50 and transactions first:10 are HARD caps with no paging — an order with >50 lines or >10 transactions silently drops the overflow from the UI AND from createXeroInvoice's line build. Re-verify large orders invoice correctly. Returns null on any error (caller 404s).
+// INVARIANT(S): id is built via shopifyOrderGid(numericId); the selected fields are the contract consumed by renderOrderDetail, createXeroInvoice, and the ship/fulfill flows — adding a consumer means extending this query.
 async function getOrderDetail(numericId) {
   if (MOCK) return getMockOrder(numericId);
   try {
@@ -1490,6 +1592,9 @@ async function getOrderDetail(numericId) {
   }
 }
 
+// WHAT: renders the customer-visible notes panel (body + date + author) on order detail.
+// CHANGE-GUARD: note.body is h()-escaped here, but the CLIENT-side refresh path in visibleNotesScript re-renders with only `.replace(/</g,'<')` — weaker escaping; keep both in mind when changing what fields are shown. Empty list shows a muted placeholder.
+// INVARIANT(S): notes come from getVisibleNotesForOrder (portal db), newest-first; addedBy is staff email.
 function renderVisibleNotesList(notes) {
   if (!notes || !notes.length) return '<p class="text-muted small-text">No visible notes yet.</p>';
   return notes.map(n => `
@@ -1499,6 +1604,9 @@ function renderVisibleNotesList(notes) {
     </div>`).join('');
 }
 
+// WHAT: the large order-detail page — status timeline, editable line items, fulfillments, transactions, address, Xero/partial-invoice state, and all the modal JS (edit/discount/fulfill/backorder/invoice/cancel/ship).
+// CHANGE-GUARD: reads several SQLite stores by gid (getXeroMap, getPartialInvoices, getBackordersForOrder) — those keys must match shopifyOrderGid(numId). The edit form posts qtys[]/prices[]/removes/addCustomLines to /orders/:id/edit; serializeCustomLines() must run before submit (onclick on Save). Re-test edit/ship/cancel modals after any markup change since the inline JS selects elements by hardcoded ids.
+// INVARIANT(S): flash strings map 1:1 to alert banners — adding a server flash value needs a branch here or it renders silently; client-side ship rates JS sorts by amount and posts to <path>/ship/rates then /ship/label; line-item product links resolve via variant.product.id or the MOCK_VARIANT_PRODUCT fallback.
 function renderOrderDetail(session, order, flash, flashMsg) {
   const numId    = shopifyNumericId(order.id);
   const isPaid   = order.displayFinancialStatus === 'PAID';
@@ -1512,6 +1620,9 @@ function renderOrderDetail(session, order, flash, flashMsg) {
 
   // Status timeline
   const step1done  = true;
+// WHAT: status-timeline gating — step2 (Payment) is 'done' for PAID/PARTIALLY_PAID/REFUNDED.
+// CHANGE-GUARD: REFUNDED counting as payment-done is intentional (money did change hands) — don't 'fix' it without checking the timeline UX. step3curr/step4curr derive from this, so editing the set shifts which node shows as current.
+// INVARIANT(S): the four steps are strictly sequential (current = prev-done && this-not-done); displayFinancialStatus is Shopify's enum, compared verbatim (case-sensitive).
   const step2done  = ['PAID','PARTIALLY_PAID','REFUNDED'].includes(order.displayFinancialStatus);
   const step3done  = isFulfilled;
   const step4done  = order.fulfillments?.some(f => f.status === 'DELIVERED') || false;
@@ -1532,10 +1643,16 @@ function renderOrderDetail(session, order, flash, flashMsg) {
 
   // Backorders for this order (from SQLite) — must be before lineItemsHtml
   const backordersForOrder = getBackordersForOrder(`gid://shopify/Order/${numId}`);
+// WHAT: indexes this order's backorder rows by line_item_id so each line can render a ⚠ Backorder badge + ETA.
+// CHANGE-GUARD: must be computed BEFORE lineItemsHtml (it is) — moving it after the .map() breaks the badge lookup. Keyed by the Shopify line-item id (item.id), which must match what fulfillBackorder/upsertBackorder persist.
+// INVARIANT(S): one backorder row per line item assumed (Map collapses duplicates to the last).
   const backorderMap = new Map(backordersForOrder.map(b => [b.line_item_id, b]));
 
   // Line items table
   const lineItems = (order.lineItems?.edges || []).map(e => e.node);
+// WHAT: builds each editable line-item row — title (linked to product), SKU, qty (static+input), unit price (static+input w/ data-retail), row total, remove toggle, and backorder badge/button.
+// CHANGE-GUARD: input names qtys[<liId>], prices[<liId>], and removes are parsed server-side in /orders/:id/edit — renaming any breaks order editing. data-retail carries the original (pre-discount) price for client validation; unitPrice prefers discounted then original then 0.
+// INVARIANT(S): rowTotal = unitPrice * quantity computed in JS for display only (server recomputes on save); productNum resolves via variant.product.id (live) or MOCK_VARIANT_PRODUCT (mock) and gates whether the title is a link; item.title is escaped into both markup and an onclick string (the onclick path uses replace(/'/g) — fragile, prefer not to add quotes-bearing data there).
   const lineItemsHtml = lineItems.map(item => {
     const unitPrice = parseFloat(item.discountedUnitPriceSet?.presentmentMoney?.amount ?? item.originalUnitPriceSet?.presentmentMoney?.amount ?? 0);
     const rowTotal  = unitPrice * (item.quantity || 0);
@@ -1627,6 +1744,9 @@ function renderOrderDetail(session, order, flash, flashMsg) {
     : '';
 
   // Edit mode JS (16A)
+// WHAT: inline edit-mode controller — toggles static-vs-input cells, manages custom-line add/remove, discount bar, and all the order modals; also the ship rates/label AJAX.
+// CHANGE-GUARD: every function selects DOM by hardcoded element id (edit-mode-bar, edit-save-bar, discount-modal, ship-modal, etc.) — renaming those ids in the markup silently no-ops the buttons. toggleEditMode(false) RESETS custom lines and discount inputs; keep that cleanup if you add fields.
+// INVARIANT(S): disabled inputs are excluded from form submission (edit mode toggles .disabled), so non-edit-mode loads never POST qty/price overrides; Escape closes all modals via the keydown handler at the bottom.
   const editModeScript = `<script>
   function toggleEditMode(enable) {
     document.getElementById('edit-mode-bar').style.display = enable ? 'block' : 'none';
@@ -1692,6 +1812,9 @@ function renderOrderDetail(session, order, flash, flashMsg) {
     }
   }
   let _selectedRateId = null;
+// WHAT: client-side 'Get rates' — collects checked ship line items + fromId + weight and POSTs <path>/ship/rates, then renders a sorted radio list of carrier rates.
+// CHANGE-GUARD: weight defaults to 1 if blank/NaN (unit is whatever the shipping bridge expects — confirm lb vs oz before changing); rates are sorted ascending by shipping_amount.amount with 9999 as the missing-price sentinel. Auto-selects the cheapest. Re-test against the shipping bridge after field renames (rate_id, shipping_amount, carrier/service codes).
+// INVARIANT(S): _selectedRateId is set to the first/cheapest rate and updated on radio change — shipBuyLabel refuses to proceed without it.
   async function shipGetRates() {
     const btn = document.getElementById('ship-get-rates-btn');
     const errEl = document.getElementById('ship-error');
@@ -1735,6 +1858,9 @@ function renderOrderDetail(session, order, flash, flashMsg) {
       btn.disabled = false; btn.textContent = 'Get rates';
     }
   }
+// WHAT: client-side 'Buy label + fulfill' — POSTs <path>/ship/label with the chosen rate_id + line items, then shows tracking + label link.
+// CHANGE-GUARD: the success copy distinguishes 'Fulfilled in Shopify' vs 'Shopify fulfill failed' purely from j.fulfillment_id presence — the server contract (tracking_number/tracking_url/label_url/carrier_code/fulfillment_id) must stay stable. Disables the button during purchase to avoid buying two labels.
+// INVARIANT(S): refuses without _selectedRateId; buying a label and fulfilling in Shopify are a single server action — the rule is fulfillment must follow the label (don't split them client-side).
   async function shipBuyLabel() {
     const btn = document.getElementById('ship-buy-btn');
     const errEl = document.getElementById('ship-error');
@@ -1778,6 +1904,9 @@ function renderOrderDetail(session, order, flash, flashMsg) {
   </script>`;
 
 
+// WHAT: client JS for the order-detail customer-comms panel — submitVisibleNote() POSTs /api/orders/:id/visible-note and re-renders the list; loadCustomerReplies() GETs /api/orders/:id/customer-messages (Re:amaze threads).
+// CHANGE-GUARD: the client re-render escapes only '<' (n.body.replace(/</g,'<')) — weaker than server-side h(); do not echo attacker-controlled HTML attributes here. Endpoint paths are hardcoded and parsed from location.pathname.split('/').pop() for the order id — keep the /orders/:id URL shape.
+// INVARIANT(S): mbody() coerces message objects/strings and truncates (300/200 chars) for preview; threads come from Re:amaze via the server, this only renders them.
   const visibleNotesScript = `
     <script>
     async function submitVisibleNote(e, orderId) {
@@ -2253,6 +2382,9 @@ function renderOrderDetail(session, order, flash, flashMsg) {
 }
 
 // ── Customers list ────────────────────────────────────────────────────────────
+// WHAT: Build the /customers list — cache-first (Phase 24D local cache via listCustomersFromCache), falling back to a live Shopify customers() GraphQL query when cache empty or MOCK.
+// CHANGE-GUARD: re-test all three paths (cache hit, MOCK, live Shopify); if cache returns 0 rows it MUST fall through to live, not show an empty list. Verify _fromCache/_syncedAt flags still set so the 'Sync now' button + sync badge render.
+// INVARIANT(S): live query is sortKey:AMOUNT_SPENT reverse:true (descending lifetime spend) and capped at first:50 — pagination is cursor-based via filters.after; segment->Shopify query-string mapping (b2b->tag:b2b, sparklayer->tag:sparklayer*, has_orders->orders_count:>0) must match the MOCK in-memory filter semantics.
 async function getCustomersData(filters) {
   // Phase 24D: try local cache first (populated by backfill); fall back to live Shopify
   if (!MOCK) {
@@ -2329,6 +2461,9 @@ async function getCustomersData(filters) {
   }
 }
 
+// WHAT: Render a single customer tag as a colored chip; picks a CSS class from the tag's lowercased prefix (b2b, sparklayer*, b2b-admin, b2b-tier:gold, b2b-tier:*).
+// CHANGE-GUARD: if you add a tier color, keep the gold check BEFORE the generic 'b2b-tier:' check (order matters — gold is a prefix of the generic match).
+// INVARIANT(S): output is HTML-escaped via h(); linked variant builds /customers?tag=<encoded> — the tag value must be URL-encoded to survive special chars.
 function tagChip(t, { linked = false } = {}) {
   const tl = (t || '').toLowerCase();
   let cls = 'tag-chip-default';
@@ -2343,6 +2478,9 @@ function tagChip(t, { linked = false } = {}) {
   return `<span class="tag-chip ${cls}">${h(t)}</span>`;
 }
 
+// WHAT: HTML for the /customers table — segment chips, search/tag/sort filter bar, rows with star badges for top-10-by-spend, and a 'Next 50' cursor link.
+// CHANGE-GUARD: the ★ top-customer badge is index-based (idx < TOP_CUSTOMER_THRESHOLD) and ONLY valid when sort is lifetime_spend_desc — if you change the default sort or page size, the star logic silently mislabels. Re-test that 'Next 50' preserves q/segment/tag/sort params plus after cursor.
+// INVARIANT(S): colspan=7 on the empty row must match the 7 <th> columns; pagination uses endCursor (opaque Shopify cursor), never an offset.
 function renderCustomersList(session, data, filters) {
   const { customers, hasNextPage, endCursor, error } = data;
 
@@ -2442,6 +2580,9 @@ function renderCustomersList(session, data, filters) {
 }
 
 // ── Customer detail ───────────────────────────────────────────────────────────
+// WHAT: Fetch one customer by numeric id (converted to gid via shopifyCustomerGid) — core fields plus addresses and the b2b-namespace metafields used by the settings card.
+// CHANGE-GUARD: metafields are fetched first:20 namespace:'b2b' — if a new per-customer setting key is added beyond 20, it won't be returned. On error returns null, which callers must treat as 404.
+// INVARIANT(S): numericId is the bare Shopify numeric id (no gid prefix); the gid round-trip must stay consistent with shopifyNumericId used elsewhere.
 async function getCustomerDetail(numericId) {
   if (MOCK) {
     const gid = shopifyCustomerGid(numericId);
@@ -2463,6 +2604,9 @@ async function getCustomerDetail(numericId) {
   }
 }
 
+// WHAT: Last 10 orders for a customer — cache-first (getCustomerOrdersFromCache, mapped into the Shopify-shaped object the renderer expects), else live orders(query:customer_id:...).
+// CHANGE-GUARD: the cache->Shopify-shape mapping must keep totalPriceSet.presentmentMoney.amount as a STRING and lineItems.edges as [] (renderer assumes these); a live failure swallows to [] (empty, not error).
+// INVARIANT(S): always sliced to 10, sortKey:PROCESSED_AT reverse:true (newest first); cache rows are NOT re-sorted here — they rely on getCustomerOrdersFromCache ordering.
 async function getCustomerRecentOrders(customerId) {
   // Phase 24D: cache first
   if (!MOCK) {
@@ -2502,6 +2646,9 @@ async function getCustomerRecentOrders(customerId) {
 
 // Phase 10: 4 per-customer fields — discount_pct, dropship_enabled, dropship_margin_pct, allow_order_on_invoice
 // min_order_usd and payment_terms are GLOBAL settings only (not per-customer).
+// WHAT: Resolve effective B2B per-customer config = defaults (global b2b_discount_pct setting + hardcoded fallbacks) overlaid with this customer's b2b-namespace metafields (discount_pct, dropship_enabled, dropship_margin_pct, allow_order_on_invoice, catalog_access_tags). Returns {effective, overrides, defaults}.
+// CHANGE-GUARD: only THESE 4 (+catalog tags) are per-customer; min_order_usd and payment_terms are GLOBAL-only (see comment above) — do not add them here. boolean parse: allow_order_on_invoice defaults true (aoiStr !== 'false'); dropship_enabled defaults via (deStr === 'true').
+// INVARIANT(S): overrides==null means 'inherit default' and the UI shows 'default applied'; effective = override ?? default. MOCK path layers mockB2bConfigOverrides over metafields and treats null entries as deletions — keep MOCK and live override semantics identical or the settings card lies.
 async function getB2bConfig(numericId) {
   const defaults = {
     discount_pct:            parseInt(getSetting('b2b_discount_pct') ?? '50', 10),
@@ -2591,6 +2738,9 @@ async function getB2bConfig(numericId) {
   }
 }
 
+// WHAT: Persist B2B per-customer settings — sets non-empty fields via metafieldsSet and DELETES fields whose value is null/'' via metafieldsDelete (a blank submit = reset to default).
+// CHANGE-GUARD: empty string '' is treated as a delete/reset, NOT as a stored empty value — re-test the per-field 'Reset'/'Clear' submit buttons (they POST name=field value=''). boolean coercion accepts true/'true'/'on'; integers go through parseInt — verify discount_pct stays within the 0-95 UI bound (server does NOT re-validate the range).
+// INVARIANT(S): metafieldsSet and metafieldsDelete are TWO separate mutations — a set+delete in one save is non-atomic; userErrors from either are not surfaced to the caller (swallowed).
 async function applyB2bConfigUpdate(numericId, body) {
   const { discount_pct, dropship_enabled, dropship_margin_pct, allow_order_on_invoice, catalog_access_tags } = body;
   const gid = shopifyCustomerGid(numericId);
@@ -2641,6 +2791,9 @@ async function applyB2bConfigUpdate(numericId, body) {
   }
 }
 
+// WHAT: Full customer detail page — impersonation modal+history, spend section (AJAX to /api/admin/customers/:id/spend), recent orders, portal activity timeline, internal notes, B2B settings form, tags, active cart, and Xero status cards.
+// CHANGE-GUARD: many cards are client-fetched (spend, activity, active-cart, xero-status) against /api/admin/customers/${numId}/* — if those route paths change, edit the inline fetch URLs here too. The impersonate flow POSTs {read_only} and window.open's the returned one-time URL. _dropshipCache param is unused (legacy).
+// INVARIANT(S): numId derives from shopifyNumericId(customer.id) and is interpolated into MANY inline-script URLs — it must be a clean numeric string (no gid). Outstanding-balance badge is best-effort (try/catch -> {total:0}). impHistory 'Used?' badge logic depends on ev.expiresAt vs Date.now() — keep ms units.
 function renderCustomerDetail(session, customer, recentOrders, notes, _dropshipCache, b2bConfig, flash, impHistory = []) {
   const numId      = shopifyNumericId(customer.id);
   const outstanding = (() => { try { return getOutstandingBalanceForCustomer(customer.id); } catch(e) { return { total: 0, count: 0 }; } })();
@@ -3140,6 +3293,9 @@ function renderCustomerDetail(session, customer, recentOrders, notes, _dropshipC
 }
 
 // ── Manual order form ─────────────────────────────────────────────────────────
+// WHAT: Manual /orders/new draft-order builder — customer + product autocomplete (/api/customers/search, /api/products/search), editable B2B price column, custom (non-catalog) line items, shipping address auto-fill, posts a JSON line_items blob.
+// CHANGE-GUARD: B2B price is computed client-side as listPrice*(1-discountPct/100) using selectedCustomer.discountPct (default 50) — re-test that the discount comes from the customer's effective config, not a hardcoded 50, and that price overrides typed by the user survive submit. The hidden line_items field is JSON.stringify(lineItems); submitNewOrder re-parses it.
+// INVARIANT(S): submit is gated (disabled) until a customer AND >=1 line item with qty>0 exist; variantId dedupe increments qty rather than adding a row; custom items carry isCustom:true / sku 'CUSTOM' and are sent as titled price lines (no variant).
 function renderNewOrderForm(session, prefillCustomer) {
   const customerJson = prefillCustomer ? JSON.stringify({ id: shopifyNumericId(prefillCustomer.id), name: prefillCustomer.displayName, email: prefillCustomer.email }) : 'null';
   return layout({ title: 'New Order', session, activePath: '/orders',
@@ -3381,6 +3537,9 @@ function renderNewOrderForm(session, prefillCustomer) {
   ` });
 }
 
+// WHAT: Create a Shopify draft order then draftOrderComplete(paymentPending:true) from the manual order form; fire-and-forget pushes an Authorised ACCREC invoice to Xero (skipped for insiders), queuing on failure.
+// CHANGE-GUARD: CRITICAL Shopify quirk encoded here — when variantId is present Shopify IGNORES originalUnitPrice, so wholesale price is applied as a per-line appliedDiscount PERCENTAGE computed from (listPrice-price)/listPrice; custom/variant-less lines use originalUnitPrice directly. Changing this re-introduces full-retail B2B orders. Re-test both line types end-to-end against Shopify (not just HTTP 200).
+// INVARIANT(S): two sequential mutations (create then complete) — userErrors from EITHER abort with {error}; tags ['b2b-portal','b2b-manual-order'] are required for the order to appear in /orders (which filters tag:b2b-portal). Xero sync runs after an 800ms delay so the order/tags are queryable; insider check uses isInsider(customer_id).
 async function submitNewOrder(req, session) {
   const { customer_id, line_items, note, po_number,
           ship_first, ship_last, ship_addr1, ship_addr2,
@@ -3479,6 +3638,9 @@ async function submitNewOrder(req, session) {
   }
 }
 
+// WHAT: Dashboard manual-review queue — B2B customers (from local cache) that are NOT yet mapped to a Xero contact and are NOT insiders.
+// CHANGE-GUARD: insider ids are HARDCODED here (4742401425601, 5163530813633) AND duplicated in isInsider elsewhere — keep them in sync or a customer shows in the review queue while their orders skip Xero. Reads data/shopify_to_xero_mapping.json (by_shopify_id keys); a missing/corrupt file degrades to 'everyone unmapped' rather than throwing.
+// INVARIANT(S): listCustomersFromCache({segment:'b2b', limit:999}) — the 999 cap silently truncates if >999 B2B customers exist; ids are normalized by stripping the gid://shopify/Customer/ prefix before the mapped/insider Set lookups.
 function getCustomersPendingXeroReview() {
   // B2B customers not yet mapped to a Xero contact (and not insiders).
   // Helps surface manual-review queue on the dashboard.
@@ -3512,6 +3674,9 @@ function getCustomersPendingXeroReview() {
 
 // ── PWA icon generator ────────────────────────────────────────────────────────
 // Creates a minimal RGB PNG at startup (lime green #9BBC0E with "FW" approximated).
+// WHAT: Hand-roll a solid-color RGB PNG at startup (no image lib) — builds CRC32 table, IHDR/IDAT(zlib.deflateSync)/IEND chunks for the PWA icon.
+// CHANGE-GUARD: byte layout is hand-encoded — IHDR is 8-bit/colortype-2 (truecolor RGB); each scanline is prefixed with a 0 filter byte (rowSize = 1 + size*3). Any change to bit depth/color type must update the IHDR bytes (ihdr[8..12]) and the raw buffer stride together.
+// INVARIANT(S): only called when public/icon-192.png is absent; output must be a valid PNG (magic bytes 137,80,78,71,13,10,26,10) — manifest.json references /icon-192.png at 192x192.
 function generateIconPng(size, r, g, b) {
   const crcTable = new Uint32Array(256);
   for (let i = 0; i < 256; i++) {
@@ -3519,6 +3684,9 @@ function generateIconPng(size, r, g, b) {
     for (let j = 0; j < 8; j++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
     crcTable[i] = c;
   }
+// WHAT: Standard PNG CRC32 over a chunk's type+data using the precomputed crcTable.
+// CHANGE-GUARD: must stay the IEEE 802.3 / PNG polynomial (0xEDB88320) with 0xFFFFFFFF init+final-XOR; any drift produces 'CRC error' / unreadable icons.
+// INVARIANT(S): operates on bytes; result coerced to unsigned 32-bit (>>> 0).
   function crc32(buf) {
     let crc = 0xFFFFFFFF;
     for (const byte of buf) crc = crcTable[(crc ^ byte) & 0xFF] ^ (crc >>> 8);
@@ -3551,6 +3719,9 @@ function generateIconPng(size, r, g, b) {
   ]);
 }
 
+// WHAT: One-time startup generation of the PWA icon (lime #9BBC0E) if it doesn't already exist on disk.
+// CHANGE-GUARD: synchronous fs at module load — runs before the server listens; if public/ is missing this throws at boot. Color 0x9B,0xBC,0x0E must match manifest theme_color.
+// INVARIANT(S): idempotent — guarded by fs.existsSync so it never overwrites an existing/custom icon.
 const ICON_PATH = path.join(__dirname, 'public', 'icon-192.png');
 if (!fs.existsSync(ICON_PATH)) {
   fs.writeFileSync(ICON_PATH, generateIconPng(192, 0x9B, 0xBC, 0x0E));
@@ -3558,10 +3729,16 @@ if (!fs.existsSync(ICON_PATH)) {
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 
+// WHAT: Liveness probe — returns {ok,app,ts}; NO auth (intentionally public for load balancer / uptime checks).
+// CHANGE-GUARD: keep unauthenticated and side-effect-free; downstream monitors key off ok:true.
+// INVARIANT(S): must stay above requireAuth-protected routes so probes never redirect to /login.
 app.get('/healthz', (_req, res) => {
   res.json({ ok: true, app: 'fww-b2b-admin', ts: Date.now() });
 });
 
+// WHAT: PWA web app manifest (standalone display, lime theme, single 192x192 icon).
+// CHANGE-GUARD: icons[].src '/icon-192.png' must match ICON_PATH / generateIconPng output; theme_color #9BBC0E is the brand lime used app-wide.
+// INVARIANT(S): public/unauthenticated; start_url '/' (the auth-gated dashboard) — installing the PWA still lands on the login redirect if no session.
 app.get('/manifest.json', (_req, res) => {
   res.json({
     name: 'FWW Admin',
@@ -3575,6 +3752,9 @@ app.get('/manifest.json', (_req, res) => {
 });
 
 // Mock: seed session
+// WHAT: TEST-ONLY backdoor that mints a real authenticated session for an arbitrary email and sets the session cookie.
+// CHANGE-GUARD: this BYPASSES the entire Google-OAuth allowlist — it is gated by MOCK || B2B_ADMIN_ALLOW_TEST_SESSION==='1'. NEVER let that env var be set in production; re-verify the 404 guard before any deploy.
+// INVARIANT(S): in real (non-MOCK) prod with the env unset it must return 404 'not found' — otherwise anyone can become any allowed admin.
 app.get('/__test__/session', (req, res) => {
   if (!MOCK && process.env.B2B_ADMIN_ALLOW_TEST_SESSION !== '1') return res.status(404).json({ error: 'not found' });
   const email = req.query.email || 'alex@fuzzywumpets.com';
@@ -3586,6 +3766,9 @@ app.get('/__test__/session', (req, res) => {
 });
 
 // Auth
+// WHAT: Start Google OAuth — sets an oauth_state CSRF cookie (HttpOnly, SameSite=Lax, 5min) then redirects to Google's consent screen; in MOCK it just mints a session and redirects to /.
+// CHANGE-GUARD: state cookie and the state query param sent to Google MUST be the same value verified in the callback; scope 'openid email profile' and prompt 'select_account' are deliberate. redirect_uri must equal REDIRECT_URI registered in the Google console.
+// INVARIANT(S): MOCK shortcut must never run in prod (no allowlist check there).
 app.get('/auth/login', (req, res) => {
   if (MOCK) {
     const sid = crypto.randomBytes(32).toString('hex');
@@ -3606,6 +3789,9 @@ app.get('/auth/login', (req, res) => {
 // WHAT: Google OAuth2 code->token->userinfo exchange; admits a session only if email_verified AND the lowercased email is in B2B_ADMIN_ALLOWED_EMAILS.
 // CHANGE-GUARD: re-test the allowlist gate, the oauth_state CSRF check, and that the state cookie is cleared on success; weakening any check opens the whole dashboard.
 // INVARIANT(S): state must equal the oauth_state cookie before token exchange; only verified + allowlisted emails get createSession; redirect_uri must match REDIRECT_URI registered in Google console (MOCK vs prod differ).
+// WHAT: OAuth callback — verifies CSRF state, exchanges code for tokens, fetches userinfo, then admits a session ONLY for verified + allowlisted emails.
+// CHANGE-GUARD: do not weaken any of: state===oauth_state cookie, user.email_verified, ALLOWED_EMAILS membership (case-insensitive). On success the oauth_state cookie is cleared and the session cookie set; non-allowed emails get a 403 renderUnauthorized.
+// INVARIANT(S): token/userinfo fetch failures redirect to /login with an error (never admit a session); client_secret comes from GOOGLE_CLIENT_SECRET env — never log tokens.
 app.get('/auth/google/callback', async (req, res) => {
   if (MOCK) return res.redirect('/');
   const { code, state, error } = req.query;
@@ -3637,6 +3823,9 @@ app.get('/auth/google/callback', async (req, res) => {
   }
 });
 
+// WHAT: Destroy the server-side session (deleteSession) + audit-log the logout, then expire the cookie and redirect to /login.
+// CHANGE-GUARD: must both deleteSession AND clear the cookie — clearing only the cookie leaves a live session id reusable.
+// INVARIANT(S): tolerant of a missing/already-dead session (no-op then expire cookie).
 app.get('/auth/logout', (req, res) => {
   const sid = getCookie(req, COOKIE_NAME);
   if (sid) {
@@ -3647,12 +3836,18 @@ app.get('/auth/logout', (req, res) => {
   res.redirect('/login');
 });
 
+// WHAT: Render the login page (Google button), passing through any ?error; redirects already-authenticated users to /.
+// CHANGE-GUARD: req.query.error is rendered — ensure renderLogin escapes it (reflected-XSS surface, error strings come from the OAuth redirect chain).
+// INVARIANT(S): public route; the authed-redirect prevents a logged-in admin from seeing the login form.
 app.get('/login', (req, res) => {
   if (getSession(getCookie(req, COOKIE_NAME))) return res.redirect('/');
   res.send(renderLogin(req.query.error || null));
 });
 
 // Dashboard
+// WHAT: Authenticated dashboard — getDashboardData() then renderDashboard; on error still renders a dashboard shell with an error banner and zeroed widgets.
+// CHANGE-GUARD: the 500 fallback object must keep every field renderDashboard reads (openOrdersCount, openOrders, weekOrdersCount, topCustomers, lowStockItems) or the error page itself throws.
+// INVARIANT(S): requireAuth populates req.adminSession; this is the start_url landing page.
 app.get('/', requireAuth, async (req, res) => {
   try {
     const data = await getDashboardData();
@@ -3664,12 +3859,18 @@ app.get('/', requireAuth, async (req, res) => {
 
 // ── Orders ──
 // MUST define /orders/new and /orders/bulk BEFORE /orders/:id
+// WHAT: Orders list — reads q/source/status/date/after/success query filters and renders the paginated table.
+// CHANGE-GUARD: ROUTE ORDER IS LOad-BEARING — /orders/new, /orders/bulk and /orders/export.csv MUST be registered before /orders/:id (see banner) or ':id' captures 'new'/'export.csv'. 'after' is the opaque Shopify cursor for pagination.
+// INVARIANT(S): filters object shape must match getOrdersData + renderOrdersList expectations; all values default to '' (never undefined).
 app.get('/orders', requireAuth, async (req, res) => {
   const filters = { q: req.query.q || '', source: req.query.source || '', status: req.query.status || '', date: req.query.date || '', after: req.query.after || '', success: req.query.success || '' };
   const data = await getOrdersData(filters);
   res.send(renderOrdersList(req.adminSession, data, filters));
 });
 
+// WHAT: Render the manual new-order form, optionally prefilling the customer from ?customer=<numericId>.
+// CHANGE-GUARD: must be declared BEFORE /orders/:id. Prefill resolves via MOCK_CUSTOMERS in mock or getCustomerDetail live — a bad/unknown id yields null (form just starts empty), not a 404.
+// INVARIANT(S): ?customer is a bare numeric id; renderNewOrderForm serializes it into the client form state.
 app.get('/orders/new', requireAuth, async (req, res) => {
   let prefillCustomer = null;
   if (req.query.customer) {
@@ -3678,6 +3879,9 @@ app.get('/orders/new', requireAuth, async (req, res) => {
   res.send(renderNewOrderForm(req.adminSession, prefillCustomer));
 });
 
+// WHAT: Handle manual order submit — delegates to submitNewOrder, renders an error page on failure, else redirects to the new order with ?success=created.
+// CHANGE-GUARD: result.error is HTML-escaped via h() into the error alert — keep that escaping. Success path trusts result.orderId for the redirect.
+// INVARIANT(S): no order is created on validation failure (submitNewOrder returns {error} before any Shopify mutation).
 app.post('/orders/new', requireAuth, async (req, res) => {
   const result = await submitNewOrder(req, req.adminSession);
   if (result.error) {
@@ -3690,6 +3894,9 @@ app.post('/orders/new', requireAuth, async (req, res) => {
   res.redirect(`/orders/${result.orderId}?success=created`);
 });
 
+// WHAT: Bulk order action from the list — currently only 'mark-paid'; iterates selected ids and calls orderMarkAsPaid per order (or mocks the status).
+// CHANGE-GUARD: must precede /orders/:id. Per-order Shopify errors are caught+logged but NOT surfaced — a partial failure still redirects to success=marked_paid (no per-order result). If you add actions, branch on `action` and keep the empty-ids early-return.
+// INVARIANT(S): ids may arrive as a single value or array — normalized via Array.isArray(ids) ? ids : [ids]. Unlike the single mark-paid route, this bulk path does NOT trigger Xero payment recording — a known asymmetry.
 app.post('/orders/bulk', requireAuth, async (req, res) => {
   const { action, ids } = req.body;
   const idList = Array.isArray(ids) ? ids : (ids ? [ids] : []);
@@ -3714,6 +3921,9 @@ app.post('/orders/bulk', requireAuth, async (req, res) => {
 });
 
 // Phase 4: Orders CSV export (must be before /orders/:id to avoid route conflict)
+// WHAT: Stream all b2b-portal orders as CSV (filename dated YYYY-MM-DD) by paging Shopify orders(query:tag:b2b-portal) at first:250.
+// CHANGE-GUARD: MUST be before /orders/:id (banner). Header row + per-row column order are coupled to csvLine — keep them aligned. tags are pipe-joined; note is raw (csvLine must quote/escape).
+// INVARIANT(S): pagination is HARD-CAPPED at 20 pages * 250 = 5000 orders — beyond that the export SILENTLY truncates with no warning to the user. Only tag:b2b-portal orders are exported.
 app.get('/orders/export.csv', requireAuth, async (req, res) => {
   const ts = new Date().toISOString().slice(0, 10);
   res.setHeader('Content-Type', 'text/csv; charset=utf-8');
@@ -3751,6 +3961,9 @@ app.get('/orders/export.csv', requireAuth, async (req, res) => {
   res.end();
 });
 
+// WHAT: Order detail — fetch by id; if not found, treat :id as an order NAME/number and redirect to the canonical /orders/<shopify_id>; else 404. Attaches portal visibleNotes (read-only).
+// CHANGE-GUARD: keep this LAST among /orders/* GETs. The name-fallback (getOrderByName) lets bare numbers like '37055' resolve — don't remove without updating links. ?success/?error/?msg are passed to the renderer for flash.
+// INVARIANT(S): shopifyId is normalized to a gid:// form before getVisibleNotesForOrder; visibleNotes attach is best-effort and must not block rendering.
 app.get('/orders/:id', requireAuth, async (req, res) => {
   let order = await getOrderDetail(req.params.id);
   if (!order) {
@@ -3766,6 +3979,9 @@ app.get('/orders/:id', requireAuth, async (req, res) => {
   res.send(renderOrderDetail(req.adminSession, order, req.query.success || req.query.error || '', req.query.msg || ''));
 });
 
+// WHAT: Mark a single order paid in Shopify (orderMarkAsPaid), audit it, then fire-and-forget record the payment in Xero (creating the invoice first if unsynced), skipping insiders.
+// CHANGE-GUARD: Xero side is non-blocking and queues via addXeroPending('record_payment',...) on failure — re-test that a Xero outage still returns success=marked_paid to the user AND lands in the retry queue. Payment amount is order total presentmentMoney; deposited to accountMap.chase_checking.
+// INVARIANT(S): Shopify userErrors abort with ?error before any Xero work; isInsider(customerId) must short-circuit Xero (insiders never post to accounting); this single-order path DOES record Xero payment whereas /orders/bulk mark-paid does NOT.
 app.post('/orders/:id/mark-paid', requireAuth, async (req, res) => {
   const numId = req.params.id;
   if (MOCK) {
@@ -3816,6 +4032,9 @@ app.post('/orders/:id/mark-paid', requireAuth, async (req, res) => {
   res.redirect(`/orders/${numId}?success=marked_paid`);
 });
 
+// WHAT: Save the internal order note (orderUpdate) — note truncated to 2000 chars; audit-logged.
+// CHANGE-GUARD: the 2000-char slice is the only length guard; Shopify userErrors are surfaced via ?error redirect. This is the INTERNAL note (order.note), distinct from customer-visible notes handled elsewhere.
+// INVARIANT(S): note is coerced to String before slice (handles missing/array body).
 app.post('/orders/:id/note', requireAuth, async (req, res) => {
   const numId = req.params.id;
   const note  = String(req.body.note || '').slice(0, 2000);
@@ -3837,6 +4056,9 @@ app.post('/orders/:id/note', requireAuth, async (req, res) => {
   res.redirect(`/orders/${numId}?success=note_saved`);
 });
 
+// WHAT: STUB — logs intent to send a Chase Pay invoice link; returns success without calling any real Chase API.
+// CHANGE-GUARD: when wiring the real Chase API, replace the auditLog-only body; the route currently 404s only if the order is missing and otherwise always 'succeeds'. Responds JSON when content-type is JSON, else redirects with success=chase_invoice_queued.
+// INVARIANT(S): no payment is actually requested yet — callers/UI must not imply the customer was charged. Audit note explicitly records 'not yet wired'.
 app.post('/orders/:id/send-chase-invoice', requireAuth, async (req, res) => {
   const numId = req.params.id;
   const order = await getOrderDetail(numId);
@@ -3856,6 +4078,9 @@ app.post('/orders/:id/send-chase-invoice', requireAuth, async (req, res) => {
 
 
 // ── Invoice CSV export ────────────────────────────────────────────────────────
+// WHAT: Build the per-order invoice CSV from selected columns (cols[]) — discovers up to 3 variant option names from line items, then emits header + one row per line item.
+// CHANGE-GUARD: variant2/variant3 columns are conditional on optionNames[1]/[2] EXISTING — header and row inclusion logic must stay symmetric (both gated by the same condition) or columns misalign. wholesale falls back discountedUnitPrice -> originalUnitPrice -> 0; line total = wholesale*qty.
+// INVARIANT(S): output uses CRLF (\r\n) line endings and quotes every field with ""-doubling — Excel-safe; 'Default Title' variant value is blanked. Retail = originalUnitPrice, wholesale = discounted price; keep these two distinct.
 function buildInvoiceCsv(order, cols) {
   const lineItems = order.lineItems?.edges?.map(e => e.node) || [];
   // Discover option names from first item that has them
@@ -3898,6 +4123,9 @@ function buildInvoiceCsv(order, cols) {
   return rows.map(r => r.map(v => `"${String(v).replace(/"/g, '""')}"`).join(',')).join('\r\n');
 }
 
+// WHAT: streams an order invoice as CSV; ?cols selects/orders columns (default title,variant1,variant2,sku,wholesale,qty,total).
+// CHANGE-GUARD: leading '﻿' BOM on res.send is intentional for Excel UTF-8 autodetect — do not strip; keep filename sanitizer regex /[^a-z0-9\-_#]/gi in sync with the .pdf route.
+// INVARIANT(S): requireAuth gates all order routes; cols come straight from the query string into buildInvoiceCsv — buildInvoiceCsv must whitelist/ignore unknown column names (no arbitrary property access).
 app.get('/orders/:id/invoice.csv', requireAuth, async (req, res) => {
   const order = await getOrderDetail(req.params.id);
   if (!order) return res.status(404).send('Order not found');
@@ -3909,6 +4137,9 @@ app.get('/orders/:id/invoice.csv', requireAuth, async (req, res) => {
   res.send('﻿' + csv);  // BOM for Excel UTF-8 detection
 });
 
+// WHAT: renders the full-order invoice PDF inline (Content-Disposition: inline) via generateInvoicePdf(order).
+// CHANGE-GUARD: generateInvoicePdf is async and may throw — keep the try/catch; a 500 here means the PDF lib failed, not a missing order (that is a 404 above).
+// INVARIANT(S): 404 returns JSON but the success path returns binary PDF; callers must branch on Content-Type, not status alone.
 app.get('/orders/:id/invoice.pdf', requireAuth, async (req, res) => {
   const order = await getOrderDetail(req.params.id);
   if (!order) return res.status(404).json({ error: 'Order not found' });
@@ -3925,6 +4156,9 @@ app.get('/orders/:id/invoice.pdf', requireAuth, async (req, res) => {
 
 // ── Phase 16E: Partial invoices ──────────────────────────────────────────────
 
+// WHAT: Phase 16E — creates a lettered partial invoice (A,B,C...) row via createPartialInvoice and streams its PDF; body {type:'full'|'fulfilled_only', shipping_handling:'first'|other}.
+// CHANGE-GUARD: 'fulfilled_only' is NOT actually implemented — both branches use allLineItems (see inline 'simplified' note); if you wire real fulfilled-line detection, re-test subtotal/tax/total math and the lineItemsJson snapshot shape consumed by the re-download route.
+// INVARIANT(S): getNextInvoiceLetter+createPartialInvoice are a non-atomic read-modify-write keyed on orderGid — two concurrent POSTs can collide on the same letter (see bugs[]); shipping is only billed when shipping_handling==='first' so it is charged on exactly one partial.
 app.post('/orders/:id/partial-invoice', requireAuth, async (req, res) => {
   const numId = req.params.id;
   const session = req.adminSession;
@@ -3981,6 +4215,9 @@ app.post('/orders/:id/partial-invoice', requireAuth, async (req, res) => {
 });
 
 // Re-download a previously generated partial invoice
+// WHAT: re-renders a previously-created partial invoice from its stored line_items_json snapshot (matched by uppercased :letter).
+// CHANGE-GUARD: reconstructs discountedUnitPriceSet/originalUnitPriceSet from the flat snapshot {unitPrice} — keep this shape aligned with what generateInvoicePdf reads and with the JSON written in the POST route.
+// INVARIANT(S): subtotal is derived as inv.total - inv.shipping - inv.tax (the snapshot does not store subtotal) so the three stored fields must stay self-consistent; currency hardcoded 'USD'.
 app.get('/orders/:id/partial-invoice/:letter.pdf', requireAuth, async (req, res) => {
   const numId  = req.params.id;
   const letter = req.params.letter.toUpperCase();
@@ -4016,6 +4253,9 @@ app.get('/orders/:id/partial-invoice/:letter.pdf', requireAuth, async (req, res)
 });
 
 // JSON API — list partial invoices for an order
+// WHAT: JSON list of all partial-invoice rows for an order (used by the order-detail UI to render the lettered-invoice list).
+// CHANGE-GUARD: returns the raw DB rows (snake_case columns) — front-end depends on invoice_letter/total/shipping/tax field names.
+// INVARIANT(S): numeric :id is wrapped to gid://shopify/Order/<id> before lookup — keep the gid prefix identical to the writer route or rows go missing.
 app.get('/api/admin/orders/:id/partial-invoices', requireAuth, (req, res) => {
   const numId = req.params.id;
   const rows = getPartialInvoices(`gid://shopify/Order/${numId}`);
@@ -4226,6 +4466,9 @@ app.post('/orders/:id/edit', requireAuth, async (req, res) => {
 });
 
 // 16B: Order-level discount (standalone; can also be triggered via /edit)
+// WHAT: 16B — applies a standalone order-level discount; body {type:'pct'|fixed, value, reason}. MOCK adjusts mockOrderOverrides; real mode uses orderEditBegin->orderEditAddLineItemDiscount(fixedValue on first calc line)->commit.
+// CHANGE-GUARD: discount is attached to calcOrder.lineItems[0] because Shopify rejects negative-priced custom items — if the order has zero line items it throws 'no line items for discount target'; re-test after API-version bumps.
+// INVARIANT(S): commit uses notifyCustomer:false; pct math is value/100 of subtotalPriceSet; failures redirect with ?error=discount_failed rather than surfacing userErrors to the client.
 app.post('/orders/:id/discount', requireAuth, async (req, res) => {
   const numId  = req.params.id;
   const { type, value, reason } = req.body;
@@ -4280,6 +4523,9 @@ app.post('/orders/:id/discount', requireAuth, async (req, res) => {
 });
 
 // Ship order — get rates via shipping bridge
+// WHAT: fetches live shipping rates from SHIPPING_BRIDGE_URL /rates for an order; body {fromId,weight,lineItems}; maps Shopify shippingAddress -> bridge addrToSS schema.
+// CHANGE-GUARD: weight defaults to 1 and units are hardcoded 'pound' — a mismatch with the bridge's expected unit silently mis-rates; residential:true is a deliberate B2B default; province is normalized via toStateCode().
+// INVARIANT(S): only rates with shipping_amount>0 are returned and amounts are normalized to {amount,currency:'usd'}; requires env SHIPPING_BRIDGE_URL + SHIPPING_BRIDGE_BEARER (bearer sent as Authorization header).
 app.post('/orders/:id/ship/rates', requireAuth, async (req, res) => {
   const numId = req.params.id;
   const { fromId = 'fww-hp', weight = 1, lineItems = [] } = req.body || {};
@@ -4406,6 +4652,9 @@ app.post('/orders/:id/ship/label', requireAuth, async (req, res) => {
 });
 
 // Cancel order (calls Shopify orderCancel mutation)
+// WHAT: cancels an order via Shopify orderCancel; body flags restock/refund/notify are the literal string '1'; reason defaults to 'OTHER'.
+// CHANGE-GUARD: orderCancel runs async server-side (returns job{id}) — userErrors are checked but a returned job is NOT polled, so a queued-but-failed cancel still redirects success; reason must be a valid OrderCancelReason enum value.
+// INVARIANT(S): MOCK path only sets cancelledAt override; real path always passes a staffNote crediting session.email; error redirect truncates err.message to 200 chars.
 app.post('/orders/:id/cancel', requireAuth, async (req, res) => {
   const numId   = req.params.id;
   const session = req.adminSession;
@@ -4451,6 +4700,9 @@ app.post('/orders/:id/cancel', requireAuth, async (req, res) => {
 });
 
 // 16C: Partial fulfillment
+// WHAT: 16C partial fulfillment — body liRaw{lineItemId:qty}; real mode maps original lineItem ids to OPEN/IN_PROGRESS fulfillmentOrder line items then fulfillmentCreate with optional tracking.
+// CHANGE-GUARD: wantedQty is clamped to mapping.remaining; lines with no FO map are skipped with a warn (silent partial); fulfillBackorder() is called per requested li after success to clear backorder flags — keep that loop.
+// INVARIANT(S): throws 'No matching open fulfillment orders' if nothing maps; fulfillmentOrders query is capped first:10 / lineItems first:50 — orders exceeding those page sizes silently drop lines (see bugs[]).
 app.post('/orders/:id/fulfill', requireAuth, async (req, res) => {
   const numId   = req.params.id;
   const session = req.adminSession;
@@ -4540,6 +4792,9 @@ app.post('/orders/:id/fulfill', requireAuth, async (req, res) => {
 });
 
 // 16D: Backorder flag per line item
+// WHAT: 16D — flags a single line item as backordered via upsertBackorder(orderGid, lineItemId, title, qty, eta, by).
+// CHANGE-GUARD: synchronous handler (no await) — upsertBackorder must stay sync or wrap; quantity parsed with parseInt fallback 0, eta passed through nullable.
+// INVARIANT(S): keyed on gid://shopify/Order/<id> + lineItemId; fulfilling the same line later calls fulfillBackorder with the SAME lineItemId to clear it — id formats must match across backorder/fulfill routes.
 app.post('/orders/:id/backorder', requireAuth, (req, res) => {
   const numId   = req.params.id;
   const { lineItemId, lineItemTitle, quantity, eta } = req.body;
@@ -4551,17 +4806,24 @@ app.post('/orders/:id/backorder', requireAuth, (req, res) => {
 });
 
 // API: get backorders for an order (used by order detail page)
+// WHAT: returns backorder rows for one order (consumed by the order-detail page).
+// INVARIANT(S): wraps numeric :id into the order gid before getBackordersForOrder — same prefix as the writer.
 app.get('/api/orders/:id/backorders', requireAuth, (req, res) => {
   const orderId = `gid://shopify/Order/${req.params.id}`;
   res.json({ backorders: getBackordersForOrder(orderId) });
 });
 
 // API: get all open backorders
+// WHAT: returns ALL open backorders across orders (feeds the /backorders queue page and any dashboards).
+// CHANGE-GUARD: getOpenBackorders() is unbounded — if backorder volume grows this needs pagination/limit.
 app.get('/api/admin/backorders', requireAuth, (req, res) => {
   res.json({ backorders: getOpenBackorders() });
 });
 
 // ── Task #45: Backorder queue page ──────────────────────────────────────────
+// WHAT: Task #45 — HTML backorder-queue page; renders one row per open backorder with order link, qty, ETA, age, and creator.
+// CHANGE-GUARD: eta_date is parsed as `${eta_date}T00:00:00` (local-midnight) to avoid UTC off-by-one day shifts — keep the T00:00:00 suffix; age uses /86400000 ms-per-day.
+// INVARIANT(S): all interpolated cells go through h() for XSS-escaping; order_id is stripped of the gid prefix only for display/link.
 app.get('/backorders', requireAuth, (req, res) => {
   const backorders = getOpenBackorders();
   const rows = backorders.map(b => {
@@ -4609,6 +4871,9 @@ app.get('/backorders', requireAuth, (req, res) => {
 
 // ── Phase 14D: Visible notes API (proxies to portal internal) ─────────────────
 
+// WHAT: Phase 14D — adds a customer-visible note to an order by proxying to the portal's internal API (callPortalInternal POST /__internal__/visible-note).
+// CHANGE-GUARD: MOCK short-circuits with a fake noteId:1; real failures return 500 with result.error — keep the trimmed-body 400 guard.
+// INVARIANT(S): addedBy is the admin session email; auditLog only fires on the real (non-MOCK) success path; the portal-internal contract (path + payload keys orderId/body/addedBy) must stay in sync with the portal repo.
 app.post('/api/orders/:id/visible-note', requireAuth, async (req, res) => {
   const numId = req.params.id;
   const shopifyId = `gid://shopify/Order/${numId}`;
@@ -4625,11 +4890,16 @@ app.post('/api/orders/:id/visible-note', requireAuth, async (req, res) => {
   res.json({ ok: true, noteId: result.noteId });
 });
 
+// WHAT: returns locally-cached visible notes for an order (getVisibleNotesForOrder), independent of the portal proxy used to write them.
+// INVARIANT(S): read path is local cache only — a note written via the POST proxy is not guaranteed visible here until the cache syncs.
 app.get('/api/orders/:id/visible-notes', requireAuth, (req, res) => {
   const shopifyId = `gid://shopify/Order/${req.params.id}`;
   res.json({ notes: getVisibleNotesForOrder(shopifyId) });
 });
 
+// WHAT: fetches Re:amaze/portal customer message threads for an order via callPortalInternal POST /__internal__/customer-messages.
+// CHANGE-GUARD: MOCK returns empty threads; real failures return 500 — front-end must tolerate both threads:[] and customerEmail:null.
+// INVARIANT(S): read-only; depends on the portal-internal contract returning {threads,customerEmail}.
 app.get('/api/orders/:id/customer-messages', requireAuth, async (req, res) => {
   const shopifyId = `gid://shopify/Order/${req.params.id}`;
   if (MOCK) return res.json({ threads: [], customerEmail: null, mock: true });
@@ -4640,6 +4910,9 @@ app.get('/api/orders/:id/customer-messages', requireAuth, async (req, res) => {
 
 // ── Phase 14C: Tax exempt admin review page ───────────────────────────────────
 
+// WHAT: Phase 14C — admin review page listing pending tax-exempt certificates pulled from the portal (getPendingTaxCertsFromPortal); approve/reject post to sibling routes.
+// CHANGE-GUARD: the 'View PDF' link rewrites PORTAL_INTERNAL_URL's 127.0.0.1 -> b2b.fuzzyreporting.com so the admin's browser (not the server) can reach it — keep that rewrite or the link 404s for users; getPendingTaxCertsFromPortal is called SYNCHRONOUSLY in a sync handler (see bugs[] — likely returns a Promise).
+// INVARIANT(S): MOCK shows no certs; customerId is split on '/' to recover the numeric id; all dynamic fields are h()-escaped.
 app.get('/tax-exempt', requireAuth, (req, res) => {
   const pendingCerts = MOCK ? [] : getPendingTaxCertsFromPortal();
   const flashHtml = req.query.success === 'approved'
@@ -4674,6 +4947,9 @@ app.get('/tax-exempt', requireAuth, (req, res) => {
     </div>` }));
 });
 
+// WHAT: approves a tax-exempt cert by proxying to portal /__internal__/tax-exempt/:id/approve with reviewedBy=admin email.
+// CHANGE-GUARD: auditLog fires BEFORE checking result.ok, so a failed approve is still audited as an approve attempt; redirect flash reflects result.ok.
+// INVARIANT(S): MOCK redirects success without calling the portal; :id is the cert id passed straight into the portal path (ensure portal validates it).
 app.post('/tax-exempt/:id/approve', requireAuth, async (req, res) => {
   if (MOCK) return res.redirect('/tax-exempt?success=approved');
   const result = await callPortalInternal('POST', `/__internal__/tax-exempt/${req.params.id}/approve`, {
@@ -4683,6 +4959,9 @@ app.post('/tax-exempt/:id/approve', requireAuth, async (req, res) => {
   res.redirect(`/tax-exempt?success=${result.ok ? 'approved' : 'error'}`);
 });
 
+// WHAT: rejects a tax-exempt cert with a reason (capped 500 chars) via the portal-internal reject endpoint.
+// CHANGE-GUARD: same pre-check audit ordering as approve; reason defaults to 'Rejected'.
+// INVARIANT(S): MOCK redirects success without portal call; reviewedBy recorded from session email.
 app.post('/tax-exempt/:id/reject', requireAuth, async (req, res) => {
   if (MOCK) return res.redirect('/tax-exempt?success=rejected');
   const reason = String(req.body?.reason || 'Rejected').slice(0, 500);
@@ -4694,6 +4973,9 @@ app.post('/tax-exempt/:id/reject', requireAuth, async (req, res) => {
 });
 
 // Phase 4: Customers CSV export
+// WHAT: Phase 4 — streams a CSV of all tag:b2b customers sorted by AMOUNT_SPENT desc, paginating Shopify customers in pages of 250.
+// CHANGE-GUARD: pagination loop is hard-capped at 10 pages (max 2500 customers) — beyond that the export SILENTLY truncates with no warning (see bugs[]); response is streamed via res.write so headers are committed before the loop (cannot switch to an error status mid-stream).
+// INVARIANT(S): column order is fixed by the header csvLine; tags joined with '|'; ids reduced via shopifyNumericId.
 app.get('/customers/export.csv', requireAuth, async (req, res) => {
   const ts = new Date().toISOString().slice(0, 10);
   res.setHeader('Content-Type', 'text/csv; charset=utf-8');
@@ -4734,12 +5016,17 @@ app.get('/customers/export.csv', requireAuth, async (req, res) => {
 });
 
 // ── Customers ──
+// WHAT: customer list page; filters {q,segment,tag,after,sort} -> getCustomersData -> renderCustomersList.
+// INVARIANT(S): cursor pagination via ?after (Shopify endCursor); all filters originate from query string and must be forwarded verbatim to keep next/prev links stable.
 app.get('/customers', requireAuth, async (req, res) => {
   const filters = { q: req.query.q || '', segment: req.query.segment || '', tag: req.query.tag || '', after: req.query.after || '', sort: req.query.sort || '' };
   const data = await getCustomersData(filters);
   res.send(renderCustomersList(req.adminSession, data, filters));
 });
 
+// WHAT: customer detail page — parallel-fetches detail, recent orders, and B2B config (Promise.all), then loads notes, dropship cache, and impersonation history before rendering.
+// CHANGE-GUARD: Promise.all means any one rejection 500s the whole page; the three follow-up reads (notes/dropship/imp) are sync local-cache calls keyed on shopifyCustomerGid(:id) — keep gid derivation consistent.
+// INVARIANT(S): 404 renders a friendly layout, not JSON; impersonation history limited to 10.
 app.get('/customers/:id', requireAuth, async (req, res) => {
   const [customer, recentOrders, b2bConfig] = await Promise.all([
     getCustomerDetail(req.params.id),
@@ -4754,6 +5041,8 @@ app.get('/customers/:id', requireAuth, async (req, res) => {
   res.send(renderCustomerDetail(req.adminSession, customer, recentOrders, notes, dropship, b2bConfig, req.query.success || '', impHistory));
 });
 
+// WHAT: saves internal admin notes (max 5000 chars) for a customer to local store; audit logs a 100-char preview.
+// INVARIANT(S): notes are local-only (not synced to Shopify); gid via shopifyCustomerGid.
 app.post('/customers/:id/notes', requireAuth, (req, res) => {
   const body = String(req.body.body || '').slice(0, 5000);
   const gid  = shopifyCustomerGid(req.params.id);
@@ -4762,6 +5051,9 @@ app.post('/customers/:id/notes', requireAuth, (req, res) => {
   res.redirect(`/customers/${req.params.id}?success=notes_saved`);
 });
 
+// WHAT: adds a Shopify customer tag (tagsAdd mutation, max 100 chars); when tag==='b2b' it ALSO fires a non-blocking Xero customer sync.
+// CHANGE-GUARD: tagsAdd userErrors are fetched but NOT inspected — a rejected tag still audits+redirects success; the Xero sync is fire-and-forget (.then/.catch) so its failure never blocks the response but also is only audited on success.
+// INVARIANT(S): syncCustomerToXero gets {email:''} (no email) — verify Xero sync can resolve the contact from the customer id alone, else it may create a blank/duplicate contact (see bugs[]).
 app.post('/customers/:id/tags/add', requireAuth, async (req, res) => {
   const tag  = String(req.body.tag || '').trim().slice(0, 100);
   const gid  = shopifyCustomerGid(req.params.id);
@@ -4783,6 +5075,9 @@ app.post('/customers/:id/tags/add', requireAuth, async (req, res) => {
   res.redirect(`/customers/${req.params.id}?success=tags_added`);
 });
 
+// WHAT: removes a Shopify customer tag (tagsRemove mutation, max 100 chars).
+// CHANGE-GUARD: success redirect uses ?success=tags_added (copy-paste from the add route — cosmetic but misleading flash); userErrors swallowed like the add route.
+// INVARIANT(S): removing the 'b2b' tag does NOT reverse the Xero sync — there is no de-sync counterpart to the add route's Xero hook.
 app.post('/customers/:id/tags/remove', requireAuth, async (req, res) => {
   const tag = String(req.body.tag || '').trim().slice(0, 100);
   const gid = shopifyCustomerGid(req.params.id);
@@ -4798,6 +5093,9 @@ app.post('/customers/:id/tags/remove', requireAuth, async (req, res) => {
   res.redirect(`/customers/${req.params.id}?success=tags_added`);
 });
 
+// WHAT: toggles dropship + margin% for a customer; writes local cache AND Shopify metafields (namespace 'b2b', keys dropship_enabled/dropship_margin_pct).
+// CHANGE-GUARD: marginPct is clamped 0..100 via Math.max/min; metafieldsSet userErrors are swallowed so a failed Shopify write leaves the local cache and Shopify out of sync (see bugs[]); enabled accepts both 'on' and 'true'.
+// INVARIANT(S): local setDropshipCache always runs even in MOCK; metafield types must stay boolean / number_integer to match the portal reader.
 app.post('/customers/:id/dropship', requireAuth, async (req, res) => {
   const enabled   = req.body.enabled === 'on' || req.body.enabled === 'true';
   const marginPct = Math.max(0, Math.min(100, parseInt(req.body.margin_pct || '0', 10)));
@@ -4819,6 +5117,9 @@ app.post('/customers/:id/dropship', requireAuth, async (req, res) => {
 
 // ── Phase 7/10: B2B config (unified: discount + dropship + allow_order_on_invoice) ──
 
+// WHAT: Phase 7/10 unified B2B-config form POST (discount + dropship + allow_order_on_invoice); checkboxes absent from the body are coerced to explicit 'false'.
+// CHANGE-GUARD: the checkbox-absence coercion is load-bearing — unchecked HTML checkboxes are omitted entirely, so without this an unchecked box would leave the prior value; keep dropship_enabled/allow_order_on_invoice in the coercion list when adding new checkboxes.
+// INVARIANT(S): before/after snapshots from getB2bConfig bracket applyB2bConfigUpdate for an accurate audit diff.
 app.post('/customers/:id/b2b-config', requireAuth, async (req, res) => {
   const numId = req.params.id;
   // Checkboxes: if absent from form body, checkbox was unchecked → explicitly set false
@@ -4834,10 +5135,15 @@ app.post('/customers/:id/b2b-config', requireAuth, async (req, res) => {
   res.redirect(`/customers/${numId}?success=b2b_settings_saved`);
 });
 
+// WHAT: JSON read of a customer's effective B2B config (getB2bConfig).
+// INVARIANT(S): read-only; shape must match the PUT writer's response and the form POST's audit snapshots.
 app.get('/api/admin/customers/:id/b2b-config', requireAuth, async (req, res) => {
   res.json(await getB2bConfig(req.params.id));
 });
 
+// WHAT: JSON API to update B2B config (same applyB2bConfigUpdate as the form route) returning {ok,...after}.
+// CHANGE-GUARD: unlike the form POST this does NOT coerce missing checkboxes to 'false' — a partial JSON body only updates the keys present, so API and form callers have DIFFERENT merge semantics (see bugs[]).
+// INVARIANT(S): before/after audit diff preserved.
 app.put('/api/admin/customers/:id/b2b-config', requireAuth, async (req, res) => {
   const numId = req.params.id;
   const before = await getB2bConfig(numId);
@@ -4850,6 +5156,9 @@ app.put('/api/admin/customers/:id/b2b-config', requireAuth, async (req, res) => 
 // ── 19A: Customer spend API ──
 
 // Manual cache refresh endpoint
+// WHAT: manual trigger to refresh the local orders/customers cache from Shopify (syncRecentFromShopify) if that fn is defined.
+// CHANGE-GUARD: guarded by typeof check so it no-ops (still returns ok:true) when the sync fn isn't loaded — callers cannot distinguish 'synced' from 'no-op'.
+// INVARIANT(S): returns syncedAt timestamp; a real sync failure surfaces as 500 with err.message.
 app.post('/api/admin/sync-now', requireAuth, async (req, res) => {
   try {
     if (typeof syncRecentFromShopify === 'function') {
@@ -4861,6 +5170,9 @@ app.post('/api/admin/sync-now', requireAuth, async (req, res) => {
   }
 });
 
+// WHAT: 19A/24D customer spend API; returns lifetime + date-ranged totals/orders. Tries the local orders cache first (real mode), then MOCK, then live Shopify.
+// CHANGE-GUARD: three code paths must return the SAME JSON shape {lifetimeTotal,lifetimeCount,rangeTotal,rangeCount,orders[]}; the live query caps orders at first:250 with NO pagination so a customer with >250 in-range orders is silently truncated (see bugs[]); from/to default to epoch-0 .. now+1day.
+// INVARIANT(S): cache path requires both a cached customer AND non-empty cache stats before short-circuiting; range filter is inclusive on both ends (created_at>=from && <=to).
 app.get('/api/admin/customers/:id/spend', requireAuth, async (req, res) => {
   const numId  = req.params.id;
   const fromTs = req.query.from ? new Date(req.query.from).getTime() : 0;
@@ -4961,6 +5273,9 @@ app.get('/api/admin/customers/:id/spend', requireAuth, async (req, res) => {
 });
 
 // ── API search ──
+// WHAT: typeahead customer search (draft-order builder); MOCK filters MOCK_CUSTOMERS, real mode queries Shopify customers with `tag:b2b <q>` capped first:10.
+// CHANGE-GUARD: the per-result discount enrichment references getB2bConfigFromCache which is undefined in this module — the ReferenceError is swallowed and discountPct ALWAYS falls back to the global default (see bugs[]); fix the cache reader rather than relying on the silent fallback.
+// INVARIANT(S): results are capped to 10; every result must include discountPct so the draft-order UI can pre-fill pricing.
 app.get('/api/customers/search', requireAuth, async (req, res) => {
   const q = String(req.query.q || '').trim().toLowerCase();
   if (!q) return res.json([]);
@@ -4995,6 +5310,9 @@ app.get('/api/customers/search', requireAuth, async (req, res) => {
   }));
 });
 
+// WHAT: typeahead product/variant search; flattens products->variants. MOCK filters MOCK_PRODUCTS by title/sku/variant; real mode queries Shopify products first:10, variants first:5.
+// CHANGE-GUARD: the Shopify query has NO `tag:b2b`/publication filter so it can surface variants not published to B2B (unlike the customer search) — confirm that is intended before relying on it for draft orders; results capped to 20.
+// INVARIANT(S): 'Default Title' variant collapses to just the product title in the label; price is the raw list/MSRP (no B2B discount applied here).
 app.get('/api/products/search', requireAuth, async (req, res) => {
   const q = String(req.query.q || '').trim().toLowerCase();
   if (!q) return res.json([]);
@@ -5045,11 +5363,16 @@ app.get('/api/products/search', requireAuth, async (req, res) => {
 
 // ── Phase 3 helpers ───────────────────────────────────────────────────────────
 
+// WHAT: helper — extracts the style name from a Shopify tag of the form 'Style_<name>' (returns the substring after the 6-char prefix), else null.
+// INVARIANT(S): the literal prefix length 6 ('Style_') and the slice(6) must stay in lockstep — renderProductDetail/renderCatalog also hardcode 'Style_'.
 function getStyleFromTags(tags) {
   const t = (tags || []).find(t => t.startsWith('Style_'));
   return t ? t.slice(6) : null;
 }
 
+// WHAT: RFC-4180-ish CSV row builder — quotes any cell containing " , \n or \r and doubles embedded quotes; appends a single '\n'.
+// CHANGE-GUARD: shared by every CSV export route (customers, reports/*) — changing the quoting/escaping or line terminator affects all of them; nulls/undefined become empty string.
+// INVARIANT(S): does NOT prefix a BOM (callers add '﻿' themselves) and does NOT guard against CSV-injection (leading =,+,-,@) — see bugs[].
 function csvLine(cells) {
   return cells.map(c => {
     const s = c == null ? '' : String(c);
@@ -5057,6 +5380,9 @@ function csvLine(cells) {
   }).join(',') + '\n';
 }
 
+// WHAT: inline SVG bar chart used on the Reports page; opts {width,height,fill,labelField,valueField}.
+// CHANGE-GUARD: x-axis labels are only drawn when data.length<=12 (avoids overlap); bar height floors at 2px and max is taken across valueField — empty data returns an empty <svg>.
+// INVARIANT(S): label values are h()-escaped into <title>/<text>; relies on the caller supplying numeric valueField (NaN max would zero all bars).
 function renderBarChart(data, opts = {}) {
   const { width = 580, height = 110, fill = '#9BBC0E', labelField = 'label', valueField = 'value' } = opts;
   if (!data.length) return `<svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg"></svg>`;
@@ -5072,6 +5398,8 @@ function renderBarChart(data, opts = {}) {
   return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${height}" width="${width}" height="${height}" style="max-width:100%;display:block">${bars}</svg>`;
 }
 
+// WHAT: tiny inline SVG polyline sparkline for per-customer revenue trend in the Reports table.
+// INVARIANT(S): returns '' for empty input; max floors at 1 to avoid divide-by-zero; single-point arrays use the `||1` guard on the x denominator.
 function renderSparkline(values, opts = {}) {
   const { width = 80, height = 24, fill = '#9BBC0E' } = opts;
   if (!values.length) return '';
@@ -5086,6 +5414,9 @@ function renderSparkline(values, opts = {}) {
 
 // ── Catalog ───────────────────────────────────────────────────────────────────
 
+// WHAT: Phase 25B/F — loads catalog products; vendor defaults to 'Fuzzywumpets' (pass vendor='all' to bypass), with status (active/draft/archived/all), style, stock (low/out), and b2b-publication filters.
+// CHANGE-GUARD: real mode fetches ONLY the first 50 products in ONE page then filters in-memory — style/stock/b2b filters therefore operate on at most 50 rows and totals are page-local, NOT catalog-wide (the `page` param is unused); statusCounts is null in real mode (only computed in MOCK). See bugs[] before trusting counts.
+// INVARIANT(S): publishedOnB2B is derived from publishedOnPublication(B2B_PUB_ID); on error returns an empty product set with the error string rather than throwing.
 async function getCatalogData({ vendor, style, stock, b2b, status = 'active', page = 1 }) {
   // Phase 25B/F: default to Fuzzywumpets vendor; use vendor='all' to bypass
   const effectiveVendor = (vendor === 'all') ? '' : (vendor || 'Fuzzywumpets');
@@ -5146,6 +5477,9 @@ async function getCatalogData({ vendor, style, stock, b2b, status = 'active', pa
   }
 }
 
+// WHAT: renders the catalog table with status filter chips, vendor/style/stock/B2B selects, a bulk publish/unpublish bar, and per-row publish toggles.
+// CHANGE-GUARD: the bulk <form id=catalog-bulk-form> WRAPS the table and posts to /catalog/bulk — the closing </form> is emitted in the template after ${table}; nested per-row <form>s for single publish/unpublish must stay outside that wrapper logically (they are inline but submit to different actions). Re-test selection JS (updateBulkBar/selectAll/clearSelection) after markup changes.
+// INVARIANT(S): all product fields rendered through h(); chip hrefs preserve the other active filters via URLSearchParams; 'active' status is the implicit default (omitted from the URL).
 function renderCatalog(session, data, filters) {
   const { products, vendors, styles, error, statusCounts, effectiveVendor } = data;
 
@@ -5282,6 +5616,8 @@ function renderCatalog(session, data, filters) {
   ` });
 }
 
+// WHAT: catalog list page; reads vendor/style/stock/b2b/status from the query (status defaults 'active') and pipes them through getCatalogData -> renderCatalog.
+// INVARIANT(S): filter object keys must match what getCatalogData/renderCatalog expect; no server-side pagination here (see getCatalogData 50-row cap).
 app.get('/catalog', requireAuth, async (req, res) => {
   const filters = {
     vendor: req.query.vendor || '',
@@ -5294,10 +5630,15 @@ app.get('/catalog', requireAuth, async (req, res) => {
   res.send(renderCatalog(req.adminSession, data, filters));
 });
 
+// WHAT: legacy alias — 301-style redirect from /catalog/:id to the canonical /products/:id detail page.
+// INVARIANT(S): keep this redirect so old catalog links and the row-action hrefs (/catalog/<id>) still resolve.
 app.get('/catalog/:id', requireAuth, async (req, res) => {
   res.redirect(`/products/${req.params.id}`);
 });
 
+// WHAT: publishes a single product to the B2B publication (publishablePublish with publicationId B2B_PUB_ID).
+// CHANGE-GUARD: userErrors are swallowed (logged only) so a failed publish still audits as published and redirects to /catalog — the UI may show stale 'B2B' state until refresh (see bugs[]).
+// INVARIANT(S): gid is gid://shopify/Product/<numId>; audit records before=false,after=true regardless of actual outcome.
 app.post('/catalog/:id/publish', requireAuth, async (req, res) => {
   const numId = req.params.id;
   const gid = `gid://shopify/Product/${numId}`;
@@ -5315,6 +5656,9 @@ app.post('/catalog/:id/publish', requireAuth, async (req, res) => {
   res.redirect('/catalog');
 });
 
+// WHAT: removes a single product from the B2B publication (publishableUnpublish).
+// CHANGE-GUARD: same swallowed-userErrors caveat as the publish route; audit records before=true,after=false unconditionally.
+// INVARIANT(S): publicationId must be B2B_PUB_ID to target the correct channel.
 app.post('/catalog/:id/unpublish', requireAuth, async (req, res) => {
   const numId = req.params.id;
   const gid = `gid://shopify/Product/${numId}`;
@@ -5332,6 +5676,9 @@ app.post('/catalog/:id/unpublish', requireAuth, async (req, res) => {
   res.redirect('/catalog');
 });
 
+// WHAT: bulk publish/unpublish — req.body.ids may be a single value or array (flattened); action defaults to 'unpublish' unless exactly 'publish'.
+// CHANGE-GUARD: products are processed SEQUENTIALLY in a for-loop (await per id) with per-item errors swallowed and logged — a large selection is slow and partial failures are invisible to the user; no Shopify bulk-publish API is used (see bugs[]).
+// INVARIANT(S): every id is audited individually as catalog:bulk:<action>; MOCK updates mockCatalogOverrides only.
 app.post('/catalog/bulk', requireAuth, async (req, res) => {
   const ids    = [req.body.ids || []].flat().filter(Boolean);
   const action = req.body.action === 'publish' ? 'publish' : 'unpublish';
@@ -5357,6 +5704,9 @@ app.post('/catalog/bulk', requireAuth, async (req, res) => {
 
 // ── Phase 19C: Product detail ─────────────────────────────────────────────────
 
+// WHAT: Phase 19C — loads a product (incl. images, variants with barcode/price/inventory, and B2B publication state) plus up to 10 recent orders that contain it.
+// CHANGE-GUARD: real-mode related-orders query matches on `sku:<first variant sku>` ONLY — products whose first variant has no SKU, or whose sales used a different variant, will show NO related orders (see bugs[]); returns null on any error (renders a 404).
+// INVARIANT(S): publishedOnB2B from publishedOnPublication(B2B_PUB_ID); MOCK synthesizes related orders by matching variant SKUs against MOCK_ORDERS line items.
 async function getProductDetail(numericId) {
   if (MOCK) {
     const p = MOCK_PRODUCTS.find(x => shopifyNumericId(x.id) === numericId);
@@ -5415,6 +5765,9 @@ async function getProductDetail(numericId) {
   }
 }
 
+// WHAT: renders the product detail page — variant table (SKU/barcode/price/compare/inventory), image thumbs, related orders, publication status, and an 'Edit in Shopify' deep link.
+// CHANGE-GUARD: the Shopify edit URL hardcodes store slug 'parttwoenterprises' — keep in sync with the actual store handle (also referenced elsewhere); inventory cells colour-code <=0 danger / <10 warning.
+// INVARIANT(S): every product/variant/order field is h()-escaped; non-Fuzzywumpets vendor products get an info banner warning that catalog ops don't apply.
 function renderProductDetail(session, product) {
   const numId = shopifyNumericId(product.id);
   const variants = (product.variants?.edges || []).map(e => e.node);
@@ -5536,6 +5889,8 @@ function renderProductDetail(session, product) {
   ` });
 }
 
+// WHAT: product detail route; 404s with a friendly layout (not JSON) when getProductDetail returns null.
+// INVARIANT(S): :id is the numeric Shopify product id (wrapped to a gid inside getProductDetail).
 app.get('/products/:id', requireAuth, async (req, res) => {
   const numId = req.params.id;
   const product = await getProductDetail(numId);
@@ -5550,6 +5905,9 @@ app.get('/products/:id', requireAuth, async (req, res) => {
 
 // ── Reports ───────────────────────────────────────────────────────────────────
 
+// WHAT: Phase 24F — builds 12-month revenue + top-customer + top-product aggregates. Prefers SQL aggregation over the local orders cache (getReportsDataFromCache); falls back to MOCK, then live Shopify.
+// CHANGE-GUARD: live fallback paginates `tag:b2b-portal created_at:><cutoff>` in pages of 250 but is HARD-CAPPED at 10 pages (2500 orders) — high-volume periods silently truncate the totals (see bugs[]); the cache and live paths must produce the same {monthly,customers,products,totalRevenue,totalOrders,aov} shape.
+// INVARIANT(S): the 12-month bucket map is pre-seeded so every month appears even with 0 revenue; customers top-20, products top-50; product key is sku||title.
 async function getReportsData() {
   // Phase 24F: read from cache first (SQL aggregation across 12mo of cached orders)
   if (!MOCK) {
@@ -5645,6 +6003,9 @@ async function getReportsData() {
   }
 }
 
+// WHAT: renders the Reports page — monthly revenue bar chart + table, top customers (with sparkline), and top products, each with a CSV download link.
+// CHANGE-GUARD: CSV links point at /reports/csv/{monthly,customers,products} — keep those three :type values in sync with the CSV route's switch; chart consumes monthly[].{month,revenue}.
+// INVARIANT(S): all names/emails/skus h()-escaped; AOV per row guards divide-by-zero with the orders/units ternaries.
 function renderReports(session, data) {
   const { monthly, customers, products, totalRevenue, totalOrders, aov, error } = data;
 
@@ -5727,11 +6088,16 @@ function renderReports(session, data) {
   ` });
 }
 
+// WHAT: Reports page route — getReportsData() -> renderReports().
+// INVARIANT(S): getReportsData never throws (returns {error} on failure) so this handler does not need its own try/catch.
 app.get('/reports', requireAuth, async (req, res) => {
   const data = await getReportsData();
   res.send(renderReports(req.adminSession, data));
 });
 
+// WHAT: streams a revenue CSV for :type in {monthly,customers,products}; recomputes getReportsData() per request.
+// CHANGE-GUARD: re-running getReportsData here means the CSV can differ from the on-screen table if the cache changed between requests; unknown :type returns 404 text; cells are NOT BOM-prefixed (unlike the customer export) so Excel may misread UTF-8 (minor) — see bugs[] re CSV-injection.
+// INVARIANT(S): each branch sets headers then streams via res.write/res.end; column orders are fixed by the header csvLine.
 app.get('/reports/csv/:type', requireAuth, async (req, res) => {
   const data = await getReportsData();
   const ts   = new Date().toISOString().slice(0, 10);
@@ -5765,6 +6131,9 @@ app.get('/reports/csv/:type', requireAuth, async (req, res) => {
 
 // ── Settings ──────────────────────────────────────────────────────────────────
 
+// WHAT: assembles the settings view-model — b2b_discount_pct/order_minimum/payment_terms/catalog_private_tags from the settings store (with defaults) plus the admin allowlist.
+// CHANGE-GUARD: allowlist source is B2B_ADMIN_ALLOWED_EMAILS env (comma-split) in real mode, hardcoded two emails in MOCK — the /settings/allowlist/add form cannot actually persist to env, so adds are display-only unless backed elsewhere (verify the add route).
+// INVARIANT(S): defaults (50 / 0 / 'Net 30' / '') must match the consumers that read these settings (e.g. b2b_discount_pct default 50 is also assumed in /api/customers/search).
 function getSettingsData(flash) {
   const settings = {
     b2b_discount_pct:    getSetting('b2b_discount_pct')    ?? '50',
@@ -5778,6 +6147,8 @@ function getSettingsData(flash) {
   return { settings, allowlist, flash };
 }
 
+// WHAT: renders the Settings page — B2B config form, admin allowlist list+add, and a read-only info block (B2B_PUB_ID, REDIRECT_URI, MOCK/PROD badge).
+// INVARIANT(S): all setting values and allowlist emails h()-escaped; the read-only block exposes B2B_PUB_ID and REDIRECT_URI to any logged-in admin (acceptable since requireAuth gates it).
 function renderSettings(session, { settings, allowlist, flash }) {
   const flashHtml = flash
     ? `<div class="alert ${flash.ok ? 'alert-success' : 'alert-error'}" style="margin-bottom:1rem">${h(flash.msg)}</div>`
@@ -5838,6 +6209,8 @@ function renderSettings(session, { settings, allowlist, flash }) {
   ` });
 }
 
+// WHAT: Settings page route; builds a flash object from ?flash=ok|err (+ optional ?msg) and renders.
+// INVARIANT(S): flash msg comes from the query string and is h()-escaped in renderSettings — do not bypass that escaping when adding new flash sources.
 app.get('/settings', requireAuth, (req, res) => {
   const flash = req.query.flash ? { ok: req.query.flash === 'ok', msg: req.query.msg || (req.query.flash === 'ok' ? 'Settings saved.' : 'Error saving settings.') } : null;
   res.send(renderSettings(req.adminSession, getSettingsData(flash)));
@@ -5886,6 +6259,9 @@ app.post('/settings/allowlist/add', requireAuth, (req, res) => {
 
 // ── SparkLayer Migration ───────────────────────────────────────────────────────
 
+// WHAT: fetches Shopify customers tagged `sparklayer` (or MOCK_SPARKLAYER_CUSTOMERS) and flags each as alreadyB2B if it already carries the `b2b` tag.
+// CHANGE-GUARD: the Shopify query is `customers(first:50,query:'tag:sparklayer')` with NO pagination loop — only the first 50 SparkLayer customers are ever considered for migration (see bugs[]); re-test counts against a real tag:sparklayer population before relying on `total`.
+// INVARIANT(S): numId is derived via shopifyNumericId(node.id) and is the checkbox value the migrate form posts; on Shopify error returns an empty candidate set with `error` set rather than throwing, so the page must render the warning banner.
 async function getMigrateData() {
   if (MOCK) {
     const candidates = MOCK_SPARKLAYER_CUSTOMERS.map(c => ({
@@ -5913,6 +6289,9 @@ async function getMigrateData() {
   }
 }
 
+// WHAT: renders the SparkLayer migration page — stat cards, a bulk Run-Migration form, and a per-customer table with checkboxes.
+// CHANGE-GUARD: the `ids` checkboxes are decorative here — POST /migrate/run ignores them and re-derives `pending` from getMigrateData(), so unchecking a row in the UI does NOT exclude it from the run; keep that in mind if you wire the checkboxes up.
+// INVARIANT(S): all user-supplied strings pass through h() for escaping; the confirm() dialog text must keep its pending.length count in sync with the server-side recompute.
 function renderMigrate(session, data, flash) {
   const { candidates, total, alreadyMigrated, error } = data;
   const flashHtml = flash ? `<div class="alert ${flash.ok?'alert-success':'alert-error'}" style="margin-bottom:1rem">${h(flash.msg)}</div>` : '';
@@ -5962,12 +6341,18 @@ function renderMigrate(session, data, flash) {
   ` });
 }
 
+// WHAT: GET /migrate — requireAuth-gated page listing SparkLayer customers eligible for the `b2b` tag.
+// CHANGE-GUARD: flash is parsed from query (?flash=ok|err&msg=...); data comes from getMigrateData() which may carry an `error` field — renderMigrate must handle the degraded case.
+// INVARIANT(S): read-only; performs no writes; safe to refresh.
 app.get('/migrate', requireAuth, async (req, res) => {
   const flash = req.query.flash ? { ok: req.query.flash === 'ok', msg: req.query.msg || '' } : null;
   const data = await getMigrateData();
   res.send(renderMigrate(req.adminSession, data, flash));
 });
 
+// WHAT: POST /migrate/run — tags every pending SparkLayer customer with `b2b` via Shopify tagsAdd (or mockSparkLayerMigrated.add in MOCK).
+// CHANGE-GUARD: it RE-FETCHES getMigrateData() and re-derives `pending` rather than trusting posted ids; two concurrent submits would each tag the same set (tagsAdd is idempotent so harmless, but migrated/errors counts double-count) — serialize if that matters.
+// INVARIANT(S): tagsAdd is idempotent (re-running is safe, as the UI claims); per-customer failures are caught, logged, and counted in `errors` without aborting the loop; every successful tag is auditLog'd as migrate:sparklayer:tag_b2b.
 app.post('/migrate/run', requireAuth, async (req, res) => {
   const data = await getMigrateData();
   const pending = data.candidates.filter(c => !c.alreadyB2B);
@@ -5996,6 +6381,9 @@ app.post('/migrate/run', requireAuth, async (req, res) => {
 
 // ── Audit log ─────────────────────────────────────────────────────────────────
 
+// WHAT: GET /audit — paginated audit-log viewer (100 rows/page) backed by getAuditLog/getAuditLogCount.
+// CHANGE-GUARD: page is parsed from req.query.page and clamped to >=1; auditTargetLink() regex-matches gid://shopify/Order|Customer and lead:N patterns to build links — extend both the regex and the link map together if new target shapes are introduced.
+// INVARIANT(S): r.after_val and r.target are h()-escaped before render; timestamps are formatted as UTC ISO sliced to 19 chars; pagination links preserve only ?page (no other filters exist on this route).
 app.get('/audit', requireAuth, (req, res) => {
   const page  = Math.max(1, parseInt(req.query.page) || 1);
   const limit = 100;
@@ -6052,6 +6440,9 @@ app.get('/audit', requireAuth, (req, res) => {
 // Mock data for labels (products with barcodes for test/demo)
 const MOCK_LABEL_PRODUCTS = MOCK_PRODUCTS;
 
+// WHAT: loads product+variant data (barcode, sku, price, inventory) for label generation, by id list or full catalog in MOCK.
+// CHANGE-GUARD: variants are fetched first:30 — products with >30 variants silently lose the overflow on labels; the Shopify `nodes(ids:)` query expects gid://shopify/Product/<id> form built here from numeric ids.
+// INVARIANT(S): result is filtered through Boolean to drop null nodes (deleted/inaccessible products); the returned shape (p.variants.edges[].node) must match what /labels and handleLabelsPdf consume.
 async function getProductsForLabels(ids) {
   if (MOCK) {
     if (ids && ids.length) return MOCK_LABEL_PRODUCTS.filter(p => ids.includes(shopifyNumericId(p.id)));
@@ -6066,6 +6457,9 @@ async function getProductsForLabels(ids) {
   return (result.data?.nodes || []).filter(Boolean);
 }
 
+// WHAT: loads one order's line items (barcode, title, variantTitle, sku, price, qty) for the 'From an Order' labels tab.
+// CHANGE-GUARD: lineItems are fetched first:50 — orders with >50 line items truncate silently; barcode comes from variant.barcode and is later validated as /^\d{12,13}$/ in renderLabelsPage, so non-UPC barcodes are dropped downstream.
+// INVARIANT(S): returns null when the order doesn't exist (caller shows 'Order not found'); MOCK path reads MOCK_ORDERS and mirrors the live shape exactly.
 async function getOrderForLabels(numericId) {
   if (MOCK) {
     const o = MOCK_ORDERS.find(o => shopifyNumericId(o.id) === numericId);
@@ -6269,6 +6663,9 @@ app.get('/labels', requireAuth, async (req, res) => {
 });
 
 // Shared label PDF generator for preview + print
+// WHAT: shared PDF generator for POST /labels/preview (inline) and /labels/print (attachment) — reads the 6 field checkboxes + selected items from the form, renders an Avery label sheet, persists last-used template/fields, and logs the batch.
+// CHANGE-GUARD: trusts client-posted item_barcode_/title_/sku_/price_ hidden fields (no server re-fetch), so barcodes are whatever the browser submitted — re-test that renderLabelSheet still rejects non-12/13-digit barcodes; the `sel` field is normalized via [req.body.sel||[]].flat() to tolerate single-vs-array.
+// INVARIANT(S): 400 if zero fields selected or zero items selected; on success sets Content-Type application/pdf with the disposition arg and emits auditLog label:generate; setSetting keys (last_label_template/last_label_fields) are per-admin (scoped by req.adminSession.email).
 async function handleLabelsPdf(req, res, disposition) {
   const itemCount = parseInt(req.body.item_count) || 0;
   const template  = req.body.template || 'avery-5160';
@@ -6319,11 +6716,17 @@ async function handleLabelsPdf(req, res, disposition) {
   }
 }
 
+// WHAT: the two label-PDF endpoints — /labels/preview opens inline (formtarget=_blank), /labels/print downloads as attachment; both delegate to handleLabelsPdf.
+// CHANGE-GUARD: the only difference is the Content-Disposition arg ('inline' vs 'attachment'); keep both requireAuth-gated since they read order/product data.
+// INVARIANT(S): both are POST (form carries item_count + per-item hidden fields); GET would lose the selection payload.
 app.post('/labels/preview', requireAuth, (req, res) => handleLabelsPdf(req, res, 'inline'));
 app.post('/labels/print',   requireAuth, (req, res) => handleLabelsPdf(req, res, 'attachment'));
 
 // ── Phase 6: Exports ──────────────────────────────────────────────────────────
 
+// WHAT: loads full product+variant detail (images, inventory, timestamps) for CSV/image exports via Shopify nodes(ids:) or MOCK_PRODUCTS.
+// CHANGE-GUARD: images first:30 and variants first:50 — exports silently drop overflow beyond those caps; the gid mapping `gid://shopify/Product/<id>` must match what getAllB2bProductIds returns (numeric ids).
+// INVARIANT(S): null nodes filtered out; b2b_price in the CSV is later derived as price*0.5 (hardcoded 50%, NOT the per-customer/global discount) — see /exports/csv.
 async function getProductsForExport(ids) {
   if (MOCK) {
     if (ids && ids.length) return MOCK_PRODUCTS.filter(p => ids.includes(shopifyNumericId(p.id)));
@@ -6344,6 +6747,9 @@ async function getProductsForExport(ids) {
   return (result.data?.nodes || []).filter(Boolean);
 }
 
+// WHAT: paginates all product ids in the B2B publication (publication_id:<B2B_PUB_ID tail>) for select-all on the export pages.
+// CHANGE-GUARD: the loop is bounded to 20 pages * 250 = 5000 products MAX and then stops silently (see bugs[]) — a larger B2B catalog will export an incomplete 'all'; raise the page bound or surface a truncation warning if the catalog grows.
+// INVARIANT(S): breaks on !hasNextPage; advances via endCursor cursor pagination; MOCK returns every MOCK_PRODUCTS id.
 async function getAllB2bProductIds() {
   if (MOCK) return MOCK_PRODUCTS.map(p => shopifyNumericId(p.id));
   const ids = [];
@@ -6360,6 +6766,9 @@ async function getAllB2bProductIds() {
   return ids;
 }
 
+// WHAT: renders the /exports landing with two cards linking to the CSV and image export flows.
+// CHANGE-GUARD: static markup only; the card hrefs (/exports/csv, /exports/images) must match the registered routes.
+// INVARIANT(S): no user data interpolated, so no escaping needed here.
 function renderExportsLanding(session) {
   return layout({ title: 'Exports', session, activePath: '/exports', content: `
     <div class="page-header"><h1>Exports</h1></div>
@@ -6378,6 +6787,9 @@ function renderExportsLanding(session) {
   ` });
 }
 
+// WHAT: renders the CSV export builder — product picker (with select-all/clear links) plus a column checklist; ALL_COLS is the canonical column catalog.
+// CHANGE-GUARD: ALL_COLS keys MUST stay in sync with the rowData object in POST /exports/csv (a key here with no rowData entry exports as blank); estRows is a cosmetic estimate (selectedCount*2 in MOCK, *3 live) — not authoritative.
+// INVARIANT(S): selCols defaults to all columns when `columns` is null; checkbox name='cols' values are the raw column keys consumed server-side.
 function renderExportsCsv(session, { products, selectedIds, columns, flash }) {
   const ALL_COLS = [
     ['product_handle','Handle'], ['product_title','Title'], ['vendor','Vendor'], ['product_type','Type'],
@@ -6437,6 +6849,9 @@ function renderExportsCsv(session, { products, selectedIds, columns, flash }) {
   ` });
 }
 
+// WHAT: renders the image-export builder — product picker plus a main-only vs full-gallery radio; estimates total image count per the chosen mode.
+// CHANGE-GUARD: imgCount/totalImgs estimates read p.images.edges.length (gallery) or 1 (main) and must match the actual enumeration logic in POST /exports/images or the estimate misleads.
+// INVARIANT(S): mode is normalized to 'gallery' vs anything-else server-side; checkbox name='ids', radio name='mode'.
 function renderExportsImages(session, { products, selectedIds, mode, flash }) {
   const productRows = products.map(p => {
     const numId = shopifyNumericId(p.id);
@@ -6494,10 +6909,16 @@ function renderExportsImages(session, { products, selectedIds, mode, flash }) {
   ` });
 }
 
+// WHAT: GET /exports — the exports landing page (requireAuth).
+// CHANGE-GUARD: pure render of renderExportsLanding; no data fetch.
+// INVARIANT(S): read-only.
 app.get('/exports', requireAuth, (req, res) => {
   res.send(renderExportsLanding(req.adminSession));
 });
 
+// WHAT: GET /exports/csv — renders the CSV builder pre-populated with all B2B products and the admin's last-used columns.
+// CHANGE-GUARD: it calls getAllB2bProductIds() then getProductsForExport(allIds) on every load — this is two full paginated Shopify passes and can be slow for large catalogs; consider caching if the catalog grows.
+// INVARIANT(S): the ?select=none|all toggle only affects which boxes are checked, NOT which products are loaded; saved columns come from per-admin setting last_export_csv_cols.
 app.get('/exports/csv', requireAuth, async (req, res) => {
   const allIds = await getAllB2bProductIds();
   const products = await getProductsForExport(allIds);
@@ -6508,6 +6929,9 @@ app.get('/exports/csv', requireAuth, async (req, res) => {
   res.send(renderExportsCsv(req.adminSession, { products, selectedIds, columns, flash: null }));
 });
 
+// WHAT: POST /exports/csv — streams a CSV (one row per variant) for the selected product ids and columns; saves the column selection per-admin.
+// CHANGE-GUARD: b2b_price is hardcoded as price*0.5 (NOT the global b2b_discount_pct or any per-customer metafield) — fix here if 50% is no longer the wholesale default; ids/cols are normalized via [x||[]].flat().filter(Boolean) to tolerate single-vs-array form posts.
+// INVARIANT(S): re-renders the builder with a flash (not a 4xx) when ids or cols are empty; writes the header row then streams variant rows via res.write/res.end; logExportBatch + auditLog export:csv fire AFTER res.end (totals reflect actual rows written).
 app.post('/exports/csv', requireAuth, async (req, res) => {
   const ids = [req.body.ids || []].flat().filter(Boolean);
   const cols = [req.body.cols || []].flat().filter(Boolean);
@@ -6566,6 +6990,9 @@ app.post('/exports/csv', requireAuth, async (req, res) => {
   auditLog(req.adminSession.email, 'export:csv', null, null, { products: products.length, rows: totalRows, cols: cols.length });
 });
 
+// WHAT: GET /exports/images — renders the image-export builder with all B2B products and the admin's last-used mode.
+// CHANGE-GUARD: same dual full-pagination cost as /exports/csv (getAllB2bProductIds + getProductsForExport); savedMode defaults to 'main-only'.
+// INVARIANT(S): ?select=none clears the pre-checked boxes, otherwise all are checked; read-only (no Shopify writes).
 app.get('/exports/images', requireAuth, async (req, res) => {
   const allIds = await getAllB2bProductIds();
   const products = await getProductsForExport(allIds);
@@ -6578,6 +7005,9 @@ app.get('/exports/images', requireAuth, async (req, res) => {
 // WHAT: streams a ZIP of product images (main-only or full gallery) fetched live from the Shopify CDN, one product at a time.
 // CHANGE-GUARD: images are fetched sequentially with no concurrency cap, no per-request timeout, and no upper bound on product count — a large selection can hang the response and the event loop (see bugs[]); re-test with the full B2B catalog before changing batch sizing.
 // INVARIANT(S): zip.finalize() must be called after all appends; a single failed image fetch is logged and skipped (does not abort the archive); filenames are derived from product.handle and must stay unique within the zip.
+// WHAT: POST /exports/images — streams a ZIP of product images fetched live from the Shopify CDN, main-only or full gallery per `mode`.
+// CHANGE-GUARD: images are fetched SEQUENTIALLY with await fetch(url) inside nested loops — no concurrency cap, no per-fetch timeout, and no upper bound on selected product count (see bugs[]); a large selection can stall the response and tie up the event loop. Re-test with the full catalog before changing batch sizing.
+// INVARIANT(S): zip.finalize() MUST run after all appends; a single failed image fetch is caught/logged/skipped (does not abort the archive); zip entry names derive from p.handle (gallery names get a 2-digit index suffix) and must be unique within the zip; res headers (application/zip + Content-Disposition) are set before the first append.
 app.post('/exports/images', requireAuth, async (req, res) => {
   const ids = [req.body.ids || []].flat().filter(Boolean);
   const mode = req.body.mode === 'gallery' ? 'gallery' : 'main-only';
@@ -6638,6 +7068,9 @@ app.post('/exports/images', requireAuth, async (req, res) => {
 
 // ── Phase 17: Wholesale Leads CRM ─────────────────────────────────────────────
 
+// WHAT: the wholesale-lead status enum — label, badge color, and `terminal` flag for each state (converted/rejected are terminal).
+// CHANGE-GUARD: keys here are the canonical status strings stored in the DB and referenced by LEAD_TRANSITIONS, renderLeadDetail badges, and audit logs — renaming a key requires a data migration AND a matching LEAD_TRANSITIONS update.
+// INVARIANT(S): every status used in LEAD_TRANSITIONS (both sides) must exist here, or badge/label lookups fall back to a muted '—'.
 const LEAD_STATUSES = {
   new:                 { label: 'New',                 color: 'blue',    terminal: false },
   under_review:        { label: 'Under Review',         color: 'warning', terminal: false },
@@ -6650,6 +7083,9 @@ const LEAD_STATUSES = {
   dormant:             { label: 'Dormant',              color: 'muted',   terminal: false },
 };
 
+// WHAT: the allowed lead state-machine edges — maps each status to the set of statuses it may move to.
+// CHANGE-GUARD: POST /leads/:id/status enforces membership here (rejects with flash=invalid_status otherwise); 'approved'->'converted' is the ONLY path that reaches the convert flow, so removing it disables conversion. Terminal states map to [].
+// INVARIANT(S): every key and every target must be a valid LEAD_STATUSES key; the machine is the single source of truth for legal transitions (the UI dropdown is built from it).
 const LEAD_TRANSITIONS = {
   new:                  ['under_review', 'rejected'],
   under_review:         ['waiting_on_docs','waiting_on_sales_tax','waiting_on_w9','approved','rejected','dormant'],
@@ -6662,6 +7098,9 @@ const LEAD_TRANSITIONS = {
   dormant:              ['under_review','rejected'],
 };
 
+// WHAT: renders the leads index — a search box, per-status filter chips with live counts, and a table; overdue follow-ups render in text-danger.
+// CHANGE-GUARD: chip links carry both status and (encoded) q so filtering+search compose; the 'all' count is summed from counts across every status — if a status is missing from counts it contributes 0.
+// INVARIANT(S): business_name/email/contact_name are h()-escaped; overdue is computed as next_followup_due < today (ISO date compare, lexicographic but safe for YYYY-MM-DD).
 function renderLeadsList(session, { leads, counts, flash, q, status }) {
   const allCount = Object.values(counts).reduce((s, n) => s + n, 0);
   const chipList = [
@@ -6714,6 +7153,9 @@ function renderLeadsList(session, { leads, counts, flash, q, status }) {
   ` });
 }
 
+// WHAT: renders the New Lead form; `prefill` repopulates fields after a validation error (e.g. duplicate email).
+// CHANGE-GUARD: the business_type and source <option> lists are hardcoded here — keep them in sync with any DB constraints or downstream reporting that buckets on these values.
+// INVARIANT(S): email is the only required field (marked *); all prefill values pass through h() including the numeric estimated_monthly_volume_usd (String()-coerced).
 function renderLeadNew(session, { flash, prefill = {} }) {
   const flashHtml = flash ? `<div class="alert alert-danger">${h(flash)}</div>` : '';
   return layout({ title: 'New Lead', session, activePath: '/leads', content: `
@@ -6763,6 +7205,9 @@ function renderLeadNew(session, { flash, prefill = {} }) {
   ` });
 }
 
+// WHAT: renders one lead — merged notes+status-history timeline (sorted by ts), a status-change form (options from LEAD_TRANSITIONS), an add-note form, a profile panel, and a follow-up editor; shows Convert button only when status==='approved'.
+// CHANGE-GUARD: timeline sort is `(a,b)=>a.ts-b.ts` over note.created_at and history.changed_at — both MUST be numeric epoch ms or the subtraction sorts wrongly (string timestamps would NaN-sort); transition <select> is built from LEAD_TRANSITIONS[lead.status].
+// INVARIANT(S): note bodies, author emails, websites and all lead fields are h()-escaped; the Convert link/button is gated on 'approved' here AND server-side in /leads/:id/convert (defense in depth).
 function renderLeadDetail(session, { lead, notes, history, flash }) {
   const st = LEAD_STATUSES[lead.status] || { label: lead.status, color: 'muted' };
   const transitions = LEAD_TRANSITIONS[lead.status] || [];
@@ -6896,6 +7341,9 @@ function renderLeadDetail(session, { lead, notes, history, flash }) {
   ` });
 }
 
+// WHAT: renders the lead->Shopify-customer conversion form, defaulting discount % to settings.b2b_discount_pct (or 50).
+// CHANGE-GUARD: field names (display_name, email, discount_pct, allow_order_on_invoice, dropship_enabled) are consumed verbatim by POST /leads/:id/convert; checkbox values arrive as 'on' there, so renaming a field breaks the metafield write.
+// INVARIANT(S): display_name and email are required; discount_pct is bounded 0..95 in the input but the server should still validate.
 function renderLeadConvert(session, { lead, flash, settings }) {
   const discountDefault = settings.b2b_discount_pct || '50';
   const flashHtml = flash ? `<div class="alert alert-danger">${h(flash)}</div>` : '';
@@ -6930,6 +7378,9 @@ function renderLeadConvert(session, { lead, flash, settings }) {
 }
 
 // Leads routes
+// WHAT: GET /leads — lead index with optional ?status filter and ?q free-text search; computes per-status counts.
+// CHANGE-GUARD: status='all' is normalized to null before getLeads(); q is trimmed and passed as search||undefined; flash maps ?flash=created|saved to messages — add new flash codes in both this map and the writers.
+// INVARIANT(S): read-only; getLeads/getLeadCounts back the table and chips.
 app.get('/leads', requireAuth, (req, res) => {
   const status = req.query.status && req.query.status !== 'all' ? req.query.status : null;
   const q      = String(req.query.q || '').trim();
@@ -6939,10 +7390,16 @@ app.get('/leads', requireAuth, (req, res) => {
   res.send(renderLeadsList(req.adminSession, { leads, counts, flash, q, status: req.query.status || 'all' }));
 });
 
+// WHAT: GET /leads/new — renders the empty New Lead form.
+// CHANGE-GUARD: pure render; the matching POST does the validation.
+// INVARIANT(S): requireAuth-gated like all lead routes.
 app.get('/leads/new', requireAuth, (req, res) => {
   res.send(renderLeadNew(req.adminSession, { flash: null }));
 });
 
+// WHAT: POST /leads/new — creates a lead from the whole req.body, seeds status history as null->'new', and redirects to the detail page.
+// CHANGE-GUARD: createLead(req.body) trusts the entire body object — it must whitelist columns internally; the catch maps a UNIQUE-constraint error to a friendly 'email already exists' message, so changing the email unique index changes this UX.
+// INVARIANT(S): email is required (early return); a created lead always gets exactly one initial status-history row and an auditLog lead:create.
 app.post('/leads/new', requireAuth, (req, res) => {
   const email = String(req.body.email || '').trim();
   if (!email) return res.send(renderLeadNew(req.adminSession, { flash: 'Email is required.', prefill: req.body }));
@@ -6957,6 +7414,9 @@ app.post('/leads/new', requireAuth, (req, res) => {
   }
 });
 
+// WHAT: GET /leads/:id — lead detail with notes + status history; 404s with a styled page when the id is unknown.
+// CHANGE-GUARD: :id is passed straight to getLead (must be parameterized in the DB layer to avoid injection); flash codes created|saved|status_changed map to messages here.
+// INVARIANT(S): read-only; notes and history are loaded by lead.id (the canonical id from getLead, not the raw param).
 app.get('/leads/:id', requireAuth, (req, res) => {
   const lead = getLead(req.params.id);
   if (!lead) return res.status(404).send(layout({ title: '404', session: req.adminSession, activePath: '/leads',
@@ -6967,6 +7427,9 @@ app.get('/leads/:id', requireAuth, (req, res) => {
   res.send(renderLeadDetail(req.adminSession, { lead, notes, history, flash }));
 });
 
+// WHAT: POST /leads/:id/status — transitions a lead, recording status history, a system note, and an audit entry.
+// CHANGE-GUARD: this is a read-modify-write (getLead then updateLead) with NO transaction/lock (see bugs[]) — two concurrent status changes can interleave and the audit `from` may not match the actual prior state; the transition is validated against LEAD_TRANSITIONS[lead.status] and rejected with flash=invalid_status if illegal.
+// INVARIANT(S): an illegal transition makes zero writes; a legal one writes history + a 'system' note + updateLead atomically-enough only if the DB serializes them; every change is auditLog'd lead:status with from/to.
 app.post('/leads/:id/status', requireAuth, (req, res) => {
   const lead = getLead(req.params.id);
   if (!lead) return res.redirect('/leads');
@@ -6981,6 +7444,9 @@ app.post('/leads/:id/status', requireAuth, (req, res) => {
   res.redirect('/leads/' + lead.id + '?flash=status_changed');
 });
 
+// WHAT: POST /leads/:id/note — appends a free-text note (type general|call|email|meeting) to a lead's timeline.
+// CHANGE-GUARD: note_type is whitelisted against the 4 allowed values (defaults to 'general'); the updateLead(lead.id,{status:lead.status}) no-op call exists only to bump updated_at — don't remove it if list ordering depends on last-activity.
+// INVARIANT(S): empty body is rejected (redirect, no write); author is req.adminSession.email.
 app.post('/leads/:id/note', requireAuth, (req, res) => {
   const lead = getLead(req.params.id);
   if (!lead) return res.redirect('/leads');
@@ -6992,6 +7458,9 @@ app.post('/leads/:id/note', requireAuth, (req, res) => {
   res.redirect('/leads/' + lead.id + '?flash=saved');
 });
 
+// WHAT: POST /leads/:id/followup — sets or clears the next_followup_due date.
+// CHANGE-GUARD: an empty date stores null (clears the follow-up); the value is YYYY-MM-DD compared lexicographically elsewhere to flag overdue — keep that format.
+// INVARIANT(S): unknown lead id redirects to /leads with no write.
 app.post('/leads/:id/followup', requireAuth, (req, res) => {
   const lead = getLead(req.params.id);
   if (!lead) return res.redirect('/leads');
@@ -7000,6 +7469,9 @@ app.post('/leads/:id/followup', requireAuth, (req, res) => {
   res.redirect('/leads/' + lead.id + '?flash=saved');
 });
 
+// WHAT: GET /leads/:id/convert — renders the conversion form, but ONLY for leads in status 'approved' (otherwise redirects back).
+// CHANGE-GUARD: the 'approved' gate is enforced here and again in the POST; both must stay aligned with LEAD_TRANSITIONS (only 'approved' transitions to 'converted').
+// INVARIANT(S): settings come from getGlobalSettings() to seed the default discount; read-only.
 app.get('/leads/:id/convert', requireAuth, (req, res) => {
   const lead = getLead(req.params.id);
   if (!lead) return res.redirect('/leads');
@@ -7007,6 +7479,9 @@ app.get('/leads/:id/convert', requireAuth, (req, res) => {
   res.send(renderLeadConvert(req.adminSession, { lead, flash: null, settings: getGlobalSettings() }));
 });
 
+// WHAT: POST /leads/:id/convert — creates a Shopify customer with the `b2b` tag + 3 b2b metafields (discount_pct, allow_order_on_invoice, dropship_enabled), fires a non-blocking Xero contact sync, then marks the lead converted.
+// CHANGE-GUARD: re-asserts status==='approved' server-side; metafields are written in a SEPARATE shopifyFetch AFTER customerCreate, so a failure there leaves a customer with the tag but no/partial metafields and the lead still gets marked converted — no rollback (see bugs[]); checkbox flags arrive as 'on'. MOCK fabricates a gid://shopify/Customer/MOCK_<leadId>.
+// INVARIANT(S): customerCreate userErrors short-circuit back to the form (no lead mutation); on success the lead is set status:'converted' + converted_at + shopify_customer_id, status-history and a system note are added, and auditLog lead:convert fires; the Xero sync is .catch'd so its failure never blocks the redirect.
 app.post('/leads/:id/convert', requireAuth, async (req, res) => {
   const lead = getLead(req.params.id);
   if (!lead) return res.redirect('/leads');
@@ -7084,6 +7559,9 @@ app.post('/leads/:id/convert', requireAuth, async (req, res) => {
 
 // ── Xero accounting routes ────────────────────────────────────────────────────
 
+// WHAT: renders the Xero account-code mapping form (sales/AR/checking/stripe/fees/discounts/terms) plus a connection-test panel; warns when retries are pending.
+// CHANGE-GUARD: the `field()` keys MUST match the setting keys read/written as 'xero_'+f in POST /settings/xero and getXeroAccountMap(); the inline testXeroConnection() script POSTs /api/admin/xero/test and expects {ok,accounts,error}.
+// INVARIANT(S): account-map values render via accountMap[key] (defaults applied in getXeroAccountMap); XERO_BEARER presence drives the Configured/Not-configured badge only (not actual connectivity).
 function renderXeroSettings(session, flash) {
   const accountMap = getXeroAccountMap();
   const flashHtml  = flash ? `<div class="alert ${flash.ok ? 'alert-success' : 'alert-error'}" style="margin-bottom:1rem">${h(flash.msg)}</div>` : '';
@@ -7147,6 +7625,9 @@ function renderXeroSettings(session, flash) {
   ` });
 }
 
+// WHAT: renders the accounting reconciliation page — the Xero invoice map table and the pending/failed actions queue, with retry-all buttons.
+// CHANGE-GUARD: badge status strings ('synced','pending_retry','done','failed') are matched literally — keep them aligned with what getXeroInvoiceMaps/getXeroPending emit; payload_json is JSON.parsed per row (a malformed payload would throw and 500 the whole page).
+// INVARIANT(S): error_text is sliced to 60-80 chars and h()-escaped; order links are built from r.order_id (gid form) by .split('/').pop() elsewhere.
 function renderAccounting(session, data) {
   const { invoiceMaps, pendingActions, pendingCount } = data;
   const pendingCountBadge = pendingCount > 0 ? `<span class="badge badge-pending">${pendingCount}</span>` : '<span class="badge badge-paid">0</span>';
@@ -7220,11 +7701,17 @@ function renderAccounting(session, data) {
   ` });
 }
 
+// WHAT: GET /settings/xero — Xero settings page (account-code mapping + connection test).
+// CHANGE-GUARD: flash parsed from ?flash=ok|err&msg; pure render otherwise.
+// INVARIANT(S): read-only.
 app.get('/settings/xero', requireAuth, (req, res) => {
   const flash = req.query.flash ? { ok: req.query.flash === 'ok', msg: req.query.msg || '' } : null;
   res.send(renderXeroSettings(req.adminSession, flash));
 });
 
+// WHAT: POST /settings/xero — persists the 7 Xero account-code fields as settings keyed 'xero_'+field (each trimmed + capped to 20 chars).
+// CHANGE-GUARD: the `fields` array is the whitelist — only these keys are written; adding a field requires updating both this array and renderXeroSettings' field() calls and getXeroAccountMap.
+// INVARIANT(S): values are global settings (no per-admin scope passed); the whole save is auditLog'd settings:xero with the field map.
 app.post('/settings/xero', requireAuth, (req, res) => {
   const fields = ['sales_revenue','accounts_receivable','chase_checking','stripe_clearing','processing_fees','discounts','payment_terms_days'];
   try {
@@ -7238,6 +7725,9 @@ app.post('/settings/xero', requireAuth, (req, res) => {
   }
 });
 
+// WHAT: GET /accounting — reconciliation dashboard combining the Xero invoice map and the pending+failed action queue.
+// CHANGE-GUARD: pendingActions concatenates getXeroPending('pending') and getXeroPending('failed') — if a third retry state is added, include it here or it won't surface.
+// INVARIANT(S): read-only view; the retry buttons POST to /api/admin/xero/sync.
 app.get('/accounting', requireAuth, (req, res) => {
   const invoiceMaps = getXeroInvoiceMaps();
   const pendingActions = getXeroPending('pending').concat(getXeroPending('failed'));
@@ -7245,6 +7735,9 @@ app.get('/accounting', requireAuth, (req, res) => {
   res.send(renderAccounting(req.adminSession, { invoiceMaps, pendingActions, pendingCount }));
 });
 
+// WHAT: POST /api/admin/xero/test — pings the Xero bridge (GET /api.xro/2.0/Accounts) and returns {ok,accounts} or {ok:false,error}.
+// CHANGE-GUARD: always responds 200 with an `ok` boolean (never a 4xx/5xx) — clients must branch on body.ok, not HTTP status; depends on xeroRequest() and a configured XERO_BEARER.
+// INVARIANT(S): read-only probe; counts result.body.Accounts.length as the connectivity signal.
 app.post('/api/admin/xero/test', requireAuth, async (req, res) => {
   try {
     const result = await xeroRequest('GET', '/api.xro/2.0/Accounts');
@@ -7255,6 +7748,9 @@ app.post('/api/admin/xero/test', requireAuth, async (req, res) => {
   }
 });
 
+// WHAT: POST /api/admin/xero/sync — drains the Xero pending-action queue via retryXeroPending() and returns done/failed/skipped counts.
+// CHANGE-GUARD: content negotiation — returns JSON when req.accepts('json') AND no _redirect flag, else redirects to /accounting with a flash; both branches must stay in sync with retryXeroPending's result shape.
+// INVARIANT(S): the whole run is auditLog'd xero:sync; errors are reported (JSON {ok:false} or err flash) rather than thrown to the client.
 app.post('/api/admin/xero/sync', requireAuth, async (req, res) => {
   try {
     const results = await retryXeroPending();
@@ -7272,6 +7768,9 @@ app.post('/api/admin/xero/sync', requireAuth, async (req, res) => {
 // WHAT: manually pushes one Shopify order to Xero as an ACCREC invoice via syncOrderToXero (which queues to xero_pending_actions on failure).
 // CHANGE-GUARD: the catch branch redirects with `success=xero_failed` instead of `error=` (see bugs[]) so the UI shows a green flash on failure — fix the query key when touching this.
 // INVARIANT(S): createXeroInvoice is idempotent via getXeroMap (status:synced short-circuits); insiders are skipped upstream; failures must enqueue a pending retry, never silently drop.
+// WHAT: POST /orders/:id/xero/sync — manually pushes one order to Xero as an ACCREC invoice via syncOrderToXero (which enqueues to xero_pending_actions on failure).
+// CHANGE-GUARD: BUG — the catch branch redirects with `?success=xero_failed` (success= key, not error=), so the order page shows a green/success flash even when the sync failed (see bugs[]); fix the query key when touching this.
+// INVARIANT(S): syncOrderToXero is idempotent via getXeroMap (status:synced short-circuits); insiders are skipped upstream; a failure must enqueue a pending retry, never silently drop the invoice.
 app.post('/orders/:id/xero/sync', requireAuth, async (req, res) => {
   const numId = req.params.id;
   try {
@@ -7284,6 +7783,9 @@ app.post('/orders/:id/xero/sync', requireAuth, async (req, res) => {
 
 // ── Phase 21: Xero customer sync endpoints ────────────────────────────────────
 
+// WHAT: GET /api/admin/customers/:id/xero-status — returns the Xero contact-sync state for a customer (dryRun in MOCK).
+// CHANGE-GUARD: always 200 with {ok}; on error returns {ok:false,state:'error',error} rather than a 5xx — UI must read .ok/.state.
+// INVARIANT(S): delegates to getXeroSyncStatus(id, xeroRequest); read-only.
 app.get('/api/admin/customers/:id/xero-status', requireAuth, async (req, res) => {
   try {
     const status = await getXeroSyncStatus(req.params.id, xeroRequest, { dryRun: MOCK });
@@ -7293,6 +7795,9 @@ app.get('/api/admin/customers/:id/xero-status', requireAuth, async (req, res) =>
   }
 });
 
+// WHAT: POST /api/admin/customers/:id/xero-sync — fetches the Shopify customer (or MOCK), then upserts them as a Xero contact via syncCustomerToXero.
+// CHANGE-GUARD: the firstName/lastName split (displayName.split(' ')) is naive and duplicated across this file (lead-convert, xero-sync) — multi-word last names land in lastName but single-word names get an empty lastName; keep the splits consistent if you refactor.
+// INVARIANT(S): 404 if the customer is missing; result.skipped short-circuits without auditing; a real create/update is auditLog'd xero:customer_sync; 500 on unexpected error.
 app.post('/api/admin/customers/:id/xero-sync', requireAuth, async (req, res) => {
   const numId = req.params.id;
   try {
@@ -7317,6 +7822,9 @@ app.post('/api/admin/customers/:id/xero-sync', requireAuth, async (req, res) => 
 
 // ── Impersonation ─────────────────────────────────────────────────────────────
 
+// WHAT: builds a base64url(payload).hex(hmac) impersonation token, HMAC-SHA256-signed with IMPERSONATION_SECRET; payload carries v:1, nonce, customer id/email/name, admin email, ro flag, and exp.
+// CHANGE-GUARD: the portal's verifier MUST use the identical secret + algorithm + payload field names (v,nonce,cid,email,name,ae,ro,exp) — any drift breaks impersonation with a generic portal error; the signature covers the base64url payload string, not the decoded object, so canonicalization matters.
+// INVARIANT(S): token is opaque/tamper-evident but NOT encrypted (payload is readable base64url); single-use is enforced separately via the persisted nonce, and expiry via `exp`.
 function makeImpersonationToken({ nonce, customerId, customerEmail, customerDisplayName, adminEmail, readOnly, exp }) {
   const payload = Buffer.from(JSON.stringify({ v: 1, nonce, cid: customerId, email: customerEmail, name: customerDisplayName, ae: adminEmail, ro: readOnly ? 1 : 0, exp })).toString('base64url');
   const sig = crypto.createHmac('sha256', IMPERSONATION_SECRET).update(payload).digest('hex');
@@ -7326,6 +7834,9 @@ function makeImpersonationToken({ nonce, customerId, customerEmail, customerDisp
 // WHAT: mints a single-use, 1-hour HMAC-signed impersonation token (nonce persisted in impersonation_nonces) and returns a portal __impersonate__ URL.
 // CHANGE-GUARD: token format is base64url(payload).hex(hmac) with IMPERSONATION_SECRET — the portal's verifier must use the identical secret + algorithm; changing either breaks impersonation silently with a generic portal error.
 // INVARIANT(S): refuses when IMPERSONATION_SECRET unset (503); blocks impersonating insider accounts (tags intersect ALLOWED_EMAILS); nonce is single-use + expiring (consumed portal-side); every issuance is audit-logged; default readOnly:true unless read_only explicitly false.
+// WHAT: POST /api/admin/customers/:id/impersonate — mints a single-use, 1-hour HMAC token (nonce persisted via createImpersonationNonce) and returns a portal __impersonate__ URL.
+// CHANGE-GUARD: refuses (503) when IMPERSONATION_SECRET is unset; the insider-block compares the CUSTOMER's Shopify tags against ALLOWED_EMAILS (admin emails) which is almost certainly a mismatch and unlikely to ever block a real insider (see bugs[]) — re-examine that check; readOnly defaults to true unless read_only is explicitly the string/false 'false'.
+// INVARIANT(S): every issuance is auditLog'd impersonate:token_issued; gcImpersonationNonces() prunes expired nonces on each mint; nonce is crypto.randomBytes(20) hex and consumed portal-side (single use); exp is Date.now()+1h.
 app.post('/api/admin/customers/:id/impersonate', requireAuth, async (req, res) => {
   if (!IMPERSONATION_SECRET) return res.status(503).json({ ok: false, error: 'B2B_IMPERSONATION_SECRET not configured' });
   const numId = req.params.id;
@@ -7371,11 +7882,17 @@ app.post('/api/admin/customers/:id/impersonate', requireAuth, async (req, res) =
 
 // ── Phase 23: Customer activity warehouse viewer ──────────────────────────────
 
+// WHAT: GET /api/admin/customers/:id/activity — proxies the portal activity warehouse (getCustomerActivityFromPortal) with the raw query as filters; returns JSON.
+// CHANGE-GUARD: passes req.query through to the warehouse reader untouched — that function owns pagination/limit bounds, so validate there; this route does no clamping.
+// INVARIANT(S): read-only; always {ok:true,...data}.
 app.get('/api/admin/customers/:id/activity', requireAuth, (req, res) => {
   const data = getCustomerActivityFromPortal(req.params.id, req.query);
   res.json({ ok: true, ...data });
 });
 
+// WHAT: GET .../activity/lookup?date=YYYY-MM-DD — answers 'did this customer place an order on date?'; returns the matching order events or falls back to last-login/last-cart context.
+// CHANGE-GUARD: the day window is [date T00:00:00Z, date T23:59:59Z] in UTC — a customer in another timezone may have a placed order attributed to the adjacent UTC day; events are matched on eventSubtype==='placed' within ts range.
+// INVARIANT(S): 400 when date is missing; read-only; the 23:59:59Z bound omits the final second's milliseconds but that's negligible.
 app.get('/api/admin/customers/:id/activity/lookup', requireAuth, (req, res) => {
   const { date } = req.query;
   if (!date) return res.status(400).json({ error: 'date required (YYYY-MM-DD)' });
@@ -7395,11 +7912,17 @@ app.get('/api/admin/customers/:id/activity/lookup', requireAuth, (req, res) => {
   res.json({ ok: true, found: false, lastLogin: context.lastLogin, lastCart: context.lastCart, date });
 });
 
+// WHAT: GET .../active-cart — returns the customer's current cart snapshot from the portal warehouse (getActiveCartFromPortal).
+// CHANGE-GUARD: thin pass-through; the cart shape is owned by getActiveCartFromPortal — keep the consuming UI aligned with it.
+// INVARIANT(S): read-only; always {ok:true,...cart}.
 app.get('/api/admin/customers/:id/active-cart', requireAuth, (req, res) => {
   const cart = getActiveCartFromPortal(req.params.id);
   res.json({ ok: true, ...cart });
 });
 
+// WHAT: GET /customers/:id/activity — full HTML activity-log page with date presets, type filter, free-text path search, expandable per-row detail (IP hash, UA, session, impersonation admin), and a 'did they order on date?' quick-lookup widget.
+// CHANGE-GUARD: defaults to a 7-day window; pagination is 50/page (totalPages from data.total) and pagination links re-encode from/to/type/q — add any new filter to BOTH the form and the pagination/canned-view query strings or it drops on page change; the inline script fetches the /activity/lookup endpoint by interpolated numId.
+// INVARIANT(S): customer displayName is best-effort (falls back to 'Customer <id>' on Shopify error, swallowed); row detail JSON is h()-escaped into a data-detail attribute and re-parsed client-side; this page is read-only.
 app.get('/customers/:id/activity', requireAuth, async (req, res) => {
   const numId = req.params.id;
   let customerName = `Customer ${numId}`;
@@ -7597,6 +8120,9 @@ app.get('/customers/:id/activity', requireAuth, async (req, res) => {
 // WHAT: Shopify webhook receiver that HMAC-verifies then upserts customers/orders/products into the local SQLite cache via setImmediate (returns 200 immediately).
 // CHANGE-GUARD: must mount express.raw BEFORE the global express.json (which it does, being defined late) or the rawBody HMAC will be over re-serialized JSON and never match; re-test signature rejection on tamper.
 // INVARIANT(S): SECURITY — verification is skipped when the x-shopify-hmac-sha256 header is absent even though a secret is set (see bugs[]); comparison is plain !== (not timing-safe); cache upsert errors are swallowed so a 200 does NOT mean the row persisted.
+// WHAT: POST /webhooks/shopify — HMAC-verifies Shopify webhooks then upserts customers/orders/products into the local SQLite cache via setImmediate (returns 200 immediately).
+// CHANGE-GUARD: SECURITY — verification is SKIPPED when the x-shopify-hmac-sha256 header is absent even though SHOPIFY_WEBHOOK_SECRET is set (the `if (SECRET && sig)` guard lets a header-less request through to the !MOCK 401, but a present-but-empty header path and the plain `!==` comparison are both weak — see bugs[]); comparison is NOT timing-safe; this express.raw mount must run BEFORE the global express.json or rawBody is re-serialized JSON and HMAC never matches.
+// INVARIANT(S): cache upserts run in setImmediate AFTER the 200 is sent, and their errors are swallowed (console.error only) — a 200 does NOT mean the row persisted; topic prefixes 'customers/', 'orders/', 'products/(create|update)' route the upsert; money fields use shop_money/total_*; tags are normalized from array-or-CSV; every dispatch is auditLog'd webhook:<topic>.
 app.post('/webhooks/shopify', express.raw({ type: 'application/json' }), (req, res) => {
   const rawBody = Buffer.isBuffer(req.body) ? req.body : Buffer.from(JSON.stringify(req.body));
   const sig = req.headers['x-shopify-hmac-sha256'];
@@ -7695,6 +8221,9 @@ app.post('/webhooks/shopify', express.raw({ type: 'application/json' }), (req, r
 // WHAT: incremental order poller — pulls orders updated since last_synced_at (minus 60s overlap) into orders_cache; the backstop for missed webhooks.
 // CHANGE-GUARD: it queries shopMoney (not presentmentMoney) and assumes currency 'USD'; the webhook path and backfill scripts use different money fields — keep the three in sync or cached totals diverge.
 // INVARIANT(S): runs only when dashboardActive() and at most every FRESH_TARGET_MS (~3min) guarded by the _syncing flag; the 60s lookback overlap is required so updates landing between polls aren't lost; never runs in MOCK or without SHOPIFY_BEARER.
+// WHAT: incremental order backstop poller — pulls orders updated since last_synced_at (minus a 60s overlap, or 6min on cold start) into orders_cache; covers webhooks that were missed.
+// CHANGE-GUARD: it reads totalPriceSet/subtotalPriceSet/totalTaxSet.shopMoney and HARDCODES currency:'USD' — the webhook path and any backfill must use the same money fields or cached totals diverge; query is sortKey:UPDATED_AT reverse with first:50 (no pagination loop, so a burst of >50 updates between polls can drop the oldest — the 60s overlap only helps at the boundary).
+// INVARIANT(S): no-ops in MOCK or without SHOPIFY_BEARER; the 60s lookback overlap is REQUIRED so updates landing between polls aren't lost; success and error both call setSyncState so last_synced_at always advances (an error still moves the cursor, meaning a failed page is not retried — intentional best-effort).
 async function syncRecentFromShopify() {
   if (MOCK || !SHOPIFY_BEARER) return;
   try {
@@ -7750,6 +8279,9 @@ async function syncRecentFromShopify() {
 // Activity-gated polling (was a flat 5-min interval). Syncs every ~3 min WHILE the
 // dashboard is being used (fresher than before); zero Shopify calls when idle, and
 // refreshes within ~60s when someone returns after an idle period.
+// WHAT: activity-gated background scheduler — every 60s, if the dashboard is active and >=FRESH_TARGET_MS (~3min) since the last run, invokes syncRecentFromShopify; plus a daily GC of expired impersonation nonces.
+// CHANGE-GUARD: the _syncing flag + _lastSyncAt guard prevent overlapping/over-frequent Shopify calls — don't remove them or an idle-return storm could hammer the API; dashboardActive() is the gate that makes it zero-cost when nobody is looking.
+// INVARIANT(S): never runs in MOCK (the whole block is !MOCK-gated); a thrown sync error is swallowed (catch{}) and _syncing is always reset in finally so a crash can't wedge the poller permanently; the nonce GC interval is 24h.
 if (!MOCK) {
   const FRESH_TARGET_MS = 3 * 60 * 1000;
   let _syncing = false, _lastSyncAt = 0;
@@ -7766,6 +8298,9 @@ if (!MOCK) {
 
 // ── Phase 24E: Unified invoices page ──────────────────────────────────────────
 
+// WHAT: GET /invoices — unified invoice list merging cache orders (getAllInvoicesForList), Xero invoice maps, and partial portal invoices, keyed by order number.
+// CHANGE-GUARD: cross-references three sources by constructing `gid://shopify/Order/<shopify_id>` to match Xero/partial records — if any source switches between numeric ids and gids this join silently breaks; xeroSet is a Set of x.order_id for O(1) membership.
+// INVARIANT(S): read-only aggregation; partialInvs is the subset of partials whose order_id matches this order's gid; hasXero/xero are derived purely from the gid join.
 app.get('/invoices', requireAuth, (req, res) => {
   const partials  = getPartialInvoicesAll();
   const xeroMaps  = getXeroInvoiceMaps();
