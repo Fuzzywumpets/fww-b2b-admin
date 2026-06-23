@@ -5274,7 +5274,7 @@ app.get('/api/admin/customers/:id/spend', requireAuth, async (req, res) => {
 
 // ── API search ──
 // WHAT: typeahead customer search (draft-order builder); MOCK filters MOCK_CUSTOMERS, real mode queries Shopify customers with `tag:b2b <q>` capped first:10.
-// CHANGE-GUARD: the per-result discount enrichment references getB2bConfigFromCache which is undefined in this module — the ReferenceError is swallowed and discountPct ALWAYS falls back to the global default (see bugs[]); fix the cache reader rather than relying on the silent fallback.
+// CHANGE-GUARD: the per-result discount enrichment reads each customer's b2b.discount_pct metafield (fetched inline in the customers query -- no N+1) and falls back to the global b2b_discount_pct default; keep the parse in sync with getB2bConfig.
 // INVARIANT(S): results are capped to 10; every result must include discountPct so the draft-order UI can pre-fill pricing.
 app.get('/api/customers/search', requireAuth, async (req, res) => {
   const q = String(req.query.q || '').trim().toLowerCase();
@@ -5284,7 +5284,7 @@ app.get('/api/customers/search', requireAuth, async (req, res) => {
     : await (async () => {
         try {
           const r = await shopifyFetch(`query($q:String!){ customers(first:10,query:$q){
-            edges{node{id displayName email defaultAddress{firstName lastName address1 address2 city province zip country}}}}}`,
+            edges{node{id displayName email defaultAddress{firstName lastName address1 address2 city province zip country} metafields(first:25,namespace:"b2b"){edges{node{key value}}}}}}}`,
             { q: `tag:b2b ${q}` });
           return r.data?.customers?.edges?.map(e => e.node) || [];
         } catch { return []; }
@@ -5294,11 +5294,15 @@ app.get('/api/customers/search', requireAuth, async (req, res) => {
     const numId = shopifyNumericId(c.id);
     let discountPct = discountDefault;
     try {
-// WHAT: intended to pull a customer's per-customer discount_pct from a local cache to enrich /api/customers/search results.
-// CHANGE-GUARD: getB2bConfigFromCache is NEVER defined or imported in this module — this line throws ReferenceError, is swallowed by the surrounding try/catch, and discountPct silently always equals the global default (see bugs[]). Fix by importing a real cache reader or removing the dead branch.
-// INVARIANT(S): search results must reflect the customer's effective discount; today they do not for any customer with a non-default override.
-      const cfg = getB2bConfigFromCache ? getB2bConfigFromCache(numId) : null;
-      if (cfg?.discount_pct != null) discountPct = parseInt(cfg.discount_pct, 10);
+// WHAT: enrich each result with the customer's effective discount = their b2b.discount_pct metafield override, else the global default.
+// CHANGE-GUARD: discount_pct is read from the b2b-namespace metafields fetched inline in the customers query above (no extra round-trip / N+1) and parsed exactly like getB2bConfig (parseInt base-10, override ?? default) -- keep the two in sync. (This branch previously called an undefined cache reader, which threw a swallowed ReferenceError and pinned every result to the default.)
+// INVARIANT(S): search results must reflect the customer's effective discount; a customer with a non-default override now returns that override, not the global default.
+      const mfs = c?.metafields?.edges || [];
+      const dpRaw = mfs.find(m => m?.node?.key === 'discount_pct')?.node?.value;
+      if (dpRaw != null && dpRaw !== '') {
+        const dp = parseInt(dpRaw, 10);
+        if (!Number.isNaN(dp)) discountPct = dp;
+      }
     } catch (e) { /* ignore */ }
     return {
       id:          numId,
