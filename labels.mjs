@@ -107,6 +107,9 @@ export async function barcodePng(code) {
 
 // Expand items by quantity and filter out items with no valid barcode.
 // Returns { labels: [...], skipped: [...] }
+// WHAT: expands selected label items by qty and drops any item whose barcode is not exactly 12 or 13 digits (UPC-A / EAN-13), collecting drops into skipped[].
+// CHANGE-GUARD: the /^\d{12,13}$/ test is the single barcode-validity gate shared by both sheet and thermal renderers — loosening it will feed bwip-js codes it cannot encode and crash a label; re-test with an empty and a malformed barcode.
+// INVARIANT(S): qty is clamped to >=1; only valid-barcode items reach the PDF; the caller relies on the {labels,skipped} split to report skips in the UI.
 export function expandItems(items) {
   const labels = [];
   const skipped = [];
@@ -123,6 +126,9 @@ export function expandItems(items) {
 }
 
 // Main entry point. Returns { pdf: Buffer, skipped: [] }.
+// WHAT: top-level label PDF entry point — pre-renders/caches one barcode PNG per unique code, then dispatches to the sheet-grid or thermal-single layout per template.type.
+// CHANGE-GUARD: barcode PNGs are cached by code string; if TEMPLATES dimensions (pts) or the barcode scale/height change, re-print on the actual Avery stock / thermal printer to confirm alignment — pixel math here maps directly to physical labels.
+// INVARIANT(S): an unknown template falls back to avery-5160; fields are merged over DEFAULT_FIELDS; a barcode that fails to render is cached as null and the barcode field is simply omitted (label still prints).
 export async function renderLabelSheet({ template = 'avery-5160', items, fields = DEFAULT_FIELDS }) {
   const tmpl = TEMPLATES[template] || TEMPLATES['avery-5160'];
   const mergedFields = { ...DEFAULT_FIELDS, ...fields };

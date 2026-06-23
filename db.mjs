@@ -500,6 +500,9 @@ export function getBackordersForOrder(orderId) {
     .all(orderId, 'pending');
 }
 
+// WHAT: sums orders_cache.total_price for a customer across PENDING/PARTIALLY_PAID/UNPAID, non-cancelled orders (the customer-detail outstanding-balance widget).
+// CHANGE-GUARD: customer_shopify_id stores the NUMERIC id, but renderCustomerDetail calls this with customer.id which is a gid:// GID — the WHERE never matches and the widget always shows $0 (see bugs[]); pass shopifyNumericId(customer.id).
+// INVARIANT(S): the status list must match the financial_status strings Shopify actually returns; total is ROUND()ed to 2dp; cancelled orders must be excluded.
 export function getOutstandingBalanceForCustomer(customerId) {
   const rows = db.prepare(
     'SELECT ROUND(SUM(total_price), 2) AS total, COUNT(*) AS count FROM orders_cache WHERE customer_shopify_id = ? AND cancelled_at IS NULL AND financial_status IN (\'PENDING\',\'PARTIALLY_PAID\',\'UNPAID\')'
@@ -573,6 +576,9 @@ export function createImpersonationNonce({ nonce, customerId, customerEmail, cus
   `).run(nonce, customerId, customerEmail || null, customerDisplayName || null, adminEmail, readOnly ? 1 : 0, expiresAt, Date.now());
 }
 
+// WHAT: atomically validates-and-burns an impersonation nonce (rejects unknown, already-used, or expired), returning the row exactly once.
+// CHANGE-GUARD: the SELECT-then-UPDATE is not wrapped in a transaction — two concurrent portal redemptions could both read used_at:null before either writes; acceptable today (single-use links, low concurrency) but re-test if impersonation volume rises.
+// INVARIANT(S): a nonce must be redeemable at most once; expiry (expires_at) and used_at are both hard gates; gcImpersonationNonces prunes rows older than 2h independently.
 export function consumeImpersonationNonce(nonce) {
   const row = db.prepare('SELECT * FROM impersonation_nonces WHERE nonce = ?').get(nonce);
   if (!row) return null;
@@ -673,6 +679,9 @@ export function listCustomersFromCache(filters = {}) {
   }));
 }
 
+// WHAT: B2B-only order list (joins customers_cache where is_b2b=1) with q/status/date filters, feeding the /orders page and CSV.
+// CHANGE-GUARD: LIMIT 200 is hardcoded with no offset/cursor — beyond 200 matching orders are silently dropped and getOrdersData reports hasNextPage:false (see bugs[]); re-test filter SQL after any status-enum change.
+// INVARIANT(S): the is_b2b=1 join is the B2B scoping guarantee — never widen it without an explicit segment flag; status buckets must mirror FINANCIAL_STATUS_FILTER in server.mjs; q is parameterized (no injection) but the LIKE has no escaping of %/_ .
 export function listOrdersFromCache(filters = {}) {
   // Phase 24D: B2B-only — joins customers_cache where is_b2b=1
   const where = ['c.is_b2b = 1'];
@@ -781,6 +790,9 @@ export function upsertOrderCache(o) {
   );
 }
 
+// WHAT: replaces the cached line items for an order (INSERT OR REPLACE per row keyed by autoincrement id).
+// CHANGE-GUARD: there is NO delete-before-insert of stale rows for the order — because the PK is a synthetic autoincrement, editing an order down to fewer lines leaves orphaned old line rows in the cache, inflating product-revenue reports; re-test reports after an order edit.
+// INVARIANT(S): is_fww_vendor is derived from vendor === 'Fuzzywumpets' (string-literal coupling shared with the backfill scripts); quantity/price default to 0; taxable normalized to 0/1.
 export function upsertOrderLineItemsCache(orderShopifyId, lineItems) {
   const stmt = db.prepare(`
     INSERT OR REPLACE INTO order_line_items_cache
@@ -861,6 +873,9 @@ export function getSyncState(resource) {
   return db.prepare('SELECT * FROM sync_state WHERE resource = ?').get(resource) || null;
 }
 
+// WHAT: upserts per-resource sync bookkeeping (last_synced_at, cursor, total, last_error) used by the poller and the backfill scripts to resume.
+// CHANGE-GUARD: last_cursor and total_synced use COALESCE(excluded,...) so passing them as null PRESERVES the prior value — callers clearing a cursor must pass an explicit sentinel, not null; re-test resume-after-full-sync logic in backfill-shopify.mjs.
+// INVARIANT(S): last_error_at only advances when last_error is non-null; lastSyncedAt defaults to now(); the 'orders_recent' resource row is owned by the live poller, distinct from the backfill 'orders' row.
 export function setSyncState(resource, { lastSyncedAt, lastCursor, totalSynced, lastError } = {}) {
   const now = Date.now();
   db.prepare(`
@@ -900,6 +915,9 @@ export function getPartialInvoicesAll({ limit = 200, offset = 0 } = {}) {
   `).all(limit, offset);
 }
 
+// WHAT: SQL-side 12-month B2B revenue rollup — monthly series, top-20 customers, top-50 products, and headline totals — all scoped to is_b2b=1 and cancelled_at IS NULL.
+// CHANGE-GUARD: product aggregation groups by COALESCE(sku,title) and depends on the line-items cache being free of stale rows (see upsertOrderLineItemsCache guard); re-verify totals against Shopify after schema or vendor-tagging changes.
+// INVARIANT(S): the month grid is pre-seeded for all 12 months so gaps render as zero; revenue uses total_price (order-level) for customers/totals but price*quantity (line-level) for products — these two bases can legitimately differ.
 export function getReportsDataFromCache() {
   // Phase 24F: SQL-side aggregation of last 12 months
   const now = new Date();

@@ -31,6 +31,9 @@ function registerBrandFonts(doc) {
   }
 }
 
+// WHAT: renders a branded B2B invoice PDF (pdfkit) from a Shopify order, with optional opts overrides for partial invoices (lineItems/subtotal/shipping/total/invoiceSuffix/paymentTerms).
+// CHANGE-GUARD: line rows use fixed heights + lineBreak:false + ellipsis and an explicit y>680 page-break; long titles/skus or added columns can overlap or push the footer off-page — re-render a multi-page order and an unpaid order (PAYMENT PENDING watermark) after layout edits.
+// INVARIANT(S): unit price falls back discountedUnitPrice -> originalUnitPrice -> 0; when opts.subtotal is supplied the totals come entirely from opts (partial-invoice path) and must already be reconciled by the caller; all text is black per brand spec (lime is accent-only).
 export async function generateInvoicePdf(order, opts = {}) {
   return new Promise((resolve, reject) => {
     const doc = new PDFDocument({ margin: 50, size: 'LETTER', autoFirstPage: true });

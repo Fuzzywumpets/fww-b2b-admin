@@ -807,6 +807,9 @@ function sessionCookie(sid, expire = false) {
 }
 
 // ── Auth middleware ───────────────────────────────────────────────────────────
+// WHAT: Express middleware gating every page/API behind a valid admin_sessions cookie; also stamps lastDashboardActivity to drive the activity-gated Shopify poller.
+// CHANGE-GUARD: re-test that /api/* returns 401 JSON (not an HTML redirect) and that browser routes redirect to /login; touching lastDashboardActivity here changes when syncRecentFromShopify fires.
+// INVARIANT(S): this is the ONLY auth gate — every mutating route must mount it; session lookup must reject expired/missing sids; no route may trust req.params/body for identity.
 function requireAuth(req, res, next) {
   lastDashboardActivity = Date.now();
   const session = getSession(getCookie(req, COOKIE_NAME));
@@ -1053,6 +1056,9 @@ function renderComingSoon(session, label, activePath) {
 }
 
 // ── Shopify ───────────────────────────────────────────────────────────────────
+// WHAT: single choke-point for all live Shopify GraphQL, proxied through the shopify-bridge Cloudflare worker with SHOPIFY_BRIDGE_BEARER.
+// CHANGE-GUARD: if the bridge URL, bearer env name, or error-shape handling changes, every order/customer/product/catalog feature breaks at once; re-test one read and one mutation.
+// INVARIANT(S): throws on res.!ok and on json.errors[] so callers can try/catch; callers must inspect per-mutation userErrors separately (this only catches transport/top-level errors, NOT mutation userErrors).
 async function shopifyFetch(query, variables = {}) {
   const res = await fetch('https://shopify-bridge.alex-037.workers.dev/api/graphql', {
     method: 'POST',
@@ -3597,6 +3603,9 @@ app.get('/auth/login', (req, res) => {
   res.redirect(`https://accounts.google.com/o/oauth2/v2/auth?${params}`);
 });
 
+// WHAT: Google OAuth2 code->token->userinfo exchange; admits a session only if email_verified AND the lowercased email is in B2B_ADMIN_ALLOWED_EMAILS.
+// CHANGE-GUARD: re-test the allowlist gate, the oauth_state CSRF check, and that the state cookie is cleared on success; weakening any check opens the whole dashboard.
+// INVARIANT(S): state must equal the oauth_state cookie before token exchange; only verified + allowlisted emails get createSession; redirect_uri must match REDIRECT_URI registered in Google console (MOCK vs prod differ).
 app.get('/auth/google/callback', async (req, res) => {
   if (MOCK) return res.redirect('/');
   const { code, state, error } = req.query;
@@ -4016,6 +4025,9 @@ app.get('/api/admin/orders/:id/partial-invoices', requireAuth, (req, res) => {
 // ── Phase 16: Order editing, partial fulfillment, backorder ──────────────────
 
 // 16A: Edit order line items (qty changes, remove, add, price override)
+// WHAT: applies qty changes, removals, per-line B2B price re-discounting, order-level discount, and custom line additions via the Shopify orderEdit* mutation suite (begin->setQuantity/removeDiscount/addLineItemDiscount/addCustomItem->commit).
+// CHANGE-GUARD: this is the most fragile handler — re-test the original-li-id -> calculated-li-id mapping (matched by variant id + title) after any Shopify API-version bump; price re-discount does remove+add (NOT updateDiscount) because discounts stack on commit.
+// INVARIANT(S): NON-ATOMIC across many round-trips — a mid-sequence failure leaves the calculatedOrder partially edited yet still commits; orderEditSetQuantity/remove userErrors are logged but not surfaced; commit uses notifyCustomer:false; restock:true only on full removes.
 app.post('/orders/:id/edit', requireAuth, async (req, res) => {
   const numId   = req.params.id;
   const session = req.adminSession;
@@ -4313,6 +4325,9 @@ app.post('/orders/:id/ship/rates', requireAuth, async (req, res) => {
 });
 
 // Ship order — buy label + auto-fulfill in Shopify
+// WHAT: buys a 4x6 PDF label via shipping-bridge then auto-fulfills the matched line items in Shopify with the returned tracking (USPS/UPS/FedEx mapped from carrier_code).
+// CHANGE-GUARD: fulfillment MUST follow the label (paid label with no Shopify fulfillment = silent drift); re-test the fulfillmentOrder line-item mapping and the carrier_code->company name map after any bridge or API-version change.
+// INVARIANT(S): label purchase is the source of truth — if fulfillmentCreate fails the label is already paid (logged, not refunded); only OPEN/IN_PROGRESS fulfillmentOrders are eligible; wantedQty is clamped to remainingQuantity; notifyCustomer:true here.
 app.post('/orders/:id/ship/label', requireAuth, async (req, res) => {
   const numId = req.params.id;
   const { rate_id, lineItems = [] } = req.body || {};
@@ -4964,6 +4979,9 @@ app.get('/api/customers/search', requireAuth, async (req, res) => {
     const numId = shopifyNumericId(c.id);
     let discountPct = discountDefault;
     try {
+// WHAT: intended to pull a customer's per-customer discount_pct from a local cache to enrich /api/customers/search results.
+// CHANGE-GUARD: getB2bConfigFromCache is NEVER defined or imported in this module — this line throws ReferenceError, is swallowed by the surrounding try/catch, and discountPct silently always equals the global default (see bugs[]). Fix by importing a real cache reader or removing the dead branch.
+// INVARIANT(S): search results must reflect the customer's effective discount; today they do not for any customer with a non-default override.
       const cfg = getB2bConfigFromCache ? getB2bConfigFromCache(numId) : null;
       if (cfg?.discount_pct != null) discountPct = parseInt(cfg.discount_pct, 10);
     } catch (e) { /* ignore */ }
@@ -5839,6 +5857,9 @@ app.post('/settings', requireAuth, (req, res) => {
   }
 });
 
+// WHAT: adds an email to B2B_ADMIN_ALLOWED_EMAILS by shelling out to `doppler secrets set` and mutating process.env in-place (privilege-grant surface).
+// CHANGE-GUARD: any admin can grant full-dashboard access to any email here — re-test the email-format regex gate and that the Doppler write succeeds before process.env is updated; a failed Doppler write must not leave a divergent in-memory allowlist.
+// INVARIANT(S): the new value persists only via Doppler (next deploy re-reads it); spawnSync has a 10s timeout and non-zero status throws; MOCK mode never persists; this is the one place the trust boundary widens at runtime.
 app.post('/settings/allowlist/add', requireAuth, (req, res) => {
   const email = String(req.body.email || '').trim().toLowerCase();
   if (!/^[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}$/.test(email)) {
@@ -6554,6 +6575,9 @@ app.get('/exports/images', requireAuth, async (req, res) => {
   res.send(renderExportsImages(req.adminSession, { products, selectedIds, mode: savedMode, flash: null }));
 });
 
+// WHAT: streams a ZIP of product images (main-only or full gallery) fetched live from the Shopify CDN, one product at a time.
+// CHANGE-GUARD: images are fetched sequentially with no concurrency cap, no per-request timeout, and no upper bound on product count — a large selection can hang the response and the event loop (see bugs[]); re-test with the full B2B catalog before changing batch sizing.
+// INVARIANT(S): zip.finalize() must be called after all appends; a single failed image fetch is logged and skipped (does not abort the archive); filenames are derived from product.handle and must stay unique within the zip.
 app.post('/exports/images', requireAuth, async (req, res) => {
   const ids = [req.body.ids || []].flat().filter(Boolean);
   const mode = req.body.mode === 'gallery' ? 'gallery' : 'main-only';
@@ -7245,6 +7269,9 @@ app.post('/api/admin/xero/sync', requireAuth, async (req, res) => {
   }
 });
 
+// WHAT: manually pushes one Shopify order to Xero as an ACCREC invoice via syncOrderToXero (which queues to xero_pending_actions on failure).
+// CHANGE-GUARD: the catch branch redirects with `success=xero_failed` instead of `error=` (see bugs[]) so the UI shows a green flash on failure — fix the query key when touching this.
+// INVARIANT(S): createXeroInvoice is idempotent via getXeroMap (status:synced short-circuits); insiders are skipped upstream; failures must enqueue a pending retry, never silently drop.
 app.post('/orders/:id/xero/sync', requireAuth, async (req, res) => {
   const numId = req.params.id;
   try {
@@ -7296,6 +7323,9 @@ function makeImpersonationToken({ nonce, customerId, customerEmail, customerDisp
   return `${payload}.${sig}`;
 }
 
+// WHAT: mints a single-use, 1-hour HMAC-signed impersonation token (nonce persisted in impersonation_nonces) and returns a portal __impersonate__ URL.
+// CHANGE-GUARD: token format is base64url(payload).hex(hmac) with IMPERSONATION_SECRET — the portal's verifier must use the identical secret + algorithm; changing either breaks impersonation silently with a generic portal error.
+// INVARIANT(S): refuses when IMPERSONATION_SECRET unset (503); blocks impersonating insider accounts (tags intersect ALLOWED_EMAILS); nonce is single-use + expiring (consumed portal-side); every issuance is audit-logged; default readOnly:true unless read_only explicitly false.
 app.post('/api/admin/customers/:id/impersonate', requireAuth, async (req, res) => {
   if (!IMPERSONATION_SECRET) return res.status(503).json({ ok: false, error: 'B2B_IMPERSONATION_SECRET not configured' });
   const numId = req.params.id;
@@ -7564,6 +7594,9 @@ app.get('/customers/:id/activity', requireAuth, async (req, res) => {
 
 // ── Phase 24C: Shopify webhook receiver ───────────────────────────────────────
 
+// WHAT: Shopify webhook receiver that HMAC-verifies then upserts customers/orders/products into the local SQLite cache via setImmediate (returns 200 immediately).
+// CHANGE-GUARD: must mount express.raw BEFORE the global express.json (which it does, being defined late) or the rawBody HMAC will be over re-serialized JSON and never match; re-test signature rejection on tamper.
+// INVARIANT(S): SECURITY — verification is skipped when the x-shopify-hmac-sha256 header is absent even though a secret is set (see bugs[]); comparison is plain !== (not timing-safe); cache upsert errors are swallowed so a 200 does NOT mean the row persisted.
 app.post('/webhooks/shopify', express.raw({ type: 'application/json' }), (req, res) => {
   const rawBody = Buffer.isBuffer(req.body) ? req.body : Buffer.from(JSON.stringify(req.body));
   const sig = req.headers['x-shopify-hmac-sha256'];
@@ -7659,6 +7692,9 @@ app.post('/webhooks/shopify', express.raw({ type: 'application/json' }), (req, r
 
 // ── Phase 24C: Background polling sync ────────────────────────────────────────
 
+// WHAT: incremental order poller — pulls orders updated since last_synced_at (minus 60s overlap) into orders_cache; the backstop for missed webhooks.
+// CHANGE-GUARD: it queries shopMoney (not presentmentMoney) and assumes currency 'USD'; the webhook path and backfill scripts use different money fields — keep the three in sync or cached totals diverge.
+// INVARIANT(S): runs only when dashboardActive() and at most every FRESH_TARGET_MS (~3min) guarded by the _syncing flag; the 60s lookback overlap is required so updates landing between polls aren't lost; never runs in MOCK or without SHOPIFY_BEARER.
 async function syncRecentFromShopify() {
   if (MOCK || !SHOPIFY_BEARER) return;
   try {

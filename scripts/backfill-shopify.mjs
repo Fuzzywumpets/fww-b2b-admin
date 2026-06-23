@@ -72,6 +72,9 @@ async function gql(query, variables = {}) {
 }
 
 // ── Cursor-based paginator ────────────────────────────────────────────────────
+// WHAT: generic cursor paginator that walks every page of a Shopify connection and upserts each node, persisting the final cursor to sync_state for resume.
+// CHANGE-GUARD: the while(hasNext) loop has NO page cap and no rate-limit backoff — a full --full sync of all orders/products will run until the connection is exhausted and can hit Shopify cost limits; re-test --since/--full resume after changing queryFn.
+// INVARIANT(S): without --full it resumes from sync_state.last_cursor; the cursor written at the end is the LAST page's endCursor (null when exhausted) — interrupting mid-run and re-running without --full resumes from the previous run's cursor, not the interruption point.
 async function paginate({ resource, queryFn, transformFn, upsertFn, pageSize = 50 }) {
   let cursor = null;
   if (!fullSync) {
@@ -171,6 +174,9 @@ async function backfillCustomers() {
 }
 
 // ── Orders ────────────────────────────────────────────────────────────────────
+// WHAT: maps a Shopify order GraphQL node to the orders_cache row shape, using presentmentMoney amounts.
+// CHANGE-GUARD: this path reads presentmentMoney while the live poller (syncRecentFromShopify) reads shopMoney and the per-customer backfill also uses shopMoney — pick one basis or cached totals will disagree depending on which writer touched the row last (see bugs[]).
+// INVARIANT(S): shopify_id is the numeric id (gid stripped); customer_shopify_id is the numeric customer id; total_refunded is hardcoded 0 here (refunds not backfilled).
 function transformOrder(node) {
   const shopifyId = node.id.replace('gid://shopify/Order/', '');
   const custId = node.customer?.id?.replace('gid://shopify/Customer/', '') || null;
