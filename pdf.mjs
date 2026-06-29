@@ -140,7 +140,7 @@ export async function generateInvoicePdf(order, opts = {}) {
     doc.rect(50, tableTop, 512, 22).fill('#F8F8F8');
     doc.fontSize(8).font('Inter-Bold').fillColor(BLACK);
     doc.text('ITEM', 56, tableTop + 7);
-    doc.text('SKU', 310, tableTop + 7);
+    doc.text('SKU', 285, tableTop + 7);
     doc.text('QTY', 385, tableTop + 7, { width: 40, align: 'right' });
     doc.text('UNIT PRICE', 430, tableTop + 7, { width: 65, align: 'right' });
     doc.text('TOTAL', 500, tableTop + 7, { width: 62, align: 'right' });
@@ -170,12 +170,15 @@ export async function generateInvoicePdf(order, opts = {}) {
       const variantTitle = (item.variant?.title && item.variant.title !== 'Default Title') ? item.variant.title : null;
       const rowH = variantTitle ? 32 : 20;
       doc.fontSize(9.5).fillColor(BLACK);
-      doc.text(fitText(item.title, 42), 56, y, { width: 248, height: 14, lineBreak: false, ellipsis: true });
+      doc.text(fitText(item.title, 37), 56, y, { width: 224, height: 14, lineBreak: false, ellipsis: true });
       if (variantTitle) {
-        doc.fontSize(8).fillColor('#555555').text(fitText(variantTitle, 50), 56, y + 13, { width: 248, height: 12, lineBreak: false, ellipsis: true });
+        doc.fontSize(8).fillColor('#555555').text(fitText(variantTitle, 50), 56, y + 13, { width: 224, height: 12, lineBreak: false, ellipsis: true });
         doc.fontSize(9.5).fillColor(BLACK);
       }
-      doc.text(fitText(item.variant?.sku, 14), 310, y, { width: 70, height: 14, lineBreak: false, ellipsis: true });
+      // SKU: full SKUs run up to 16 chars (e.g. CRSWLK0533258XS8); 8.5pt + 90px column fits them without truncation.
+      doc.fontSize(8.5);
+      doc.text(fitText(item.variant?.sku, 20), 285, y, { width: 90, height: 14, lineBreak: false, ellipsis: true });
+      doc.fontSize(9.5);
       doc.text(String(item.quantity || 0), 385, y, { width: 40, height: 14, align: 'right', lineBreak: false });
       doc.text(fmt(unitPrice), 430, y, { width: 65, height: 14, align: 'right', lineBreak: false });
       doc.text(fmt(rowTotal), 500, y, { width: 62, height: 14, align: 'right', lineBreak: false });
