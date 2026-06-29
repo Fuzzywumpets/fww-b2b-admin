@@ -2819,12 +2819,10 @@ function renderOrderDetail(session, order, flash, flashMsg) {
         ${/* Second build (Build C): Record manual payment modal — cloned from cancel-modal styling */''}${canRecordPayment ? `<div id="record-payment-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center">
           <div style="background:#fff;border-radius:8px;padding:24px;min-width:380px;max-width:500px">
             <h3 style="margin:0 0 16px">Record manual payment</h3>
-            <p style="color:#555;margin:0 0 16px">Record an off-Shopify payment (check, ACH, cash on pickup, etc.) against ${h(order.name)}. Outstanding balance: <b>${fmtMoney(outstanding)}</b>.</p>
+            <p style="color:#555;margin:0 0 16px">Record an off-Shopify payment (check, ACH, cash on pickup, etc.) against ${h(order.name)}.</p>
             <form method="POST" action="/orders/${h(numId)}/record-payment" onsubmit="var b=document.getElementById('record-payment-submit'); if(b){b.disabled=true;b.textContent='Recording…';}">
-              <div style="margin-bottom:12px">
-                <label style="font-size:13px;font-weight:500">Amount</label><br>
-                <input type="number" name="amount" step="0.01" min="0" value="${outstanding.toFixed(2)}" class="filter-input" style="width:100%;margin-top:4px">
-                <div style="font-size:11px;color:var(--muted);margin-top:4px">Leave as the full balance, or lower it to record a partial payment.</div>
+              <div style="margin-bottom:12px;font-size:13px;background:#f6f8f2;border:1px solid var(--border);border-radius:6px;padding:10px">
+                Marks the <b>full balance ${fmtMoney(outstanding)}</b> as paid. <span style="color:var(--muted)">Partial manual payments aren't supported on this Shopify plan.</span>
               </div>
               <div style="margin-bottom:12px">
                 <label style="font-size:13px;font-weight:500">Payment method <span style="color:#c00">*</span></label><br>
@@ -5994,20 +5992,21 @@ app.post('/orders/:id/cancel', requireAuth, async (req, res) => {
 });
 
 // Second build (Build C): Record a manual (off-Shopify) payment against an order.
-// WHAT: posts orderCreateManualPayment(id, amount?, paymentMethodName, processedAt) so a
-//   B2B order paid by check / ACH / cash shows the money received in Shopify (and surfaces
-//   in the Transactions card). amount omitted ⇒ Shopify records the FULL outstanding balance;
-//   a provided amount records that partial. Audit-logged as 'record_manual_payment' (which
-//   also surfaces in the Build D order-history timeline via summarizeAudit).
+// WHAT: marks a B2B order paid via orderMarkAsPaid (FULL outstanding) so an off-Shopify payment
+//   (check / ACH / cash) shows as received in Shopify + the Transactions card. FULL-PAYMENT ONLY:
+//   this store is on Shopify "Advanced", where partial manual payments aren't supported — the
+//   orderCreateManualPayment mutation is Plus-gated, and the Shopify admin can't do partials
+//   either. The payment method + note are recorded in the audit log → Build D order-history
+//   timeline (Shopify books the payment against the pending balance; no custom gateway label).
 // CHANGE-GUARD: modeled on /orders/:id/cancel — MOCK branch first, then real mutation, then
 //   audit + PRG redirect. Validation gates a comp/zero-outstanding order (Shopify userErrors
 //   on those) and a partial amount > the FRESH outstanding (re-fetched immediately before the
 //   mutation, NOT trusting the page-render prefill — an in-flight auto-save edit can change it).
 //   Never swallow a failure: userErrors / exceptions redirect with ?error=payment_failed&msg=…
-// INVARIANT(S): paymentMethod is REQUIRED (blank ⇒ ?error=method_required). amount, if given,
-//   must be > 0 and <= fresh outstanding (else ?error=bad_amount&msg=…). currencyCode hard-coded
-//   USD (this store is USD-only, mirroring the rest of the order-edit suite). No Xero recording
-//   in v1 — a known asymmetry vs mark-paid (flagged follow-up).
+// INVARIANT(S): paymentMethod is REQUIRED (blank ⇒ ?error=method_required). Marks the FULL
+//   balance paid (no amount input). Gates a comp/zero-outstanding order (fresh-refetched ⇒
+//   ?error=payment_failed). No Xero recording in v1 (flagged follow-up). Mirrors the existing
+//   /mark-paid mutation, plus a captured method/note for the audit trail.
 app.post('/orders/:id/record-payment', requireAuth, async (req, res) => {
   const numId   = req.params.id;
   const session = req.adminSession;
@@ -6038,24 +6037,20 @@ app.post('/orders/:id/record-payment', requireAuth, async (req, res) => {
       return Math.max(0, parseFloat(order.totalPriceSet?.presentmentMoney?.amount || 0) || 0);
     })();
     if (!(outstanding > 0)) return res.redirect(`/orders/${numId}?error=payment_failed&msg=${encodeURIComponent('Order has no outstanding balance to pay.')}`);
-    if (amountProvided && (!(amt > 0) || amt > outstanding + 0.001)) {
-      return res.redirect(`/orders/${numId}?error=bad_amount&msg=${encodeURIComponent(`amount must be between 0 and ${outstanding.toFixed(2)}`)}`);
-    }
-    const pay = amountProvided ? amt : outstanding;
+    // Full-payment only (Advanced plan): mark the whole balance paid.
     const overrides = mockOrderOverrides.get(numId) || {};
-    const newReceived = parseFloat(order.totalReceivedSet?.presentmentMoney?.amount || 0) + pay;
-    const newOutstanding = Math.max(0, outstanding - pay);
-    overrides.displayFinancialStatus = newOutstanding <= 0.001 ? 'PAID' : 'PARTIALLY_PAID';
-    overrides.totalOutstandingSet = { presentmentMoney: { amount: newOutstanding.toFixed(2), currencyCode: 'USD' } };
+    const newReceived = parseFloat(order.totalReceivedSet?.presentmentMoney?.amount || 0) + outstanding;
+    overrides.displayFinancialStatus = 'PAID';
+    overrides.totalOutstandingSet = { presentmentMoney: { amount: '0.00', currencyCode: 'USD' } };
     overrides.totalReceivedSet    = { presentmentMoney: { amount: newReceived.toFixed(2), currencyCode: 'USD' } };
     const existingTx = overrides.transactions || order.transactions || [];
     overrides.transactions = [...existingTx, {
       id: `tx-manual-${Date.now()}`, status: 'SUCCESS', kind: 'SALE', gateway: method,
       createdAt: processedAt || new Date().toISOString(),
-      amountSet: { presentmentMoney: { amount: pay.toFixed(2), currencyCode: 'USD' } },
+      amountSet: { presentmentMoney: { amount: outstanding.toFixed(2), currencyCode: 'USD' } },
     }];
     mockOrderOverrides.set(numId, overrides);
-    auditLog(session.email, 'record_manual_payment', orderId, null, { amount: amountProvided ? amt.toFixed(2) : 'full_outstanding', paymentMethod: method, note, processedAt });
+    auditLog(session.email, 'record_manual_payment', orderId, null, { amount: 'full_balance', paymentMethod: method, note, processedAt });
     return res.redirect(`/orders/${numId}?success=payment_recorded`);
   }
 
@@ -6069,19 +6064,16 @@ app.post('/orders/:id/record-payment', requireAuth, async (req, res) => {
     if (!(outstanding > 0)) {
       return res.redirect(`/orders/${numId}?error=payment_failed&msg=${encodeURIComponent('Order has no outstanding balance to pay (it may be a comp / 100%-discount order, already paid, or in-flight edits removed the balance).')}`);
     }
-    if (amountProvided && (!(amt > 0) || amt > outstanding + 0.001)) {
-      return res.redirect(`/orders/${numId}?error=bad_amount&msg=${encodeURIComponent(`amount must be greater than 0 and no more than the outstanding ${outstanding.toFixed(2)}`)}`);
-    }
-    const vars = { id: orderId, paymentMethodName: method };
-    if (amountProvided) vars.amount = { amount: amt.toFixed(2), currencyCode: 'USD' };
-    if (processedAt) vars.processedAt = processedAt;
-    const r = await shopifyFetch(`mutation rec($id:ID!,$amount:MoneyInput,$paymentMethodName:String,$processedAt:DateTime){
-      orderCreateManualPayment(id:$id, amount:$amount, paymentMethodName:$paymentMethodName, processedAt:$processedAt){
-        order{ id displayFinancialStatus totalOutstandingSet{presentmentMoney{amount}} }
+    // Full-payment only: orderCreateManualPayment is Shopify-Plus-gated and this store is on
+    // "Advanced"; orderMarkAsPaid works on all plans and marks the full outstanding paid. The
+    // method + note are recorded in the audit/order-history (not on the Shopify transaction).
+    const r = await shopifyFetch(`mutation mp($id:ID!){
+      orderMarkAsPaid(input:{id:$id}){
+        order{ id displayFinancialStatus totalReceivedSet{presentmentMoney{amount}} }
         userErrors{ field message }
       }
-    }`, vars);
-    const ue = r.data?.orderCreateManualPayment?.userErrors || [];
+    }`, { id: orderId });
+    const ue = r.data?.orderMarkAsPaid?.userErrors || [];
     if (ue.length) {
       const msg = ue.map(e => e.message).join('; ');
       console.error('record-payment userErrors:', msg);

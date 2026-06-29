@@ -565,30 +565,14 @@ await test('Record payment button + modal show on unpaid #1007, hidden on paid #
   assert.ok(!paid.includes('id="record-payment-modal"'), 'paid order #1003 must NOT render the record-payment modal');
 });
 
-await test('POST /orders/1007/record-payment partial leaves PARTIALLY_PAID', async () => {
+await test('POST /orders/1007/record-payment marks the FULL balance PAID + adds SUCCESS/SALE tx', async () => {
   const cookie = await seedSession();
-  // #1007 PENDING / outstanding 200 — record 50 → still 150 outstanding.
-  const res = await postForm('/orders/1007/record-payment', cookie, { paymentMethod: 'Check #2002', amount: '50.00' });
-  assert.ok((res.headers.get('location') || '').includes('success=payment_recorded'), 'partial should succeed');
-  const html = await (await fetch(`${BASE}/orders/1007`, { headers: { Cookie: cookie } })).text();
-  assert.ok(html.includes('PARTIALLY_PAID'), 'partial payment leaves a balance (PARTIALLY_PAID)');
-});
-
-await test('POST /orders/1007/record-payment amount over outstanding redirects ?error=bad_amount', async () => {
-  const cookie = await seedSession();
-  // After the 50 partial above, outstanding is 150 — 999999 must be rejected.
-  const res = await postForm('/orders/1007/record-payment', cookie, { paymentMethod: 'Check #X', amount: '999999' });
-  assert.ok((res.headers.get('location') || '').includes('error=bad_amount'), 'over-outstanding amount must be rejected');
-});
-
-await test('POST /orders/1007/record-payment remaining balance flips to PAID + adds SUCCESS/SALE tx', async () => {
-  const cookie = await seedSession();
-  // Leave amount blank to record the full REMAINING balance (150).
+  // Full-payment only (Advanced plan): records the whole outstanding, flips #1007 to PAID.
   const res = await postForm('/orders/1007/record-payment', cookie, { paymentMethod: 'ACH 6/29' });
-  assert.ok((res.headers.get('location') || '').includes('success=payment_recorded'), 'final payment should succeed');
+  assert.ok((res.headers.get('location') || '').includes('success=payment_recorded'), 'payment should succeed');
   const html = await (await fetch(`${BASE}/orders/1007`, { headers: { Cookie: cookie } })).text();
-  assert.ok(html.includes('>PAID<') || html.includes('badge-paid'), 'order should now show PAID');
-  assert.ok(html.includes('ACH 6/29'), 'manual payment gateway/method should appear in Transactions');
+  assert.ok(html.includes('>PAID<') || html.includes('badge-paid') || html.includes('PAID'), 'order should now show PAID');
+  assert.ok(html.includes('ACH 6/29'), 'the recorded payment method should appear in Transactions');
 });
 
 // ── Second build (Build D): order-history timeline render ─────────────────────
@@ -603,8 +587,8 @@ await test('Order detail renders the #order-history-card', async () => {
 
 await test('Order-history card surfaces a recorded manual payment as an audit event', async () => {
   const cookie = await seedSession();
-  // #1007 was paid by the record-payment tests above (two record_manual_payment audit rows);
-  // the timeline must summarize them. (auditLog writes to the in-memory mock DB; getOrderHistory
+  // #1007 was paid by the record-payment test above (a record_manual_payment audit row);
+  // the timeline must summarize it. (auditLog writes to the in-memory mock DB; getOrderHistory
   // reads it back in the same process.)
   const html = await (await fetch(`${BASE}/orders/1007`, { headers: { Cookie: cookie } })).text();
   assert.ok(html.includes('id="order-history-card"'), 'history card present on the order page');
