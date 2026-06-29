@@ -5605,7 +5605,7 @@ app.get('/api/products/search', requireAuth, async (req, res) => {
     : await (async () => {
         try {
           const r = await shopifyFetch(`query($q:String!){ products(first:10,query:$q){
-            edges{node{id title variants(first:${PRODUCT_VARIANT_CAP}){edges{node{id title sku price inventoryQuantity selectedOptions{name value}}}}}}}`,
+            edges{node{id title variants(first:${PRODUCT_VARIANT_CAP}){edges{node{id title sku price inventoryQuantity selectedOptions{name value}}}}}}}}`,
             { q });
           return (r.data?.products?.edges || []).map(e => ({
             productId:   shopifyNumericId(e.node.id),
@@ -5622,7 +5622,7 @@ app.get('/api/products/search', requireAuth, async (req, res) => {
             // full page of 25 the product *may* have more variants we didn't fetch.
             variantsTruncated: (e.node.variants?.edges || []).length >= PRODUCT_VARIANT_CAP,
           }));
-        } catch { return []; }
+        } catch (e) { console.error('[products-search] shopify query failed (returning empty):', e.message); return []; }
       })();
 
   if (grouped) {
