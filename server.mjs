@@ -4949,10 +4949,18 @@ function withOrderLock(orderId, fn) {
 
 // Read authoritative line state straight off the live order (NOT a calculatedOrder).
 // Returns currentQuantity (Shopify retains removed/zeroed lines — UI must key off this, not quantity).
+// CHANGE-GUARD (total-not-updating bug, 2026-06-29): use current*PriceSet, NOT subtotal/totalPriceSet.
+// On an edited order, subtotalPriceSet / totalPriceSet stay frozen at the ORIGINAL amounts and never
+// reflect removals/qty changes — that was the "the order TOTAL did not update" half of the bug.
+// currentSubtotalPriceSet / currentTotalPriceSet ARE the post-edit truth. We also recompute the
+// subtotal from the surviving lines (currentQuantity * unitPrice) as a belt-and-braces fallback in
+// case the current* fields lag immediately after a rapid edit.
 async function readCommittedLineState(orderId) {
   const r = await shopifyFetch(`query($id:ID!){order(id:$id){
     subtotalPriceSet{presentmentMoney{amount}}
     totalPriceSet{presentmentMoney{amount}}
+    currentSubtotalPriceSet{presentmentMoney{amount}}
+    currentTotalPriceSet{presentmentMoney{amount}}
     lineItems(first:100){edges{node{
       id title quantity currentQuantity sku
       variant{id}
@@ -4970,12 +4978,28 @@ async function readCommittedLineState(orderId) {
     unitPrice: parseFloat(n.discountedUnitPriceSet?.presentmentMoney?.amount ?? n.originalUnitPriceSet?.presentmentMoney?.amount ?? 0),
   }));
   const lineCount = lines.filter(l => (l.currentQuantity || 0) > 0).length;
-  return {
-    lines,
-    subtotal: parseFloat(o?.subtotalPriceSet?.presentmentMoney?.amount || 0),
-    total: parseFloat(o?.totalPriceSet?.presentmentMoney?.amount || 0),
-    lineCount,
-  };
+  // Line-derived subtotal: the most direct post-edit truth (sum of surviving lines).
+  const lineSubtotal = lines.reduce((s, l) => s + l.unitPrice * (l.currentQuantity || 0), 0);
+  const curSub = o?.currentSubtotalPriceSet?.presentmentMoney?.amount;
+  const curTot = o?.currentTotalPriceSet?.presentmentMoney?.amount;
+  // Prefer current* (post-edit). If current subtotal is missing/stale (still equals the frozen
+  // original while lines say otherwise), fall back to the line-derived sum.
+  const origSub = parseFloat(o?.subtotalPriceSet?.presentmentMoney?.amount || 0);
+  let subtotal = curSub != null ? parseFloat(curSub) : lineSubtotal;
+  if (curSub != null && Math.abs(subtotal - origSub) < 0.005 && Math.abs(lineSubtotal - origSub) >= 0.005) {
+    subtotal = lineSubtotal; // current* lagged at the frozen original — trust the lines.
+  }
+  // Total: prefer current total; otherwise derive from subtotal + (originalTotal - originalSubtotal)
+  // i.e. keep shipping/tax delta. If current total missing, approximate as subtotal + ship/tax.
+  const origTot = parseFloat(o?.totalPriceSet?.presentmentMoney?.amount || 0);
+  let total;
+  if (curTot != null && !(Math.abs(parseFloat(curTot) - origTot) < 0.005 && Math.abs(lineSubtotal - origSub) >= 0.005)) {
+    total = parseFloat(curTot);
+  } else {
+    const extras = Math.max(0, origTot - origSub); // shipping + tax baked into the original total
+    total = subtotal + extras;
+  }
+  return { lines, subtotal, total, lineCount };
 }
 
 // True when the calculated line already carries an order-level / stacked discount
@@ -4990,7 +5014,11 @@ function lineHasStackedOrderDiscount(calcItem) {
 // stageFn(calcId, ctx) does the per-action staging; ctx exposes { calcOrder, calcItems, warnings }.
 // stageFn may push human-readable strings into ctx.warnings (e.g. "added at list price — order
 // already has a discount") which are returned to the client but do NOT fail the action.
-async function runOrderEdit(orderId, idemKey, editedBy, action, payload, stageFn) {
+// verifyFn(lineState) (optional) runs AFTER commit + readCommittedLineState but BEFORE the action
+// is recorded `committed`: if it throws, the action is marked `failed` and the error surfaces —
+// so the idempotency ledger never records a commit that did not actually take effect on Shopify
+// (the delete-persist false-green). Returning a string from verifyFn pushes it as a warning.
+async function runOrderEdit(orderId, idemKey, editedBy, action, payload, stageFn, verifyFn) {
   // 1) DEDUPE FIRST — never re-stage a committed action (kills the double-add hazard).
   const existing = getEditAction(idemKey);
   if (existing && existing.status === 'committed') {
@@ -5036,8 +5064,15 @@ async function runOrderEdit(orderId, idemKey, editedBy, action, payload, stageFn
       const cErrs = commitRes.data?.orderEditCommit?.userErrors || [];
       if (cErrs.length) throw new OrderEditError(cErrs.map(e => e.message));
 
-      // Read authoritative committed state and persist the action as committed.
+      // Read authoritative committed state. VERIFY-OR-FAIL before recording committed: a
+      // mis-mapped or no-op'd mutation can `commit` cleanly yet leave the targeted line
+      // untouched — verifyFn re-checks the live state and throws if reality disagrees, so we
+      // never record a false-green in the idempotency ledger or return ok:true to the UI.
       const lineState = await readCommittedLineState(orderId);
+      if (verifyFn) {
+        const w = await verifyFn(lineState);
+        if (typeof w === 'string' && w) ctx.warnings.push(w);
+      }
       const result = { ok: true, idemKey, warnings: ctx.warnings, order: { subtotal: lineState.subtotal, total: lineState.total, lineCount: lineState.lineCount }, lineState };
       putEditAction({ idemKey, orderId, action, payload, result, status: 'committed', editedBy });
       return result;
@@ -5390,15 +5425,34 @@ app.post('/orders/:id/edit', requireAuth, async (req, res) => {
 // On Shopify userError they return 422 { ok:false, errors:[...] } — NEVER a false 200.
 
 // Helper: map an ORIGINAL Shopify line-item id to its calculated line-item id within a fresh
-// calculatedOrder (matches by variant id + title, then title alone — mirrors batch idMap logic).
+// calculatedOrder.
+// CHANGE-GUARD (delete-persist bug, 2026-06-29): the PRIMARY mapping is by NUMERIC ID SUFFIX —
+// Shopify mints CalculatedLineItem ids that share the SAME numeric suffix as the OrderLineItem
+// (orig gid://shopify/LineItem/123  ->  calc gid://shopify/CalculatedLineItem/123). This is the
+// ONLY 1:1 mapping. The previous variant+title (then title-alone) heuristic returned the FIRST
+// match, so on an order with duplicate variant+title lines (e.g. the same variant added twice via
+// allowDuplicates, or many same-title sizes) EVERY line resolved to the first calc line — a
+// remove/qty/price then mutated the WRONG line while the endpoint still reported success and
+// logged "removed". Keep the suffix match first; the variant+title heuristic is a last-ditch
+// fallback only for the (rare) case where Shopify does NOT preserve the suffix.
 async function mapOrigToCalc(orderId, calcItems, origLiId) {
   const origRes = await shopifyFetch(`query($id:ID!){order(id:$id){lineItems(first:100){edges{node{id title variant{id} originalUnitPriceSet{presentmentMoney{amount}} discountedUnitPriceSet{presentmentMoney{amount}}}}}}}`, { id: orderId });
   const origItems = origRes.data?.order?.lineItems?.edges?.map(e => e.node) || [];
   const orig = origItems.find(o => o.id === origLiId);
   if (!orig) return { calcLiId: null, orig: null, calcItem: null };
-  let match = orig.variant?.id ? calcItems.find(c => c.variant?.id === orig.variant.id && c.title === orig.title) : null;
-  if (!match) match = calcItems.find(c => c.title === orig.title && !c.variant);
-  if (!match) match = calcItems.find(c => c.title === orig.title);
+  // PRIMARY: exact numeric-suffix match (1:1, collision-free).
+  const wantNum = shopifyNumericId(origLiId);
+  let match = calcItems.find(c => shopifyNumericId(c.id) === wantNum);
+  // FALLBACK ONLY (suffix not preserved): variant+title, then title alone. To avoid the
+  // duplicate-collision the suffix match exists to prevent, skip any calc line already claimed
+  // by another original line via its own suffix.
+  if (!match) {
+    const claimed = new Set(origItems.map(o => shopifyNumericId(o.id)).filter(n => calcItems.some(c => shopifyNumericId(c.id) === n)));
+    const free = calcItems.filter(c => !claimed.has(shopifyNumericId(c.id)));
+    match = (orig.variant?.id ? free.find(c => c.variant?.id === orig.variant.id && c.title === orig.title) : null)
+      || free.find(c => c.title === orig.title && !c.variant)
+      || free.find(c => c.title === orig.title);
+  }
   return { calcLiId: match?.id || null, orig, calcItem: match || null };
 }
 
@@ -5462,9 +5516,18 @@ app.post('/orders/:id/line/add', requireAuth, async (req, res) => {
         }
       }
     });
-    // Find the committed line for this add: best-effort match by sku/title with currentQuantity>0.
+    // Find the committed line for this add so the client can stamp committedLiId (lets an add
+    // then in-session delete target the right line WITHOUT a reload). A freshly added line always
+    // gets the HIGHEST numeric line-item id, so among SKU/title matches prefer the newest id.
+    // payload.title is the variant-suffixed picker label; lineState carries the product title —
+    // so SKU is the reliable key, title is only a coarse fallback.
     const committed = (result.lineState?.lines || []).filter(l => (l.currentQuantity || 0) > 0);
-    const line = committed.find(l => payload.sku && l.sku === payload.sku) || committed.find(l => l.title === payload.title) || committed[committed.length - 1];
+    const byNewest = (arr) => arr.slice().sort((a, b) => Number(shopifyNumericId(b.liId)) - Number(shopifyNumericId(a.liId)))[0];
+    const skuMatches = payload.sku ? committed.filter(l => l.sku === payload.sku) : [];
+    const titleMatches = committed.filter(l => l.title === payload.title);
+    const line = (skuMatches.length ? byNewest(skuMatches) : null)
+      || (titleMatches.length ? byNewest(titleMatches) : null)
+      || committed[committed.length - 1];
     logOrderEdit(orderId, session.email, null, { action: 'line/add', payload });
     auditLog(session.email, 'order_edit_line_add', orderId, null, payload);
     return res.json({ ok: true, idemKey, replayed: !!result.replayed, warnings: result.warnings || [], line: { liId: line?.liId, title: line?.title || payload.title, sku: line?.sku || payload.sku, qty: line?.currentQuantity ?? q, unitPrice: line?.unitPrice ?? pr }, order: result.order });
@@ -5557,6 +5620,13 @@ app.post('/orders/:id/line/qty', requireAuth, async (req, res) => {
         { id: calcId, li: calcLiId, qty: q, r: q === 0 });
       const errs = r.data?.orderEditSetQuantity?.userErrors || [];
       if (errs.length) throw new OrderEditError(errs.map(e => e.message));
+    }, (lineState) => {
+      // VERIFY-OR-FAIL: the targeted line MUST reflect the requested quantity post-commit.
+      const l = (lineState.lines || []).find(x => x.liId === payload.liId);
+      const got = l ? (l.currentQuantity || 0) : 0;
+      if (got !== q) {
+        throw new OrderEditError(`quantity did not persist — expected ${q}, order still shows ${got} (please retry)`);
+      }
     });
     const l = (result.lineState?.lines || []).find(x => x.liId === payload.liId);
     logOrderEdit(orderId, session.email, null, { action: 'line/qty', payload });
@@ -5666,6 +5736,12 @@ app.post('/orders/:id/line/remove', requireAuth, async (req, res) => {
         { id: calcId, li: calcLiId, qty: 0, r: true });
       const errs = r.data?.orderEditSetQuantity?.userErrors || [];
       if (errs.length) throw new OrderEditError(errs.map(e => e.message));
+    }, (lineState) => {
+      // VERIFY-OR-FAIL: the targeted line MUST be gone (absent) or at currentQuantity 0.
+      const l = (lineState.lines || []).find(x => x.liId === payload.liId);
+      if (l && (l.currentQuantity || 0) > 0) {
+        throw new OrderEditError('removal did not persist — the line is still on the order (please retry)');
+      }
     });
     const l = (result.lineState?.lines || []).find(x => x.liId === payload.liId);
     logOrderEdit(orderId, session.email, null, { action: 'line/remove', payload });
