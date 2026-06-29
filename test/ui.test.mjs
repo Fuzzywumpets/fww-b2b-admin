@@ -709,6 +709,42 @@ await test('/orders/1001 edit mode activates on button click', async (page, ctx)
   assert.ok(isVisible, 'Edit mode bar should be visible after clicking Edit order');
 });
 
+// Phase 16G: grouped multi-select picker must actually populate the dropdown on type.
+// This exercises the real keystroke → debounced fetch(?grouped=1) → render() path in a
+// browser and fails on ANY console/page error (a thrown exception in the picker IIFE
+// silently hides the dropdown otherwise — the exact prod regression we are guarding).
+await test('/orders/1001 Add-product search shows grouped suggestions on type', async (page, ctx) => {
+  const errors = [];
+  page.on('console', m => { if (m.type() === 'error') errors.push('console.error: ' + m.text()); });
+  page.on('pageerror', e => errors.push('pageerror: ' + e.message));
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/orders/1001`);
+  await page.waitForSelector('#edit-btn');
+  await page.click('#edit-btn');                    // reveal the Add-product toolbar
+  await page.waitForSelector('#edit-product-search', { state: 'visible' });
+  // Type a product name; min-char gate is 2, debounce 220ms — type a real pattern.
+  await page.fill('#edit-product-search', 'pinpoint');
+  // Wait for the dropdown to populate (real fetch round-trip + render).
+  await page.waitForSelector('#edit-product-results .edit-var-cb', { timeout: 4000 });
+  const box = page.locator('#edit-product-results');
+  assert.equal(await box.evaluate(el => getComputedStyle(el).display), 'block', 'results dropdown must be visible');
+  const cbCount = await page.locator('#edit-product-results .edit-var-cb').count();
+  assert.ok(cbCount >= 2, `expected >=2 variant checkboxes, got ${cbCount}`);
+  // Grouped: a product header row and an "Add selected" action must be present.
+  const html = await box.innerHTML();
+  assert.ok(/Pinpoint Limited Slip/.test(html), 'product header should appear in grouped dropdown');
+  assert.ok(await page.locator('#edit-add-selected').count() >= 1, '"Add selected" button missing');
+  // Selecting multiple variants + Add selected must add multiple new catalog rows.
+  const cbs = page.locator('#edit-product-results .edit-var-cb');
+  await cbs.nth(0).check();
+  await cbs.nth(1).check();
+  await page.click('#edit-add-selected');
+  const newRows = await page.locator('#edit-form tr.catalog-line-new').count();
+  assert.equal(newRows, 2, `expected 2 new catalog line rows after "Add selected", got ${newRows}`);
+  assert.equal(errors.length, 0, 'no JS errors during picker use; got: ' + errors.join(' | '));
+});
+
 await test('/orders/1001 fulfill modal opens on button click', async (page, ctx) => {
   const sid = await seedSession();
   await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
