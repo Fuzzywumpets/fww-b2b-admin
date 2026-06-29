@@ -349,6 +349,64 @@ await test('GET /api/products/search returns JSON array with variantId', async (
   assert.ok(json[0].price, 'Result should have price');
 });
 
+// Phase 16G: grouped multi-select picker
+await test('GET /api/products/search?grouped=1 returns products with nested variants', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/api/products/search?grouped=1&q=elite`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const json = await res.json();
+  assert.ok(Array.isArray(json));
+  assert.ok(json.length > 0, 'Should return at least one product group');
+  const p = json[0];
+  assert.ok(p.productId, 'group has productId');
+  assert.ok(p.productTitle, 'group has productTitle');
+  assert.ok(Array.isArray(p.variants) && p.variants.length > 0, 'group has nested variants');
+  const v = p.variants[0];
+  assert.ok(v.variantId, 'variant has variantId');
+  assert.ok(v.label, 'variant has label');
+  assert.ok('sku' in v, 'variant has sku');
+  assert.ok(v.price, 'variant has price (for wholesale prefill)');
+  assert.ok(Array.isArray(v.selectedOptions), 'variant carries selectedOptions');
+});
+
+await test('GET /api/products/search?grouped=1 nests ONLY that product\'s variants (no cross-product collapse)', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/api/products/search?grouped=1&q=pinpoint`, { headers: { Cookie: cookie } });
+  const json = await res.json();
+  const pin = json.find(p => /pinpoint/i.test(p.productTitle));
+  assert.ok(pin, 'Pinpoint product present');
+  // Pinpoint mock is a Width × Size product (5 variants). All variants belong to it.
+  assert.ok(pin.variants.length >= 5, 'all Pinpoint width×size variants nested under the one product');
+  const hasWidth = pin.variants.some(v => (v.selectedOptions || []).some(o => /width/i.test(o.name)));
+  assert.ok(hasWidth, 'Pinpoint variants carry a Width option (drives width sub-grouping in UI)');
+});
+
+await test('GET /api/products/search default (flat) shape unchanged for New Order page', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/api/products/search?q=elite`, { headers: { Cookie: cookie } });
+  const json = await res.json();
+  assert.ok(Array.isArray(json));
+  // Flat shape = per-variant rows with variantId/label/sublabel/sku/price; NOT grouped.
+  assert.ok(json[0].variantId && json[0].label && json[0].price, 'flat row shape preserved');
+  assert.ok(!('variants' in json[0]), 'flat row is NOT a grouped product object');
+});
+
+await test('POST /orders/1001/edit with multi-variant addVariantLines adds multiple lines', async () => {
+  const cookie = await seedSession();
+  const body = new URLSearchParams();
+  // Two sizes of the Pinpoint product checked at once in the grouped picker.
+  body.append('addVariantLines', JSON.stringify([
+    { variantId: '350', title: 'Pinpoint Limited Slip — 1/2" / SM', sku: 'PLS-12-SM', qty: 2, listPrice: 28.0, price: 14.0 },
+    { variantId: '353', title: 'Pinpoint Limited Slip — 1.5" / SM', sku: 'PLS-15-SM', qty: 1, listPrice: 32.0, price: 16.0 },
+  ]));
+  const res = await fetch(`${BASE}/orders/1001/edit`, {
+    method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: body.toString(), redirect: 'manual',
+  });
+  assert.ok([301, 302].includes(res.status), 'Should redirect after multi-variant edit');
+  assert.ok(res.headers.get('location')?.includes('order_edited'), 'Should redirect with success flash');
+});
+
 await test('GET /api/products/search requires auth', async () => {
   const res = await fetch(`${BASE}/api/products/search?q=elite`, { redirect: 'manual' });
   assert.equal(res.status, 401);

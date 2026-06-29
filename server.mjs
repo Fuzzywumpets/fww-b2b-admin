@@ -678,9 +678,9 @@ const MOCK_PRODUCTS = [
       { node: { url: 'https://cdn.shopify.com/mock/elite-collar-2.jpg', altText: '' } },
     ]},
     variants: { edges: [
-      { node: { id: 'gid://shopify/ProductVariant/301', title: 'Small / Navy', sku: 'EC-001-S-NV', price: '36.00', compareAtPrice: '54.00', barcode: '012345678901', inventoryQuantity: 24 } },
-      { node: { id: 'gid://shopify/ProductVariant/302', title: 'Medium / Navy', sku: 'EC-001-M-NV', price: '36.00', compareAtPrice: '54.00', barcode: '012345678902', inventoryQuantity: 12 } },
-      { node: { id: 'gid://shopify/ProductVariant/307', title: 'Large / Navy',  sku: 'EC-001-L-NV', price: '36.00', compareAtPrice: '54.00', barcode: '',             inventoryQuantity: 0  } },
+      { node: { id: 'gid://shopify/ProductVariant/301', title: 'Small / Navy', sku: 'EC-001-S-NV', price: '36.00', compareAtPrice: '54.00', barcode: '012345678901', inventoryQuantity: 24, selectedOptions: [{ name: 'Size', value: 'Small' }, { name: 'Color', value: 'Navy' }] } },
+      { node: { id: 'gid://shopify/ProductVariant/302', title: 'Medium / Navy', sku: 'EC-001-M-NV', price: '36.00', compareAtPrice: '54.00', barcode: '012345678902', inventoryQuantity: 12, selectedOptions: [{ name: 'Size', value: 'Medium' }, { name: 'Color', value: 'Navy' }] } },
+      { node: { id: 'gid://shopify/ProductVariant/307', title: 'Large / Navy',  sku: 'EC-001-L-NV', price: '36.00', compareAtPrice: '54.00', barcode: '',             inventoryQuantity: 0, selectedOptions: [{ name: 'Size', value: 'Large' }, { name: 'Color', value: 'Navy' }] } },
     ]}
   },
   { id: 'gid://shopify/Product/202', title: 'Luxe Leash', handle: 'luxe-leash',
@@ -713,7 +713,20 @@ const MOCK_PRODUCTS = [
       { node: { url: 'https://cdn.shopify.com/mock/everyday-bundle-1.jpg', altText: '' } },
     ]},
     variants: { edges: [
-      { node: { id: 'gid://shopify/ProductVariant/306', title: 'XL', sku: 'ECB-010-XL', price: '60.00', compareAtPrice: '90.00', barcode: '012345678906', inventoryQuantity: 8 } },
+      { node: { id: 'gid://shopify/ProductVariant/306', title: 'XL', sku: 'ECB-010-XL', price: '60.00', compareAtPrice: '90.00', barcode: '012345678906', inventoryQuantity: 8, selectedOptions: [{ name: 'Size', value: 'XL' }] } },
+    ]}
+  },
+  // Two-dimension product (Width × Size) — exercises the grouped picker's width sub-headers.
+  { id: 'gid://shopify/Product/205', title: 'Pinpoint Limited Slip', handle: 'pinpoint-limited-slip',
+    vendor: 'Fuzzywumpets', productType: 'Dog Collar', tags: ['Style_Pinpoint', 'b2b'],
+    featuredImage: { url: 'https://cdn.shopify.com/mock/pinpoint-1.jpg', altText: 'Pinpoint Limited Slip' },
+    images: { edges: [ { node: { url: 'https://cdn.shopify.com/mock/pinpoint-1.jpg', altText: '' } } ]},
+    variants: { edges: [
+      { node: { id: 'gid://shopify/ProductVariant/350', title: '1/2" / SM',  sku: 'PLS-12-SM',  price: '28.00', compareAtPrice: '42.00', barcode: '', inventoryQuantity: 10, selectedOptions: [{ name: 'Width', value: '1/2"' }, { name: 'Size', value: 'SM' }] } },
+      { node: { id: 'gid://shopify/ProductVariant/351', title: '1/2" / MED', sku: 'PLS-12-MED', price: '28.00', compareAtPrice: '42.00', barcode: '', inventoryQuantity: 6,  selectedOptions: [{ name: 'Width', value: '1/2"' }, { name: 'Size', value: 'MED' }] } },
+      { node: { id: 'gid://shopify/ProductVariant/352', title: '1/2" / LG',  sku: 'PLS-12-LG',  price: '28.00', compareAtPrice: '42.00', barcode: '', inventoryQuantity: 3,  selectedOptions: [{ name: 'Width', value: '1/2"' }, { name: 'Size', value: 'LG' }] } },
+      { node: { id: 'gid://shopify/ProductVariant/353', title: '1.5" / SM',  sku: 'PLS-15-SM',  price: '32.00', compareAtPrice: '48.00', barcode: '', inventoryQuantity: 9,  selectedOptions: [{ name: 'Width', value: '1.5"' }, { name: 'Size', value: 'SM' }] } },
+      { node: { id: 'gid://shopify/ProductVariant/354', title: '1.5" / MED', sku: 'PLS-15-MED', price: '32.00', compareAtPrice: '48.00', barcode: '', inventoryQuantity: 4,  selectedOptions: [{ name: 'Width', value: '1.5"' }, { name: 'Size', value: 'MED' }] } },
     ]}
   },
 ];
@@ -2037,7 +2050,7 @@ function renderOrderDetail(session, order, flash, flashMsg) {
               </div>
               <button type="button" class="btn btn-ghost btn-sm" onclick="addCustomLineRow()" title="Add a one-off (non-catalog) line item to this order">+ Add custom line</button>
             </div>
-            <div style="font-size:11px;color:var(--muted);margin-top:4px">Catalog items are priced at this customer's wholesale rate (${editDiscPct}% off); adjust the unit price inline if needed.</div>
+            <div style="font-size:11px;color:var(--muted);margin-top:4px">Type a product name to see its sizes; check the variants you want and click <strong>Add selected</strong> to add them all at once. Catalog items are priced at this customer's wholesale rate (${editDiscPct}% off); adjust each unit price/qty inline.</div>
           </div>
           <input type="hidden" name="addCustomLines" id="addCustomLinesInput" value="[]">
           <input type="hidden" name="addVariantLines" id="addVariantLinesInput" value="[]">
@@ -2137,40 +2150,117 @@ function renderOrderDetail(session, order, flash, flashMsg) {
                 tbody.appendChild(tr);
               };
 
-              // Phase 16F: lightweight product autocomplete for the edit toolbar
+              // Phase 16G: grouped multi-select product picker (Shopify-style "Add item").
+              // Type a product name → dropdown shows each matching PRODUCT as a header with
+              // its OWN variants nested as checkboxes; products with a Width option are
+              // further sub-grouped Width → Size. Check any number across products, then
+              // "Add selected" adds them all as new catalog line rows at once.
               (function(){
                 var input = document.getElementById('edit-product-search');
                 var box   = document.getElementById('edit-product-results');
                 if (!input || !box) return;
                 var t = null, lastSeq = 0;
-                function hide(){ box.style.display = 'none'; box.innerHTML = ''; }
+                function esc(s){ return String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+                function hide(){ box.style.display = 'none'; box.innerHTML = ''; window.__editGrouped = null; }
+
+                // Natural size ordering; unknown sizes sort last (Infinity), then alpha.
+                var SIZE_RANK = (function(){
+                  var order = ['XXS','2XS','XS','XSM','S','SM','SMALL','M','MED','MEDIUM','L','LG','LARGE','XL','XLG','XLARGE','XXL','2XL','XXLG','XXLARGE','XXXL','3XL'];
+                  var map = {}; order.forEach(function(k,i){ map[k] = i; }); return map;
+                })();
+                function sizeRank(v){ var k = String(v||'').toUpperCase().replace(/\\s+/g,''); return SIZE_RANK[k] != null ? SIZE_RANK[k] : Infinity; }
+                // Width ordering: parse leading numeric (handles fractions like 1/2") so 1/2" < 1.5" < 2".
+                function widthVal(w){
+                  var s = String(w||'').replace(/["”]/g,'').trim();
+                  var frac = s.match(/^(\\d+)\\s*\\/\\s*(\\d+)$/);
+                  if (frac) return parseInt(frac[1],10) / parseInt(frac[2],10);
+                  var num = parseFloat(s); return isNaN(num) ? Infinity : num;
+                }
+                function optVal(variant, nameLc){
+                  var o = (variant.selectedOptions||[]).find(function(x){ return String(x.name||'').toLowerCase() === nameLc; });
+                  return o ? o.value : null;
+                }
+                function hasOption(variant, nameLc){ return (variant.selectedOptions||[]).some(function(x){ return String(x.name||'').toLowerCase() === nameLc; }); }
+
+                // Render one variant checkbox <label>. data-key indexes into window.__editGrouped flat list.
+                function variantRow(key, v, indent){
+                  var size = optVal(v, 'size');
+                  var shown = size != null ? size : (v.variantTitle === 'Default Title' ? 'Add this item' : v.variantTitle);
+                  var oos = (v.inventoryQuantity != null && v.inventoryQuantity <= 0);
+                  return '<label class="edit-var-opt" style="display:flex;align-items:center;gap:8px;padding:5px 10px 5px ' + indent + 'px;cursor:pointer;font-size:13px">' +
+                    '<input type="checkbox" class="edit-var-cb" data-key="' + key + '" style="margin:0">' +
+                    '<span>' + esc(shown) + (oos ? ' <span style="color:#b91c1c;font-size:11px">(out of stock)</span>' : '') + '</span>' +
+                    '<span style="margin-left:auto;color:var(--muted);font-size:11px">' + esc(v.sku || '—') + '</span>' +
+                    '</label>';
+                }
+
+                function render(products){
+                  if (!Array.isArray(products) || !products.length){
+                    box.innerHTML = '<div style="padding:8px 10px;color:var(--muted);font-size:13px">No matches</div>';
+                    box.style.display = 'block'; window.__editGrouped = null; return;
+                  }
+                  // Flatten variants into a keyed lookup for serialization on "Add selected".
+                  var flat = []; // each: {variantId,label,sku,price}
+                  var html = '';
+                  products.forEach(function(p){
+                    html += '<div style="padding:7px 10px;background:#f3f4f6;border-bottom:1px solid #e5e7eb;font-weight:600;font-size:13px;color:#111827">' + esc(p.productTitle) +
+                            (p.variantsTruncated ? ' <span style="font-weight:400;color:#b45309;font-size:11px">(showing first 25 sizes)</span>' : '') + '</div>';
+                    var vs = (p.variants || []).slice();
+                    var anyWidth = vs.some(function(v){ return hasOption(v, 'width'); });
+                    function pushKey(v){ var key = flat.length; flat.push({ variantId: v.variantId, label: v.label, sku: v.sku, price: v.price }); return key; }
+                    if (anyWidth){
+                      // Group by width, sort widths asc, sizes natural within each.
+                      var byWidth = {};
+                      vs.forEach(function(v){ var w = optVal(v,'width') || '—'; (byWidth[w] = byWidth[w] || []).push(v); });
+                      Object.keys(byWidth).sort(function(a,b){ return widthVal(a) - widthVal(b) || a.localeCompare(b); }).forEach(function(w){
+                        html += '<div style="padding:4px 10px 4px 18px;font-size:12px;font-weight:600;color:#4b5563">' + esc(w) + '</div>';
+                        byWidth[w].sort(function(a,b){ return sizeRank(optVal(a,'size')) - sizeRank(optVal(b,'size')) || String(optVal(a,'size')||a.variantTitle).localeCompare(String(optVal(b,'size')||b.variantTitle)); })
+                          .forEach(function(v){ html += variantRow(pushKey(v), v, 34); });
+                      });
+                    } else {
+                      // Single dimension (or none): list sizes in natural order under the product.
+                      vs.sort(function(a,b){ return sizeRank(optVal(a,'size')) - sizeRank(optVal(b,'size')) || String(optVal(a,'size')||a.variantTitle).localeCompare(String(optVal(b,'size')||b.variantTitle)); })
+                        .forEach(function(v){ html += variantRow(pushKey(v), v, 22); });
+                    }
+                  });
+                  // Sticky footer with the "Add selected" action.
+                  html += '<div style="position:sticky;bottom:0;background:#fff;border-top:1px solid #e5e7eb;padding:8px 10px;display:flex;align-items:center;gap:8px">' +
+                          '<button type="button" id="edit-add-selected" class="btn btn-primary btn-sm">Add selected</button>' +
+                          '<span id="edit-sel-count" style="color:var(--muted);font-size:12px">0 selected</span></div>';
+                  box.innerHTML = html;
+                  box.style.display = 'block';
+                  window.__editGrouped = flat;
+
+                  var countEl = box.querySelector('#edit-sel-count');
+                  function refreshCount(){ var n = box.querySelectorAll('.edit-var-cb:checked').length; if (countEl) countEl.textContent = n + ' selected'; }
+                  Array.prototype.forEach.call(box.querySelectorAll('.edit-var-cb'), function(cb){
+                    cb.addEventListener('change', refreshCount);
+                  });
+                  // Keep clicks inside the box from closing it / blurring the input.
+                  box.querySelectorAll('label.edit-var-opt').forEach(function(l){ l.addEventListener('mousedown', function(ev){ ev.preventDefault(); }); });
+                  var addBtn = box.querySelector('#edit-add-selected');
+                  if (addBtn){
+                    addBtn.addEventListener('mousedown', function(ev){ ev.preventDefault(); });
+                    addBtn.addEventListener('click', function(){
+                      var chosen = Array.prototype.map.call(box.querySelectorAll('.edit-var-cb:checked'), function(cb){
+                        return (window.__editGrouped || [])[parseInt(cb.dataset.key, 10)];
+                      }).filter(Boolean);
+                      if (!chosen.length) return;
+                      chosen.forEach(function(p){ addCatalogLineRow(p); });
+                      input.value = ''; hide(); input.focus();
+                    });
+                  }
+                }
+
                 input.addEventListener('input', function(){
                   var q = input.value.trim();
                   if (t) clearTimeout(t);
                   if (q.length < 2) { hide(); return; }
                   var seq = ++lastSeq;
                   t = setTimeout(function(){
-                    fetch('/api/products/search?q=' + encodeURIComponent(q), { credentials: 'same-origin' })
+                    fetch('/api/products/search?grouped=1&q=' + encodeURIComponent(q), { credentials: 'same-origin' })
                       .then(function(r){ return r.json(); })
-                      .then(function(items){
-                        if (seq !== lastSeq) return;
-                        if (!Array.isArray(items) || !items.length) { box.innerHTML = '<div style="padding:8px 10px;color:var(--muted);font-size:13px">No matches</div>'; box.style.display = 'block'; return; }
-                        box.innerHTML = items.map(function(p, i){
-                          return '<div class="edit-prod-opt" data-i="' + i + '" style="padding:8px 10px;cursor:pointer;font-size:13px;border-bottom:1px solid #f0f0f0">' +
-                                 '<div>' + (p.label||'').replace(/</g,'&lt;') + '</div>' +
-                                 '<div style="color:var(--muted);font-size:11px">' + (p.sublabel||'').replace(/</g,'&lt;') + '</div></div>';
-                        }).join('');
-                        box.style.display = 'block';
-                        window.__editProdItems = items;
-                        Array.prototype.forEach.call(box.querySelectorAll('.edit-prod-opt'), function(el){
-                          el.addEventListener('mousedown', function(ev){ ev.preventDefault(); });
-                          el.addEventListener('click', function(){
-                            var p = window.__editProdItems[parseInt(el.dataset.i, 10)];
-                            if (p) addCatalogLineRow(p);
-                            input.value = ''; hide(); input.focus();
-                          });
-                        });
-                      })
+                      .then(function(products){ if (seq !== lastSeq) return; render(products); })
                       .catch(function(){ hide(); });
                   }, 220);
                 });
@@ -5472,49 +5562,96 @@ app.get('/api/customers/search', requireAuth, async (req, res) => {
 // WHAT: typeahead product/variant search; flattens products->variants. MOCK filters MOCK_PRODUCTS by title/sku/variant; real mode queries Shopify products first:10, variants first:5.
 // CHANGE-GUARD: the Shopify query has NO `tag:b2b`/publication filter so it can surface variants not published to B2B (unlike the customer search) — confirm that is intended before relying on it for draft orders; results capped to 20.
 // INVARIANT(S): 'Default Title' variant collapses to just the product title in the label; price is the raw list/MSRP (no B2B discount applied here).
+// CHANGE-GUARD (Phase 16G): this endpoint serves TWO shapes off the same query.
+//   • default (flat): array of {variantId,label,sublabel,sku,price} — used by the
+//     New Order page setupAutocomplete('product-search',...) AND the legacy edit-modal
+//     single-variant picker. DO NOT change this shape.
+//   • ?grouped=1: array of products {productId,productTitle,variants:[{variantId,
+//     variantTitle,label,sku,price,sublabel,inventoryQuantity}]} — used by the edit-modal
+//     multi-select picker (addCatalogLineRow needs label/sku/price per variant).
+// Variant cap raised first:5 → first:25 so all collar sizes (SM/MED/LG/XLG/XXLG and
+// width/colour combos) surface in the grouped picker. Products with >25 variants set
+// variantsTruncated:true on their group (caller may surface a hint).
+const PRODUCT_VARIANT_CAP = 25;
 app.get('/api/products/search', requireAuth, async (req, res) => {
   const q = String(req.query.q || '').trim().toLowerCase();
+  const grouped = String(req.query.grouped || '') === '1';
   if (!q) return res.json([]);
 
-  const allVariants = MOCK
-    ? MOCK_PRODUCTS.flatMap(p =>
-        (p.variants?.edges || []).map(e => ({
-          id: shopifyNumericId(p.id),
+  const fmtUsd = (v) => new Intl.NumberFormat('en-US',{style:'currency',currency:'USD'}).format(parseFloat(v||0));
+
+  // Build a uniform list of products, each with its OWN variants (product→variants
+  // structure preserved end to end; we never collapse multiple products into one bucket).
+  // A product matches if its title OR any of its variant titles/skus contains q.
+  const products = MOCK
+    ? MOCK_PRODUCTS
+        .map(p => ({
+          productId:   shopifyNumericId(p.id),
           productTitle: p.title,
-          variantId: shopifyNumericId(e.node.id),
-          variantTitle: e.node.title,
-          sku: e.node.sku,
-          price: e.node.price,
-          inventoryQuantity: e.node.inventoryQuantity,
+          variants: (p.variants?.edges || []).map(e => ({
+            variantId: shopifyNumericId(e.node.id),
+            variantTitle: e.node.title,
+            sku: e.node.sku,
+            price: e.node.price,
+            inventoryQuantity: e.node.inventoryQuantity,
+            selectedOptions: e.node.selectedOptions || [],
+          })).slice(0, PRODUCT_VARIANT_CAP),
+          variantsTruncated: (p.variants?.edges || []).length > PRODUCT_VARIANT_CAP,
         }))
-      ).filter(v =>
-        v.productTitle.toLowerCase().includes(q) ||
-        (v.sku || '').toLowerCase().includes(q) ||
-        v.variantTitle.toLowerCase().includes(q)
-      )
+        .filter(p =>
+          p.productTitle.toLowerCase().includes(q) ||
+          p.variants.some(v => (v.sku || '').toLowerCase().includes(q) || (v.variantTitle || '').toLowerCase().includes(q))
+        )
     : await (async () => {
         try {
           const r = await shopifyFetch(`query($q:String!){ products(first:10,query:$q){
-            edges{node{id title variants(first:5){edges{node{id title sku price inventoryQuantity}}}}}}}`,
+            edges{node{id title variants(first:${PRODUCT_VARIANT_CAP}){edges{node{id title sku price inventoryQuantity selectedOptions{name value}}}}}}}`,
             { q });
-          return (r.data?.products?.edges || []).flatMap(e =>
-            (e.node.variants?.edges || []).map(ve => ({
-              id: shopifyNumericId(e.node.id),
-              productTitle: e.node.title,
+          return (r.data?.products?.edges || []).map(e => ({
+            productId:   shopifyNumericId(e.node.id),
+            productTitle: e.node.title,
+            variants: (e.node.variants?.edges || []).map(ve => ({
               variantId: shopifyNumericId(ve.node.id),
               variantTitle: ve.node.title,
               sku: ve.node.sku,
               price: ve.node.price,
               inventoryQuantity: ve.node.inventoryQuantity,
-            }))
-          );
+              selectedOptions: ve.node.selectedOptions || [],
+            })),
+            // first:25 cap is enforced server-side by the query; if Shopify returned a
+            // full page of 25 the product *may* have more variants we didn't fetch.
+            variantsTruncated: (e.node.variants?.edges || []).length >= PRODUCT_VARIANT_CAP,
+          }));
         } catch { return []; }
       })();
 
+  if (grouped) {
+    return res.json(products.slice(0, 10).map(p => ({
+      productId:    p.productId,
+      productTitle: p.productTitle,
+      variantsTruncated: !!p.variantsTruncated,
+      variants: p.variants.map(v => ({
+        variantId:    v.variantId,
+        variantTitle: v.variantTitle,
+        // label/sku/price match the fields addCatalogLineRow(p) consumes per row.
+        label:        v.variantTitle === 'Default Title' ? p.productTitle : `${p.productTitle} — ${v.variantTitle}`,
+        sublabel:     `${v.sku || '—'} · ${fmtUsd(v.price)} list`,
+        sku:          v.sku,
+        price:        v.price,
+        inventoryQuantity: v.inventoryQuantity,
+        selectedOptions: v.selectedOptions || [],
+      })),
+    })));
+  }
+
+  // Default flat shape (unchanged): one row per variant.
+  const allVariants = products.flatMap(p =>
+    p.variants.map(v => ({ productTitle: p.productTitle, ...v }))
+  );
   res.json(allVariants.slice(0, 20).map(v => ({
     variantId: v.variantId,
     label:     v.variantTitle === 'Default Title' ? v.productTitle : `${v.productTitle} — ${v.variantTitle}`,
-    sublabel:  `${v.sku || '—'} · ${new Intl.NumberFormat('en-US',{style:'currency',currency:'USD'}).format(parseFloat(v.price||0))} list`,
+    sublabel:  `${v.sku || '—'} · ${fmtUsd(v.price)} list`,
     sku:       v.sku,
     price:     v.price,
   })));
