@@ -28,6 +28,7 @@ import {
   getXeroMap, setXeroMap, addXeroPending, getXeroPending, markXeroPendingDone, markXeroPendingFailed, getXeroPendingCount, getXeroInvoiceMaps,
   createImpersonationNonce, consumeImpersonationNonce, gcImpersonationNonces,
   createPartialInvoice, getPartialInvoices, getNextInvoiceLetter,
+  getOrderHistory,
   upsertCustomerCache, upsertOrderCache, upsertOrderLineItemsCache, upsertProductCache,
   getOrdersFromCache, getOrderFromCache, getOrderSpendFromCache, getCustomerFromCache,
   getCustomersCountInCache, getOrdersCountInCache, getProductsCountInCache,
@@ -581,6 +582,31 @@ const MOCK_ORDERS = [
     fulfillments: [{ status: 'SUCCESS', trackingInfo: [], createdAt: '2026-05-15T14:30:00Z' }],
     transactions: [{ id: 'tx5', status: 'SUCCESS', kind: 'SALE', gateway: 'pos', createdAt: '2026-05-15T14:30:00Z', amountSet: { presentmentMoney: { amount: '220.00', currencyCode: 'USD' } } }],
   },
+  // Second build (Build C): a dedicated PENDING fixture for record-manual-payment testing.
+  // NOT mutated by the mark-paid / bulk / edit tests (which use #1001/#1002), so its outstanding
+  // balance is deterministic at test time. Carries totalOutstandingSet so the MOCK route reads it
+  // authoritatively (mirrors the real Shopify Order.totalOutstandingSet field).
+  {
+    id: 'gid://shopify/Order/1007', name: '#1007', processedAt: '2026-05-26T10:00:00Z',
+    customer: { id: 'gid://shopify/Customer/102', displayName: 'Happy Paws Boutique', email: 'orders@happypaws.com' },
+    displayFinancialStatus: 'PENDING', displayFulfillmentStatus: 'UNFULFILLED',
+    totalPriceSet: { presentmentMoney: { amount: '200.00', currencyCode: 'USD' } },
+    sourceName: 'web', tags: ['b2b-portal'], note: '',
+    lineItems: { edges: [
+      { node: { id: 'li9', title: 'Everyday Walking Lead', quantity: 4, variant: { id: 'v307', sku: 'EWL-009', price: '50.00', inventoryQuantity: 20 },
+          discountedUnitPriceSet: { presentmentMoney: { amount: '50.00', currencyCode: 'USD' } },
+          originalUnitPriceSet:   { presentmentMoney: { amount: '50.00', currencyCode: 'USD' } } } },
+    ]},
+    subtotalPriceSet:      { presentmentMoney: { amount: '200.00', currencyCode: 'USD' } },
+    totalShippingPriceSet: { presentmentMoney: { amount: '0.00', currencyCode: 'USD' } },
+    totalTaxSet:           { presentmentMoney: { amount: '0.00', currencyCode: 'USD' } },
+    totalOutstandingSet:   { presentmentMoney: { amount: '200.00', currencyCode: 'USD' } },
+    totalReceivedSet:      { presentmentMoney: { amount: '0.00', currencyCode: 'USD' } },
+    shippingAddress: { firstName: 'Jane', lastName: 'Smith', address1: '456 Park Ave', address2: '', city: 'Seattle', province: 'WA', zip: '98101', country: 'US' },
+    billingAddress:  { firstName: 'Jane', lastName: 'Smith', address1: '456 Park Ave', address2: '', city: 'Seattle', province: 'WA', zip: '98101', country: 'US' },
+    fulfillments: [],
+    transactions: [{ id: 'tx7', status: 'PENDING', kind: 'AUTHORIZATION', gateway: 'manual', createdAt: '2026-05-26T10:00:00Z', amountSet: { presentmentMoney: { amount: '200.00', currencyCode: 'USD' } } }],
+  },
 ];
 
 // In-memory overrides for mock mutations (mark paid, note changes)
@@ -945,6 +971,134 @@ function fmtMoney(amount, currency = 'USD') {
 function fmtDate(iso) {
   if (!iso) return '—';
   return new Date(iso).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+}
+
+// ── Second build (Build D): order-history timeline helpers ─────────────────────
+// All pure functions. They take RAW stored strings (from getOrderHistory) and return
+// plain text — every value is escaped via h() at the render site, never here.
+
+// WHAT: staff initials from an email local-part or display name. alex@→A, mason@→M,
+//   first.last@→FL, "Jane Doe"→JD. Falls back to '?'.
+// INVARIANT(S): pure; never throws on null/empty.
+function staffInitials(emailOrName) {
+  const s = String(emailOrName || '').trim();
+  if (!s) return '?';
+  const local = s.includes('@') ? s.split('@')[0] : s;
+  const parts = local.split(/[.\-_\s]+/).filter(Boolean);
+  if (!parts.length) return (local[0] || '?').toUpperCase();
+  return parts.slice(0, 2).map(p => p[0].toUpperCase()).join('');
+}
+
+// WHAT: "Jun 29, 2026 · 1:42 PM" from an epoch-ms timestamp.
+function fmtDateTime(ts) {
+  if (!ts) return '—';
+  const d = new Date(Number(ts));
+  if (isNaN(d.getTime())) return '—';
+  return d.toLocaleString('en-US', { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' });
+}
+
+function safeJsonParse(str) {
+  if (str == null) return null;
+  try { return JSON.parse(str); } catch { return null; }
+}
+
+// WHAT: human one-line summary of an order_edit_log row. Handles BOTH shapes:
+//   - incremental (Phase 16H): { action:'line/add', payload:{...} }
+//   - legacy batch: { qtys, removes, prices, discountPct, discountFixed, addVariantLines, addCustomLines }
+//   Rows are full post-edit state, not deltas, so counts are described, not diffs.
+// INVARIANT(S): pure; returns a plain string (escaped at render). staffNote, when present,
+//   is appended as a parenthetical so it shows in the timeline.
+function summarizeEdit(changesJson, staffNote) {
+  const c = safeJsonParse(changesJson) || {};
+  let line;
+  if (c.action) {
+    // Incremental auto-save shape.
+    const p = c.payload || {};
+    switch (c.action) {
+      case 'line/add':    line = `added ${p.title || p.sku || 'an item'}${p.qty ? ` × ${p.qty}` : ''}`; break;
+      case 'line/custom': line = `added custom line "${p.title || 'item'}"${p.qty ? ` × ${p.qty}` : ''}`; break;
+      case 'line/qty':    line = `changed a line quantity${p.qty != null ? ` to ${p.qty}` : ''}`; break;
+      case 'line/price':  line = `changed a line price${p.price != null ? ` to ${fmtMoney(p.price)}` : ''}`; break;
+      case 'line/remove': line = 'removed a line'; break;
+      case 'discount/order': line = `applied an order discount${p.discountPct ? ` (${p.discountPct}%)` : p.discountFixed ? ` (${fmtMoney(p.discountFixed)})` : ''}${p.discountReason ? ` — ${p.discountReason}` : ''}`; break;
+      default: line = `edited the order (${String(c.action).replace(/[/_:]/g, ' ')})`;
+    }
+  } else {
+    // Legacy batch shape — describe the bundle of changes.
+    const bits = [];
+    const addV = Array.isArray(c.addVariantLines) ? c.addVariantLines.length : 0;
+    const addC = Array.isArray(c.addCustomLines) ? c.addCustomLines.length : 0;
+    if (addV) bits.push(`added ${addV} catalog line${addV === 1 ? '' : 's'}`);
+    if (addC) bits.push(`added ${addC} custom line${addC === 1 ? '' : 's'}`);
+    const removed = Array.isArray(c.removes) ? c.removes.length : 0;
+    if (removed) bits.push(`removed ${removed} line${removed === 1 ? '' : 's'}`);
+    const qtyN = c.qtys && typeof c.qtys === 'object' ? Object.keys(c.qtys).length : 0;
+    if (qtyN) bits.push(`updated ${qtyN} quantit${qtyN === 1 ? 'y' : 'ies'}`);
+    const priceN = c.prices && typeof c.prices === 'object' ? Object.keys(c.prices).length : 0;
+    if (priceN) bits.push(`updated ${priceN} price${priceN === 1 ? '' : 's'}`);
+    if (c.discountPct) bits.push(`applied ${c.discountPct}% discount`);
+    else if (c.discountFixed) bits.push(`applied ${fmtMoney(c.discountFixed)} discount`);
+    line = bits.length ? `edited the order: ${bits.join(', ')}` : 'edited the order';
+  }
+  if (staffNote) line += ` — "${staffNote}"`;
+  return line;
+}
+
+// WHAT: human summary of an order_edit_action row (fallback path only).
+function summarizeEditAction(action, payloadJson) {
+  return summarizeEdit(JSON.stringify({ action, payload: safeJsonParse(payloadJson) || {} }), null);
+}
+
+// WHAT: human summary of a NON-edit admin_audit_log verb. after_val carries the detail.
+// INVARIANT(S): pure; unknown verbs fall back to a readable form of the verb string.
+function summarizeAudit(action, afterJson) {
+  const after = safeJsonParse(afterJson) || {};
+  switch (action) {
+    case 'mark_paid':              return 'marked the order paid';
+    case 'record_manual_payment': {
+      const amt = after.amount && after.amount !== 'full_outstanding' ? fmtMoney(after.amount) : 'the full balance';
+      const method = after.paymentMethod ? ` via ${after.paymentMethod}` : '';
+      return `recorded a manual payment of ${amt}${method}`;
+    }
+    case 'order_cancel':           return `canceled the order${after.reason ? ` (${String(after.reason).toLowerCase()})` : ''}`;
+    case 'create_order':           return `created the order${after.lineItemCount ? ` (${after.lineItemCount} line${after.lineItemCount === 1 ? '' : 's'})` : ''}`;
+    case 'order_fulfill':          return `recorded a fulfillment${after.trackingNumber ? ` (tracking ${after.trackingNumber})` : ''}`;
+    case 'partial_invoice_created':return `issued invoice ${after.letter || ''}${after.type ? ` (${String(after.type).replace(/_/g, ' ')})` : ''}${after.total != null ? ` for ${fmtMoney(after.total)}` : ''}`.replace(/\s+/g, ' ').trim();
+    case 'visible-note-add':       return 'added a customer-visible note';
+    case 'update_note':            return 'updated the internal order note';
+    case 'xero:sync':              return 'synced the order to Xero';
+    case 'xero:payment_recorded':  return `recorded a Xero payment${after.amount != null ? ` of ${fmtMoney(after.amount)}` : ''}`;
+    case 'xero:invoice_failed':    return 'Xero invoice sync failed';
+    case 'chase_invoice_queued':   return 'queued a Chase invoice link';
+    default:                       return String(action || 'activity').replace(/[/_:]/g, ' ');
+  }
+}
+
+// WHAT: server-rendered #order-history-card body (newest-first). One row per event:
+//   initials chip · actor · summary · datetime. Mirrors the existing visible-notes list
+//   styling (lime left-border, pale background). No client JS, no new route.
+// CHANGE-GUARD: every dynamic value is escaped via h(). The card id #order-history-card
+//   is fresh — do NOT reuse #visible-notes-list / #customer-replies-list (the inline JS
+//   keys off those ids). Empty history renders a muted placeholder, never an empty card.
+function renderOrderHistoryCard(history) {
+  const rows = (history || []).map(ev => {
+    let summary;
+    if (ev.kind === 'edit') summary = summarizeEdit(ev.changesJson, ev.staffNote);
+    else if (ev.kind === 'edit_action') summary = summarizeEditAction(ev.action, ev.payloadJson);
+    else summary = summarizeAudit(ev.action, ev.afterJson);
+    const initials = staffInitials(ev.actor);
+    return `<div style="display:flex;gap:10px;align-items:flex-start;border-left:3px solid var(--lime);padding:8px 12px;margin-bottom:8px;background:#f9fdf0;border-radius:0 4px 4px 0">
+      <span title="${h(ev.actor || '')}" style="flex:0 0 auto;width:26px;height:26px;border-radius:50%;background:var(--lime,#9BBC0E);color:#1a2400;font-size:11px;font-weight:700;display:inline-flex;align-items:center;justify-content:center">${h(initials)}</span>
+      <div style="flex:1;min-width:0">
+        <div style="font-size:13px"><b>${h(ev.actor || 'Someone')}</b> ${h(summary)}</div>
+        <div style="font-size:11px;color:var(--muted);margin-top:2px">${h(fmtDateTime(ev.ts))}</div>
+      </div>
+    </div>`;
+  }).join('');
+  return `<div class="card" id="order-history-card">
+    <div class="card-header"><h2>Order History</h2></div>
+    ${rows || '<p class="text-muted small-text">No history yet.</p>'}
+  </div>`;
 }
 
 // WHAT: extracts the trailing numeric id from a Shopify gid (gid://shopify/Order/1001 → '1001') by taking the last '/'-segment.
@@ -1587,6 +1741,8 @@ async function getOrderDetail(numericId) {
         subtotalPriceSet{presentmentMoney{amount currencyCode}}
         totalShippingPriceSet{presentmentMoney{amount currencyCode}}
         totalTaxSet{presentmentMoney{amount currencyCode}}
+        totalOutstandingSet{presentmentMoney{amount currencyCode}}
+        totalReceivedSet{presentmentMoney{amount currencyCode}}
         note tags
         shippingAddress{firstName lastName address1 address2 city province zip country}
         billingAddress{firstName lastName address1 address2 city province zip country}
@@ -1624,10 +1780,22 @@ function renderVisibleNotesList(notes) {
 function renderOrderDetail(session, order, flash, flashMsg) {
   const numId    = shopifyNumericId(order.id);
   const isPaid   = order.displayFinancialStatus === 'PAID';
+  // Second build (Build C): outstanding balance for the Record-payment button + modal prefill.
+  // Prefer the authoritative totalOutstandingSet from Shopify; fall back to a status-derived
+  // estimate (so MOCK fixtures without the field still gate/ prefill sensibly).
+  const outstanding = (() => {
+    const v = order.totalOutstandingSet?.presentmentMoney?.amount;
+    if (v != null && v !== '') return Math.max(0, parseFloat(v) || 0);
+    if (['PAID', 'REFUNDED', 'PARTIALLY_REFUNDED'].includes(order.displayFinancialStatus)) return 0;
+    return Math.max(0, parseFloat(order.totalPriceSet?.presentmentMoney?.amount || 0) || 0);
+  })();
+  const canRecordPayment = !isPaid && outstanding > 0;
   // Xero map (read from SQLite)
   const xeroMap  = getXeroMap(numId);
   // Partial invoices (read from SQLite)
   const partialInvoices = getPartialInvoices(`gid://shopify/Order/${numId}`);
+  // Second build (Build D): read-only order-history timeline (edits + non-edit audit verbs).
+  const orderHistory = getOrderHistory(`gid://shopify/Order/${numId}`);
   const isFulfilled = ['FULFILLED','PARTIALLY_FULFILLED'].includes(order.displayFulfillmentStatus);
   const finStatus = (order.displayFinancialStatus || '').toLowerCase();
   const fulStatus = (order.displayFulfillmentStatus || '').toLowerCase().replace(/_/g, '-');
@@ -1691,8 +1859,13 @@ function renderOrderDetail(session, order, flash, flashMsg) {
       : h(item.title);
     const bo = backorderMap.get(item.id);
     const boBadge = bo ? `<span class="badge badge-warning" title="ETA: ${bo.eta_date || 'unknown'}">⚠ Backorder</span>` : '';
-    const boBtn = `<button type="button" class="btn btn-ghost btn-xs edit-remove-btn" style="display:none;margin-left:4px"
-      onclick="toggleBackorderModal('${h(item.id)}','${h(item.title).replace(/'/g,"\\'")}','${item.quantity}',true)">Backorder</button>`;
+    // Second build (Build 4): the per-line Backorder control read like a STATUS ("Backorder" on
+    // every line in edit mode), making every line look backordered. Relabel/restyle it as a clear
+    // ACTION — a small muted "⚑ Mark backordered" link — WITHOUT changing behavior (still opens
+    // toggleBackorderModal). Keeps the edit-remove-btn class so the edit-mode toggle reveals it.
+    const boBtn = `<button type="button" class="edit-remove-btn bo-action-btn" title="Flag this line as backordered"
+      style="display:none;margin-left:6px;background:none;border:none;padding:0;font-size:11px;color:var(--muted);cursor:pointer;text-decoration:underline;text-underline-offset:2px"
+      onclick="toggleBackorderModal('${h(item.id)}','${h(item.title).replace(/'/g,"\\'")}','${item.quantity}',true)">⚑ Mark backordered</button>`;
     return `<tr data-removed="0" data-li-id="${h(item.id)}" data-existing="1">
       <td>${titleCell} ${boBadge}${boBtn}
         <span class="row-save-chip" data-state="idle" style="display:none;margin-left:8px;font-size:11px;vertical-align:middle"></span>
@@ -1746,6 +1919,14 @@ function renderOrderDetail(session, order, flash, flashMsg) {
 
   const flashHtml = flash === 'marked_paid'
     ? `<div class="alert alert-success">Order marked as paid.</div>`
+    : flash === 'payment_recorded'
+    ? `<div class="alert alert-success">Manual payment recorded.</div>`
+    : flash === 'payment_failed'
+    ? `<div class="alert alert-warning">Payment failed — nothing was recorded. ${flashMsg ? h(flashMsg) : 'Check server logs.'}</div>`
+    : flash === 'method_required'
+    ? `<div class="alert alert-warning">A payment method is required to record a payment.</div>`
+    : flash === 'bad_amount'
+    ? `<div class="alert alert-warning">Payment amount is invalid${flashMsg ? `: ${h(flashMsg)}` : ' — must be greater than 0 and no more than the outstanding balance.'}</div>`
     : flash === 'note_saved'
     ? `<div class="alert alert-success">Note saved.</div>`
     : flash === 'chase_invoice_queued'
@@ -1831,6 +2012,17 @@ function renderOrderDetail(session, order, flash, flashMsg) {
   }
   function toggleCancelModal(show) {
     document.getElementById('cancel-modal').style.display = show ? 'flex' : 'none';
+  }
+  // Second build (Build C): record-manual-payment modal toggle.
+  function toggleRecordPaymentModal(show) {
+    var m = document.getElementById('record-payment-modal');
+    if (!m) return;
+    m.style.display = show ? 'flex' : 'none';
+    if (show) {
+      // Re-enable the submit button each time the modal opens (a prior failed submit may have disabled it).
+      var b = document.getElementById('record-payment-submit');
+      if (b) { b.disabled = false; b.textContent = 'Record payment'; }
+    }
   }
   function toggleShipModal(show) {
     const m = document.getElementById('ship-modal');
@@ -1932,6 +2124,7 @@ function renderOrderDetail(session, order, flash, flashMsg) {
       document.getElementById('invoice-modal').style.display = 'none';
       const cm = document.getElementById('cancel-modal'); if (cm) cm.style.display = 'none';
       const sm = document.getElementById('ship-modal'); if (sm) sm.style.display = 'none';
+      const rpm = document.getElementById('record-payment-modal'); if (rpm) rpm.style.display = 'none';
     }
   });
   </script>`;
@@ -1976,6 +2169,17 @@ function renderOrderDetail(session, order, flash, flashMsg) {
       }
     }
     function mbody(m){ return String((m && m.body !== undefined) ? m.body : (m || '')).replace(/</g,'&lt;'); }
+    // Second build (Build B): brand for the Re:amaze STAFF inbox URL, injected server-side
+    // (never read process.env in client JS, never hardcode the brand). The staff URL
+    // (https://<brand>.reamaze.com/admin/conversations/<slug>) opens the live agent conversation;
+    // it falls back to t.permaUrl when no slug is present so the link is never broken.
+    var REAMAZE_BRAND = ${JSON.stringify(process.env.REAMAZE_BRAND || 'fuzzywumpets')};
+    function reamazeStaffUrl(t){
+      if (t && t.staffUrl) return t.staffUrl;
+      if (t && t.slug) return 'https://' + REAMAZE_BRAND + '.reamaze.com/admin/conversations/' + encodeURIComponent(t.slug);
+      return (t && t.permaUrl) ? t.permaUrl : '';
+    }
+    function openReamaze(url){ if (url) window.open(url, '_blank', 'noopener'); }
     async function loadCustomerReplies(orderId) {
       const el = document.getElementById('customer-replies-list');
       if (!el) return;
@@ -1984,11 +2188,15 @@ function renderOrderDetail(session, order, flash, flashMsg) {
         const j = await r.json();
         const threads = j.threads || [];
         if (!threads.length) { el.innerHTML = '<p class="text-muted small-text">No customer replies yet. Replies to notes will appear here.</p>'; return; }
-        el.innerHTML = threads.map(function(t){ return '<div style="border-left:3px solid var(--lime,#9BBC0E);padding:8px 12px;margin-bottom:8px;background:#f9fdf0;border-radius:0 4px 4px 0">'
+        el.innerHTML = threads.map(function(t){
+          var staffUrl = reamazeStaffUrl(t);
+          var clickAttrs = staffUrl ? ' style="border-left:3px solid var(--lime,#9BBC0E);padding:8px 12px;margin-bottom:8px;background:#f9fdf0;border-radius:0 4px 4px 0;cursor:pointer" onclick="openReamaze(' + JSON.stringify(staffUrl).replace(/"/g,'&quot;') + ')" title="Open in Re:amaze staff inbox"'
+                                   : ' style="border-left:3px solid var(--lime,#9BBC0E);padding:8px 12px;margin-bottom:8px;background:#f9fdf0;border-radius:0 4px 4px 0"';
+          return '<div' + clickAttrs + '>'
           + '<div style="font-weight:600;font-size:13px">' + String(t.subject||'(no subject)').replace(/</g,'&lt;') + '</div>'
           + (t.lastCustomerMessage ? '<div style="font-size:13px;margin-top:4px"><b>Customer:</b> ' + mbody(t.lastCustomerMessage).slice(0,300) + '</div>' : '')
           + (t.lastStaffMessage ? '<div style="font-size:12px;color:#777;margin-top:2px"><b>Us:</b> ' + mbody(t.lastStaffMessage).slice(0,200) + '</div>' : '')
-          + (t.permaUrl ? '<a href="' + t.permaUrl + '" target="_blank" rel="noopener" style="font-size:11px">Open in Re:amaze</a>' : '')
+          + (staffUrl ? '<a href="' + staffUrl.replace(/"/g,'&quot;') + '" target="_blank" rel="noopener" style="font-size:11px" onclick="event.stopPropagation()">Open in Re:amaze ↗</a>' : '')
           + '</div>'; }).join('');
       } catch(e) { el.innerHTML = '<p class="text-muted small-text">Could not load replies.</p>'; }
     }
@@ -2013,6 +2221,7 @@ function renderOrderDetail(session, order, flash, flashMsg) {
         ${!isPaid ? `<form method="POST" action="/orders/${h(numId)}/mark-paid" style="display:inline">
           <button class="btn btn-success" onclick="return confirm('Mark ${h(order.name)} as paid?')">Mark Paid</button>
         </form>` : ''}
+        ${canRecordPayment ? `<button type="button" class="btn btn-success" onclick="toggleRecordPaymentModal(true)" title="Record a manual payment (check, ACH, cash, etc.)">Record payment</button>` : ''}
         ${order.cancelledAt || order.displayFulfillmentStatus === 'FULFILLED' ? '' : `
         <button class="btn btn-primary" onclick="toggleShipModal(true)" title="Buy a shipping label and fulfill this order">📦 Ship order</button>`}
         <button id="edit-btn" class="btn btn-secondary" onclick="toggleEditMode(true)">Edit order</button>
@@ -2607,6 +2816,36 @@ function renderOrderDetail(session, order, flash, flashMsg) {
             </form>
           </div>
         </div>
+        ${/* Second build (Build C): Record manual payment modal — cloned from cancel-modal styling */''}${canRecordPayment ? `<div id="record-payment-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center">
+          <div style="background:#fff;border-radius:8px;padding:24px;min-width:380px;max-width:500px">
+            <h3 style="margin:0 0 16px">Record manual payment</h3>
+            <p style="color:#555;margin:0 0 16px">Record an off-Shopify payment (check, ACH, cash on pickup, etc.) against ${h(order.name)}. Outstanding balance: <b>${fmtMoney(outstanding)}</b>.</p>
+            <form method="POST" action="/orders/${h(numId)}/record-payment" onsubmit="var b=document.getElementById('record-payment-submit'); if(b){b.disabled=true;b.textContent='Recording…';}">
+              <div style="margin-bottom:12px">
+                <label style="font-size:13px;font-weight:500">Amount</label><br>
+                <input type="number" name="amount" step="0.01" min="0" value="${outstanding.toFixed(2)}" class="filter-input" style="width:100%;margin-top:4px">
+                <div style="font-size:11px;color:var(--muted);margin-top:4px">Leave as the full balance, or lower it to record a partial payment.</div>
+              </div>
+              <div style="margin-bottom:12px">
+                <label style="font-size:13px;font-weight:500">Payment method <span style="color:#c00">*</span></label><br>
+                <input type="text" name="paymentMethod" required placeholder="e.g. Check #1234, ACH 6/29, Cash on pickup" class="filter-input" style="width:100%;margin-top:4px">
+              </div>
+              <div style="margin-bottom:12px">
+                <label style="font-size:13px;font-weight:500">Date received</label><br>
+                <input type="date" name="processedAt" class="filter-input" style="width:100%;margin-top:4px">
+                <div style="font-size:11px;color:var(--muted);margin-top:4px">Optional — defaults to now.</div>
+              </div>
+              <div style="margin-bottom:16px">
+                <label style="font-size:13px;font-weight:500">Internal note</label><br>
+                <textarea name="note" class="textarea" rows="2" placeholder="Optional note for staff (not shown to customer)"></textarea>
+              </div>
+              <div style="display:flex;gap:8px;justify-content:flex-end">
+                <button type="button" class="btn btn-ghost" onclick="toggleRecordPaymentModal(false)">Cancel</button>
+                <button type="submit" id="record-payment-submit" class="btn btn-success">Record payment</button>
+              </div>
+            </form>
+          </div>
+        </div>` : ''}
         ${/* Ship Order modal */''}<div id="ship-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center">
           <div style="background:#fff;border-radius:8px;padding:24px;min-width:520px;max-width:640px;max-height:90vh;overflow-y:auto">
             <h3 style="margin:0 0 16px;display:flex;align-items:center;gap:8px">📦 Ship order ${h(order.name)}</h3>
@@ -2713,6 +2952,7 @@ function renderOrderDetail(session, order, flash, flashMsg) {
             <div style="margin-top:0.5rem"><button type="submit" class="btn btn-secondary btn-sm">Save Note</button></div>
           </form>
         </div>
+        ${renderOrderHistoryCard(orderHistory)}
         <div class="card" id="visible-notes-card">
           <div class="card-header"><h2>Note visible to customer</h2></div>
           <div id="visible-notes-list" style="margin-bottom:10px">${renderVisibleNotesList(order.visibleNotes || [])}</div>
@@ -5750,6 +5990,108 @@ app.post('/orders/:id/cancel', requireAuth, async (req, res) => {
   } catch (err) {
     console.error('order cancel error:', err.message);
     res.redirect(`/orders/${numId}?error=cancel_failed&msg=${encodeURIComponent(err.message.slice(0, 200))}`);
+  }
+});
+
+// Second build (Build C): Record a manual (off-Shopify) payment against an order.
+// WHAT: posts orderCreateManualPayment(id, amount?, paymentMethodName, processedAt) so a
+//   B2B order paid by check / ACH / cash shows the money received in Shopify (and surfaces
+//   in the Transactions card). amount omitted ⇒ Shopify records the FULL outstanding balance;
+//   a provided amount records that partial. Audit-logged as 'record_manual_payment' (which
+//   also surfaces in the Build D order-history timeline via summarizeAudit).
+// CHANGE-GUARD: modeled on /orders/:id/cancel — MOCK branch first, then real mutation, then
+//   audit + PRG redirect. Validation gates a comp/zero-outstanding order (Shopify userErrors
+//   on those) and a partial amount > the FRESH outstanding (re-fetched immediately before the
+//   mutation, NOT trusting the page-render prefill — an in-flight auto-save edit can change it).
+//   Never swallow a failure: userErrors / exceptions redirect with ?error=payment_failed&msg=…
+// INVARIANT(S): paymentMethod is REQUIRED (blank ⇒ ?error=method_required). amount, if given,
+//   must be > 0 and <= fresh outstanding (else ?error=bad_amount&msg=…). currencyCode hard-coded
+//   USD (this store is USD-only, mirroring the rest of the order-edit suite). No Xero recording
+//   in v1 — a known asymmetry vs mark-paid (flagged follow-up).
+app.post('/orders/:id/record-payment', requireAuth, async (req, res) => {
+  const numId   = req.params.id;
+  const session = req.adminSession;
+  const orderId = `gid://shopify/Order/${numId}`;
+  const method  = String(req.body.paymentMethod || '').trim();
+  const note    = String(req.body.note || '').trim().slice(0, 500);
+  const rawDate = String(req.body.processedAt || '').trim();
+  const rawAmt  = String(req.body.amount ?? '').trim();
+  const amountProvided = rawAmt !== '';
+  const amt     = amountProvided ? parseFloat(rawAmt) : null;
+
+  // processedAt: accept a date (yyyy-mm-dd) and send an ISO datetime; blank ⇒ omit (Shopify uses now).
+  let processedAt = null;
+  if (rawDate) {
+    const d = new Date(rawDate);
+    if (!isNaN(d.getTime())) processedAt = d.toISOString();
+  }
+
+  if (!method) return res.redirect(`/orders/${numId}?error=method_required`);
+
+  if (MOCK) {
+    const order = getMockOrder(numId);
+    if (!order) return res.status(404).json({ error: 'order not found' });
+    const outstanding = (() => {
+      const v = order.totalOutstandingSet?.presentmentMoney?.amount;
+      if (v != null && v !== '') return Math.max(0, parseFloat(v) || 0);
+      if (['PAID', 'REFUNDED', 'PARTIALLY_REFUNDED'].includes(order.displayFinancialStatus)) return 0;
+      return Math.max(0, parseFloat(order.totalPriceSet?.presentmentMoney?.amount || 0) || 0);
+    })();
+    if (!(outstanding > 0)) return res.redirect(`/orders/${numId}?error=payment_failed&msg=${encodeURIComponent('Order has no outstanding balance to pay.')}`);
+    if (amountProvided && (!(amt > 0) || amt > outstanding + 0.001)) {
+      return res.redirect(`/orders/${numId}?error=bad_amount&msg=${encodeURIComponent(`amount must be between 0 and ${outstanding.toFixed(2)}`)}`);
+    }
+    const pay = amountProvided ? amt : outstanding;
+    const overrides = mockOrderOverrides.get(numId) || {};
+    const newReceived = parseFloat(order.totalReceivedSet?.presentmentMoney?.amount || 0) + pay;
+    const newOutstanding = Math.max(0, outstanding - pay);
+    overrides.displayFinancialStatus = newOutstanding <= 0.001 ? 'PAID' : 'PARTIALLY_PAID';
+    overrides.totalOutstandingSet = { presentmentMoney: { amount: newOutstanding.toFixed(2), currencyCode: 'USD' } };
+    overrides.totalReceivedSet    = { presentmentMoney: { amount: newReceived.toFixed(2), currencyCode: 'USD' } };
+    const existingTx = overrides.transactions || order.transactions || [];
+    overrides.transactions = [...existingTx, {
+      id: `tx-manual-${Date.now()}`, status: 'SUCCESS', kind: 'SALE', gateway: method,
+      createdAt: processedAt || new Date().toISOString(),
+      amountSet: { presentmentMoney: { amount: pay.toFixed(2), currencyCode: 'USD' } },
+    }];
+    mockOrderOverrides.set(numId, overrides);
+    auditLog(session.email, 'record_manual_payment', orderId, null, { amount: amountProvided ? amt.toFixed(2) : 'full_outstanding', paymentMethod: method, note, processedAt });
+    return res.redirect(`/orders/${numId}?success=payment_recorded`);
+  }
+
+  try {
+    // Re-fetch the FRESH outstanding right before mutating (don't trust the page prefill —
+    // an in-flight auto-save edit may have changed the order total since render).
+    const freshRes = await shopifyFetch(`query($id:ID!){order(id:$id){displayFinancialStatus totalOutstandingSet{presentmentMoney{amount currencyCode}}}}`, { id: orderId });
+    const fo = freshRes.data?.order;
+    if (!fo) return res.redirect(`/orders/${numId}?error=payment_failed&msg=${encodeURIComponent('Order not found.')}`);
+    const outstanding = Math.max(0, parseFloat(fo.totalOutstandingSet?.presentmentMoney?.amount || 0) || 0);
+    if (!(outstanding > 0)) {
+      return res.redirect(`/orders/${numId}?error=payment_failed&msg=${encodeURIComponent('Order has no outstanding balance to pay (it may be a comp / 100%-discount order, already paid, or in-flight edits removed the balance).')}`);
+    }
+    if (amountProvided && (!(amt > 0) || amt > outstanding + 0.001)) {
+      return res.redirect(`/orders/${numId}?error=bad_amount&msg=${encodeURIComponent(`amount must be greater than 0 and no more than the outstanding ${outstanding.toFixed(2)}`)}`);
+    }
+    const vars = { id: orderId, paymentMethodName: method };
+    if (amountProvided) vars.amount = { amount: amt.toFixed(2), currencyCode: 'USD' };
+    if (processedAt) vars.processedAt = processedAt;
+    const r = await shopifyFetch(`mutation rec($id:ID!,$amount:MoneyInput,$paymentMethodName:String,$processedAt:DateTime){
+      orderCreateManualPayment(id:$id, amount:$amount, paymentMethodName:$paymentMethodName, processedAt:$processedAt){
+        order{ id displayFinancialStatus totalOutstandingSet{presentmentMoney{amount}} }
+        userErrors{ field message }
+      }
+    }`, vars);
+    const ue = r.data?.orderCreateManualPayment?.userErrors || [];
+    if (ue.length) {
+      const msg = ue.map(e => e.message).join('; ');
+      console.error('record-payment userErrors:', msg);
+      return res.redirect(`/orders/${numId}?error=payment_failed&msg=${encodeURIComponent(msg.slice(0, 200))}`);
+    }
+    auditLog(session.email, 'record_manual_payment', orderId, null, { amount: amountProvided ? amt.toFixed(2) : 'full_outstanding', paymentMethod: method, note, processedAt });
+    return res.redirect(`/orders/${numId}?success=payment_recorded`);
+  } catch (err) {
+    console.error('record-payment error:', err.message);
+    return res.redirect(`/orders/${numId}?error=payment_failed&msg=${encodeURIComponent(err.message.slice(0, 200))}`);
   }
 });
 

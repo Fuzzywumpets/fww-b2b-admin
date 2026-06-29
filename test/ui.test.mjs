@@ -159,6 +159,32 @@ await test('/orders/1001 shows order detail with timeline and line items', async
   assert.ok(html.includes('Generate Invoice'), 'Missing Generate Invoice button');
 });
 
+// Second build (Build C + D): record-payment control + order-history card on order detail.
+await test('/orders/1001 shows Record payment button and order-history card', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/orders/1001`);
+  await page.waitForSelector('#order-history-card');
+  const html = await page.content();
+  assert.ok(html.includes('Order History'), 'Missing Order History card');
+  // #1001 is PENDING with an outstanding balance (unless a prior test paid it in the same process);
+  // assert the control wiring exists on the page so the action is reachable.
+  const hasRecordBtn = await page.$('button[onclick="toggleRecordPaymentModal(true)"]');
+  const isPaid = html.includes('badge-paid');
+  if (!isPaid) assert.ok(hasRecordBtn, 'Unpaid order should expose the Record payment button');
+});
+
+await test('/orders/1001 backorder control is an action ("Mark backordered"), not a status', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/orders/1001`);
+  await page.waitForSelector('.timeline');
+  const html = await page.content();
+  assert.ok(html.includes('Mark backordered'), 'Backorder control should read as an action');
+  // The control must still open the backorder modal (behavior unchanged).
+  assert.ok(html.includes('class="edit-remove-btn bo-action-btn"'), 'backorder action keeps edit-mode reveal class');
+});
+
 await test('/orders/new shows customer and product search', async (page, ctx) => {
   const sid = await seedSession();
   await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);

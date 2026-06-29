@@ -530,6 +530,87 @@ await test('GET /api/orders/1001/line-state requires auth', async () => {
   assert.equal(res.status, 401);
 });
 
+// ── Second build (Build C): record manual payment ────────────────────────────
+console.log('\nAPI tests — Second build: record manual payment:');
+
+async function postForm(path, cookie, fields) {
+  const body = new URLSearchParams(fields);
+  return fetch(`${BASE}${path}`, {
+    method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: body.toString(), redirect: 'manual',
+  });
+}
+
+// All success-path tests use #1007 — a dedicated PENDING fixture (outstanding 200) that the
+// mark-paid / bulk / edit tests never touch, so its balance is deterministic here.
+await test('POST /orders/1007/record-payment requires auth (redirects to /login)', async () => {
+  const res = await postForm('/orders/1007/record-payment', '', { paymentMethod: 'Check #1', amount: '10' });
+  assert.equal(res.status, 302);
+  assert.ok((res.headers.get('location') || '').includes('/login'));
+});
+
+await test('POST /orders/1007/record-payment with blank method redirects ?error=method_required', async () => {
+  const cookie = await seedSession();
+  const res = await postForm('/orders/1007/record-payment', cookie, { paymentMethod: '', amount: '10' });
+  assert.ok([301, 302].includes(res.status));
+  assert.ok((res.headers.get('location') || '').includes('error=method_required'), 'blank method must be rejected');
+});
+
+await test('Record payment button + modal show on unpaid #1007, hidden on paid #1003', async () => {
+  const cookie = await seedSession();
+  const unpaid = await (await fetch(`${BASE}/orders/1007`, { headers: { Cookie: cookie } })).text();
+  assert.ok(unpaid.includes('id="record-payment-modal"'), 'unpaid order #1007 must render the record-payment modal');
+  assert.ok(unpaid.includes('toggleRecordPaymentModal(true)'), 'unpaid order #1007 must render the Record payment button');
+  const paid = await (await fetch(`${BASE}/orders/1003`, { headers: { Cookie: cookie } })).text();
+  assert.ok(!paid.includes('id="record-payment-modal"'), 'paid order #1003 must NOT render the record-payment modal');
+});
+
+await test('POST /orders/1007/record-payment partial leaves PARTIALLY_PAID', async () => {
+  const cookie = await seedSession();
+  // #1007 PENDING / outstanding 200 — record 50 → still 150 outstanding.
+  const res = await postForm('/orders/1007/record-payment', cookie, { paymentMethod: 'Check #2002', amount: '50.00' });
+  assert.ok((res.headers.get('location') || '').includes('success=payment_recorded'), 'partial should succeed');
+  const html = await (await fetch(`${BASE}/orders/1007`, { headers: { Cookie: cookie } })).text();
+  assert.ok(html.includes('PARTIALLY_PAID'), 'partial payment leaves a balance (PARTIALLY_PAID)');
+});
+
+await test('POST /orders/1007/record-payment amount over outstanding redirects ?error=bad_amount', async () => {
+  const cookie = await seedSession();
+  // After the 50 partial above, outstanding is 150 — 999999 must be rejected.
+  const res = await postForm('/orders/1007/record-payment', cookie, { paymentMethod: 'Check #X', amount: '999999' });
+  assert.ok((res.headers.get('location') || '').includes('error=bad_amount'), 'over-outstanding amount must be rejected');
+});
+
+await test('POST /orders/1007/record-payment remaining balance flips to PAID + adds SUCCESS/SALE tx', async () => {
+  const cookie = await seedSession();
+  // Leave amount blank to record the full REMAINING balance (150).
+  const res = await postForm('/orders/1007/record-payment', cookie, { paymentMethod: 'ACH 6/29' });
+  assert.ok((res.headers.get('location') || '').includes('success=payment_recorded'), 'final payment should succeed');
+  const html = await (await fetch(`${BASE}/orders/1007`, { headers: { Cookie: cookie } })).text();
+  assert.ok(html.includes('>PAID<') || html.includes('badge-paid'), 'order should now show PAID');
+  assert.ok(html.includes('ACH 6/29'), 'manual payment gateway/method should appear in Transactions');
+});
+
+// ── Second build (Build D): order-history timeline render ─────────────────────
+console.log('\nAPI tests — Second build: order-history timeline:');
+
+await test('Order detail renders the #order-history-card', async () => {
+  const cookie = await seedSession();
+  const html = await (await fetch(`${BASE}/orders/1001`, { headers: { Cookie: cookie } })).text();
+  assert.ok(html.includes('id="order-history-card"'), 'order-history card present');
+  assert.ok(html.includes('Order History'), 'order-history heading present');
+});
+
+await test('Order-history card surfaces a recorded manual payment as an audit event', async () => {
+  const cookie = await seedSession();
+  // #1007 was paid by the record-payment tests above (two record_manual_payment audit rows);
+  // the timeline must summarize them. (auditLog writes to the in-memory mock DB; getOrderHistory
+  // reads it back in the same process.)
+  const html = await (await fetch(`${BASE}/orders/1007`, { headers: { Cookie: cookie } })).text();
+  assert.ok(html.includes('id="order-history-card"'), 'history card present on the order page');
+  assert.ok(html.includes('recorded a manual payment'), 'manual payment appears in the timeline');
+});
+
 console.log('\nAPI tests — Phase 3: Catalog:');
 
 await test('GET /catalog returns 200 with product table', async () => {

@@ -657,6 +657,76 @@ export function getPartialInvoices(orderId) {
   return db.prepare('SELECT * FROM partial_invoices WHERE order_id = ? ORDER BY created_at ASC').all(orderId);
 }
 
+// ── Second build (Build D): read-only order-history timeline ───────────────────
+// WHAT: assembles a newest-first activity timeline for ONE order by UNIONing three
+//   tables: (a) order_edit_log — the canonical committed-edit ledger (every edit path,
+//   legacy batch AND Phase-16H incremental, writes here); (b) order_edit_action — the
+//   incremental idempotency ledger, used here ONLY as a graceful fallback when
+//   order_edit_log has no rows for the order (today every committed action double-writes
+//   to BOTH, so unioning it unconditionally would DOUBLE-list every auto-saved edit —
+//   see the live DB: order #7025395859691 has the same line/add in both tables 1ms apart);
+//   (c) admin_audit_log — NON-edit audit verbs only (mark_paid / record_manual_payment /
+//   order_cancel / create_order / partial_invoice_created / xero:* / visible-note-add …).
+// CHANGE-GUARD: this is the de-dupe spine. The order-edit audit verbs (order_edit and the
+//   order_edit_line_* / order_edit_discount incremental verbs) are EXCLUDED from the
+//   admin_audit_log pull because each of those rows duplicates a row already counted from
+//   order_edit_log — including them would double/triple-list a single edit. If a new
+//   edit-path audit verb is added, add it to EDIT_AUDIT_ACTIONS below or it will surface twice.
+// INVARIANT(S): pure reads, no writes. Every table access is wrapped so a missing table
+//   (e.g. order_edit_action on an older DB) degrades to []. Returns rows shaped as
+//   { kind, actor, ts, ...} sorted by ts DESC. JSON parsing is delegated to the caller's
+//   summarizers — this helper only attaches the raw stored strings.
+const EDIT_AUDIT_ACTIONS = new Set([
+  'order_edit',
+  'order_edit_line_add', 'order_edit_line_custom', 'order_edit_line_qty',
+  'order_edit_line_price', 'order_edit_line_remove', 'order_edit_discount',
+]);
+
+export function getOrderHistory(orderGid) {
+  if (!orderGid) return [];
+  const events = [];
+
+  // (a) order_edit_log — canonical committed edits (legacy batch + incremental auto-save).
+  let editLogRows = [];
+  try {
+    editLogRows = db.prepare(
+      'SELECT order_id, edited_by, staff_note, changes_json, ts FROM order_edit_log WHERE order_id = ? ORDER BY ts DESC'
+    ).all(orderGid);
+  } catch { editLogRows = []; }
+  for (const r of editLogRows) {
+    events.push({ kind: 'edit', actor: r.edited_by, ts: r.ts, staffNote: r.staff_note || null, changesJson: r.changes_json || null });
+  }
+
+  // (b) order_edit_action — incremental ledger; FALLBACK ONLY when order_edit_log is empty
+  //     for this order (avoids double-listing, since committed actions write to both today).
+  //     Guarded: a DB without this table (or without these columns) degrades silently to [].
+  if (editLogRows.length === 0) {
+    try {
+      const actionRows = db.prepare(
+        "SELECT order_id, action, payload_json, edited_by, ts FROM order_edit_action WHERE order_id = ? AND status = 'committed' ORDER BY ts DESC"
+      ).all(orderGid);
+      for (const r of actionRows) {
+        events.push({ kind: 'edit_action', actor: r.edited_by, ts: r.ts, action: r.action, payloadJson: r.payload_json || null });
+      }
+    } catch { /* table absent or schema differs — degrade gracefully */ }
+  }
+
+  // (c) admin_audit_log — NON-edit verbs only (edits are covered by (a)/(b) above).
+  let auditRows = [];
+  try {
+    auditRows = db.prepare(
+      'SELECT email, action, before_val, after_val, ts FROM admin_audit_log WHERE target = ? ORDER BY ts DESC'
+    ).all(orderGid);
+  } catch { auditRows = []; }
+  for (const r of auditRows) {
+    if (EDIT_AUDIT_ACTIONS.has(r.action)) continue; // de-dupe: already counted as an edit
+    events.push({ kind: 'audit', actor: r.email, ts: r.ts, action: r.action, beforeJson: r.before_val || null, afterJson: r.after_val || null });
+  }
+
+  events.sort((a, b) => (b.ts || 0) - (a.ts || 0));
+  return events;
+}
+
 // ── Phase 24: Cache helpers ────────────────────────────────────────────────────
 
 export function upsertCustomerCache(c) {
