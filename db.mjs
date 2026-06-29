@@ -146,6 +146,22 @@ db.exec(`
     ts INTEGER NOT NULL
   );
 
+  -- Phase 16H: incremental order-edit action ledger.
+  -- The UNIQUE idem_key is the dedupe spine that kills the double-add hazard for id-less
+  -- new rows: a committed action is never re-staged — its stored result_json is replayed.
+  CREATE TABLE IF NOT EXISTS order_edit_action (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    idem_key TEXT NOT NULL UNIQUE,
+    order_id TEXT NOT NULL,
+    action TEXT NOT NULL,
+    payload_json TEXT,
+    result_json TEXT,
+    status TEXT NOT NULL,
+    edited_by TEXT,
+    ts INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_oea_order ON order_edit_action(order_id);
+
   CREATE TABLE IF NOT EXISTS xero_invoice_map (
     order_id TEXT PRIMARY KEY,
     xero_invoice_id TEXT,
@@ -523,6 +539,31 @@ export function fulfillBackorder(orderId, lineItemId) {
 export function logOrderEdit(orderId, editedBy, staffNote, changesJson) {
   db.prepare('INSERT INTO order_edit_log (order_id, edited_by, staff_note, changes_json, ts) VALUES (?, ?, ?, ?, ?)')
     .run(orderId, editedBy, staffNote || null, JSON.stringify(changesJson), Date.now());
+}
+
+// Phase 16H: incremental order-edit action ledger (idempotency + audit).
+// getEditAction returns the row for an idem_key (or null). A row with status='committed'
+// means the action already ran and MUST NOT be re-staged — replay result_json verbatim.
+export function getEditAction(idemKey) {
+  if (!idemKey) return null;
+  return db.prepare('SELECT * FROM order_edit_action WHERE idem_key = ?').get(idemKey) || null;
+}
+
+// putEditAction upserts on idem_key. status: 'committed' | 'failed'. payload/result are
+// objects (JSON-serialized here). A failed row may later be overwritten by a retry.
+export function putEditAction({ idemKey, orderId, action, payload, result, status, editedBy }) {
+  db.prepare(`
+    INSERT INTO order_edit_action (idem_key, order_id, action, payload_json, result_json, status, edited_by, ts)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(idem_key) DO UPDATE SET
+      order_id = excluded.order_id, action = excluded.action, payload_json = excluded.payload_json,
+      result_json = excluded.result_json, status = excluded.status, edited_by = excluded.edited_by, ts = excluded.ts
+  `).run(
+    idemKey, orderId, action,
+    payload != null ? JSON.stringify(payload) : null,
+    result != null ? JSON.stringify(result) : null,
+    status, editedBy || null, Date.now()
+  );
 }
 
 // ── Xero accounting ───────────────────────────────────────────────────────────

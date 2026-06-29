@@ -23,6 +23,7 @@ import {
   createLead, getLeads, getLeadCounts, getLead, updateLead,
   addLeadNote, getLeadNotes, addLeadStatusHistory, getLeadStatusHistory,
   upsertBackorder, getBackordersForOrder, getOpenBackorders, fulfillBackorder, logOrderEdit,
+  getEditAction, putEditAction,
   getOutstandingBalanceForCustomer,
   getXeroMap, setXeroMap, addXeroPending, getXeroPending, markXeroPendingDone, markXeroPendingFailed, getXeroPendingCount, getXeroInvoiceMaps,
   createImpersonationNonce, consumeImpersonationNonce, gcImpersonationNonces,
@@ -1277,7 +1278,7 @@ function renderDashboard(session, data) {
     ? `<table class="data-table compact"><thead><tr><th>Customer</th><th class="text-right">Spend</th><th></th></tr></thead><tbody>
       ${data.pendingReview.slice(0, 5).map(c => `<tr>
         <td><a href="/customers/${h(c.id)}">${h(c.company || c.displayName)}</a><br><small class="text-muted">${h(c.email || '')}</small></td>
-        <td class="text-right">$${(c.spend||0).toLocaleString('en-US', {minimumFractionDigits: 0, maximumFractionDigits: 0})}</td>
+        <td class="text-right mono">${fmtMoney(c.spend)}</td>
         <td class="text-right"><a href="/customers/${h(c.id)}" class="btn btn-ghost btn-sm">Review</a></td>
       </tr>`).join('')}
     </tbody></table>${data.pendingReview.length > 5 ? `<p class="text-muted small-text" style="margin-top:8px;font-size:11px">+${data.pendingReview.length - 5} more</p>` : ''}`
@@ -1692,8 +1693,9 @@ function renderOrderDetail(session, order, flash, flashMsg) {
     const boBadge = bo ? `<span class="badge badge-warning" title="ETA: ${bo.eta_date || 'unknown'}">⚠ Backorder</span>` : '';
     const boBtn = `<button type="button" class="btn btn-ghost btn-xs edit-remove-btn" style="display:none;margin-left:4px"
       onclick="toggleBackorderModal('${h(item.id)}','${h(item.title).replace(/'/g,"\\'")}','${item.quantity}',true)">Backorder</button>`;
-    return `<tr data-removed="0">
+    return `<tr data-removed="0" data-li-id="${h(item.id)}" data-existing="1">
       <td>${titleCell} ${boBadge}${boBtn}
+        <span class="row-save-chip" data-state="idle" style="display:none;margin-left:8px;font-size:11px;vertical-align:middle"></span>
         <input type="hidden" name="removes" value="${h(item.id)}" disabled id="remove_${h(item.id)}">
       </td>
       <td class="mono">${h(item.variant?.sku || '—')}</td>
@@ -1749,7 +1751,7 @@ function renderOrderDetail(session, order, flash, flashMsg) {
     : flash === 'chase_invoice_queued'
     ? `<div class="alert alert-success">Chase invoice intent logged. Wire Chase API to send the real link.</div>`
     : flash === 'order_edited'
-    ? `<div class="alert alert-success">Order updated.</div>`
+    ? `<div class="alert alert-success">Order updated.${flashMsg ? ` <span style="color:#b45309">Note: ${h(flashMsg)}</span>` : ''}</div>`
     : flash === 'discount_applied'
     ? `<div class="alert alert-success">Discount applied.</div>`
     : flash === 'fulfilled'
@@ -1764,8 +1766,10 @@ function renderOrderDetail(session, order, flash, flashMsg) {
     ? `<div class="alert alert-warning">Xero sync failed — queued for retry. Check /accounting.</div>`
     : flash === 'partial_invoice_created'
     ? `<div class="alert alert-success">Partial invoice generated.</div>`
-    : flash === 'order_canceled' ? `<div class="alert alert-success">Order canceled.</div>` : flash === 'cancel_failed' ? `<div class="alert alert-warning">Cancel failed: ${h(flashMsg || 'see logs')}</div>` : flash === 'edit_failed' || flash === 'fulfillment_failed' || flash === 'discount_failed'
-    ? `<div class="alert alert-warning">Action failed — check server logs.</div>`
+    : flash === 'order_canceled' ? `<div class="alert alert-success">Order canceled.</div>` : flash === 'cancel_failed' ? `<div class="alert alert-warning">Cancel failed: ${h(flashMsg || 'see logs')}</div>` : flash === 'edit_failed'
+    ? `<div class="alert alert-warning">Order edit failed — nothing was saved. ${flashMsg ? h(flashMsg) : 'Check server logs.'}</div>`
+    : flash === 'fulfillment_failed' || flash === 'discount_failed'
+    ? `<div class="alert alert-warning">Action failed — ${flashMsg ? h(flashMsg) : 'check server logs.'}</div>`
     : '';
 
   // Edit mode JS (16A)
@@ -1794,6 +1798,10 @@ function renderOrderDetail(session, order, flash, flashMsg) {
     row.style.opacity = removed ? '1' : '0.4';
     const input = document.getElementById('remove_' + liId);
     if (input) input.disabled = removed;
+    // Phase 16H: incremental auto-save — when toggling TO removed, persist immediately.
+    // (Toggling back is a no-op server-side; Shopify can't un-remove a committed removal — the
+    // batch Save fallback / a fresh add would be needed, which is intentionally out of v1 scope.)
+    if (!removed && window.__autosave) window.__autosave.removeLine(liId, row);
   }
   function toggleDiscountModal(show) {
     document.getElementById('discount-modal').style.display = show ? 'flex' : 'none';
@@ -2029,6 +2037,7 @@ function renderOrderDetail(session, order, flash, flashMsg) {
             <h2>Line Items</h2>
             <span id="edit-mode-bar" style="display:none">
               <span style="font-size:12px;color:var(--muted);margin-right:8px">✏ Edit mode</span>
+              <span id="autosave-pill" data-state="saved" style="font-size:12px;font-weight:600;padding:2px 10px;border-radius:12px;margin-right:8px;background:#e8f5ea;color:#1b7a3d">All changes saved</span>
               <button type="button" class="btn btn-ghost btn-sm" onclick="toggleEditMode(false)">Cancel</button>
             </span>
           </div>
@@ -2088,22 +2097,31 @@ function renderOrderDetail(session, order, flash, flashMsg) {
                 tr.className = 'custom-line-new';
                 tr.dataset.newIdx = idx;
                 tr.innerHTML =
-                  '<td><input type="text" class="filter-input ncl-title" placeholder="Custom item title" style="width:90%"></td>' +
+                  '<td><input type="text" class="filter-input ncl-title" placeholder="Custom item title" style="width:80%">' +
+                    ' <span class="row-save-chip" data-state="idle" style="font-size:11px;vertical-align:middle"></span></td>' +
                   '<td><span class="text-muted">CUSTOM</span></td>' +
                   '<td class="text-right"><input type="number" class="filter-input ncl-qty" value="1" min="1" step="1" style="width:60px;text-align:right"></td>' +
                   '<td class="text-right"><input type="number" class="filter-input ncl-price" value="0.00" min="0" step="0.01" style="width:80px;text-align:right"></td>' +
                   '<td class="text-right"><button type="button" class="btn btn-ghost btn-sm" onclick="removeCustomLineRow(this)" title="Remove this new line">\u00D7</button></td>';
                 tbody.appendChild(tr);
                 tr.querySelector('.ncl-title').focus();
+                // Phase 16H: incremental auto-save \u2014 persist on blur once title/qty/price are valid.
+                if (window.__autosave) window.__autosave.wireCustomRow(tr);
               };
               window.removeCustomLineRow = function(btn) {
                 var tr = btn.closest('tr');
-                if (tr) tr.remove();
+                if (!tr) return;
+                // If this row was already committed incrementally, remove it from Shopify too.
+                if (window.__autosave && tr.dataset.committedLiId) { window.__autosave.removeLine(tr.dataset.committedLiId, tr); return; }
+                tr.remove();
               };
               window.serializeCustomLines = function() {
                 var rows = document.querySelectorAll('tr.custom-line-new');
                 var out = [];
                 rows.forEach(function(r){
+                  // Phase 16H: skip rows already persisted by incremental auto-save — otherwise the
+                  // batch Save path (no idemKey dedupe) would double-add them.
+                  if (r.dataset.committedLiId) return;
                   var title = r.querySelector('.ncl-title')?.value?.trim();
                   var qty   = parseInt(r.querySelector('.ncl-qty')?.value, 10);
                   var price = parseFloat(r.querySelector('.ncl-price')?.value);
@@ -2114,6 +2132,7 @@ function renderOrderDetail(session, order, flash, flashMsg) {
                 var crows = document.querySelectorAll('tr.catalog-line-new');
                 var cout = [];
                 crows.forEach(function(r){
+                  if (r.dataset.committedLiId) return; // already saved incrementally — don't re-add
                   var qty   = parseInt(r.querySelector('.cl-qty')?.value, 10);
                   var price = parseFloat(r.querySelector('.cl-price')?.value);
                   if (r.dataset.variantId && qty > 0 && price >= 0) cout.push({
@@ -2142,12 +2161,15 @@ function renderOrderDetail(session, order, flash, flashMsg) {
                 tr.dataset.sku       = p.sku || '';
                 tr.dataset.listPrice = String(listPrice);
                 tr.innerHTML =
-                  '<td><span class="badge badge-success" style="margin-right:6px">NEW</span>' + (p.label ? p.label.replace(/</g,'&lt;') : 'Catalog item') + '</td>' +
+                  '<td><span class="badge badge-success" style="margin-right:6px">NEW</span>' + (p.label ? p.label.replace(/</g,'&lt;') : 'Catalog item') +
+                    ' <span class="row-save-chip" data-state="idle" style="margin-left:8px;font-size:11px;vertical-align:middle"></span></td>' +
                   '<td><span class="text-muted">' + ((p.sku||'').replace(/</g,'&lt;') || '—') + '</span></td>' +
                   '<td class="text-right"><input type="number" class="filter-input cl-qty" value="1" min="1" step="1" style="width:60px;text-align:right"></td>' +
                   '<td class="text-right"><input type="number" class="filter-input cl-price" value="' + wholesale.toFixed(2) + '" min="0" step="0.01" style="width:80px;text-align:right" title="Wholesale unit price (list ' + listPrice.toFixed(2) + ')"></td>' +
                   '<td class="text-right"><button type="button" class="btn btn-ghost btn-sm" onclick="removeCustomLineRow(this)" title="Remove this new line">×</button></td>';
                 tbody.appendChild(tr);
+                // Phase 16H: incremental auto-save — persist this added line immediately.
+                if (window.__autosave) window.__autosave.addCatalogLine(p, tr, wholesale, listPrice);
               };
 
               // Phase 16G: grouped multi-select product picker (Shopify-style "Add item").
@@ -2265,6 +2287,207 @@ function renderOrderDetail(session, order, flash, flashMsg) {
                   }, 220);
                 });
                 document.addEventListener('click', function(ev){ if (ev.target !== input && !box.contains(ev.target)) hide(); });
+              })();
+
+              // ── Phase 16H: incremental auto-save controller ─────────────────
+              // Each user action persists immediately via its own atomic begin->commit on the
+              // server, keyed by a client uuid idemKey so retries/double-fires never double-add.
+              // Per-row chip + global pill reflect saving/saved/failed; failures are CLICKABLE to
+              // retry (same idemKey) and never silently disappear. The batch "Save changes" button
+              // stays as a fallback (server dedupes committed idemKeys, so it can't double-add).
+              (function(){
+                var ORDER_ID = '${h(numId)}';
+                function uuid(){ try { return crypto.randomUUID(); } catch(e){ return 'k-'+Date.now()+'-'+Math.random().toString(16).slice(2); } }
+                var inflight = 0, anyFailed = false;
+                var pill = document.getElementById('autosave-pill');
+                function setPill(){
+                  if (!pill) return;
+                  if (anyFailed) { pill.textContent = 'Changes not saved — review'; pill.dataset.state='failed'; pill.style.background='#fdecec'; pill.style.color='#c00'; }
+                  else if (inflight > 0) { pill.textContent = 'Saving ' + inflight + ' change' + (inflight===1?'':'s') + '…'; pill.dataset.state='saving'; pill.style.background='#fff6e6'; pill.style.color='#b45309'; }
+                  else { pill.textContent = 'All changes saved'; pill.dataset.state='saved'; pill.style.background='#e8f5ea'; pill.style.color='#1b7a3d'; }
+                }
+                function recomputeFailed(){ anyFailed = document.querySelectorAll('.row-save-chip[data-state="failed"]').length > 0; }
+                function chipOf(tr){ return tr ? tr.querySelector('.row-save-chip') : null; }
+                function setChip(tr, state, msg){
+                  var c = chipOf(tr); if (!c) return;
+                  c.dataset.state = state; c.title = msg || '';
+                  c.style.cursor = 'default'; c.onclick = null;
+                  if (state === 'saving'){ c.style.display='inline'; c.style.color='var(--muted)'; c.textContent='● Saving…'; }
+                  else if (state === 'saved'){ c.style.display='inline'; c.style.color='#1b7a3d'; c.textContent='✓ Saved';
+                    setTimeout(function(){ if (c.dataset.state==='saved'){ c.style.display='none'; c.textContent=''; } }, 2000); }
+                  else if (state === 'failed'){ c.style.display='inline'; c.style.color='#c00'; c.style.cursor='pointer'; c.textContent='⚠ Not saved'; }
+                  else { c.style.display='none'; c.textContent=''; }
+                  recomputeFailed(); setPill();
+                }
+                window.addEventListener('beforeunload', function(e){
+                  if (inflight > 0 || anyFailed){ e.preventDefault(); e.returnValue=''; return ''; }
+                });
+
+                // POST helper. Returns {ok, json} ; ok=false on 422/5xx/network.
+                function post(path, body){
+                  return fetch(path, { method:'POST', credentials:'same-origin',
+                    headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) })
+                    .then(function(r){ return r.json().then(function(j){ return { ok:r.ok, json:j }; }, function(){ return { ok:false, json:{ errors:['bad response'] } }; }); })
+                    .catch(function(){ return { ok:false, json:{ errors:['network error'] } }; });
+                }
+                function totals(order){
+                  if (!order) return;
+                  function money(n){ return '$' + (Number(n)||0).toFixed(2); }
+                  var rows = document.querySelectorAll('.totals-block .totals-row');
+                  if (rows[0]) rows[0].lastElementChild.textContent = money(order.subtotal);
+                  var totRow = document.querySelector('.totals-block .totals-total');
+                  if (totRow) totRow.lastElementChild.textContent = money(order.total);
+                }
+                function reconcile(){
+                  fetch('/api/orders/' + ORDER_ID + '/line-state', { credentials:'same-origin' })
+                    .then(function(r){ return r.json(); })
+                    .then(function(s){ if (s && s.ok){ totals(s); } })
+                    .catch(function(){});
+                }
+
+                // Generic single-action runner with per-row chip + idemKey + retry.
+                function run(tr, idemKey, path, body, onOk){
+                  setChip(tr, 'saving'); inflight++; setPill();
+                  return post(path, body).then(function(res){
+                    inflight--;
+                    if (res.ok && res.json && res.json.ok){
+                      setChip(tr, 'saved', (res.json.warnings && res.json.warnings.length) ? res.json.warnings.join(' ') : '');
+                      totals(res.json.order);
+                      if (onOk) onOk(res.json);
+                    } else {
+                      var msg = (res.json && res.json.errors) ? res.json.errors.join('; ') : 'Save failed';
+                      setChip(tr, 'failed', msg);
+                      var c = chipOf(tr);
+                      if (c) c.onclick = function(){ run(tr, idemKey, path, body, onOk); }; // retry, SAME idemKey
+                      reconcile();
+                    }
+                    setPill();
+                  });
+                }
+
+                window.__autosave = {
+                  // Add-from-picker: persist immediately; stamp committed liId onto the row.
+                  addCatalogLine: function(p, tr, wholesale, listPrice){
+                    var qtyEl = tr.querySelector('.cl-qty'), priceEl = tr.querySelector('.cl-price');
+                    var idemKey = tr.dataset.idemKey || (tr.dataset.idemKey = uuid());
+                    var body = { idemKey: idemKey, variantId: p.variantId, title: p.label || '', sku: p.sku || '',
+                      qty: parseInt(qtyEl ? qtyEl.value : '1', 10) || 1,
+                      listPrice: parseFloat(listPrice) || 0, price: parseFloat(priceEl ? priceEl.value : wholesale) };
+                    run(tr, idemKey, '/orders/' + ORDER_ID + '/line/add', body, function(j){
+                      if (j.line && j.line.liId){ tr.dataset.committedLiId = j.line.liId; }
+                    });
+                  },
+                  // Custom row: persist on blur once title && qty>0 && price>=0; once committed it
+                  // becomes an existing line keyed by committedLiId (qty/price edits re-route there).
+                  wireCustomRow: function(tr){
+                    var titleEl = tr.querySelector('.ncl-title'), qtyEl = tr.querySelector('.ncl-qty'), priceEl = tr.querySelector('.ncl-price');
+                    function trySave(){
+                      if (tr.dataset.committedLiId) return; // already saved; (qty/price changes after are out of scope for custom v1)
+                      var title = (titleEl && titleEl.value || '').trim();
+                      var qty = parseInt(qtyEl && qtyEl.value, 10);
+                      var price = parseFloat(priceEl && priceEl.value);
+                      if (!title || !(qty > 0) || !(price >= 0)) return;
+                      var idemKey = tr.dataset.idemKey || (tr.dataset.idemKey = uuid());
+                      run(tr, idemKey, '/orders/' + ORDER_ID + '/line/custom', { idemKey: idemKey, title: title, qty: qty, price: price }, function(j){
+                        if (j.line && j.line.liId){ tr.dataset.committedLiId = j.line.liId; }
+                      });
+                    }
+                    [titleEl, qtyEl, priceEl].forEach(function(el){ if (el) el.addEventListener('blur', trySave); });
+                  },
+                  // Existing-line qty change (debounced, single-flight, last-write-wins).
+                  qtyChange: function(tr, liId, qty){
+                    debouncedLine(tr, liId, 'qty', { qty: qty }, '/orders/' + ORDER_ID + '/line/qty');
+                  },
+                  priceChange: function(tr, liId, price){
+                    debouncedLine(tr, liId, 'price', { price: price }, '/orders/' + ORDER_ID + '/line/price');
+                  },
+                  removeLine: function(liId, tr){
+                    var idemKey = uuid();
+                    run(tr, idemKey, '/orders/' + ORDER_ID + '/line/remove', { idemKey: idemKey, liId: liId }, function(){
+                      tr.style.opacity = '0.4'; tr.dataset.removed = '1';
+                    });
+                  },
+                };
+
+                // Per-line single-flight + debounce for qty/price. Latest value wins.
+                var lineTimers = {}, lineInflight = {}, linePending = {};
+                function debouncedLine(tr, liId, kind, extra, path){
+                  var key = liId + ':' + kind;
+                  linePending[key] = { tr: tr, extra: extra, path: path, liId: liId };
+                  if (lineTimers[key]) clearTimeout(lineTimers[key]);
+                  lineTimers[key] = setTimeout(function(){ flushLine(key); }, 500);
+                }
+                function flushLine(key){
+                  if (lineInflight[key]) return; // will re-fire after current resolves
+                  var p = linePending[key]; if (!p) return;
+                  linePending[key] = null; lineInflight[key] = true;
+                  var idemKey = uuid();
+                  var body = Object.assign({ idemKey: idemKey, liId: p.liId }, p.extra);
+                  setChip(p.tr, 'saving'); inflight++; setPill();
+                  post(p.path, body).then(function(res){
+                    inflight--; lineInflight[key] = false;
+                    if (res.ok && res.json && res.json.ok){ setChip(p.tr, 'saved'); totals(res.json.order); }
+                    else {
+                      var msg = (res.json && res.json.errors) ? res.json.errors.join('; ') : 'Save failed';
+                      setChip(p.tr, 'failed', msg);
+                      // FAILURE: mark failed + offer a CLICKABLE manual retry. Do NOT re-queue into
+                      // linePending here — the trailing auto-flush (below) would then re-fire the
+                      // just-failed action instantly and loop forever (stuck "Saving N change…").
+                      // The retry click re-queues THEN flushes, exactly once.
+                      var c = chipOf(p.tr); if (c) c.onclick = function(){ linePending[key] = { tr: p.tr, extra: p.extra, path: p.path, liId: p.liId }; flushLine(key); };
+                      reconcile();
+                    }
+                    setPill();
+                    // Only fires when debouncedLine queued a NEWER change while this was in-flight
+                    // (legit last-write-wins) — never on failure, since the failure path no longer re-queues.
+                    if (linePending[key] && !lineInflight[key]) flushLine(key);
+                  });
+                }
+
+                // Wire change handlers on EXISTING line rows (qty + price inputs).
+                function wireExisting(){
+                  document.querySelectorAll('#edit-form tr[data-existing="1"]').forEach(function(tr){
+                    var liId = tr.dataset.liId; if (!liId) return;
+                    var qtyEl = tr.querySelector('.edit-qty-input');
+                    var priceEl = tr.querySelector('.edit-price-input');
+                    if (qtyEl && !qtyEl.dataset.asWired){ qtyEl.dataset.asWired='1';
+                      qtyEl.addEventListener('change', function(){ var q = parseInt(qtyEl.value,10); if (q>=0) window.__autosave.qtyChange(tr, liId, q); });
+                      qtyEl.addEventListener('input', function(){ var q = parseInt(qtyEl.value,10); if (q>=0) window.__autosave.qtyChange(tr, liId, q); });
+                    }
+                    if (priceEl && !priceEl.dataset.asWired){ priceEl.dataset.asWired='1';
+                      priceEl.addEventListener('change', function(){ var pr = parseFloat(priceEl.value); if (pr>=0) window.__autosave.priceChange(tr, liId, pr); });
+                    }
+                  });
+                }
+                wireExisting();
+
+                // Order-level discount bar: persist on blur once reason + a value are present.
+                (function(){
+                  var bar = document.getElementById('edit-discount-bar'); if (!bar) return;
+                  var pctEl = bar.querySelector('input[name="discountPct"]');
+                  var fixedEl = bar.querySelector('input[name="discountFixed"]');
+                  var reasonEl = bar.querySelector('input[name="discountReason"]');
+                  var saved = false;
+                  function trySave(){
+                    if (saved) return;
+                    var pct = parseFloat(pctEl && pctEl.value) || 0;
+                    var fixed = parseFloat(fixedEl && fixedEl.value) || 0;
+                    var reason = (reasonEl && reasonEl.value || '').trim();
+                    if (!reason || (!(pct>0) && !(fixed>0))) return;
+                    saved = true;
+                    var idemKey = uuid();
+                    inflight++; setPill();
+                    post('/orders/' + ORDER_ID + '/discount/order', { idemKey: idemKey, discountPct: pct||'', discountFixed: fixed||'', discountReason: reason }).then(function(res){
+                      inflight--;
+                      if (res.ok && res.json && res.json.ok){ totals(res.json.order); }
+                      else { saved = false; anyFailed = true; }
+                      setPill();
+                    });
+                  }
+                  [pctEl, fixedEl, reasonEl].forEach(function(el){ if (el) el.addEventListener('blur', trySave); });
+                })();
+
+                setPill();
               })();
             })();
           </script>
@@ -3851,7 +4074,7 @@ function getCustomersPendingXeroReview() {
       displayName: c.displayName,
       company:     c.company || null,
       email:       c.email,
-      spend:       c.amountSpent || 0,
+      spend:       parseFloat(c.amountSpent?.amount || 0),
       orders:      c.numberOfOrders || 0,
     }));
   } catch (err) {
@@ -4452,6 +4675,182 @@ app.get('/api/admin/orders/:id/partial-invoices', requireAuth, (req, res) => {
 
 // ── Phase 16: Order editing, partial fulfillment, backorder ──────────────────
 
+// ── Phase 16H: incremental ("constantly update") order-edit core ──────────────
+// WHY: the prior batch handler swallowed orderEditCommit.userErrors and the per-line
+// wholesale-discount userError, then logged success + redirected ?success while NOTHING
+// (or only part) persisted — the live #37583 "Got Collar" false-green. This core fixes
+// that at the source: every action is its OWN atomic begin->stage->commit, EVERY userError
+// (including commit) is inspected and surfaced, the committed line delta is read back, and a
+// client-supplied idemKey + UNIQUE-key dedupe makes a retried/duplicated request a no-op
+// (never a double-add). Actions per order are serialized by a tiny async mutex so two begins
+// can't race the same calculatedOrder.
+
+class OrderEditError extends Error {
+  constructor(messages) {
+    const list = Array.isArray(messages) ? messages : [messages];
+    super(list.filter(Boolean).join('; ') || 'order edit failed');
+    this.name = 'OrderEditError';
+    this.userMessages = list.filter(Boolean);
+  }
+}
+
+// Per-order serialization: chain of promises keyed by orderId so concurrent rapid edits
+// (5 qty changes + an add fired at once) run one-at-a-time and never race a begin/commit.
+const orderEditLocks = new Map(); // orderId -> Promise (tail of the chain)
+function withOrderLock(orderId, fn) {
+  const prev = orderEditLocks.get(orderId) || Promise.resolve();
+  // Run fn after prev settles (regardless of prior outcome). `result` is what the caller awaits.
+  const result = prev.then(() => fn(), () => fn());
+  // The chain tail must never reject (or the next waiter would short-circuit), so swallow here.
+  const tail = result.then(() => {}, () => {});
+  orderEditLocks.set(orderId, tail);
+  // Best-effort cleanup so the Map doesn't grow unbounded across many orders.
+  tail.then(() => { if (orderEditLocks.get(orderId) === tail) orderEditLocks.delete(orderId); });
+  return result;
+}
+
+// Read authoritative line state straight off the live order (NOT a calculatedOrder).
+// Returns currentQuantity (Shopify retains removed/zeroed lines — UI must key off this, not quantity).
+async function readCommittedLineState(orderId) {
+  const r = await shopifyFetch(`query($id:ID!){order(id:$id){
+    subtotalPriceSet{presentmentMoney{amount}}
+    totalPriceSet{presentmentMoney{amount}}
+    lineItems(first:100){edges{node{
+      id title quantity currentQuantity sku
+      variant{id}
+      discountedUnitPriceSet{presentmentMoney{amount}}
+      originalUnitPriceSet{presentmentMoney{amount}}
+    }}}
+  }}`, { id: orderId });
+  const o = r.data?.order;
+  const edges = o?.lineItems?.edges?.map(e => e.node) || [];
+  const lines = edges.map(n => ({
+    liId: n.id,
+    title: n.title,
+    sku: n.sku || n.variant?.sku || '',
+    currentQuantity: n.currentQuantity != null ? n.currentQuantity : n.quantity,
+    unitPrice: parseFloat(n.discountedUnitPriceSet?.presentmentMoney?.amount ?? n.originalUnitPriceSet?.presentmentMoney?.amount ?? 0),
+  }));
+  const lineCount = lines.filter(l => (l.currentQuantity || 0) > 0).length;
+  return {
+    lines,
+    subtotal: parseFloat(o?.subtotalPriceSet?.presentmentMoney?.amount || 0),
+    total: parseFloat(o?.totalPriceSet?.presentmentMoney?.amount || 0),
+    lineCount,
+  };
+}
+
+// True when the calculated line already carries an order-level / stacked discount
+// (targetSelection:ALL). Adding orderEditAddLineItemDiscount on top throws
+// "The order has a discount which prevents applying additional discounts to this line item."
+function lineHasStackedOrderDiscount(calcItem) {
+  return (calcItem?.calculatedDiscountAllocations || []).some(a =>
+    a?.discountApplication?.targetSelection === 'ALL');
+}
+
+// THE chokepoint. idempotent + atomic + serialized + userError-honest.
+// stageFn(calcId, ctx) does the per-action staging; ctx exposes { calcOrder, calcItems, warnings }.
+// stageFn may push human-readable strings into ctx.warnings (e.g. "added at list price — order
+// already has a discount") which are returned to the client but do NOT fail the action.
+async function runOrderEdit(orderId, idemKey, editedBy, action, payload, stageFn) {
+  // 1) DEDUPE FIRST — never re-stage a committed action (kills the double-add hazard).
+  const existing = getEditAction(idemKey);
+  if (existing && existing.status === 'committed') {
+    try { return { ...JSON.parse(existing.result_json || '{}'), replayed: true }; }
+    catch { return { replayed: true }; }
+  }
+  // 2) Serialize per order so two begins don't race the same calculatedOrder.
+  return withOrderLock(orderId, async () => {
+    // Re-check inside the lock (a concurrent request with the same key may have just committed).
+    const again = getEditAction(idemKey);
+    if (again && again.status === 'committed') {
+      try { return { ...JSON.parse(again.result_json || '{}'), replayed: true }; }
+      catch { return { replayed: true }; }
+    }
+    try {
+      const beginResult = await shopifyFetch(`
+        mutation begin($id:ID!){orderEditBegin(id:$id){
+          calculatedOrder{
+            id
+            lineItems(first:100){edges{node{
+              id title quantity variant{id}
+              calculatedDiscountAllocations{ discountApplication{id targetType targetSelection} }
+            }}}
+          }
+          userErrors{field message}
+        }}
+      `, { id: orderId });
+      const beginErrs = beginResult.data?.orderEditBegin?.userErrors || [];
+      if (beginErrs.length) throw new OrderEditError(beginErrs.map(e => e.message));
+      const calcOrder = beginResult.data?.orderEditBegin?.calculatedOrder;
+      const calcId = calcOrder?.id;
+      if (!calcId) throw new OrderEditError('orderEditBegin returned no calculatedOrder');
+      const calcItems = calcOrder.lineItems?.edges?.map(e => e.node) || [];
+
+      const ctx = { calcOrder, calcItems, warnings: [] };
+      await stageFn(calcId, ctx);
+
+      // Commit — and ACTUALLY READ userErrors (this is the bug the user hit).
+      const commitRes = await shopifyFetch(`mutation commit($id:ID!,$notify:Boolean!,$note:String){
+        orderEditCommit(id:$id,notifyCustomer:$notify,staffNote:$note){
+          order{id} userErrors{field message}}}`,
+        { id: calcId, notify: false, note: payload?.staffNote || null });
+      const cErrs = commitRes.data?.orderEditCommit?.userErrors || [];
+      if (cErrs.length) throw new OrderEditError(cErrs.map(e => e.message));
+
+      // Read authoritative committed state and persist the action as committed.
+      const lineState = await readCommittedLineState(orderId);
+      const result = { ok: true, idemKey, warnings: ctx.warnings, order: { subtotal: lineState.subtotal, total: lineState.total, lineCount: lineState.lineCount }, lineState };
+      putEditAction({ idemKey, orderId, action, payload, result, status: 'committed', editedBy });
+      return result;
+    } catch (err) {
+      const messages = err instanceof OrderEditError ? err.userMessages : [err.message];
+      putEditAction({ idemKey, orderId, action, payload, result: { ok: false, errors: messages }, status: 'failed', editedBy });
+      const e = new OrderEditError(messages);
+      throw e;
+    }
+  });
+}
+
+// MOCK helper: apply an incremental action to mockOrderOverrides and return the same shape
+// the real runOrderEdit returns, with idem dedupe via order_edit_action so the mock suite can
+// assert "no double-add on same idemKey". editFn(edges) mutates the edges array in place and
+// returns optional { warnings }.
+function mockIncrementalEdit({ numId, idemKey, action, payload, editFn, editedBy }) {
+  const existing = getEditAction(idemKey);
+  if (existing && existing.status === 'committed') {
+    try { return { ...JSON.parse(existing.result_json || '{}'), replayed: true }; }
+    catch { return { replayed: true }; }
+  }
+  const order = getMockOrder(numId);
+  if (!order) return null;
+  const overrides = mockOrderOverrides.get(numId) || {};
+  const baseEdges = overrides.lineItems?.edges || (order.lineItems?.edges || []);
+  // deep-ish clone so we don't mutate fixtures
+  const edges = baseEdges.map(e => ({ node: { ...e.node } }));
+  const warnings = editFn(edges) || [];
+  let subtotal = 0;
+  for (const e of edges) {
+    const cq = e.node.currentQuantity != null ? e.node.currentQuantity : e.node.quantity;
+    const price = parseFloat(e.node.discountedUnitPriceSet?.presentmentMoney?.amount || 0);
+    subtotal += price * (cq || 0);
+  }
+  const ship = parseFloat(order.totalShippingPriceSet?.presentmentMoney?.amount || 0);
+  overrides.lineItems = { edges };
+  overrides.subtotalPriceSet = { presentmentMoney: { amount: subtotal.toFixed(2), currencyCode: 'USD' } };
+  overrides.totalPriceSet    = { presentmentMoney: { amount: (subtotal + ship).toFixed(2), currencyCode: 'USD' } };
+  mockOrderOverrides.set(numId, overrides);
+  const lines = edges.map(e => ({
+    liId: e.node.id, title: e.node.title, sku: e.node.variant?.sku || '',
+    currentQuantity: e.node.currentQuantity != null ? e.node.currentQuantity : e.node.quantity,
+    unitPrice: parseFloat(e.node.discountedUnitPriceSet?.presentmentMoney?.amount || 0),
+  }));
+  const lineCount = lines.filter(l => (l.currentQuantity || 0) > 0).length;
+  const result = { ok: true, idemKey, warnings, order: { subtotal, total: subtotal + ship, lineCount }, lineState: { lines, subtotal, total: subtotal + ship, lineCount } };
+  putEditAction({ idemKey, orderId: `gid://shopify/Order/${numId}`, action, payload, result, status: 'committed', editedBy });
+  return result;
+}
+
 // 16A: Edit order line items (qty changes, remove, add, price override)
 // WHAT: applies qty changes, removals, per-line B2B price re-discounting, order-level discount, and custom line additions via the Shopify orderEdit* mutation suite (begin->setQuantity/removeDiscount/addLineItemDiscount/addCustomItem->commit).
 // CHANGE-GUARD: this is the most fragile handler — re-test the original-li-id -> calculated-li-id mapping (matched by variant id + title) after any Shopify API-version bump; price re-discount does remove+add (NOT updateDiscount) because discounts stack on commit.
@@ -4669,18 +5068,29 @@ app.post('/orders/:id/edit', requireAuth, async (req, res) => {
     // Phase 16F: add real catalog variants, then apply each line's B2B wholesale price.
     // CRITICAL: when a variantId is present Shopify uses the variant's full retail price and
     // IGNORES any manual unit price — so wholesale is applied as a per-line appliedDiscount
-    // PERCENTAGE = (listPrice - wholesalePrice)/listPrice, mirroring submitNewOrder. Soft-fail per line.
+    // PERCENTAGE = (listPrice - wholesalePrice)/listPrice, mirroring submitNewOrder.
+    // GUARD: if the order already carries an order-level/stacked discount (targetSelection:ALL),
+    // orderEditAddLineItemDiscount throws "The order has a discount which prevents applying
+    // additional discounts to this line item" — so the line is added at LIST price and a
+    // warning is collected and surfaced (NOT a silent continue, NOT a swallowed userError).
+    const batchWarnings = [];
     for (const line of newVariantLines) {
       const variantGid = line.variantId.startsWith('gid://') ? line.variantId : `gid://shopify/ProductVariant/${line.variantId}`;
       const addRes = await shopifyFetch(`mutation addVar($id:ID!,$v:ID!,$q:Int!){
         orderEditAddVariant(id:$id,variantId:$v,quantity:$q,allowDuplicates:true){
-          calculatedLineItem{id} calculatedOrder{id} userErrors{field message}}}`,
+          calculatedLineItem{id calculatedDiscountAllocations{discountApplication{targetSelection}}} calculatedOrder{id} userErrors{field message}}}`,
         { id: calcId, v: variantGid, q: line.qty });
       const addErrs = addRes.data?.orderEditAddVariant?.userErrors || [];
-      if (addErrs.length) { console.error('[order-edit] addVariant failed:', JSON.stringify(addErrs)); continue; }
-      const calcLiId = addRes.data?.orderEditAddVariant?.calculatedLineItem?.id;
+      if (addErrs.length) { throw new Error('add ' + (line.sku || line.variantId) + ': ' + addErrs.map(e => e.message).join('; ')); }
+      const calcLineItem = addRes.data?.orderEditAddVariant?.calculatedLineItem;
+      const calcLiId = calcLineItem?.id;
       const listPrice = line.listPrice > 0 ? line.listPrice : line.price;
       if (calcLiId && listPrice > 0 && line.price >= 0 && line.price < listPrice) {
+        if (lineHasStackedOrderDiscount(calcLineItem)) {
+          batchWarnings.push(`"${line.title || line.sku || line.variantId}" added at list price ($${listPrice.toFixed(2)}) — this order already has a discount, so a wholesale line discount could not be stacked.`);
+          console.warn('[order-edit] skipped wholesale discount (stacked order discount):', line.sku || line.variantId);
+          continue;
+        }
         const pct = ((listPrice - line.price) / listPrice) * 100;
         if (pct > 0 && pct <= 100) {
           const dRes = await shopifyFetch(`mutation addDisc($id:ID!,$li:ID!,$d:OrderEditAppliedDiscountInput!){
@@ -4688,25 +5098,424 @@ app.post('/orders/:id/edit', requireAuth, async (req, res) => {
               calculatedOrder{id} userErrors{field message}}}`,
             { id: calcId, li: calcLiId, d: { percentValue: parseFloat(pct.toFixed(4)), description: 'B2B wholesale' } });
           const dErrs = dRes.data?.orderEditAddLineItemDiscount?.userErrors || [];
-          if (dErrs.length) console.error('[order-edit] addVariant discount failed:', JSON.stringify(dErrs));
-          else console.log('[order-edit] catalog line added:', line.sku || line.variantId, 'x', line.qty, '@', line.price, `(${pct.toFixed(2)}% off ${listPrice})`);
+          if (dErrs.length) {
+            // Surface, don't swallow. The line IS added (at list price) — collect a warning.
+            batchWarnings.push(`"${line.title || line.sku || line.variantId}" added at list price — ${dErrs.map(e => e.message).join('; ')}`);
+            console.warn('[order-edit] addVariant discount failed:', JSON.stringify(dErrs));
+          } else {
+            console.log('[order-edit] catalog line added:', line.sku || line.variantId, 'x', line.qty, '@', line.price, `(${pct.toFixed(2)}% off ${listPrice})`);
+          }
         }
       } else {
         console.log('[order-edit] catalog line added at list price:', line.sku || line.variantId, 'x', line.qty);
       }
     }
 
-    // Commit
-    await shopifyFetch(`mutation commit($id:ID!,$notify:Boolean!,$note:String){
+    // Count expected committed line delta BEFORE commit so we can verify it actually applied.
+    // (Adds increase the live line count; this is the honest "did it save?" check the prior
+    // handler skipped, which is exactly how the #37583 false-green slipped through.)
+    const preState = await readCommittedLineState(orderId).catch(() => null);
+    const expectedAdds = newCustomLines.length + newVariantLines.length;
+
+    // Commit — CAPTURE the result and INSPECT userErrors (was fire-and-forget: the root-cause bug).
+    const commitRes = await shopifyFetch(`mutation commit($id:ID!,$notify:Boolean!,$note:String){
       orderEditCommit(id:$id,notifyCustomer:$notify,staffNote:$note){
         order{id} userErrors{field message}}}`,
       { id: calcId, notify: false, note: staffNote || null });
+    const cErrs = commitRes.data?.orderEditCommit?.userErrors || [];
+    if (cErrs.length) throw new Error('commit: ' + cErrs.map(e => e.message).join('; '));
+
+    // Verify the committed line delta actually applied (additions must increase the live count).
+    if (expectedAdds > 0 && preState) {
+      const postState = await readCommittedLineState(orderId).catch(() => null);
+      if (postState && postState.lineCount < preState.lineCount + expectedAdds) {
+        throw new Error(`commit reported success but only ${postState.lineCount - preState.lineCount} of ${expectedAdds} added lines persisted`);
+      }
+    }
     logOrderEdit(orderId, session.email, staffNote, changes);
     auditLog(session.email, 'order_edit', orderId, null, changes);
+    if (batchWarnings.length) {
+      return res.redirect(`/orders/${numId}?success=order_edited&msg=${encodeURIComponent(batchWarnings.join(' ').slice(0, 300))}`);
+    }
     res.redirect(`/orders/${numId}?success=order_edited`);
   } catch (err) {
     console.error('order edit error:', err.message);
-    res.redirect(`/orders/${numId}?error=edit_failed`);
+    // Surface the REAL Shopify reason in the banner (renderOrderDetail plumbs ?msg= into flashMsg).
+    res.redirect(`/orders/${numId}?error=edit_failed&msg=${encodeURIComponent(String(err.message || '').slice(0, 300))}`);
+  }
+});
+
+// ── Phase 16H: incremental ("constantly update") order-edit endpoints ─────────
+// Each endpoint runs ONE atomic begin->stage->commit via runOrderEdit (real) or
+// mockIncrementalEdit (mock), requires a client uuid idemKey for dedupe, inspects every
+// userError incl. commit, and returns authoritative server state so the client re-syncs.
+// On Shopify userError they return 422 { ok:false, errors:[...] } — NEVER a false 200.
+
+// Helper: map an ORIGINAL Shopify line-item id to its calculated line-item id within a fresh
+// calculatedOrder (matches by variant id + title, then title alone — mirrors batch idMap logic).
+async function mapOrigToCalc(orderId, calcItems, origLiId) {
+  const origRes = await shopifyFetch(`query($id:ID!){order(id:$id){lineItems(first:100){edges{node{id title variant{id} originalUnitPriceSet{presentmentMoney{amount}} discountedUnitPriceSet{presentmentMoney{amount}}}}}}}`, { id: orderId });
+  const origItems = origRes.data?.order?.lineItems?.edges?.map(e => e.node) || [];
+  const orig = origItems.find(o => o.id === origLiId);
+  if (!orig) return { calcLiId: null, orig: null, calcItem: null };
+  let match = orig.variant?.id ? calcItems.find(c => c.variant?.id === orig.variant.id && c.title === orig.title) : null;
+  if (!match) match = calcItems.find(c => c.title === orig.title && !c.variant);
+  if (!match) match = calcItems.find(c => c.title === orig.title);
+  return { calcLiId: match?.id || null, orig, calcItem: match || null };
+}
+
+// POST /orders/:id/line/add — incremental add-from-picker (one variant). Idempotent.
+app.post('/orders/:id/line/add', requireAuth, async (req, res) => {
+  const numId = req.params.id;
+  const session = req.adminSession;
+  const orderId = `gid://shopify/Order/${numId}`;
+  const { idemKey, variantId, title, sku, qty, listPrice, price } = req.body || {};
+  if (!idemKey) return res.status(400).json({ ok: false, errors: ['idemKey required'] });
+  const q = parseInt(qty, 10);
+  if (!variantId || !(q > 0)) return res.status(400).json({ ok: false, errors: ['variantId and qty>0 required'] });
+  const lp = parseFloat(listPrice) || 0;
+  const pr = Math.max(0, parseFloat(price) || 0);
+  const payload = { variantId: String(variantId), title: String(title || ''), sku: String(sku || ''), qty: q, listPrice: lp, price: pr };
+
+  if (MOCK) {
+    const out = mockIncrementalEdit({ numId, idemKey, action: 'line/add', payload, editedBy: session.email, editFn: (edges) => {
+      const warnings = [];
+      const exists = edges.find(e => e.node.id === `gid://shopify/LineItem/idem-${idemKey}`);
+      if (exists) return warnings; // belt-and-braces (dedupe already handled)
+      edges.push({ node: {
+        id: `gid://shopify/LineItem/idem-${idemKey}`,
+        title: payload.title || 'Catalog item', quantity: q, currentQuantity: q,
+        variant: { id: `gid://shopify/ProductVariant/${payload.variantId}`, sku: payload.sku },
+        discountedUnitPriceSet: { presentmentMoney: { amount: pr.toFixed(2), currencyCode: 'USD' } },
+        originalUnitPriceSet:   { presentmentMoney: { amount: (lp || pr).toFixed(2), currencyCode: 'USD' } },
+      } });
+      return warnings;
+    }});
+    if (!out) return res.status(404).json({ ok: false, errors: ['order not found'] });
+    const added = out.lineState.lines.find(l => l.liId === `gid://shopify/LineItem/idem-${idemKey}`) || out.lineState.lines[out.lineState.lines.length - 1];
+    logOrderEdit(orderId, session.email, null, { action: 'line/add', payload });
+    return res.json({ ok: true, idemKey: out.idemKey, replayed: !!out.replayed, warnings: out.warnings, line: { liId: added?.liId, title: payload.title, sku: payload.sku, qty: q, unitPrice: pr }, order: out.order });
+  }
+
+  try {
+    const result = await runOrderEdit(orderId, idemKey, session.email, 'line/add', payload, async (calcId, ctx) => {
+      const variantGid = payload.variantId.startsWith('gid://') ? payload.variantId : `gid://shopify/ProductVariant/${payload.variantId}`;
+      const addRes = await shopifyFetch(`mutation addVar($id:ID!,$v:ID!,$q:Int!){
+        orderEditAddVariant(id:$id,variantId:$v,quantity:$q,allowDuplicates:true){
+          calculatedLineItem{id calculatedDiscountAllocations{discountApplication{targetSelection}}} calculatedOrder{id} userErrors{field message}}}`,
+        { id: calcId, v: variantGid, q });
+      const addErrs = addRes.data?.orderEditAddVariant?.userErrors || [];
+      if (addErrs.length) throw new OrderEditError(addErrs.map(e => e.message));
+      const calcLineItem = addRes.data?.orderEditAddVariant?.calculatedLineItem;
+      const calcLiId = calcLineItem?.id;
+      const lpEff = lp > 0 ? lp : pr;
+      if (calcLiId && lpEff > 0 && pr >= 0 && pr < lpEff) {
+        if (lineHasStackedOrderDiscount(calcLineItem)) {
+          ctx.warnings.push(`Added at list price ($${lpEff.toFixed(2)}) — this order already has a discount, so a wholesale line discount could not be stacked.`);
+        } else {
+          const pct = ((lpEff - pr) / lpEff) * 100;
+          if (pct > 0 && pct <= 100) {
+            const dRes = await shopifyFetch(`mutation addDisc($id:ID!,$li:ID!,$d:OrderEditAppliedDiscountInput!){
+              orderEditAddLineItemDiscount(id:$id,lineItemId:$li,discount:$d){ calculatedOrder{id} userErrors{field message}}}`,
+              { id: calcId, li: calcLiId, d: { percentValue: parseFloat(pct.toFixed(4)), description: 'B2B wholesale' } });
+            const dErrs = dRes.data?.orderEditAddLineItemDiscount?.userErrors || [];
+            if (dErrs.length) ctx.warnings.push(`Added at list price — ${dErrs.map(e => e.message).join('; ')}`);
+          }
+        }
+      }
+    });
+    // Find the committed line for this add: best-effort match by sku/title with currentQuantity>0.
+    const committed = (result.lineState?.lines || []).filter(l => (l.currentQuantity || 0) > 0);
+    const line = committed.find(l => payload.sku && l.sku === payload.sku) || committed.find(l => l.title === payload.title) || committed[committed.length - 1];
+    logOrderEdit(orderId, session.email, null, { action: 'line/add', payload });
+    auditLog(session.email, 'order_edit_line_add', orderId, null, payload);
+    return res.json({ ok: true, idemKey, replayed: !!result.replayed, warnings: result.warnings || [], line: { liId: line?.liId, title: line?.title || payload.title, sku: line?.sku || payload.sku, qty: line?.currentQuantity ?? q, unitPrice: line?.unitPrice ?? pr }, order: result.order });
+  } catch (err) {
+    const msgs = err instanceof OrderEditError ? err.userMessages : [err.message];
+    console.error('[line/add] failed:', msgs.join('; '));
+    return res.status(422).json({ ok: false, idemKey, errors: msgs });
+  }
+});
+
+// POST /orders/:id/line/custom — incremental custom (non-catalog) line. Idempotent.
+app.post('/orders/:id/line/custom', requireAuth, async (req, res) => {
+  const numId = req.params.id;
+  const session = req.adminSession;
+  const orderId = `gid://shopify/Order/${numId}`;
+  const { idemKey, title, qty, price } = req.body || {};
+  if (!idemKey) return res.status(400).json({ ok: false, errors: ['idemKey required'] });
+  const q = parseInt(qty, 10);
+  const pr = parseFloat(price);
+  if (!title || !(q > 0) || !(pr >= 0)) return res.status(400).json({ ok: false, errors: ['title, qty>0 and price>=0 required'] });
+  const payload = { title: String(title).slice(0, 200), qty: q, price: pr };
+
+  if (MOCK) {
+    const out = mockIncrementalEdit({ numId, idemKey, action: 'line/custom', payload, editedBy: session.email, editFn: (edges) => {
+      edges.push({ node: {
+        id: `gid://shopify/LineItem/idem-${idemKey}`,
+        title: payload.title, quantity: q, currentQuantity: q, variant: null,
+        discountedUnitPriceSet: { presentmentMoney: { amount: pr.toFixed(2), currencyCode: 'USD' } },
+        originalUnitPriceSet:   { presentmentMoney: { amount: pr.toFixed(2), currencyCode: 'USD' } },
+      } });
+      return [];
+    }});
+    if (!out) return res.status(404).json({ ok: false, errors: ['order not found'] });
+    const added = out.lineState.lines.find(l => l.liId === `gid://shopify/LineItem/idem-${idemKey}`) || out.lineState.lines[out.lineState.lines.length - 1];
+    logOrderEdit(orderId, session.email, null, { action: 'line/custom', payload });
+    return res.json({ ok: true, idemKey: out.idemKey, replayed: !!out.replayed, warnings: out.warnings, line: { liId: added?.liId, title: payload.title, sku: '', qty: q, unitPrice: pr }, order: out.order });
+  }
+
+  try {
+    const result = await runOrderEdit(orderId, idemKey, session.email, 'line/custom', payload, async (calcId) => {
+      const addRes = await shopifyFetch(`mutation addItem($id:ID!,$title:String!,$price:MoneyInput!,$qty:Int!){
+        orderEditAddCustomItem(id:$id,title:$title,price:$price,quantity:$qty,taxable:false,requiresShipping:true){
+          calculatedOrder{id} userErrors{field message}}}`,
+        { id: calcId, title: payload.title, price: { amount: pr.toFixed(2), currencyCode: 'USD' }, qty: q });
+      const addErrs = addRes.data?.orderEditAddCustomItem?.userErrors || [];
+      if (addErrs.length) throw new OrderEditError(addErrs.map(e => e.message));
+    });
+    const committed = (result.lineState?.lines || []).filter(l => (l.currentQuantity || 0) > 0);
+    const line = committed.find(l => l.title === payload.title && !l.sku) || committed.find(l => l.title === payload.title) || committed[committed.length - 1];
+    logOrderEdit(orderId, session.email, null, { action: 'line/custom', payload });
+    auditLog(session.email, 'order_edit_line_custom', orderId, null, payload);
+    return res.json({ ok: true, idemKey, replayed: !!result.replayed, warnings: result.warnings || [], line: { liId: line?.liId, title: payload.title, sku: '', qty: line?.currentQuantity ?? q, unitPrice: line?.unitPrice ?? pr }, order: result.order });
+  } catch (err) {
+    const msgs = err instanceof OrderEditError ? err.userMessages : [err.message];
+    console.error('[line/custom] failed:', msgs.join('; '));
+    return res.status(422).json({ ok: false, idemKey, errors: msgs });
+  }
+});
+
+// POST /orders/:id/line/qty — incremental qty change on an EXISTING line. Idempotent.
+// qty 0 mirrors remove semantics (restock:true). Returns currentQuantity (not quantity).
+app.post('/orders/:id/line/qty', requireAuth, async (req, res) => {
+  const numId = req.params.id;
+  const session = req.adminSession;
+  const orderId = `gid://shopify/Order/${numId}`;
+  const { idemKey, liId, qty } = req.body || {};
+  if (!idemKey) return res.status(400).json({ ok: false, errors: ['idemKey required'] });
+  const q = parseInt(qty, 10);
+  if (!liId || !(q >= 0)) return res.status(400).json({ ok: false, errors: ['liId and qty>=0 required'] });
+  const payload = { liId: String(liId), qty: q };
+
+  if (MOCK) {
+    const out = mockIncrementalEdit({ numId, idemKey, action: 'line/qty', payload, editedBy: session.email, editFn: (edges) => {
+      const e = edges.find(x => x.node.id === payload.liId);
+      if (e) { e.node.quantity = q; e.node.currentQuantity = q; }
+      return [];
+    }});
+    if (!out) return res.status(404).json({ ok: false, errors: ['order not found'] });
+    const l = out.lineState.lines.find(x => x.liId === payload.liId);
+    logOrderEdit(orderId, session.email, null, { action: 'line/qty', payload });
+    return res.json({ ok: true, idemKey: out.idemKey, replayed: !!out.replayed, warnings: out.warnings, line: { liId: payload.liId, currentQuantity: l?.currentQuantity ?? q }, order: out.order });
+  }
+
+  try {
+    const result = await runOrderEdit(orderId, idemKey, session.email, 'line/qty', payload, async (calcId, ctx) => {
+      const { calcLiId } = await mapOrigToCalc(orderId, ctx.calcItems, payload.liId);
+      if (!calcLiId) throw new OrderEditError('line not found on order');
+      const r = await shopifyFetch(`mutation setQty($id:ID!,$li:ID!,$qty:Int!,$r:Boolean!){
+        orderEditSetQuantity(id:$id,lineItemId:$li,quantity:$qty,restock:$r){ calculatedOrder{id} userErrors{field message}}}`,
+        { id: calcId, li: calcLiId, qty: q, r: q === 0 });
+      const errs = r.data?.orderEditSetQuantity?.userErrors || [];
+      if (errs.length) throw new OrderEditError(errs.map(e => e.message));
+    });
+    const l = (result.lineState?.lines || []).find(x => x.liId === payload.liId);
+    logOrderEdit(orderId, session.email, null, { action: 'line/qty', payload });
+    auditLog(session.email, 'order_edit_line_qty', orderId, null, payload);
+    return res.json({ ok: true, idemKey, replayed: !!result.replayed, warnings: result.warnings || [], line: { liId: payload.liId, currentQuantity: l?.currentQuantity ?? q }, order: result.order });
+  } catch (err) {
+    const msgs = err instanceof OrderEditError ? err.userMessages : [err.message];
+    console.error('[line/qty] failed:', msgs.join('; '));
+    return res.status(422).json({ ok: false, idemKey, errors: msgs });
+  }
+});
+
+// POST /orders/:id/line/price — incremental unit-price change on an existing discountable line.
+// Removes the explicit per-line discount then re-adds at the new %; guards the stacked-discount case.
+app.post('/orders/:id/line/price', requireAuth, async (req, res) => {
+  const numId = req.params.id;
+  const session = req.adminSession;
+  const orderId = `gid://shopify/Order/${numId}`;
+  const { idemKey, liId, price } = req.body || {};
+  if (!idemKey) return res.status(400).json({ ok: false, errors: ['idemKey required'] });
+  const pr = parseFloat(price);
+  if (!liId || !(pr >= 0)) return res.status(400).json({ ok: false, errors: ['liId and price>=0 required'] });
+  const payload = { liId: String(liId), price: pr };
+
+  if (MOCK) {
+    const out = mockIncrementalEdit({ numId, idemKey, action: 'line/price', payload, editedBy: session.email, editFn: (edges) => {
+      const e = edges.find(x => x.node.id === payload.liId);
+      if (e) e.node.discountedUnitPriceSet = { presentmentMoney: { amount: pr.toFixed(2), currencyCode: 'USD' } };
+      return [];
+    }});
+    if (!out) return res.status(404).json({ ok: false, errors: ['order not found'] });
+    const l = out.lineState.lines.find(x => x.liId === payload.liId);
+    logOrderEdit(orderId, session.email, null, { action: 'line/price', payload });
+    return res.json({ ok: true, idemKey: out.idemKey, replayed: !!out.replayed, warnings: out.warnings, line: { liId: payload.liId, unitPrice: l?.unitPrice ?? pr }, order: out.order });
+  }
+
+  try {
+    const result = await runOrderEdit(orderId, idemKey, session.email, 'line/price', payload, async (calcId, ctx) => {
+      // Need calc item + its discount allocations + retail price to re-discount.
+      const { calcLiId, orig, calcItem } = await mapOrigToCalc(orderId, ctx.calcItems, payload.liId);
+      if (!calcLiId || !orig) throw new OrderEditError('line not found on order');
+      const retail = parseFloat(orig.originalUnitPriceSet?.presentmentMoney?.amount || 0);
+      if (!(retail > 0)) throw new OrderEditError('line has no retail price to discount from');
+      // Find an EXPLICIT per-line discount to remove first.
+      const explicitDisc = (calcItem?.calculatedDiscountAllocations || [])
+        .map(a => a.discountApplication).find(da => da?.targetSelection === 'EXPLICIT');
+      if (lineHasStackedOrderDiscount(calcItem) && !explicitDisc) {
+        throw new OrderEditError('The order has a discount which prevents applying additional discounts to this line item.');
+      }
+      if (explicitDisc?.id) {
+        const remRes = await shopifyFetch(`mutation rem($id:ID!,$did:ID!){
+          orderEditRemoveDiscount(id:$id,discountApplicationId:$did){ calculatedOrder{id} userErrors{field message}}}`,
+          { id: calcId, did: explicitDisc.id });
+        const remErrs = remRes.data?.orderEditRemoveDiscount?.userErrors || [];
+        if (remErrs.length) throw new OrderEditError(remErrs.map(e => e.message));
+      }
+      const pct = ((retail - pr) / retail) * 100;
+      if (pct < 0 || pct > 100) throw new OrderEditError(`price $${pr.toFixed(2)} is out of range for retail $${retail.toFixed(2)}`);
+      if (pct >= 0.0001) {
+        const addRes = await shopifyFetch(`mutation addDisc($id:ID!,$li:ID!,$d:OrderEditAppliedDiscountInput!){
+          orderEditAddLineItemDiscount(id:$id,lineItemId:$li,discount:$d){ calculatedOrder{id} userErrors{field message}}}`,
+          { id: calcId, li: calcLiId, d: { percentValue: parseFloat(pct.toFixed(4)), description: 'B2B price adj' } });
+        const addErrs = addRes.data?.orderEditAddLineItemDiscount?.userErrors || [];
+        if (addErrs.length) throw new OrderEditError(addErrs.map(e => e.message));
+      }
+    });
+    const l = (result.lineState?.lines || []).find(x => x.liId === payload.liId);
+    logOrderEdit(orderId, session.email, null, { action: 'line/price', payload });
+    auditLog(session.email, 'order_edit_line_price', orderId, null, payload);
+    return res.json({ ok: true, idemKey, replayed: !!result.replayed, warnings: result.warnings || [], line: { liId: payload.liId, unitPrice: l?.unitPrice ?? pr }, order: result.order });
+  } catch (err) {
+    const msgs = err instanceof OrderEditError ? err.userMessages : [err.message];
+    console.error('[line/price] failed:', msgs.join('; '));
+    return res.status(422).json({ ok: false, idemKey, errors: msgs });
+  }
+});
+
+// POST /orders/:id/line/remove — incremental remove (setQuantity 0, restock). Idempotent.
+// Shopify retains the line at currentQuantity:0 — client greys the row, does not delete it.
+app.post('/orders/:id/line/remove', requireAuth, async (req, res) => {
+  const numId = req.params.id;
+  const session = req.adminSession;
+  const orderId = `gid://shopify/Order/${numId}`;
+  const { idemKey, liId } = req.body || {};
+  if (!idemKey) return res.status(400).json({ ok: false, errors: ['idemKey required'] });
+  if (!liId) return res.status(400).json({ ok: false, errors: ['liId required'] });
+  const payload = { liId: String(liId) };
+
+  if (MOCK) {
+    const out = mockIncrementalEdit({ numId, idemKey, action: 'line/remove', payload, editedBy: session.email, editFn: (edges) => {
+      const e = edges.find(x => x.node.id === payload.liId);
+      if (e) e.node.currentQuantity = 0;
+      return [];
+    }});
+    if (!out) return res.status(404).json({ ok: false, errors: ['order not found'] });
+    const l = out.lineState.lines.find(x => x.liId === payload.liId);
+    logOrderEdit(orderId, session.email, null, { action: 'line/remove', payload });
+    return res.json({ ok: true, idemKey: out.idemKey, replayed: !!out.replayed, warnings: out.warnings, line: { liId: payload.liId, currentQuantity: l?.currentQuantity ?? 0 }, order: out.order });
+  }
+
+  try {
+    const result = await runOrderEdit(orderId, idemKey, session.email, 'line/remove', payload, async (calcId, ctx) => {
+      const { calcLiId } = await mapOrigToCalc(orderId, ctx.calcItems, payload.liId);
+      if (!calcLiId) throw new OrderEditError('line not found on order');
+      const r = await shopifyFetch(`mutation setQty($id:ID!,$li:ID!,$qty:Int!,$r:Boolean!){
+        orderEditSetQuantity(id:$id,lineItemId:$li,quantity:$qty,restock:$r){ calculatedOrder{id} userErrors{field message}}}`,
+        { id: calcId, li: calcLiId, qty: 0, r: true });
+      const errs = r.data?.orderEditSetQuantity?.userErrors || [];
+      if (errs.length) throw new OrderEditError(errs.map(e => e.message));
+    });
+    const l = (result.lineState?.lines || []).find(x => x.liId === payload.liId);
+    logOrderEdit(orderId, session.email, null, { action: 'line/remove', payload });
+    auditLog(session.email, 'order_edit_line_remove', orderId, null, payload);
+    return res.json({ ok: true, idemKey, replayed: !!result.replayed, warnings: result.warnings || [], line: { liId: payload.liId, currentQuantity: l?.currentQuantity ?? 0 }, order: result.order });
+  } catch (err) {
+    const msgs = err instanceof OrderEditError ? err.userMessages : [err.message];
+    console.error('[line/remove] failed:', msgs.join('; '));
+    return res.status(422).json({ ok: false, idemKey, errors: msgs });
+  }
+});
+
+// POST /orders/:id/discount/order — incremental order-level discount (negative custom item).
+app.post('/orders/:id/discount/order', requireAuth, async (req, res) => {
+  const numId = req.params.id;
+  const session = req.adminSession;
+  const orderId = `gid://shopify/Order/${numId}`;
+  const { idemKey, discountPct, discountFixed, discountReason } = req.body || {};
+  if (!idemKey) return res.status(400).json({ ok: false, errors: ['idemKey required'] });
+  if (!discountReason) return res.status(422).json({ ok: false, errors: ['discountReason is required'] });
+  const pct = parseFloat(discountPct) || 0;
+  const fixed = parseFloat(discountFixed) || 0;
+  if (!(pct > 0) && !(fixed > 0)) return res.status(422).json({ ok: false, errors: ['a discount % or $ amount is required'] });
+  const payload = { discountPct: pct || null, discountFixed: fixed || null, discountReason: String(discountReason).slice(0, 200) };
+
+  if (MOCK) {
+    const out = mockIncrementalEdit({ numId, idemKey, action: 'discount/order', payload, editedBy: session.email, editFn: (edges) => {
+      let sub = 0;
+      for (const e of edges) { const cq = e.node.currentQuantity != null ? e.node.currentQuantity : e.node.quantity; sub += parseFloat(e.node.discountedUnitPriceSet?.presentmentMoney?.amount || 0) * (cq || 0); }
+      const amt = pct > 0 ? sub * pct / 100 : fixed;
+      edges.push({ node: {
+        id: `gid://shopify/LineItem/idem-${idemKey}`, title: `Order discount: ${payload.discountReason}`, quantity: 1, currentQuantity: 1, variant: null,
+        discountedUnitPriceSet: { presentmentMoney: { amount: (-amt).toFixed(2), currencyCode: 'USD' } },
+        originalUnitPriceSet:   { presentmentMoney: { amount: (-amt).toFixed(2), currencyCode: 'USD' } },
+      } });
+      return [];
+    }});
+    if (!out) return res.status(404).json({ ok: false, errors: ['order not found'] });
+    logOrderEdit(orderId, session.email, null, { action: 'discount/order', payload });
+    return res.json({ ok: true, idemKey: out.idemKey, replayed: !!out.replayed, warnings: out.warnings, order: out.order });
+  }
+
+  try {
+    const result = await runOrderEdit(orderId, idemKey, session.email, 'discount/order', payload, async (calcId) => {
+      const totResult = await shopifyFetch(`query($id:ID!){order(id:$id){subtotalPriceSet{presentmentMoney{amount}}}}`, { id: orderId });
+      const subTotal = parseFloat(totResult.data?.order?.subtotalPriceSet?.presentmentMoney?.amount || 0);
+      const discAmt = pct > 0 ? subTotal * pct / 100 : fixed;
+      const addRes = await shopifyFetch(`mutation addItem($id:ID!,$title:String!,$price:MoneyInput!,$qty:Int!){
+        orderEditAddCustomItem(id:$id,title:$title,price:$price,quantity:$qty,taxable:false,requiresShipping:false){
+          calculatedOrder{id} userErrors{field message}}}`,
+        { id: calcId, title: `Order discount: ${payload.discountReason}`, price: { amount: `-${discAmt.toFixed(2)}`, currencyCode: 'USD' }, qty: 1 });
+      const addErrs = addRes.data?.orderEditAddCustomItem?.userErrors || [];
+      if (addErrs.length) throw new OrderEditError(addErrs.map(e => e.message));
+    });
+    logOrderEdit(orderId, session.email, null, { action: 'discount/order', payload });
+    auditLog(session.email, 'order_edit_discount', orderId, null, payload);
+    return res.json({ ok: true, idemKey, replayed: !!result.replayed, warnings: result.warnings || [], order: result.order });
+  } catch (err) {
+    const msgs = err instanceof OrderEditError ? err.userMessages : [err.message];
+    console.error('[discount/order] failed:', msgs.join('; '));
+    return res.status(422).json({ ok: false, idemKey, errors: msgs });
+  }
+});
+
+// GET /api/orders/:id/line-state — authoritative line state for the client to re-sync/reconcile.
+app.get('/api/orders/:id/line-state', requireAuth, async (req, res) => {
+  const numId = req.params.id;
+  const orderId = `gid://shopify/Order/${numId}`;
+  if (MOCK) {
+    const order = getMockOrder(numId);
+    if (!order) return res.status(404).json({ ok: false, error: 'order not found' });
+    const edges = order.lineItems?.edges || [];
+    let subtotal = 0;
+    const lines = edges.map(e => {
+      const cq = e.node.currentQuantity != null ? e.node.currentQuantity : e.node.quantity;
+      const up = parseFloat(e.node.discountedUnitPriceSet?.presentmentMoney?.amount || 0);
+      subtotal += up * (cq || 0);
+      return { liId: e.node.id, currentQuantity: cq, unitPrice: up };
+    });
+    const ship = parseFloat(order.totalShippingPriceSet?.presentmentMoney?.amount || 0);
+    return res.json({ ok: true, lines, subtotal, total: subtotal + ship, lineCount: lines.filter(l => (l.currentQuantity || 0) > 0).length });
+  }
+  try {
+    const st = await readCommittedLineState(orderId);
+    return res.json({ ok: true, lines: st.lines.map(l => ({ liId: l.liId, currentQuantity: l.currentQuantity, unitPrice: l.unitPrice })), subtotal: st.subtotal, total: st.total, lineCount: st.lineCount });
+  } catch (err) {
+    console.error('[line-state] failed:', err.message);
+    return res.status(502).json({ ok: false, error: err.message });
   }
 });
 

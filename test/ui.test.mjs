@@ -745,6 +745,71 @@ await test('/orders/1001 Add-product search shows grouped suggestions on type', 
   assert.equal(errors.length, 0, 'no JS errors during picker use; got: ' + errors.join(' | '));
 });
 
+// ── Phase 16H: incremental auto-save (the "constantly update" behaviour) ──────
+// Drives the REAL edit page in a browser: add a catalog variant via the grouped picker and
+// assert it persists (row flips saving->saved, gains a committed line id) WITHOUT clicking the
+// batch "Save changes" button — then add the same way again and assert NO double-add. Fails on
+// ANY console error / pageerror (a thrown exception in the auto-save controller would otherwise
+// hide silently — the exact class of regression we are guarding against).
+await test('/orders/1001 add-from-picker auto-saves WITHOUT manual Save + no double-add', async (page, ctx) => {
+  const errors = [];
+  page.on('console', m => { if (m.type() === 'error') errors.push('console.error: ' + m.text()); });
+  page.on('pageerror', e => errors.push('pageerror: ' + e.message));
+  page.on('requestfailed', r => {
+    // ignore favicon / aborted navigations; flag failed XHRs to our endpoints
+    const u = r.url();
+    if (/\/orders\/\d+\/(line|discount)\//.test(u) || /\/api\/orders\/\d+\/line-state/.test(u)) errors.push('requestfailed: ' + u);
+  });
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/orders/1001`);
+  await page.waitForSelector('#edit-btn');
+  await page.click('#edit-btn');                              // enter edit mode
+  await page.waitForSelector('#edit-product-search', { state: 'visible' });
+  await page.fill('#edit-product-search', 'pinpoint');
+  await page.waitForSelector('#edit-product-results .edit-var-cb', { timeout: 5000 });
+
+  // Add a single variant via the picker.
+  await page.locator('#edit-product-results .edit-var-cb').nth(0).check();
+  await page.click('#edit-add-selected');
+  const row = page.locator('#edit-form tr.catalog-line-new').first();
+  await row.waitFor();
+
+  // Auto-save must complete and stamp a committed line id — WITHOUT touching the Save button.
+  await page.waitForFunction(() => {
+    const r = document.querySelector('#edit-form tr.catalog-line-new');
+    return r && r.dataset.committedLiId;
+  }, { timeout: 8000 });
+  const committedId1 = await row.evaluate(el => el.dataset.committedLiId);
+  assert.ok(committedId1, 'first added row must gain a committed line id from /line/add (no manual Save)');
+
+  // The global pill should settle back to "All changes saved".
+  await page.waitForFunction(() => {
+    const p = document.getElementById('autosave-pill');
+    return p && p.dataset.state === 'saved';
+  }, { timeout: 8000 });
+
+  // Capture authoritative line count, then add a SECOND distinct variant.
+  const stateA = await page.evaluate(async () => (await (await fetch('/api/orders/1001/line-state', { credentials: 'same-origin' })).json()));
+  await page.fill('#edit-product-search', 'pinpoint');
+  await page.waitForSelector('#edit-product-results .edit-var-cb', { timeout: 5000 });
+  await page.locator('#edit-product-results .edit-var-cb').nth(1).check();
+  await page.click('#edit-add-selected');
+  await page.waitForFunction((n) => document.querySelectorAll('#edit-form tr.catalog-line-new').length === n, 2);
+  await page.waitForFunction(() => {
+    const rows = document.querySelectorAll('#edit-form tr.catalog-line-new');
+    return rows.length === 2 && [...rows].every(r => r.dataset.committedLiId);
+  }, { timeout: 8000 });
+  const stateB = await page.evaluate(async () => (await (await fetch('/api/orders/1001/line-state', { credentials: 'same-origin' })).json()));
+  assert.equal(stateB.lineCount, stateA.lineCount + 1, 'second distinct add increases lineCount by exactly 1 (no double-add)');
+
+  // Two new rows must carry DISTINCT committed ids (proves each persisted once).
+  const ids = await page.locator('#edit-form tr.catalog-line-new').evaluateAll(rows => rows.map(r => r.dataset.committedLiId));
+  assert.equal(new Set(ids).size, 2, 'each added row has a distinct committed id');
+
+  assert.equal(errors.length, 0, 'no JS/network errors during auto-save flow; got: ' + errors.join(' | '));
+});
+
 await test('/orders/1001 fulfill modal opens on button click', async (page, ctx) => {
   const sid = await seedSession();
   await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);

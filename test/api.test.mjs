@@ -412,6 +412,124 @@ await test('GET /api/products/search requires auth', async () => {
   assert.equal(res.status, 401);
 });
 
+// ── Phase 16H: incremental ("constantly update") order-edit endpoints ─────────
+console.log('\nAPI tests — Phase 16H: incremental auto-save order edit:');
+
+function uuid() { return crypto.randomUUID(); }
+async function postJson(path, cookie, body) {
+  const res = await fetch(`${BASE}${path}`, {
+    method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body), redirect: 'manual',
+  });
+  let json = null; try { json = await res.json(); } catch {}
+  return { status: res.status, json };
+}
+
+await test('POST /orders/1001/line/add requires auth (redirects unauthenticated to /login)', async () => {
+  const res = await fetch(`${BASE}/orders/1001/line/add`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ idemKey: uuid(), variantId: '350', qty: 1 }), redirect: 'manual',
+  });
+  // Non-/api/ routes use requireAuth which redirects to /login (302) when unauthenticated.
+  assert.equal(res.status, 302, 'unauthenticated add must redirect');
+  assert.ok((res.headers.get('location') || '').includes('/login'), 'redirect target is /login');
+});
+
+await test('POST /orders/1001/line/add adds a line and returns authoritative order state', async () => {
+  const cookie = await seedSession();
+  const before = await (await fetch(`${BASE}/api/orders/1001/line-state`, { headers: { Cookie: cookie } })).json();
+  const r = await postJson('/orders/1001/line/add', cookie, { idemKey: uuid(), variantId: '350', title: 'Pinpoint SM', sku: 'PLS-12-SM', qty: 2, listPrice: 28.0, price: 14.0 });
+  assert.equal(r.status, 200, 'add should 200');
+  assert.equal(r.json.ok, true);
+  assert.ok(r.json.line && r.json.line.liId, 'returns committed line id (so client can swap optimistic id)');
+  assert.ok(r.json.order && typeof r.json.order.lineCount === 'number', 'returns order.lineCount');
+  assert.equal(r.json.order.lineCount, before.lineCount + 1, 'lineCount increases by exactly 1');
+});
+
+await test('POST /orders/1001/line/add is IDEMPOTENT — same idemKey does NOT double-add', async () => {
+  const cookie = await seedSession();
+  const key = uuid();
+  const body = { idemKey: key, variantId: '353', title: 'Pinpoint SM 1.5', sku: 'PLS-15-SM', qty: 1, listPrice: 32.0, price: 16.0 };
+  const r1 = await postJson('/orders/1001/line/add', cookie, body);
+  assert.equal(r1.json.ok, true);
+  assert.equal(r1.json.replayed, false, 'first call is a real commit');
+  const countAfter1 = r1.json.order.lineCount;
+  const r2 = await postJson('/orders/1001/line/add', cookie, body); // same key
+  assert.equal(r2.json.ok, true);
+  assert.equal(r2.json.replayed, true, 'second call with same idemKey is a replay');
+  assert.equal(r2.json.order.lineCount, countAfter1, 'lineCount UNCHANGED on replay — no double-add');
+});
+
+await test('POST /orders/1001/line/add with DIFFERENT idemKeys adds two distinct lines', async () => {
+  const cookie = await seedSession();
+  const base = await (await fetch(`${BASE}/api/orders/1001/line-state`, { headers: { Cookie: cookie } })).json();
+  await postJson('/orders/1001/line/add', cookie, { idemKey: uuid(), variantId: '350', title: 'A', sku: 'A1', qty: 1, listPrice: 28, price: 14 });
+  const r2 = await postJson('/orders/1001/line/add', cookie, { idemKey: uuid(), variantId: '353', title: 'B', sku: 'B1', qty: 1, listPrice: 32, price: 16 });
+  assert.equal(r2.json.order.lineCount, base.lineCount + 2, 'two distinct keys add two lines');
+});
+
+await test('POST /orders/1001/line/custom adds a custom line', async () => {
+  const cookie = await seedSession();
+  const r = await postJson('/orders/1001/line/custom', cookie, { idemKey: uuid(), title: 'Rush fee', qty: 1, price: 9.99 });
+  assert.equal(r.status, 200);
+  assert.equal(r.json.ok, true);
+  assert.ok(r.json.line.liId, 'custom line returns a committed id');
+  assert.equal(r.json.line.unitPrice, 9.99);
+});
+
+await test('POST /orders/1001/line/custom rejects missing fields with 4xx', async () => {
+  const cookie = await seedSession();
+  const r = await postJson('/orders/1001/line/custom', cookie, { idemKey: uuid(), title: '', qty: 0, price: -1 });
+  assert.ok(r.status >= 400, 'invalid custom line must not 200');
+  assert.equal(r.json.ok, false);
+});
+
+await test('POST /orders/:id/line/* requires idemKey (400 without it)', async () => {
+  const cookie = await seedSession();
+  const r = await postJson('/orders/1001/line/add', cookie, { variantId: '350', qty: 1 });
+  assert.equal(r.status, 400);
+  assert.ok((r.json.errors || []).join(' ').includes('idemKey'));
+});
+
+await test('POST /orders/1001/line/qty changes an existing line and returns currentQuantity', async () => {
+  const cookie = await seedSession();
+  const r = await postJson('/orders/1001/line/qty', cookie, { idemKey: uuid(), liId: 'li1', qty: 7 });
+  assert.equal(r.status, 200);
+  assert.equal(r.json.ok, true);
+  assert.equal(r.json.line.currentQuantity, 7, 'returns the updated currentQuantity');
+});
+
+await test('POST /orders/1001/line/remove zeroes currentQuantity (line retained)', async () => {
+  const cookie = await seedSession();
+  const r = await postJson('/orders/1001/line/remove', cookie, { idemKey: uuid(), liId: 'li2' });
+  assert.equal(r.status, 200);
+  assert.equal(r.json.ok, true);
+  assert.equal(r.json.line.currentQuantity, 0, 'removed line reports currentQuantity 0, not deleted');
+});
+
+await test('POST /orders/1001/discount/order requires a reason (422 without it)', async () => {
+  const cookie = await seedSession();
+  const r = await postJson('/orders/1001/discount/order', cookie, { idemKey: uuid(), discountPct: 10 });
+  assert.equal(r.status, 422);
+  assert.equal(r.json.ok, false);
+});
+
+await test('GET /api/orders/1001/line-state returns lines with currentQuantity + totals', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/api/orders/1001/line-state`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const json = await res.json();
+  assert.equal(json.ok, true);
+  assert.ok(Array.isArray(json.lines), 'lines array present');
+  assert.ok(json.lines.every(l => 'currentQuantity' in l), 'every line has currentQuantity');
+  assert.ok(typeof json.subtotal === 'number' && typeof json.lineCount === 'number');
+});
+
+await test('GET /api/orders/1001/line-state requires auth', async () => {
+  const res = await fetch(`${BASE}/api/orders/1001/line-state`, { redirect: 'manual' });
+  assert.equal(res.status, 401);
+});
+
 console.log('\nAPI tests — Phase 3: Catalog:');
 
 await test('GET /catalog returns 200 with product table', async () => {
