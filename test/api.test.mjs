@@ -213,6 +213,110 @@ await test('GET /orders/1001/invoice.pdf returns PDF content-type', async () => 
   assert.ok(res.headers.get('content-type')?.includes('application/pdf'));
 });
 
+// CURRENT-FIELDS (2026-06-29): invoice CSV must reflect post-edit line qtys + Line Totals (currentQuantity,
+// fallback frozen quantity) and DROP lines removed in an edit (currentQuantity 0). Fixture #1008 is edited:
+//   - li1008a partial: quantity 2 -> currentQuantity 1 @ $30  => qty col '1', Line Total '30.00'
+//   - li1008b untouched: quantity 1 / currentQuantity 1 @ $80 => qty '1', total '80.00'
+//   - li1008c removed: currentQuantity 0 => MUST be absent
+// So with the default cols the CSV has a header row + exactly 2 data rows; removed line title/SKU absent.
+function parseCsvBody(text) {
+  // strip leading UTF-8 BOM, split on CRLF (buildInvoiceCsv joins rows with carriage-return + newline)
+  const body = text.replace(/^﻿/, '');
+  return body.split('\r\n').filter(l => l.length > 0).map(line => {
+    const cells = [];
+    let cur = '', inQ = false;
+    for (let i = 0; i < line.length; i++) {
+      const c = line[i];
+      if (inQ) {
+        if (c === '"' && line[i + 1] === '"') { cur += '"'; i++; }
+        else if (c === '"') inQ = false;
+        else cur += c;
+      } else {
+        if (c === '"') inQ = true;
+        else if (c === ',') { cells.push(cur); cur = ''; }
+        else cur += c;
+      }
+    }
+    cells.push(cur);
+    return cells;
+  });
+}
+
+await test('GET /orders/1008/invoice.csv (EDITED) drops removed lines + uses currentQuantity for qty/total', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/orders/1008/invoice.csv`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200, 'invoice.csv should 200');
+  assert.ok(res.headers.get('content-type')?.includes('text/csv'), 'content-type text/csv');
+  const text = await res.text();
+  const rows = parseCsvBody(text);
+  // header + 2 active data rows (removed line excluded)
+  assert.equal(rows.length, 3, `expected header + 2 data rows, got ${rows.length}: ${JSON.stringify(rows)}`);
+  const header = rows[0];
+  const data = rows.slice(1);
+  // Removed line must be absent (by title and SKU)
+  assert.ok(!text.includes('Removed Harness'), 'Removed (currentQuantity 0) title must be absent from CSV');
+  assert.ok(!text.includes('RH-003'), 'Removed (currentQuantity 0) SKU must be absent from CSV');
+  // Locate qty + total + sku columns by header name (default cols: title,variant1,variant2,sku,wholesale,qty,total)
+  const qtyIdx   = header.indexOf('Qty');
+  const totalIdx = header.indexOf('Line Total');
+  const skuIdx   = header.indexOf('SKU');
+  assert.ok(qtyIdx >= 0 && totalIdx >= 0 && skuIdx >= 0, `missing expected columns in header ${JSON.stringify(header)}`);
+  const partial = data.find(r => r[skuIdx] === 'EP-001');
+  assert.ok(partial, 'partial line EP-001 should be present');
+  assert.equal(partial[qtyIdx], '1', `partial qty should be currentQuantity 1, got ${partial[qtyIdx]}`);
+  assert.equal(partial[totalIdx], '30.00', `partial Line Total should be 1 x $30 = 30.00, got ${partial[totalIdx]}`);
+  const untouched = data.find(r => r[skuIdx] === 'UL-002');
+  assert.ok(untouched, 'untouched line UL-002 should be present');
+  assert.equal(untouched[qtyIdx], '1', `untouched qty should be 1, got ${untouched[qtyIdx]}`);
+  assert.equal(untouched[totalIdx], '80.00', `untouched total should be 80.00, got ${untouched[totalIdx]}`);
+});
+
+await test('GET /orders/1001/invoice.csv (UNEDITED) regression — frozen quantity preserved, all lines present', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/orders/1001/invoice.csv`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const text = await res.text();
+  const rows = parseCsvBody(text);
+  // #1001 has 2 lines, neither edited (no currentQuantity) => header + 2 data rows, both present.
+  assert.equal(rows.length, 3, `unedited #1001 should have header + 2 data rows, got ${rows.length}`);
+  const header = rows[0];
+  const data = rows.slice(1);
+  const qtyIdx   = header.indexOf('Qty');
+  const totalIdx = header.indexOf('Line Total');
+  const skuIdx   = header.indexOf('SKU');
+  const elite = data.find(r => r[skuIdx] === 'EC-001-S-NV');
+  const luxe  = data.find(r => r[skuIdx] === 'LL-005');
+  assert.ok(elite && luxe, 'both unedited lines present');
+  assert.equal(elite[qtyIdx], '5', 'Elite Collar qty = frozen quantity 5');
+  assert.equal(elite[totalIdx], '90.00', 'Elite Collar total = 5 x $18 = 90.00');
+  assert.equal(luxe[qtyIdx], '2', 'Luxe Leash qty = frozen quantity 2');
+  assert.equal(luxe[totalIdx], '75.00', 'Luxe Leash total = 2 x $37.50 = 75.00');
+});
+
+// CURRENT-FIELDS (2026-06-29): orders-list line summary must reflect CURRENT qty (currentQuantity,
+// fallback frozen quantity) and skip removed (currentQuantity 0) lines. #1008 summary should read
+// "Edited Partial Collar x1, Untouched Leash x1" — NOT "x2", and must not mention "Removed Harness".
+await test('GET /orders list summary reflects currentQuantity + hides removed line for edited #1008', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/orders`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  // Isolate the #1008 row's cells to avoid matching other orders.
+  // The summary cell uses the multiplication sign char between title and qty.
+  const MUL = String.fromCharCode(215); // ×
+  assert.ok(html.includes('Edited Partial Collar ' + MUL + '1'),
+    `#1008 partial line should show current qty 1 (got no "Edited Partial Collar ${MUL}1")`);
+  assert.ok(!html.includes('Edited Partial Collar ' + MUL + '2'),
+    `#1008 partial line must NOT show frozen qty 2`);
+  assert.ok(html.includes('Untouched Leash ' + MUL + '1'),
+    `#1008 untouched line should show qty 1`);
+  assert.ok(!html.includes('Removed Harness'),
+    `Removed (currentQuantity 0) line must not appear in any list summary`);
+  // Regression: an unedited order (#1001) still shows its frozen qty (Elite Collar x5).
+  assert.ok(html.includes('Elite Collar ' + MUL + '5'),
+    `Unedited #1001 summary should still show frozen qty 5`);
+});
+
 await test('POST /orders/bulk mark-paid redirects to /orders', async () => {
   const cookie = await seedSession();
   const res = await fetch(`${BASE}/orders/bulk`, {

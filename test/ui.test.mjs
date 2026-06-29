@@ -494,6 +494,44 @@ await test('/labels order tab shows form after loading order', async (page, ctx)
   assert.ok(html.includes('Elite Collar') || html.includes('Avery'), 'Should show order items or options');
 });
 
+// CURRENT-FIELDS (2026-06-29): packing labels from an EDITED order must show post-edit qtys (currentQuantity,
+// fallback frozen quantity) and OMIT lines removed in the edit (currentQuantity 0). Fixture #1008:
+//   li1008a Edited Partial Collar quantity2->currentQuantity1 ; li1008b Untouched Leash currentQuantity1 ;
+//   li1008c Removed Harness currentQuantity0 (MUST be absent). So 2 label rows; partial qty input = 1.
+await test('/labels?order=1008 (EDITED) lists only active lines + qty input reflects currentQuantity', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/labels?source=order&order=1008`);
+  await page.waitForSelector('.tab-bar');
+  const html = await page.content();
+  // Removed line must be absent
+  assert.ok(!html.includes('Removed Harness'), 'Removed (currentQuantity 0) line must not appear on labels');
+  // Active lines present
+  assert.ok(html.includes('Edited Partial Collar'), 'Partial line should appear');
+  assert.ok(html.includes('Untouched Leash'), 'Untouched line should appear');
+  // Exactly 2 per-item qty inputs (one per active line)
+  const qtyInputs = await page.$$eval('input[name^="item_qty_"]', els => els.map(e => e.value));
+  assert.equal(qtyInputs.length, 2, `Expected 2 label qty inputs (active lines only), got ${qtyInputs.length}`);
+  // Partial line's qty input must be currentQuantity (1), not frozen 2.
+  // Items render in fixture order: [0]=partial(1), [1]=untouched(1). Both are 1, and neither is 2.
+  assert.ok(!qtyInputs.includes('2'), `No label qty should be the frozen 2 on this edited order; got ${JSON.stringify(qtyInputs)}`);
+  assert.deepEqual(qtyInputs, ['1', '1'], `Both active label qtys should be currentQuantity 1; got ${JSON.stringify(qtyInputs)}`);
+});
+
+await test('/labels?order=1001 (UNEDITED) regression — all lines present, qty inputs = frozen quantity', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/labels?source=order&order=1001`);
+  await page.waitForSelector('.tab-bar');
+  const html = await page.content();
+  assert.ok(html.includes('Elite Collar'), 'Elite Collar present');
+  assert.ok(html.includes('Luxe Leash'), 'Luxe Leash present');
+  const qtyInputs = await page.$$eval('input[name^="item_qty_"]', els => els.map(e => e.value));
+  assert.equal(qtyInputs.length, 2, `Unedited #1001 should have 2 label rows, got ${qtyInputs.length}`);
+  // #1001 lines: Elite Collar quantity 5, Luxe Leash quantity 2 (no currentQuantity => frozen values).
+  assert.deepEqual(qtyInputs.sort(), ['2', '5'], `Unedited qty inputs should be frozen [5,2]; got ${JSON.stringify(qtyInputs)}`);
+});
+
 await test('/labels preview button is present in product view', async (page, ctx) => {
   const sid = await seedSession();
   await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);

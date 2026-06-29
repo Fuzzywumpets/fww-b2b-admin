@@ -1636,7 +1636,7 @@ async function getOrdersData(filters) {
             displayFinancialStatus displayFulfillmentStatus
             totalPriceSet{presentmentMoney{amount currencyCode}}
             sourceName note tags
-            lineItems(first:3){edges{node{title quantity variant{sku}}}}
+            lineItems(first:3){edges{node{title quantity currentQuantity variant{sku}}}}
           }}
           pageInfo{hasNextPage endCursor}
         }
@@ -1664,8 +1664,13 @@ function renderOrdersList(session, data, filters) {
     const numId  = shopifyNumericId(o.id);
     const status = (o.displayFinancialStatus || '').toLowerCase();
     const fstatus = (o.displayFulfillmentStatus || '').toLowerCase().replace(/_/g, '-');
-    const lineItemSummary = (o.lineItems?.edges || []).slice(0, 3)
-      .map(e => `${e.node.title} ×${e.node.quantity}`).join(', ');
+    // CURRENT-FIELDS (2026-06-29): list preview reflects what's CURRENTLY in the order — show
+    // currentQuantity (post-edit truth, fallback frozen quantity) and skip lines removed in an
+    // edit (currentQuantity 0). slice(0,3) AFTER filtering so a removed line never eats a preview slot.
+    const lineItemSummary = (o.lineItems?.edges || [])
+      .filter(e => ((e.node.currentQuantity != null ? e.node.currentQuantity : e.node.quantity) || 0) > 0)
+      .slice(0, 3)
+      .map(e => `${e.node.title} ×${e.node.currentQuantity != null ? e.node.currentQuantity : e.node.quantity}`).join(', ');
     const src = deriveOrderSource(o);
     const srcLabel = ORDER_SOURCE_LABELS[src] || src;
     const srcColor = ORDER_SOURCE_COLORS[src] || 'muted';
@@ -4872,6 +4877,13 @@ function buildInvoiceCsv(order, cols) {
   if (cols.includes('total'))    headers.push('Line Total');
   const rows = [headers];
   for (const item of lineItems) {
+    // CURRENT-FIELDS (2026-06-29): invoice the order's CURRENT lines. qty + Line Total key off
+    // currentQuantity (post-edit truth), falling back to the frozen `quantity` for unedited orders
+    // (where currentQuantity is absent). Lines fully removed in an edit (currentQuantity 0) are SKIPPED
+    // entirely — Shopify retains them on the order but they're no longer part of it. getOrderDetail
+    // (the only feeder of this fn) already selects currentQuantity per line.
+    const currentQty = item.currentQuantity != null ? item.currentQuantity : (item.quantity || 0);
+    if (currentQty <= 0) continue;
     const wholesale = parseFloat(item.discountedUnitPriceSet?.presentmentMoney?.amount ?? item.originalUnitPriceSet?.presentmentMoney?.amount ?? 0);
     const retail    = parseFloat(item.originalUnitPriceSet?.presentmentMoney?.amount ?? 0);
     const opts = item.variant?.selectedOptions || [];
@@ -4884,8 +4896,8 @@ function buildInvoiceCsv(order, cols) {
     if (cols.includes('sku'))      row.push(item.variant?.sku || '');
     if (cols.includes('retail'))   row.push(retail.toFixed(2));
     if (cols.includes('wholesale'))row.push(wholesale.toFixed(2));
-    if (cols.includes('qty'))      row.push(String(item.quantity || 0));
-    if (cols.includes('total'))    row.push((wholesale * (item.quantity || 0)).toFixed(2));
+    if (cols.includes('qty'))      row.push(String(currentQty));
+    if (cols.includes('total'))    row.push((wholesale * currentQty).toFixed(2));
     rows.push(row);
   }
   return rows.map(r => r.map(v => `"${String(v).replace(/"/g, '""')}"`).join(',')).join('\r\n');
@@ -8088,7 +8100,11 @@ async function getOrderForLabels(numericId) {
   if (MOCK) {
     const o = MOCK_ORDERS.find(o => shopifyNumericId(o.id) === numericId);
     if (!o) return null;
-    return { order: o, items: o.lineItems.edges.map(e => {
+    return { order: o, items: o.lineItems.edges
+      // CURRENT-FIELDS (2026-06-29): drop lines removed in an edit (currentQuantity 0) so packing
+      // labels never list a line that's no longer part of the order.
+      .filter(e => ((e.node.currentQuantity != null ? e.node.currentQuantity : e.node.quantity) || 0) > 0)
+      .map(e => {
       const v = e.node.variant || {};
       return {
         barcode:      v.barcode || '',
@@ -8096,7 +8112,8 @@ async function getOrderForLabels(numericId) {
         variantTitle: v.displayName || v.sku || 'Default Title',
         sku:          v.sku || '',
         price:        v.price || '0.00',
-        qty:          e.node.quantity,
+        // qty keys off currentQuantity (post-edit truth), falling back to frozen quantity for unedited orders.
+        qty:          e.node.currentQuantity != null ? e.node.currentQuantity : e.node.quantity,
       };
     })};
   }
@@ -8104,7 +8121,7 @@ async function getOrderForLabels(numericId) {
     query($id:ID!){order(id:$id){
       name
       lineItems(first:50){edges{node{
-        title quantity
+        title quantity currentQuantity
         variant{id sku price barcode displayName}
       }}}
     }}`, { id: `gid://shopify/Order/${numericId}` });
@@ -8112,13 +8129,17 @@ async function getOrderForLabels(numericId) {
   if (!o) return null;
   return {
     order: o,
-    items: o.lineItems.edges.map(e => ({
+    items: o.lineItems.edges
+      // CURRENT-FIELDS (2026-06-29): drop lines removed in an edit (currentQuantity 0).
+      .filter(e => ((e.node.currentQuantity != null ? e.node.currentQuantity : e.node.quantity) || 0) > 0)
+      .map(e => ({
       barcode:      e.node.variant?.barcode || '',
       title:        e.node.title,
       variantTitle: e.node.variant?.displayName || e.node.variant?.sku || '',
       sku:          e.node.variant?.sku || '',
       price:        e.node.variant?.price || '0.00',
-      qty:          e.node.quantity,
+      // qty keys off currentQuantity (post-edit truth), falling back to frozen quantity for unedited orders.
+      qty:          e.node.currentQuantity != null ? e.node.currentQuantity : e.node.quantity,
     })),
   };
 }
