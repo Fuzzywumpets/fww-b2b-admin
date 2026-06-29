@@ -185,6 +185,60 @@ await test('/orders/1001 backorder control is an action ("Mark backordered"), no
   assert.ok(html.includes('class="edit-remove-btn bo-action-btn"'), 'backorder action keeps edit-mode reveal class');
 });
 
+// CURRENT-FIELDS (2026-06-29): an EDITED order must render its CURRENT state on FIRST PAINT —
+// currentQuantity line rows + current totals, with fully-removed (currentQuantity 0) lines hidden —
+// independent of the client reconcile JS (which only fires after an edit action, not on load).
+// Fixture #1008: frozen subtotal/total $300.00, current $110.00; 3 line edges (1 partial qty2→1,
+// 1 untouched, 1 removed) ⇒ 2 active rows / $110.00 expected, NOT 3 rows / $300.00.
+await test('/orders/1008 edited order renders CURRENT qty rows + current totals on first paint, hides removed lines', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/orders/1008`);
+  await page.waitForSelector('.timeline');
+
+  // Exactly 2 active existing line rows (the removed line is NOT rendered).
+  const rowCount = await page.$$eval('#edit-form tr[data-existing="1"]', rows => rows.length);
+  assert.equal(rowCount, 2, `Expected 2 active line rows, got ${rowCount}`);
+
+  const html = await page.content();
+  // Removed line must be absent everywhere (line table, fulfill picker, ship picker).
+  assert.ok(!html.includes('Removed Harness'), 'Removed (currentQuantity 0) line must be hidden');
+  assert.ok(html.includes('Edited Partial Collar'), 'Partial line should still render');
+  assert.ok(html.includes('Untouched Leash'), 'Untouched line should still render');
+
+  // Partial line's static qty must show currentQuantity (1), not the frozen original (2).
+  const partialRowQty = await page.$eval(
+    '#edit-form tr[data-li-id="li1008a"] .edit-qty-static',
+    el => el.textContent.trim());
+  assert.equal(partialRowQty, '1', `Partial line should show currentQuantity 1, got ${partialRowQty}`);
+
+  // Totals block: subtotal AND total = $110.00 (current), never the frozen $300.00.
+  const subtotalText = await page.$eval('.totals-block .totals-row', el => el.lastElementChild.textContent.trim());
+  const totalText    = await page.$eval('.totals-block .totals-total', el => el.lastElementChild.textContent.trim());
+  assert.ok(subtotalText.includes('110.00'), `Subtotal should be current $110.00, got "${subtotalText}"`);
+  assert.ok(totalText.includes('110.00'), `Total should be current $110.00, got "${totalText}"`);
+  assert.ok(!subtotalText.includes('300.00'), 'Subtotal must not show the frozen $300.00');
+  assert.ok(!totalText.includes('300.00'), 'Total must not show the frozen $300.00');
+
+  // Cancel-modal headline total must also reflect the current $110.00.
+  assert.ok(html.includes('($110.00)'), 'Cancel modal should show current total $110.00');
+});
+
+await test('/orders/1007 unedited order is UNCHANGED — line renders + totals intact (regression)', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/orders/1007`);
+  await page.waitForSelector('.timeline');
+  // #1007: 1 line item, no currentQuantity override → it renders; subtotal & total $200 unchanged.
+  // (Dedicated fixture not mutated by other tests, so the row count is deterministic.)
+  const rowCount = await page.$$eval('#edit-form tr[data-existing="1"]', rows => rows.length);
+  assert.equal(rowCount, 1, `Unedited order should render its 1 line, got ${rowCount}`);
+  const subtotalText = await page.$eval('.totals-block .totals-row', el => el.lastElementChild.textContent.trim());
+  const totalText    = await page.$eval('.totals-block .totals-total', el => el.lastElementChild.textContent.trim());
+  assert.ok(subtotalText.includes('200.00'), `Unedited subtotal should be $200.00, got "${subtotalText}"`);
+  assert.ok(totalText.includes('200.00'), `Unedited total should be $200.00, got "${totalText}"`);
+});
+
 await test('/orders/new shows customer and product search', async (page, ctx) => {
   const sid = await seedSession();
   await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);

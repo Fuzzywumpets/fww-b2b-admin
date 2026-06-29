@@ -343,19 +343,25 @@ async function createXeroInvoice(order, accountMap) {
 
   const contactId = await ensureXeroContact(order.customer || { displayName: 'Unknown', email: '' });
 
-  const lineItems = (order.lineItems?.edges || []).map(e => {
-    const li     = e.node;
-    const price  = parseFloat(li.originalUnitPriceSet?.presentmentMoney?.amount || li.discountedUnitPriceSet?.presentmentMoney?.amount || '0');
-    const qty    = li.quantity || 1;
-    return {
-      Description:    `${li.title}${li.variantTitle ? ' — ' + li.variantTitle : ''}`,
-      Quantity:        qty,
-      UnitAmount:      price,
-      AccountCode:     accountMap.sales_revenue,
-      TaxType:         'NONE',
-      LineAmount:      Math.round(price * qty * 100) / 100,
-    };
-  });
+  // CURRENT-FIELDS (2026-06-29): invoice the order's CURRENT lines — use currentQuantity (post-edit truth)
+  // and DROP lines removed in an edit (currentQuantity 0). getOrderDetail (the only feeder of this fn) now
+  // selects currentQuantity; it falls back to `quantity` when the field is absent (unedited orders / webhook
+  // shapes that omit it) so unedited orders invoice exactly as before.
+  const lineItems = (order.lineItems?.edges || [])
+    .map(e => e.node)
+    .filter(li => (li.currentQuantity != null ? li.currentQuantity : (li.quantity || 0)) > 0)
+    .map(li => {
+      const price  = parseFloat(li.originalUnitPriceSet?.presentmentMoney?.amount || li.discountedUnitPriceSet?.presentmentMoney?.amount || '0');
+      const qty    = li.currentQuantity != null ? li.currentQuantity : (li.quantity || 1);
+      return {
+        Description:    `${li.title}${li.variantTitle ? ' — ' + li.variantTitle : ''}`,
+        Quantity:        qty,
+        UnitAmount:      price,
+        AccountCode:     accountMap.sales_revenue,
+        TaxType:         'NONE',
+        LineAmount:      Math.round(price * qty * 100) / 100,
+      };
+    });
 
   // Add order-level discounts if present (as negative line)
   if (order.discountApplications?.edges?.length) {
@@ -369,7 +375,8 @@ async function createXeroInvoice(order, accountMap) {
 
   const orderDate  = toXeroDate(order.processedAt || order.createdAt);
   const dueDate    = addDays(orderDate, accountMap.payment_terms_days);
-  const totalPrice = parseFloat(order.totalPriceSet?.presentmentMoney?.amount || '0');
+  // CURRENT-FIELDS: degenerate no-line fallback uses the CURRENT total (post-edit), not the frozen original.
+  const totalPrice = deriveCurrentOrderTotals(order).total;
 
   const res = await xeroRequest('PUT', '/api.xro/2.0/Invoices', {
     Invoices: [{
@@ -606,6 +613,43 @@ const MOCK_ORDERS = [
     billingAddress:  { firstName: 'Jane', lastName: 'Smith', address1: '456 Park Ave', address2: '', city: 'Seattle', province: 'WA', zip: '98101', country: 'US' },
     fulfillments: [],
     transactions: [{ id: 'tx7', status: 'PENDING', kind: 'AUTHORIZATION', gateway: 'manual', createdAt: '2026-05-26T10:00:00Z', amountSet: { presentmentMoney: { amount: '200.00', currencyCode: 'USD' } } }],
+  },
+  // CURRENT-FIELDS test fixture (#1008): an EDITED order. Mirrors live #37639's pathology — the FROZEN
+  // subtotal/totalPriceSet stay at the ORIGINAL ($300.00) while currentSubtotal/currentTotalPriceSet carry
+  // the post-edit truth ($110.00). 3 line edges: one partial (qty 2 → currentQuantity 1), one untouched
+  // (qty 1), one fully removed (currentQuantity 0). So 2 lines are active; a correct first paint shows 2 rows
+  // and $110.00, NOT 3 rows / $300.00. Used by the ui.test "edited order renders current state on first paint".
+  {
+    id: 'gid://shopify/Order/1008', name: '#1008', processedAt: '2026-05-27T10:00:00Z',
+    customer: { id: 'gid://shopify/Customer/101', displayName: 'Acme Pet Supply', email: 'buyer@acme.com' },
+    displayFinancialStatus: 'PENDING', displayFulfillmentStatus: 'UNFULFILLED',
+    totalPriceSet:    { presentmentMoney: { amount: '300.00', currencyCode: 'USD' } }, // FROZEN original
+    subtotalPriceSet: { presentmentMoney: { amount: '300.00', currencyCode: 'USD' } }, // FROZEN original
+    currentTotalPriceSet:    { presentmentMoney: { amount: '110.00', currencyCode: 'USD' } }, // post-edit truth
+    currentSubtotalPriceSet: { presentmentMoney: { amount: '110.00', currencyCode: 'USD' } }, // post-edit truth
+    sourceName: 'web', tags: ['b2b-portal'], note: '',
+    lineItems: { edges: [
+      // partial: qty 2 → currentQuantity 1 @ $30 ⇒ contributes $30
+      { node: { id: 'li1008a', title: 'Edited Partial Collar', quantity: 2, currentQuantity: 1, variant: { id: 'v401', sku: 'EP-001', price: '30.00', inventoryQuantity: 10 },
+          discountedUnitPriceSet: { presentmentMoney: { amount: '30.00', currencyCode: 'USD' } },
+          originalUnitPriceSet:   { presentmentMoney: { amount: '30.00', currencyCode: 'USD' } } } },
+      // untouched: qty 1 / currentQuantity 1 @ $80 ⇒ contributes $80
+      { node: { id: 'li1008b', title: 'Untouched Leash', quantity: 1, currentQuantity: 1, variant: { id: 'v402', sku: 'UL-002', price: '80.00', inventoryQuantity: 4 },
+          discountedUnitPriceSet: { presentmentMoney: { amount: '80.00', currencyCode: 'USD' } },
+          originalUnitPriceSet:   { presentmentMoney: { amount: '80.00', currencyCode: 'USD' } } } },
+      // fully removed: currentQuantity 0 — MUST be hidden, MUST NOT contribute to subtotal
+      { node: { id: 'li1008c', title: 'Removed Harness', quantity: 1, currentQuantity: 0, variant: { id: 'v403', sku: 'RH-003', price: '190.00', inventoryQuantity: 2 },
+          discountedUnitPriceSet: { presentmentMoney: { amount: '190.00', currencyCode: 'USD' } },
+          originalUnitPriceSet:   { presentmentMoney: { amount: '190.00', currencyCode: 'USD' } } } },
+    ]},
+    totalShippingPriceSet: { presentmentMoney: { amount: '0.00', currencyCode: 'USD' } },
+    totalTaxSet:           { presentmentMoney: { amount: '0.00', currencyCode: 'USD' } },
+    totalOutstandingSet:   { presentmentMoney: { amount: '110.00', currencyCode: 'USD' } },
+    totalReceivedSet:      { presentmentMoney: { amount: '0.00', currencyCode: 'USD' } },
+    shippingAddress: { firstName: 'John', lastName: 'Doe', address1: '123 Main St', address2: '', city: 'Chicago', province: 'IL', zip: '60601', country: 'US' },
+    billingAddress:  { firstName: 'John', lastName: 'Doe', address1: '123 Main St', address2: '', city: 'Chicago', province: 'IL', zip: '60601', country: 'US' },
+    fulfillments: [],
+    transactions: [{ id: 'tx8', status: 'PENDING', kind: 'AUTHORIZATION', gateway: 'manual', createdAt: '2026-05-27T10:00:00Z', amountSet: { presentmentMoney: { amount: '110.00', currencyCode: 'USD' } } }],
   },
 ];
 
@@ -1729,6 +1773,7 @@ function renderOrdersList(session, data, filters) {
 // WHAT: fetches one order's full detail (customer, line items w/ variant+barcode, addresses, fulfillments, transactions) for the detail page and Xero sync.
 // CHANGE-GUARD: lineItems first:50 and transactions first:10 are HARD caps with no paging — an order with >50 lines or >10 transactions silently drops the overflow from the UI AND from createXeroInvoice's line build. Re-verify large orders invoice correctly. Returns null on any error (caller 404s).
 // INVARIANT(S): id is built via shopifyOrderGid(numericId); the selected fields are the contract consumed by renderOrderDetail, createXeroInvoice, and the ship/fulfill flows — adding a consumer means extending this query.
+// CURRENT-FIELDS (2026-06-29): each lineItems node carries BOTH quantity (frozen original) and currentQuantity (post-edit truth; 0 = removed). The order carries BOTH subtotal/totalPriceSet (frozen) and currentSubtotal/currentTotalPriceSet (post-edit truth). Consumers that mean "what is in the order NOW" (renderOrderDetail line rows + totals, fulfill/ship/cancel, createXeroInvoice) MUST read the current* variants; the frozen ones are kept only where the ORIGINAL value is intended.
 async function getOrderDetail(numericId) {
   if (MOCK) return getMockOrder(numericId);
   try {
@@ -1739,6 +1784,8 @@ async function getOrderDetail(numericId) {
         displayFinancialStatus displayFulfillmentStatus
         totalPriceSet{presentmentMoney{amount currencyCode}}
         subtotalPriceSet{presentmentMoney{amount currencyCode}}
+        currentSubtotalPriceSet{presentmentMoney{amount currencyCode}}
+        currentTotalPriceSet{presentmentMoney{amount currencyCode}}
         totalShippingPriceSet{presentmentMoney{amount currencyCode}}
         totalTaxSet{presentmentMoney{amount currencyCode}}
         totalOutstandingSet{presentmentMoney{amount currencyCode}}
@@ -1746,7 +1793,7 @@ async function getOrderDetail(numericId) {
         note tags
         shippingAddress{firstName lastName address1 address2 city province zip country}
         billingAddress{firstName lastName address1 address2 city province zip country}
-        lineItems(first:50){edges{node{id title quantity
+        lineItems(first:50){edges{node{id title quantity currentQuantity
           variant{id title sku barcode selectedOptions{name value} price inventoryQuantity product{id title}}
           discountedUnitPriceSet{presentmentMoney{amount currencyCode}}
           originalUnitPriceSet{presentmentMoney{amount currencyCode}}
@@ -1774,6 +1821,52 @@ function renderVisibleNotesList(notes) {
     </div>`).join('');
 }
 
+// WHAT: derives the order's CURRENT (post-edit) subtotal/total straight from a getOrderDetail order
+// object. On a FRESH page load of an EDITED order, currentSubtotal/currentTotalPriceSet are the truth and
+// subtotal/totalPriceSet are FROZEN at the original — so renderOrderDetail must NOT read the frozen fields.
+// CHANGE-GUARD (current-fields, 2026-06-29): the Σ currentQuantity*unitPrice line-sum is ONLY a fallback,
+// and it is gated on hasEdit = "some line has currentQuantity != quantity". This is critical: on an
+// UNEDITED order that carries an ORDER-LEVEL discount (e.g. SparkLayer B2B 50%), the per-line
+// discountedUnitPrice is the LIST price and the line-sum is ~2x the discounted subtotal — so the line-sum
+// must NEVER override Shopify's authoritative currentSubtotalPriceSet unless we have real evidence the
+// order was edited AND current* is lagging. (An earlier version fired the fallback whenever curSub==origSub
+// && lineSum!=origSub, which wrongly doubled the subtotal of discounted unedited orders like #37637.)
+// INVARIANT(S): unitPrice prefers discounted then original then 0 (matches the row + invoice math); a line
+// with currentQuantity 0 contributes 0 to the subtotal and is excluded from lineCount; when current* is
+// present and there is no lagging-edit evidence, current* is used VERBATIM (discounts preserved).
+function deriveCurrentOrderTotals(order) {
+  const lines = (order.lineItems?.edges || []).map(e => e.node);
+  const lineCount = lines.filter(n => ((n.currentQuantity != null ? n.currentQuantity : n.quantity) || 0) > 0).length;
+  const lineSubtotal = lines.reduce((s, n) => {
+    const cq = (n.currentQuantity != null ? n.currentQuantity : n.quantity) || 0;
+    const up = parseFloat(n.discountedUnitPriceSet?.presentmentMoney?.amount ?? n.originalUnitPriceSet?.presentmentMoney?.amount ?? 0);
+    return s + up * cq;
+  }, 0);
+  // Real edit evidence: at least one line whose currentQuantity differs from its original quantity.
+  const hasEdit = lines.some(n => n.currentQuantity != null && n.currentQuantity !== n.quantity);
+  const curSub = order.currentSubtotalPriceSet?.presentmentMoney?.amount;
+  const curTot = order.currentTotalPriceSet?.presentmentMoney?.amount;
+  const origSub = parseFloat(order.subtotalPriceSet?.presentmentMoney?.amount || 0);
+  const origTot = parseFloat(order.totalPriceSet?.presentmentMoney?.amount || 0);
+  // current* lags only when the order WAS edited but currentSubtotal still equals the frozen original.
+  const curSubLags = hasEdit && curSub != null && Math.abs(parseFloat(curSub) - origSub) < 0.005;
+  let subtotal;
+  if (curSub != null && !curSubLags) {
+    subtotal = parseFloat(curSub);            // authoritative current subtotal (discounts preserved)
+  } else {
+    subtotal = lineSubtotal;                  // missing, or lagging after a rapid edit → trust the lines
+  }
+  const curTotLags = hasEdit && curTot != null && Math.abs(parseFloat(curTot) - origTot) < 0.005;
+  let total;
+  if (curTot != null && !curTotLags) {
+    total = parseFloat(curTot);               // authoritative current total
+  } else {
+    const extras = Math.max(0, origTot - origSub); // shipping + tax baked into the original total
+    total = subtotal + extras;
+  }
+  return { subtotal, total, lineCount };
+}
+
 // WHAT: the large order-detail page — status timeline, editable line items, fulfillments, transactions, address, Xero/partial-invoice state, and all the modal JS (edit/discount/fulfill/backorder/invoice/cancel/ship).
 // CHANGE-GUARD: reads several SQLite stores by gid (getXeroMap, getPartialInvoices, getBackordersForOrder) — those keys must match shopifyOrderGid(numId). The edit form posts qtys[]/prices[]/removes/addCustomLines to /orders/:id/edit; serializeCustomLines() must run before submit (onclick on Save). Re-test edit/ship/cancel modals after any markup change since the inline JS selects elements by hardcoded ids.
 // INVARIANT(S): flash strings map 1:1 to alert banners — adding a server flash value needs a branch here or it renders silently; client-side ship rates JS sorts by amount and posts to <path>/ship/rates then /ship/label; line-item product links resolve via variant.product.id or the MOCK_VARIANT_PRODUCT fallback.
@@ -1787,7 +1880,9 @@ function renderOrderDetail(session, order, flash, flashMsg) {
     const v = order.totalOutstandingSet?.presentmentMoney?.amount;
     if (v != null && v !== '') return Math.max(0, parseFloat(v) || 0);
     if (['PAID', 'REFUNDED', 'PARTIALLY_REFUNDED'].includes(order.displayFinancialStatus)) return 0;
-    return Math.max(0, parseFloat(order.totalPriceSet?.presentmentMoney?.amount || 0) || 0);
+    // CURRENT-FIELDS (2026-06-29): fall back to the CURRENT total (post-edit), not the frozen original,
+    // when Shopify's authoritative totalOutstandingSet is absent (e.g. MOCK fixtures).
+    return Math.max(0, deriveCurrentOrderTotals(order).total || 0);
   })();
   const canRecordPayment = !isPaid && outstanding > 0;
   // Xero map (read from SQLite)
@@ -1846,10 +1941,17 @@ function renderOrderDetail(session, order, flash, flashMsg) {
   })();
 // WHAT: builds each editable line-item row — title (linked to product), SKU, qty (static+input), unit price (static+input w/ data-retail), row total, remove toggle, and backorder badge/button.
 // CHANGE-GUARD: input names qtys[<liId>], prices[<liId>], and removes are parsed server-side in /orders/:id/edit — renaming any breaks order editing. data-retail carries the original (pre-discount) price for client validation; unitPrice prefers discounted then original then 0.
-// INVARIANT(S): rowTotal = unitPrice * quantity computed in JS for display only (server recomputes on save); productNum resolves via variant.product.id (live) or MOCK_VARIANT_PRODUCT (mock) and gates whether the title is a link; item.title is escaped into both markup and an onclick string (the onclick path uses replace(/'/g) — fragile, prefer not to add quotes-bearing data there).
+// CURRENT-FIELDS (2026-06-29): rows render the order's CURRENT state on first paint — qty (static + input)
+// and rowTotal key off currentQuantity (post-edit truth), NOT the frozen `quantity`. Lines fully removed
+// in an edit (currentQuantity 0) are HIDDEN — Shopify retains them on the order but they're not part of it
+// anymore, so they must not show as line rows, inflate the count, or contribute to the subtotal. currentQty
+// falls back to `quantity` when the field is absent (MOCK fixtures / unedited orders) so behavior is unchanged there.
+// INVARIANT(S): rowTotal = unitPrice * currentQty computed in JS for display only (server recomputes on save); productNum resolves via variant.product.id (live) or MOCK_VARIANT_PRODUCT (mock) and gates whether the title is a link; item.title is escaped into both markup and an onclick string (the onclick path uses replace(/'/g) — fragile, prefer not to add quotes-bearing data there).
   const lineItemsHtml = lineItems.map(item => {
+    const currentQty = item.currentQuantity != null ? item.currentQuantity : (item.quantity || 0);
+    if (currentQty <= 0) return ''; // removed in a prior edit — not part of the order anymore
     const unitPrice = parseFloat(item.discountedUnitPriceSet?.presentmentMoney?.amount ?? item.originalUnitPriceSet?.presentmentMoney?.amount ?? 0);
-    const rowTotal  = unitPrice * (item.quantity || 0);
+    const rowTotal  = unitPrice * currentQty;
     // Resolve product ID: from GraphQL `variant.product.id` or mock lookup
     const varId = item.variant?.id || '';
     const productGid = item.variant?.product?.id;
@@ -1865,7 +1967,7 @@ function renderOrderDetail(session, order, flash, flashMsg) {
     // toggleBackorderModal). Keeps the edit-remove-btn class so the edit-mode toggle reveals it.
     const boBtn = `<button type="button" class="edit-remove-btn bo-action-btn" title="Flag this line as backordered"
       style="display:none;margin-left:6px;background:none;border:none;padding:0;font-size:11px;color:var(--muted);cursor:pointer;text-decoration:underline;text-underline-offset:2px"
-      onclick="toggleBackorderModal('${h(item.id)}','${h(item.title).replace(/'/g,"\\'")}','${item.quantity}',true)">⚑ Mark backordered</button>`;
+      onclick="toggleBackorderModal('${h(item.id)}','${h(item.title).replace(/'/g,"\\'")}','${currentQty}',true)">⚑ Mark backordered</button>`;
     return `<tr data-removed="0" data-li-id="${h(item.id)}" data-existing="1">
       <td>${titleCell} ${boBadge}${boBtn}
         <span class="row-save-chip" data-state="idle" style="display:none;margin-left:8px;font-size:11px;vertical-align:middle"></span>
@@ -1873,8 +1975,8 @@ function renderOrderDetail(session, order, flash, flashMsg) {
       </td>
       <td class="mono">${h(item.variant?.sku || '—')}</td>
       <td class="text-right">
-        <span class="edit-qty-static">${item.quantity}</span>
-        <input type="number" name="qtys[${h(item.id)}]" value="${item.quantity}" min="0" class="edit-qty-input" style="display:none;width:60px">
+        <span class="edit-qty-static">${currentQty}</span>
+        <input type="number" name="qtys[${h(item.id)}]" value="${currentQty}" min="0" class="edit-qty-input" style="display:none;width:60px">
         <button type="button" class="btn btn-ghost btn-xs edit-remove-btn" style="display:none;margin-left:4px" onclick="markRemove('${h(item.id)}',this)">✕</button>
       </td>
       <td class="text-right">
@@ -1885,9 +1987,14 @@ function renderOrderDetail(session, order, flash, flashMsg) {
     </tr>`;
   }).join('');
 
-  const sub   = fmtMoney(order.subtotalPriceSet?.presentmentMoney?.amount);
+  // CURRENT-FIELDS (2026-06-29): show the CURRENT (post-edit) subtotal/total on first paint — the frozen
+  // subtotal/totalPriceSet would render the pre-edit amounts ($921.72 on #37639) until the client reconcile
+  // JS fired (which only runs AFTER an edit action, never on a plain load). deriveCurrentOrderTotals carries
+  // the same belt-and-braces fallback as the post-edit reconcile path. Shipping is unchanged by line edits.
+  const curTotals = deriveCurrentOrderTotals(order);
+  const sub   = fmtMoney(curTotals.subtotal);
   const ship  = fmtMoney(order.totalShippingPriceSet?.presentmentMoney?.amount);
-  const total = fmtMoney(order.totalPriceSet?.presentmentMoney?.amount);
+  const total = fmtMoney(curTotals.total);
 
   // Fulfillments
   const fulfillmentsHtml = (order.fulfillments || []).length > 0
@@ -2732,12 +2839,16 @@ function renderOrderDetail(session, order, flash, flashMsg) {
             <h3 style="margin:0 0 16px">Fulfill items</h3>
             <form method="POST" action="/orders/${h(numId)}/fulfill">
               <div style="margin-bottom:12px">
-                ${lineItems.map(item => {
+                ${/* CURRENT-FIELDS (2026-06-29): only CURRENTLY-active lines are fulfillable — a line removed
+                      in a prior edit (currentQuantity 0) is no longer part of the order, so it's excluded from
+                      the fulfill picker, and the max/value reflect currentQuantity not the frozen original. */''}
+                ${lineItems.filter(item => ((item.currentQuantity != null ? item.currentQuantity : item.quantity) || 0) > 0).map(item => {
+                  const cq = item.currentQuantity != null ? item.currentQuantity : (item.quantity || 0);
                   const bo = backorderMap.get(item.id);
                   return `<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;font-size:13px">
                     <input type="checkbox" name="sel_${h(item.id)}" value="1" checked style="flex-shrink:0">
                     <span style="flex:1">${h(item.title)}${bo ? ' <span class="badge badge-warning">Backorder</span>' : ''}</span>
-                    <input type="number" name="lineItems[${h(item.id)}]" value="${item.quantity}" min="0" max="${item.quantity}" style="width:60px">
+                    <input type="number" name="lineItems[${h(item.id)}]" value="${cq}" min="0" max="${cq}" style="width:60px">
                   </div>`;
                 }).join('')}
               </div>
@@ -2779,7 +2890,8 @@ function renderOrderDetail(session, order, flash, flashMsg) {
         ${/* Cancel modal */''}<div id="cancel-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center">
           <div style="background:#fff;border-radius:8px;padding:24px;min-width:380px;max-width:500px">
             <h3 style="margin:0 0 16px;color:#c00">Cancel this order?</h3>
-            <p style="color:#555;margin:0 0 16px">This will cancel ${h(order.name)} (${fmtMoney(order.totalPriceSet?.presentmentMoney?.amount)}) in Shopify. The order will be marked CANCELED and stock will be restored.</p>
+            ${/* CURRENT-FIELDS (2026-06-29): show the CURRENT total (post-edit truth) the staffer is canceling, not the frozen original. */''}
+            <p style="color:#555;margin:0 0 16px">This will cancel ${h(order.name)} (${fmtMoney(curTotals.total)}) in Shopify. The order will be marked CANCELED and stock will be restored.</p>
             <form method="POST" action="/orders/${h(numId)}/cancel">
               <div style="margin-bottom:12px">
                 <label style="font-size:13px;font-weight:500">Reason</label><br>
@@ -2850,12 +2962,17 @@ function renderOrderDetail(session, order, flash, flashMsg) {
             <div style="margin-bottom:14px">
               <label style="display:block;font-size:13px;font-weight:500;margin-bottom:6px">Items to ship <span style="color:#999;font-weight:400;font-size:12px">(uncheck to split-ship later)</span></label>
               <div style="border:1px solid #e5e5e5;border-radius:4px;padding:8px;max-height:160px;overflow-y:auto">
-                ${(order.lineItems?.edges || []).map(e => `
+                ${/* CURRENT-FIELDS (2026-06-29): ship only CURRENTLY-active lines — a removed line (currentQuantity 0)
+                      is no longer shippable, and the qty shown/posted is currentQuantity not the frozen original. */''}
+                ${(order.lineItems?.edges || []).filter(e => ((e.node.currentQuantity != null ? e.node.currentQuantity : e.node.quantity) || 0) > 0).map(e => {
+                  const cq = e.node.currentQuantity != null ? e.node.currentQuantity : (e.node.quantity || 0);
+                  return `
                   <label style="display:flex;align-items:center;gap:8px;padding:4px 0;font-size:13px">
-                    <input type="checkbox" name="ship_li[]" value="${h(e.node.id || '')}" data-qty="${e.node.quantity || 1}" checked>
-                    <span style="flex:1">${h(e.node.title || '—')} × ${e.node.quantity || 0}</span>
+                    <input type="checkbox" name="ship_li[]" value="${h(e.node.id || '')}" data-qty="${cq || 1}" checked>
+                    <span style="flex:1">${h(e.node.title || '—')} × ${cq}</span>
                     <span class="text-muted" style="font-size:11px">${h(e.node.variant?.sku || '')}</span>
-                  </label>`).join('')}
+                  </label>`;
+                }).join('')}
               </div>
             </div>
             <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:14px">
@@ -4667,7 +4784,9 @@ app.post('/orders/:id/mark-paid', requireAuth, async (req, res) => {
         if (order) xeroInvoiceId = await createXeroInvoice(order, accountMap);
       }
       if (xeroInvoiceId) {
-        const amount = parseFloat(order?.totalPriceSet?.presentmentMoney?.amount || '0');
+        // CURRENT-FIELDS (2026-06-29): pay the CURRENT total (post-edit truth) — the frozen totalPriceSet
+        // would over-pay an edited order (e.g. $921.72 instead of $601.24 on #37639).
+        const amount = order ? deriveCurrentOrderTotals(order).total : 0;
         await recordXeroPayment(numId, xeroInvoiceId, amount, null, accountMap.chase_checking);
         auditLog(req.adminSession.email, 'xero:payment_recorded', shopifyOrderGid(numId), null, { xeroInvoiceId, amount });
       }
@@ -4968,7 +5087,7 @@ async function readCommittedLineState(orderId) {
       originalUnitPriceSet{presentmentMoney{amount}}
     }}}
   }}`, { id: orderId });
-  const o = r.data?.order;
+  const o = r.data?.order || {};
   const edges = o?.lineItems?.edges?.map(e => e.node) || [];
   const lines = edges.map(n => ({
     liId: n.id,
@@ -4977,28 +5096,10 @@ async function readCommittedLineState(orderId) {
     currentQuantity: n.currentQuantity != null ? n.currentQuantity : n.quantity,
     unitPrice: parseFloat(n.discountedUnitPriceSet?.presentmentMoney?.amount ?? n.originalUnitPriceSet?.presentmentMoney?.amount ?? 0),
   }));
-  const lineCount = lines.filter(l => (l.currentQuantity || 0) > 0).length;
-  // Line-derived subtotal: the most direct post-edit truth (sum of surviving lines).
-  const lineSubtotal = lines.reduce((s, l) => s + l.unitPrice * (l.currentQuantity || 0), 0);
-  const curSub = o?.currentSubtotalPriceSet?.presentmentMoney?.amount;
-  const curTot = o?.currentTotalPriceSet?.presentmentMoney?.amount;
-  // Prefer current* (post-edit). If current subtotal is missing/stale (still equals the frozen
-  // original while lines say otherwise), fall back to the line-derived sum.
-  const origSub = parseFloat(o?.subtotalPriceSet?.presentmentMoney?.amount || 0);
-  let subtotal = curSub != null ? parseFloat(curSub) : lineSubtotal;
-  if (curSub != null && Math.abs(subtotal - origSub) < 0.005 && Math.abs(lineSubtotal - origSub) >= 0.005) {
-    subtotal = lineSubtotal; // current* lagged at the frozen original — trust the lines.
-  }
-  // Total: prefer current total; otherwise derive from subtotal + (originalTotal - originalSubtotal)
-  // i.e. keep shipping/tax delta. If current total missing, approximate as subtotal + ship/tax.
-  const origTot = parseFloat(o?.totalPriceSet?.presentmentMoney?.amount || 0);
-  let total;
-  if (curTot != null && !(Math.abs(parseFloat(curTot) - origTot) < 0.005 && Math.abs(lineSubtotal - origSub) >= 0.005)) {
-    total = parseFloat(curTot);
-  } else {
-    const extras = Math.max(0, origTot - origSub); // shipping + tax baked into the original total
-    total = subtotal + extras;
-  }
+  // Subtotal/total + active line count use the SHARED helper so this stays in lockstep with the
+  // first-paint totals in renderOrderDetail (deriveCurrentOrderTotals). Both honor the same
+  // belt-and-braces fallback (prefer current*; trust Σ currentQuantity*unitPrice when current* lags).
+  const { subtotal, total, lineCount } = deriveCurrentOrderTotals(o);
   return { lines, subtotal, total, lineCount };
 }
 
