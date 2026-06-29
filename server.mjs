@@ -1650,6 +1650,18 @@ function renderOrderDetail(session, order, flash, flashMsg) {
 
   // Line items table
   const lineItems = (order.lineItems?.edges || []).map(e => e.node);
+  // Phase 16F: infer this order's effective B2B discount % from an existing catalog line
+  // (original vs discounted unit price) so the "Add product" UI prefills wholesale pricing.
+  // Falls back to the global b2b_discount_pct setting, then 50. Staff can override the unit price inline.
+  const editDiscPct = (() => {
+    for (const it of lineItems) {
+      const o = parseFloat(it.originalUnitPriceSet?.presentmentMoney?.amount || 0);
+      const d = parseFloat(it.discountedUnitPriceSet?.presentmentMoney?.amount || 0);
+      if (o > 0 && d > 0 && d < o) return Math.round(((o - d) / o) * 1000) / 10;
+    }
+    const s = parseInt(getSetting('b2b_discount_pct') ?? '50', 10);
+    return Number.isFinite(s) ? s : 50;
+  })();
 // WHAT: builds each editable line-item row — title (linked to product), SKU, qty (static+input), unit price (static+input w/ data-retail), row total, remove toggle, and backorder badge/button.
 // CHANGE-GUARD: input names qtys[<liId>], prices[<liId>], and removes are parsed server-side in /orders/:id/edit — renaming any breaks order editing. data-retail carries the original (pre-discount) price for client validation; unitPrice prefers discounted then original then 0.
 // INVARIANT(S): rowTotal = unitPrice * quantity computed in JS for display only (server recomputes on save); productNum resolves via variant.product.id (live) or MOCK_VARIANT_PRODUCT (mock) and gates whether the title is a link; item.title is escaped into both markup and an onclick string (the onclick path uses replace(/'/g) — fragile, prefer not to add quotes-bearing data there).
@@ -1753,7 +1765,7 @@ function renderOrderDetail(session, order, flash, flashMsg) {
     document.getElementById('edit-save-bar').style.display = enable ? 'block' : 'none';
     var addBar = document.getElementById('edit-add-bar'); if (addBar) addBar.style.display = enable ? 'block' : 'none';
     var discBar = document.getElementById('edit-discount-bar'); if (discBar) discBar.style.display = enable ? 'block' : 'none';
-    if (!enable) { document.querySelectorAll('tr.custom-line-new').forEach(function(r){ r.remove(); }); if (window.__newCustomLines) window.__newCustomLines = []; var db2 = document.getElementById('edit-discount-bar'); if (db2) db2.querySelectorAll('input').forEach(function(i){ i.value=''; }); }
+    if (!enable) { document.querySelectorAll('tr.custom-line-new').forEach(function(r){ r.remove(); }); document.querySelectorAll('tr.catalog-line-new').forEach(function(r){ r.remove(); }); var avi = document.getElementById('addVariantLinesInput'); if (avi) avi.value = '[]'; var eps = document.getElementById('edit-product-search'); if (eps) eps.value = ''; var epr = document.getElementById('edit-product-results'); if (epr) { epr.style.display='none'; epr.innerHTML=''; } if (window.__newCustomLines) window.__newCustomLines = []; var db2 = document.getElementById('edit-discount-bar'); if (db2) db2.querySelectorAll('input').forEach(function(i){ i.value=''; }); }
     document.getElementById('edit-btn').style.display = enable ? 'none' : 'inline-flex';
     document.querySelectorAll('.edit-qty-input').forEach(el => { el.style.display = enable ? 'inline-block' : 'none'; el.disabled = !enable; });
     document.querySelectorAll('.edit-qty-static').forEach(el => { el.style.display = enable ? 'none' : 'inline'; });
@@ -2018,9 +2030,17 @@ function renderOrderDetail(session, order, flash, flashMsg) {
             <div class="totals-row totals-total"><span>Total</span><span>${total}</span></div>
           </div>
           <div id="edit-add-bar" style="display:none;padding:8px 0">
-            <button type="button" class="btn btn-ghost btn-sm" onclick="addCustomLineRow()" title="Add a one-off line item to this order">+ Add custom line</button>
+            <div style="display:flex;gap:8px;align-items:flex-start;flex-wrap:wrap">
+              <div style="position:relative;flex:1;min-width:260px">
+                <input type="text" id="edit-product-search" class="filter-input" placeholder="Add product — search name or SKU…" autocomplete="off" style="width:100%">
+                <div id="edit-product-results" style="display:none;position:absolute;z-index:60;left:0;right:0;top:100%;background:#fff;border:1px solid var(--border);border-radius:4px;max-height:260px;overflow-y:auto;box-shadow:0 4px 12px rgba(0,0,0,0.12)"></div>
+              </div>
+              <button type="button" class="btn btn-ghost btn-sm" onclick="addCustomLineRow()" title="Add a one-off (non-catalog) line item to this order">+ Add custom line</button>
+            </div>
+            <div style="font-size:11px;color:var(--muted);margin-top:4px">Catalog items are priced at this customer's wholesale rate (${editDiscPct}% off); adjust the unit price inline if needed.</div>
           </div>
           <input type="hidden" name="addCustomLines" id="addCustomLinesInput" value="[]">
+          <input type="hidden" name="addVariantLines" id="addVariantLinesInput" value="[]">
           <div id="edit-discount-bar" style="display:none;padding:12px 0;border-top:1px solid var(--border);margin-top:8px">
             <div style="font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:8px">Order Discount (optional)</div>
             <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
@@ -2077,7 +2097,85 @@ function renderOrderDetail(session, order, flash, flashMsg) {
                   if (title && qty > 0 && price >= 0) out.push({ title: title, qty: qty, price: price });
                 });
                 document.getElementById('addCustomLinesInput').value = JSON.stringify(out);
+                // Phase 16F: serialize newly added catalog (real product) lines
+                var crows = document.querySelectorAll('tr.catalog-line-new');
+                var cout = [];
+                crows.forEach(function(r){
+                  var qty   = parseInt(r.querySelector('.cl-qty')?.value, 10);
+                  var price = parseFloat(r.querySelector('.cl-price')?.value);
+                  if (r.dataset.variantId && qty > 0 && price >= 0) cout.push({
+                    variantId: r.dataset.variantId,
+                    title:     r.dataset.title || '',
+                    sku:       r.dataset.sku || '',
+                    qty:       qty,
+                    listPrice: parseFloat(r.dataset.listPrice) || 0,
+                    price:     price
+                  });
+                });
+                document.getElementById('addVariantLinesInput').value = JSON.stringify(cout);
               };
+
+              // Phase 16F: add a real catalog product as a new line (priced at wholesale)
+              var EDIT_DISC_PCT = ${editDiscPct};
+              window.addCatalogLineRow = function(p) {
+                var tbody = document.querySelector('#edit-form table.data-table tbody');
+                if (!tbody) return;
+                var listPrice = parseFloat(p.price || 0);
+                var wholesale = (listPrice * (1 - EDIT_DISC_PCT/100));
+                var tr = document.createElement('tr');
+                tr.className = 'catalog-line-new';
+                tr.dataset.variantId = p.variantId;
+                tr.dataset.title     = p.label || '';
+                tr.dataset.sku       = p.sku || '';
+                tr.dataset.listPrice = String(listPrice);
+                tr.innerHTML =
+                  '<td><span class="badge badge-success" style="margin-right:6px">NEW</span>' + (p.label ? p.label.replace(/</g,'&lt;') : 'Catalog item') + '</td>' +
+                  '<td><span class="text-muted">' + ((p.sku||'').replace(/</g,'&lt;') || '—') + '</span></td>' +
+                  '<td class="text-right"><input type="number" class="filter-input cl-qty" value="1" min="1" step="1" style="width:60px;text-align:right"></td>' +
+                  '<td class="text-right"><input type="number" class="filter-input cl-price" value="' + wholesale.toFixed(2) + '" min="0" step="0.01" style="width:80px;text-align:right" title="Wholesale unit price (list ' + listPrice.toFixed(2) + ')"></td>' +
+                  '<td class="text-right"><button type="button" class="btn btn-ghost btn-sm" onclick="removeCustomLineRow(this)" title="Remove this new line">×</button></td>';
+                tbody.appendChild(tr);
+              };
+
+              // Phase 16F: lightweight product autocomplete for the edit toolbar
+              (function(){
+                var input = document.getElementById('edit-product-search');
+                var box   = document.getElementById('edit-product-results');
+                if (!input || !box) return;
+                var t = null, lastSeq = 0;
+                function hide(){ box.style.display = 'none'; box.innerHTML = ''; }
+                input.addEventListener('input', function(){
+                  var q = input.value.trim();
+                  if (t) clearTimeout(t);
+                  if (q.length < 2) { hide(); return; }
+                  var seq = ++lastSeq;
+                  t = setTimeout(function(){
+                    fetch('/api/products/search?q=' + encodeURIComponent(q), { credentials: 'same-origin' })
+                      .then(function(r){ return r.json(); })
+                      .then(function(items){
+                        if (seq !== lastSeq) return;
+                        if (!Array.isArray(items) || !items.length) { box.innerHTML = '<div style="padding:8px 10px;color:var(--muted);font-size:13px">No matches</div>'; box.style.display = 'block'; return; }
+                        box.innerHTML = items.map(function(p, i){
+                          return '<div class="edit-prod-opt" data-i="' + i + '" style="padding:8px 10px;cursor:pointer;font-size:13px;border-bottom:1px solid #f0f0f0">' +
+                                 '<div>' + (p.label||'').replace(/</g,'&lt;') + '</div>' +
+                                 '<div style="color:var(--muted);font-size:11px">' + (p.sublabel||'').replace(/</g,'&lt;') + '</div></div>';
+                        }).join('');
+                        box.style.display = 'block';
+                        window.__editProdItems = items;
+                        Array.prototype.forEach.call(box.querySelectorAll('.edit-prod-opt'), function(el){
+                          el.addEventListener('mousedown', function(ev){ ev.preventDefault(); });
+                          el.addEventListener('click', function(){
+                            var p = window.__editProdItems[parseInt(el.dataset.i, 10)];
+                            if (p) addCatalogLineRow(p);
+                            input.value = ''; hide(); input.focus();
+                          });
+                        });
+                      })
+                      .catch(function(){ hide(); });
+                  }, 220);
+                });
+                document.addEventListener('click', function(ev){ if (ev.target !== input && !box.contains(ev.target)) hide(); });
+              })();
             })();
           </script>
         </div>
@@ -4271,7 +4369,7 @@ app.get('/api/admin/orders/:id/partial-invoices', requireAuth, (req, res) => {
 app.post('/orders/:id/edit', requireAuth, async (req, res) => {
   const numId   = req.params.id;
   const session = req.adminSession;
-  const { qtys, removes, staffNote, discountPct, discountFixed, discountReason, addCustomLines, prices } = req.body;
+  const { qtys, removes, staffNote, discountPct, discountFixed, discountReason, addCustomLines, addVariantLines, prices } = req.body;
   // qtys: { lineItemId: newQty, ... }   removes: [lineItemId, ...]
   const qtysMap   = Object.fromEntries(Object.entries(qtys || {}).map(([k,v]) => [k, parseInt(v,10) || 0]));
   const removeSet = new Set([removes || []].flat());
@@ -4289,8 +4387,24 @@ app.post('/orders/:id/edit', requireAuth, async (req, res) => {
     console.warn('[order-edit] addCustomLines parse failed:', e.message);
   }
 
+  // Phase 16F: parse new catalog (real product/variant) additions
+  let newVariantLines = [];
+  try {
+    const raw = typeof addVariantLines === 'string' ? JSON.parse(addVariantLines || '[]') : (addVariantLines || []);
+    newVariantLines = (Array.isArray(raw) ? raw : []).filter(l => l && l.variantId && Number(l.qty) > 0).map(l => ({
+      variantId: String(l.variantId),
+      title:     String(l.title || '').slice(0, 200),
+      sku:       String(l.sku || '').slice(0, 64),
+      qty:       parseInt(l.qty, 10),
+      listPrice: parseFloat(l.listPrice) || 0,
+      price:     Math.max(0, parseFloat(l.price) || 0),
+    }));
+  } catch (e) {
+    console.warn('[order-edit] addVariantLines parse failed:', e.message);
+  }
+
   const pricesMap = Object.fromEntries(Object.entries(prices || {}).map(([k,v]) => [k, parseFloat(v) || 0]));
-  const changes = { qtys: qtysMap, removes: [...removeSet], prices: pricesMap, discountPct, discountFixed, discountReason, addCustomLines: newCustomLines };
+  const changes = { qtys: qtysMap, removes: [...removeSet], prices: pricesMap, discountPct, discountFixed, discountReason, addCustomLines: newCustomLines, addVariantLines: newVariantLines };
 
   if (MOCK) {
     const order = getMockOrder(numId);
@@ -4300,6 +4414,17 @@ app.post('/orders/:id/edit', requireAuth, async (req, res) => {
     const newEdges = (order.lineItems?.edges || []).filter(e => !removeSet.has(e.node.id)).map(e => {
       const newQty = qtysMap[e.node.id] ?? e.node.quantity;
       return { node: { ...e.node, quantity: newQty } };
+    });
+    // Phase 16F: append synthetic edges for newly added catalog variants (mock display)
+    newVariantLines.forEach((l, i) => {
+      newEdges.push({ node: {
+        id: `gid://shopify/LineItem/new-variant-${i}`,
+        title: l.title || 'Catalog item',
+        quantity: l.qty,
+        variant: { id: `gid://shopify/ProductVariant/${l.variantId}`, sku: l.sku || '' },
+        discountedUnitPriceSet: { presentmentMoney: { amount: l.price.toFixed(2), currencyCode: 'USD' } },
+        originalUnitPriceSet:   { presentmentMoney: { amount: (l.listPrice || l.price).toFixed(2), currencyCode: 'USD' } },
+      } });
     });
     overrides.lineItems = { edges: newEdges };
     // Recalculate totals
@@ -4448,6 +4573,36 @@ app.post('/orders/:id/edit', requireAuth, async (req, res) => {
       if (addErrs.length) {
         console.error('[order-edit] addCustomItem failed:', JSON.stringify(addErrs));
         // continue with remaining lines; soft-fail
+      }
+    }
+
+    // Phase 16F: add real catalog variants, then apply each line's B2B wholesale price.
+    // CRITICAL: when a variantId is present Shopify uses the variant's full retail price and
+    // IGNORES any manual unit price — so wholesale is applied as a per-line appliedDiscount
+    // PERCENTAGE = (listPrice - wholesalePrice)/listPrice, mirroring submitNewOrder. Soft-fail per line.
+    for (const line of newVariantLines) {
+      const variantGid = line.variantId.startsWith('gid://') ? line.variantId : `gid://shopify/ProductVariant/${line.variantId}`;
+      const addRes = await shopifyFetch(`mutation addVar($id:ID!,$v:ID!,$q:Int!){
+        orderEditAddVariant(id:$id,variantId:$v,quantity:$q,allowDuplicates:true){
+          calculatedLineItem{id} calculatedOrder{id} userErrors{field message}}}`,
+        { id: calcId, v: variantGid, q: line.qty });
+      const addErrs = addRes.data?.orderEditAddVariant?.userErrors || [];
+      if (addErrs.length) { console.error('[order-edit] addVariant failed:', JSON.stringify(addErrs)); continue; }
+      const calcLiId = addRes.data?.orderEditAddVariant?.calculatedLineItem?.id;
+      const listPrice = line.listPrice > 0 ? line.listPrice : line.price;
+      if (calcLiId && listPrice > 0 && line.price >= 0 && line.price < listPrice) {
+        const pct = ((listPrice - line.price) / listPrice) * 100;
+        if (pct > 0 && pct <= 100) {
+          const dRes = await shopifyFetch(`mutation addDisc($id:ID!,$li:ID!,$d:OrderEditAppliedDiscountInput!){
+            orderEditAddLineItemDiscount(id:$id,lineItemId:$li,discount:$d){
+              calculatedOrder{id} userErrors{field message}}}`,
+            { id: calcId, li: calcLiId, d: { percentValue: parseFloat(pct.toFixed(4)), description: 'B2B wholesale' } });
+          const dErrs = dRes.data?.orderEditAddLineItemDiscount?.userErrors || [];
+          if (dErrs.length) console.error('[order-edit] addVariant discount failed:', JSON.stringify(dErrs));
+          else console.log('[order-edit] catalog line added:', line.sku || line.variantId, 'x', line.qty, '@', line.price, `(${pct.toFixed(2)}% off ${listPrice})`);
+        }
+      } else {
+        console.log('[order-edit] catalog line added at list price:', line.sku || line.variantId, 'x', line.qty);
       }
     }
 
@@ -6228,6 +6383,14 @@ app.post('/settings', requireAuth, (req, res) => {
     if (payment_terms       !== undefined) setSetting('payment_terms',        String(payment_terms).slice(0, 100));
     if (catalog_private_tags !== undefined) setSetting('catalog_private_tags', String(catalog_private_tags || '').slice(0, 500));
     auditLog(req.adminSession.email, 'settings:update', null, null, { b2b_discount_pct, order_minimum, payment_terms, catalog_private_tags });
+    // Push the global order minimum to the b2b-portal so IT enforces this value (admin is the single
+    // source of truth) instead of a hardcoded env default. Fire-and-forget — the portal sync must not
+    // block or fail the admin save; callPortalInternal never throws (returns {ok:false} on error).
+    if (order_minimum !== undefined) {
+      callPortalInternal('POST', '/__internal__/settings', { order_minimum: Number(order_minimum) || 0 })
+        .then(r => { if (!r.ok) console.error('[settings] portal min-order sync failed:', r.error || r); })
+        .catch(e => console.error('[settings] portal min-order sync threw:', e?.message || e));
+    }
     res.redirect('/settings?flash=ok&msg=Settings+saved.');
   } catch (err) {
     res.redirect(`/settings?flash=err&msg=${encodeURIComponent(err.message)}`);
