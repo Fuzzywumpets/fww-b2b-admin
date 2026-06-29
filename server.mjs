@@ -4338,7 +4338,63 @@ app.post('/orders/:id/ship/label', requireAuth, async (req, res) => {
   }
 });
 
+// --- Async cancel-job polling -------------------------------------------------
+// Shopify's orderCancel mutation only QUEUES the cancel and returns a job{id}
+// that finishes server-side. We must confirm that job is done before telling the
+// operator the order is canceled.
+// CHANGE-GUARD: these bound the post-cancel poll. Defaults are tuned for prod;
+// MOCK/tests shrink them (env override below, plus the small MOCK base). If you
+// raise CANCEL_JOB_POLL_ATTEMPTS, keep the worst-case total wait (sum of capped
+// backoffs) under any upstream/proxy request timeout, or the operator sees a hung
+// POST instead of a success/error flash.
+const CANCEL_JOB_POLL_ATTEMPTS = Math.max(1, Number(process.env.CANCEL_JOB_POLL_ATTEMPTS) || 6);
+const CANCEL_JOB_POLL_BASE_MS  = Number(process.env.CANCEL_JOB_POLL_BASE_MS) || (MOCK ? 5 : 300);
+const CANCEL_JOB_POLL_MAX_MS   = Number(process.env.CANCEL_JOB_POLL_MAX_MS) || 4000;
+
+// Returns { done:boolean } for a Shopify Job gid, or null when the job node is
+// missing (treated as not-yet-confirmed). MOCK encodes the outcome in the job id
+// so tests can drive both the confirmed-done and never-confirmed paths without
+// hitting Shopify (see the cancel route's MOCK branch).
+async function getCancelJobStatus(jobId) {
+  if (MOCK) {
+    if (jobId.includes('mock-gone'))  return null;            // job node 404s
+    if (jobId.includes('mock-stuck')) return { done: false }; // never completes
+    return { done: true };
+  }
+  const r = await shopifyFetch(
+    `query cancelJob($id:ID!){ node(id:$id){ ... on Job { id done } } }`,
+    { id: jobId }
+  );
+  const job = r?.data?.node;
+  if (!job) return null;
+  return { done: !!job.done };
+}
+
+// Poll getCancelJobStatus with bounded exponential backoff. Resolves true ONLY
+// when the job is confirmed done; false if it never confirms within the attempt
+// budget. Transient poll errors are swallowed and retried — a failed poll is not
+// a failed cancel, we just could not confirm it yet.
+async function pollCancelJobDone(jobId) {
+  for (let attempt = 0; attempt < CANCEL_JOB_POLL_ATTEMPTS; attempt++) {
+    let status = null;
+    try {
+      status = await getCancelJobStatus(jobId);
+    } catch (e) {
+      console.warn('cancel job poll error:', e.message);
+    }
+    if (status && status.done) return true;
+    if (attempt < CANCEL_JOB_POLL_ATTEMPTS - 1) {
+      const delay = Math.min(CANCEL_JOB_POLL_BASE_MS * 2 ** attempt, CANCEL_JOB_POLL_MAX_MS);
+      await new Promise(r => setTimeout(r, delay));
+    }
+  }
+  return false;
+}
+
 // Cancel order (calls Shopify orderCancel mutation)
+// WHAT: cancels an order via Shopify orderCancel; body flags restock/refund/notify are the literal string '1'; reason defaults to 'OTHER'.
+// CHANGE-GUARD: orderCancel runs async server-side (returns job{id}); we now POLL that job (pollCancelJobDone) and only redirect ?success=order_canceled once it is confirmed done. A queued-but-failed / never-confirmed cancel redirects ?error=cancel_failed&msg=... instead, so the operator never sees a false success banner. reason must be a valid OrderCancelReason enum value.
+// INVARIANT(S): MOCK path only sets the cancelledAt override (and only on confirmed success); MOCK job outcome is driven by body.mock_job ('done'|'stuck'|'gone') for tests; real path always passes a staffNote crediting session.email; error redirect truncates err.message to 200 chars.
 app.post('/orders/:id/cancel', requireAuth, async (req, res) => {
   const numId   = req.params.id;
   const session = req.adminSession;
@@ -4346,35 +4402,53 @@ app.post('/orders/:id/cancel', requireAuth, async (req, res) => {
   const restock = req.body.restock === '1';
   const refund  = req.body.refund === '1';
   const notify  = req.body.notify === '1';
-
-  if (MOCK) {
-    const order = getMockOrder(numId);
-    if (order) {
-      const overrides = mockOrderOverrides.get(numId) || {};
-      overrides.cancelledAt = new Date().toISOString();
-      mockOrderOverrides.set(numId, overrides);
-    }
-    auditLog(session.email, 'order_cancel', `gid://shopify/Order/${numId}`, null, { reason, restock, refund, notify });
-    return res.redirect(`/orders/${numId}?success=order_canceled`);
-  }
+  const orderId = `gid://shopify/Order/${numId}`;
 
   try {
-    const orderId = `gid://shopify/Order/${numId}`;
-    const result = await shopifyFetch(`
-      mutation cancel($id:ID!,$reason:OrderCancelReason!,$refund:Boolean!,$restock:Boolean!,$notify:Boolean!,$staffNote:String){
-        orderCancel(orderId:$id, reason:$reason, refund:$refund, restock:$restock, notifyCustomer:$notify, staffNote:$staffNote){
-          job{id} userErrors{field message}
-        }
-      }`, {
-      id: orderId,
-      reason,
-      refund,
-      restock,
-      notify,
-      staffNote: `Canceled via FWW admin by ${session.email}`,
-    });
-    const errs = result.data?.orderCancel?.userErrors || [];
-    if (errs.length) throw new Error(errs.map(e => e.message).join(', '));
+    let jobId = null;
+
+    if (MOCK) {
+      // Simulate orderCancel returning an async job; outcome driven by body.mock_job
+      // ('done' = confirms immediately, 'stuck' = never confirms, 'gone' = job node missing).
+      const outcome = String(req.body.mock_job || 'done');
+      jobId = `gid://shopify/Job/mock-${outcome}-${numId}`;
+    } else {
+      const result = await shopifyFetch(`
+        mutation cancel($id:ID!,$reason:OrderCancelReason!,$refund:Boolean!,$restock:Boolean!,$notify:Boolean!,$staffNote:String){
+          orderCancel(orderId:$id, reason:$reason, refund:$refund, restock:$restock, notifyCustomer:$notify, staffNote:$staffNote){
+            job{id} userErrors{field message}
+          }
+        }`, {
+        id: orderId,
+        reason,
+        refund,
+        restock,
+        notify,
+        staffNote: `Canceled via FWW admin by ${session.email}`,
+      });
+      const errs = result.data?.orderCancel?.userErrors || [];
+      if (errs.length) throw new Error(errs.map(e => e.message).join(', '));
+      jobId = result.data?.orderCancel?.job?.id || null;
+    }
+
+    // Confirm the queued cancel actually finished before reporting success.
+    // (If Shopify returned no job, there is nothing async to wait on.)
+    if (jobId) {
+      const confirmed = await pollCancelJobDone(jobId);
+      if (!confirmed) {
+        throw new Error('cancel did not confirm complete in time — order may still be active; re-check in Shopify');
+      }
+    }
+
+    // Confirmed done: reflect it in MOCK state, and audit in both modes.
+    if (MOCK) {
+      const order = getMockOrder(numId);
+      if (order) {
+        const overrides = mockOrderOverrides.get(numId) || {};
+        overrides.cancelledAt = new Date().toISOString();
+        mockOrderOverrides.set(numId, overrides);
+      }
+    }
     auditLog(session.email, 'order_cancel', orderId, null, { reason, restock, refund, notify });
     res.redirect(`/orders/${numId}?success=order_canceled`);
   } catch (err) {

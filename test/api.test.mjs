@@ -2311,6 +2311,64 @@ await test('GET /catalog → vendor select has Fuzzywumpets as default option', 
   assert.ok(html.includes('Fuzzywumpets (default)') || html.includes('selected'), 'Should show Fuzzywumpets as default vendor');
 });
 
+// ── Cancel order: confirm async orderCancel job before claiming success ────
+console.log('\nAPI tests — cancel job poll:');
+
+await test('POST /orders/:id/cancel (job confirms done) → ?success=order_canceled', async () => {
+  const cookie = await seedSession();
+  const body = new URLSearchParams({ reason: 'OTHER', mock_job: 'done' });
+  const res = await fetch(`${BASE}/orders/9990/cancel`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: body.toString(), redirect: 'manual',
+  });
+  assert.equal(res.status, 302);
+  const loc = res.headers.get('location') || '';
+  assert.ok(loc.includes('/orders/9990'), `expected redirect to order, got ${loc}`);
+  assert.ok(loc.includes('success=order_canceled'), `expected success flash, got ${loc}`);
+  assert.ok(!loc.includes('error='), `must not surface error on a confirmed cancel, got ${loc}`);
+});
+
+await test('POST /orders/:id/cancel (job never confirms done) → ?error=cancel_failed', async () => {
+  const cookie = await seedSession();
+  const body = new URLSearchParams({ reason: 'OTHER', mock_job: 'stuck' });
+  const res = await fetch(`${BASE}/orders/9991/cancel`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: body.toString(), redirect: 'manual',
+  });
+  assert.equal(res.status, 302);
+  const loc = res.headers.get('location') || '';
+  assert.ok(loc.includes('/orders/9991'), `expected redirect to order, got ${loc}`);
+  assert.ok(loc.includes('error=cancel_failed'), `expected cancel_failed flash, got ${loc}`);
+  assert.ok(loc.includes('msg='), `cancel_failed should carry a msg, got ${loc}`);
+  assert.ok(!loc.includes('success='), `must NOT claim success when job never confirms, got ${loc}`);
+});
+
+await test('POST /orders/:id/cancel (job node missing) → ?error=cancel_failed', async () => {
+  const cookie = await seedSession();
+  const body = new URLSearchParams({ reason: 'OTHER', mock_job: 'gone' });
+  const res = await fetch(`${BASE}/orders/9992/cancel`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: body.toString(), redirect: 'manual',
+  });
+  assert.equal(res.status, 302);
+  const loc = res.headers.get('location') || '';
+  assert.ok(loc.includes('error=cancel_failed'), `expected cancel_failed flash, got ${loc}`);
+  assert.ok(!loc.includes('success='), `must NOT claim success when job node missing, got ${loc}`);
+});
+
+await test('POST /orders/:id/cancel requires auth (unauthenticated → /login)', async () => {
+  const res = await fetch(`${BASE}/orders/9990/cancel`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: 'reason=OTHER', redirect: 'manual',
+  });
+  assert.equal(res.status, 302);
+  assert.ok((res.headers.get('location') || '').includes('/login'));
+});
+
 console.log(`\n  ${passed} passed, ${failed} failed`);
 
 // ── Task 45: Backorder queue API ─────────────────────────────────────────────
