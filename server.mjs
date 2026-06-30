@@ -1680,6 +1680,8 @@ async function getOrdersData(filters) {
             customer{id displayName email}
             displayFinancialStatus displayFulfillmentStatus
             totalPriceSet{presentmentMoney{amount currencyCode}}
+            currentSubtotalPriceSet{presentmentMoney{amount currencyCode}}
+            currentTotalPriceSet{presentmentMoney{amount currencyCode}}
             sourceName note tags
             lineItems(first:3){edges{node{title quantity currentQuantity variant{sku}}}}
           }}
