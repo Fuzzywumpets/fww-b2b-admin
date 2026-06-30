@@ -146,6 +146,38 @@ await test('/orders page shows orders table with data', async (page, ctx) => {
   assert.ok(html.includes('New Order'), 'Missing New Order button');
 });
 
+// LIST CURRENT-TOTAL (2026-06-29): the /orders LIST row for an EDITED order must show its CURRENT total,
+// not the frozen original. Fixture #1008 is frozen at $300.00 (totalPriceSet) with currentTotalPriceSet
+// $110.00. Mirrors live #37639 ($921.72 frozen, $601.24 current). The clean order #1007 (no current* set)
+// must still show its frozen total unchanged (fallback path).
+await test('/orders list row shows CURRENT total for edited order, frozen fallback for clean order', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+
+  await page.goto(`${BASE}/orders`);
+  await page.waitForSelector('.data-table');
+
+  // Scope to the #1008 row's money cell — the 7th cell (Total) of the row containing the #1008 link.
+  const row1008Total = await page.evaluate(() => {
+    const link = [...document.querySelectorAll('a.order-link')].find(a => a.textContent.trim() === '#1008');
+    if (!link) return null;
+    const tr = link.closest('tr');
+    return tr ? tr.querySelector('td.text-right.mono')?.textContent.trim() : null;
+  });
+  assert.ok(row1008Total, 'Could not find #1008 list row total cell');
+  assert.ok(row1008Total.includes('110.00'), `#1008 list total should be CURRENT $110.00, got "${row1008Total}"`);
+  assert.ok(!row1008Total.includes('300.00'), `#1008 list total must NOT be the frozen $300.00, got "${row1008Total}"`);
+
+  // Clean order #1007 has no current* set ⇒ frozen total renders unchanged (regression guard for fallback).
+  const row1007Total = await page.evaluate(() => {
+    const link = [...document.querySelectorAll('a.order-link')].find(a => a.textContent.trim() === '#1007');
+    if (!link) return null;
+    const tr = link.closest('tr');
+    return tr ? tr.querySelector('td.text-right.mono')?.textContent.trim() : null;
+  });
+  assert.ok(row1007Total && /\$\d/.test(row1007Total), `#1007 (clean) list total should render a money value, got "${row1007Total}"`);
+});
+
 await test('/orders/1001 shows order detail with timeline and line items', async (page, ctx) => {
   const sid = await seedSession();
   await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
