@@ -44,6 +44,9 @@ import {
 import { generateInvoicePdf, lineItemTrueTotal, lineItemTrueUnit, lineItemCurrentQty } from './pdf.mjs';
 import { renderLabelSheet, expandItems, TEMPLATES as LABEL_TEMPLATES, DEFAULT_FIELDS } from './labels.mjs';
 import { isInsider, resolveXeroContact, syncCustomerToXero, getXeroSyncStatus } from './lib/xero-customer-sync.mjs';
+// fww-error-sink monitoring (injected 2026-06-30): error-logging shim only. To disable, remove this import, the installGlobalHandlers() call, and the expressErrorMiddleware() app.use. See fww-error-sink RUNBOOK.
+import { installGlobalHandlers, expressErrorMiddleware } from './fww-logsink.mjs';
+installGlobalHandlers();
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const MOCK  = process.env.B2B_ADMIN_MOCK === '1';
@@ -10198,6 +10201,9 @@ app.get('/invoices', requireAuth, (req, res) => {
 
 // Static
 app.use(express.static(path.join(__dirname, 'public')));
+
+// fww-error-sink: error middleware must be LAST (after all routes + static)
+app.use(expressErrorMiddleware());
 
 app.listen(PORT, '127.0.0.1', () => {
   console.log(`fww-b2b-admin listening on http://127.0.0.1:${PORT} (MOCK=${MOCK})`);
