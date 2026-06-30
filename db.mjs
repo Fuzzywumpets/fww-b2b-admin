@@ -2,6 +2,7 @@ import Database from 'better-sqlite3';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { reportEvent } from './fww-logsink.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const MOCK = process.env.B2B_ADMIN_MOCK === '1';
@@ -361,6 +362,7 @@ export function deleteSession(sid) {
 }
 
 export function auditLog(email, action, target, before, after) {
+  const ts = Date.now();
   db.prepare(`
     INSERT INTO admin_audit_log (email, action, target, before_val, after_val, ts)
     VALUES (?, ?, ?, ?, ?, ?)
@@ -370,8 +372,23 @@ export function auditLog(email, action, target, before, after) {
     target ?? null,
     before !== undefined && before !== null ? JSON.stringify(before) : null,
     after !== undefined && after !== null ? JSON.stringify(after) : null,
-    Date.now()
+    ts
   );
+  // Forward the structured audit event to the error-sink (additive, best-effort).
+  // reportEvent() never throws and returns immediately, so it cannot block or
+  // break the local DB write above.
+  try {
+    reportEvent({
+      kind: 'audit',
+      severity: 'info',
+      app: 'fww-b2b-admin',
+      actor: email ?? null,
+      action,
+      target: target ?? null,
+      message: `audit: ${action}`,
+      ts,
+    });
+  } catch (_) { /* never let audit-forward affect the write */ }
 }
 
 export function getCustomerNotes(customerId) {
