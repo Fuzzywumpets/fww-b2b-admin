@@ -2698,12 +2698,19 @@ function renderOrderDetail(session, order, flash, flashMsg) {
                       if (j.line && j.line.liId){ tr.dataset.committedLiId = j.line.liId; }
                     });
                   },
-                  // Custom row: persist on blur once title && qty>0 && price>=0; once committed it
+                  // Custom row: persist once title && qty>0 && price>=0; once committed it
                   // becomes an existing line keyed by committedLiId (qty/price edits re-route there).
+                  // P0 fix (2026-06-29): DEBOUNCE the save. The old code fired on the blur of ANY field,
+                  // so leaving the title box (with qty still at its default 1 and price at 0.00) committed
+                  // a premature "1 × $0.00" line and stamped an idemKey — then the corrected qty/price
+                  // blurs were DEDUPED as replays and ignored, so the custom line saved as garbage and
+                  // looked broken. Debouncing 600ms after the LAST edit lets the user fill all three
+                  // fields; only the final values are committed (one idemKey assigned at flush time).
                   wireCustomRow: function(tr){
                     var titleEl = tr.querySelector('.ncl-title'), qtyEl = tr.querySelector('.ncl-qty'), priceEl = tr.querySelector('.ncl-price');
-                    function trySave(){
-                      if (tr.dataset.committedLiId) return; // already saved; (qty/price changes after are out of scope for custom v1)
+                    var t = null;
+                    function flush(){
+                      if (tr.dataset.committedLiId) return; // already saved
                       var title = (titleEl && titleEl.value || '').trim();
                       var qty = parseInt(qtyEl && qtyEl.value, 10);
                       var price = parseFloat(priceEl && priceEl.value);
@@ -2713,7 +2720,10 @@ function renderOrderDetail(session, order, flash, flashMsg) {
                         if (j.line && j.line.liId){ tr.dataset.committedLiId = j.line.liId; }
                       });
                     }
-                    [titleEl, qtyEl, priceEl].forEach(function(el){ if (el) el.addEventListener('blur', trySave); });
+                    function schedule(){ if (t) clearTimeout(t); t = setTimeout(flush, 600); }
+                    // Re-arm the debounce on every edit; also flush promptly when the row loses focus
+                    // entirely (user tabbed/clicked away) so a finished line saves without waiting.
+                    [titleEl, qtyEl, priceEl].forEach(function(el){ if (el){ el.addEventListener('input', schedule); el.addEventListener('blur', schedule); } });
                   },
                   // Existing-line qty change (debounced, single-flight, last-write-wins).
                   qtyChange: function(tr, liId, qty){
@@ -2772,8 +2782,12 @@ function renderOrderDetail(session, order, flash, flashMsg) {
                     var qtyEl = tr.querySelector('.edit-qty-input');
                     var priceEl = tr.querySelector('.edit-price-input');
                     if (qtyEl && !qtyEl.dataset.asWired){ qtyEl.dataset.asWired='1';
+                      // P0 fix (2026-06-29): save on COMMIT (change/blur) only — NOT per-keystroke.
+                      // The old 'input' listener fired qtyChange on every keystroke, so editing "3" to
+                      // "15" briefly sent "1" then "15", and clicking into a field could fire a save at
+                      // the unchanged current value — which Shopify rejects with "at least one change"
+                      // and painted the red pill. 'change' fires once when the user leaves the field.
                       qtyEl.addEventListener('change', function(){ var q = parseInt(qtyEl.value,10); if (q>=0) window.__autosave.qtyChange(tr, liId, q); });
-                      qtyEl.addEventListener('input', function(){ var q = parseInt(qtyEl.value,10); if (q>=0) window.__autosave.qtyChange(tr, liId, q); });
                     }
                     if (priceEl && !priceEl.dataset.asWired){ priceEl.dataset.asWired='1';
                       priceEl.addEventListener('change', function(){ var pr = parseFloat(priceEl.value); if (pr>=0) window.__autosave.priceChange(tr, liId, pr); });
@@ -5132,6 +5146,10 @@ function lineHasStackedOrderDiscount(calcItem) {
 // so the idempotency ledger never records a commit that did not actually take effect on Shopify
 // (the delete-persist false-green). Returning a string from verifyFn pushes it as a warning.
 async function runOrderEdit(orderId, idemKey, editedBy, action, payload, stageFn, verifyFn) {
+  // [order-edit] P0 instrumentation (2026-06-29): log every save attempt + its REAL outcome so a
+  // future failure shows the actual Shopify userError / exception in journalctl, not just a red pill.
+  const _payloadSummary = (() => { try { const p = payload || {}; return JSON.stringify({ liId: p.liId, qty: p.qty, price: p.price, variantId: p.variantId, title: p.title ? String(p.title).slice(0,40) : undefined }); } catch { return '<unserializable>'; } })();
+  console.log(`[order-edit] BEGIN action=${action} order=${orderId} idem=${idemKey} payload=${_payloadSummary}`);
   // 1) DEDUPE FIRST — never re-stage a committed action (kills the double-add hazard).
   const existing = getEditAction(idemKey);
   if (existing && existing.status === 'committed') {
@@ -5160,10 +5178,10 @@ async function runOrderEdit(orderId, idemKey, editedBy, action, payload, stageFn
         }}
       `, { id: orderId });
       const beginErrs = beginResult.data?.orderEditBegin?.userErrors || [];
-      if (beginErrs.length) throw new OrderEditError(beginErrs.map(e => e.message));
+      if (beginErrs.length) { console.error(`[order-edit] ${action} orderEditBegin userErrors:`, JSON.stringify(beginErrs)); throw new OrderEditError(beginErrs.map(e => e.message)); }
       const calcOrder = beginResult.data?.orderEditBegin?.calculatedOrder;
       const calcId = calcOrder?.id;
-      if (!calcId) throw new OrderEditError('orderEditBegin returned no calculatedOrder');
+      if (!calcId) { console.error(`[order-edit] ${action} orderEditBegin returned no calculatedOrder; raw=`, JSON.stringify(beginResult.data?.orderEditBegin || beginResult.errors || beginResult).slice(0, 600)); throw new OrderEditError('orderEditBegin returned no calculatedOrder'); }
       const calcItems = calcOrder.lineItems?.edges?.map(e => e.node) || [];
 
       const ctx = { calcOrder, calcItems, warnings: [] };
@@ -5175,7 +5193,28 @@ async function runOrderEdit(orderId, idemKey, editedBy, action, payload, stageFn
           order{id} userErrors{field message}}}`,
         { id: calcId, notify: false, note: payload?.staffNote || null });
       const cErrs = commitRes.data?.orderEditCommit?.userErrors || [];
-      if (cErrs.length) throw new OrderEditError(cErrs.map(e => e.message));
+      if (cErrs.length) {
+        // NO-OP IS NOT A FAILURE (P0 regression fix, 2026-06-29): Shopify returns
+        // "There must be at least one change to be made." when the staged edit produced no net
+        // change — e.g. a qty re-save to the value the order ALREADY has. Since commit a6c1735 the
+        // qty input renders currentQuantity (the post-edit truth), so "confirm without changing"
+        // (or a per-keystroke autosave landing on the current value) stages nothing and commit
+        // 422s — which surfaced to staff as a red "Changes not saved — review" pill even though the
+        // order was already in the desired state. Treat that specific userError as a SUCCESSFUL
+        // no-op: read the live state and return ok:true so the pill stays green. Any OTHER commit
+        // userError is still a real failure and throws.
+        const isNoChange = cErrs.every(e => /at least one change/i.test(e.message || ''));
+        if (isNoChange) {
+          console.log(`[order-edit] ${action} commit was a NO-OP (order already in desired state) — treating as success`);
+          const lineState = await readCommittedLineState(orderId);
+          if (verifyFn) { const w = await verifyFn(lineState); if (typeof w === 'string' && w) ctx.warnings.push(w); }
+          const result = { ok: true, idemKey, noop: true, warnings: ctx.warnings, order: { subtotal: lineState.subtotal, total: lineState.total, lineCount: lineState.lineCount }, lineState };
+          putEditAction({ idemKey, orderId, action, payload, result, status: 'committed', editedBy });
+          return result;
+        }
+        console.error(`[order-edit] ${action} orderEditCommit userErrors:`, JSON.stringify(cErrs));
+        throw new OrderEditError(cErrs.map(e => e.message));
+      }
 
       // Read authoritative committed state. VERIFY-OR-FAIL before recording committed: a
       // mis-mapped or no-op'd mutation can `commit` cleanly yet leave the targeted line
@@ -5188,9 +5227,12 @@ async function runOrderEdit(orderId, idemKey, editedBy, action, payload, stageFn
       }
       const result = { ok: true, idemKey, warnings: ctx.warnings, order: { subtotal: lineState.subtotal, total: lineState.total, lineCount: lineState.lineCount }, lineState };
       putEditAction({ idemKey, orderId, action, payload, result, status: 'committed', editedBy });
+      console.log(`[order-edit] OK action=${action} order=${orderId} idem=${idemKey} lineCount=${result.order?.lineCount} subtotal=${result.order?.subtotal} warnings=${(result.warnings||[]).length}`);
       return result;
     } catch (err) {
       const messages = err instanceof OrderEditError ? err.userMessages : [err.message];
+      // [order-edit] P0: surface the REAL failure reason (userMessages or the raw stack) in journalctl.
+      console.error(`[order-edit] FAIL action=${action} order=${orderId} idem=${idemKey} reason=${JSON.stringify(messages)}${err instanceof OrderEditError ? '' : '\n' + (err && err.stack ? err.stack : String(err))}`);
       putEditAction({ idemKey, orderId, action, payload, result: { ok: false, errors: messages }, status: 'failed', editedBy });
       const e = new OrderEditError(messages);
       throw e;
@@ -5280,6 +5322,7 @@ app.post('/orders/:id/edit', requireAuth, async (req, res) => {
 
   const pricesMap = Object.fromEntries(Object.entries(prices || {}).map(([k,v]) => [k, parseFloat(v) || 0]));
   const changes = { qtys: qtysMap, removes: [...removeSet], prices: pricesMap, discountPct, discountFixed, discountReason, addCustomLines: newCustomLines, addVariantLines: newVariantLines };
+  console.log(`[order-edit] BATCH /edit order=${numId} qtys=${Object.keys(qtysMap).length} removes=${removeSet.size} prices=${Object.keys(pricesMap).length} addCustom=${newCustomLines.length} addVariant=${newVariantLines.length} disc=${discountPct||discountFixed||'none'}`);
 
   if (MOCK) {
     const order = getMockOrder(numId);
@@ -5502,6 +5545,14 @@ app.post('/orders/:id/edit', requireAuth, async (req, res) => {
     // handler skipped, which is exactly how the #37583 false-green slipped through.)
     const preState = await readCommittedLineState(orderId).catch(() => null);
     const expectedAdds = newCustomLines.length + newVariantLines.length;
+    // P0 fix (2026-06-29): the post-commit count check MUST account for REMOVES in the same batch.
+    // A batch that removes 1 line AND adds 1 leaves lineCount unchanged, so the old check
+    // (postCount >= preCount + adds) false-FAILED an edit that Shopify had actually saved — staff saw
+    // "edit failed" while the qty/remove/add all persisted. Count only removes that were ACTIVE
+    // pre-edit (removing an already-removed line is a no-op and must not inflate the expected delta).
+    const expectedRemoves = preState
+      ? [...removeSet].filter(li => (preState.lines.find(l => l.liId === li)?.currentQuantity || 0) > 0).length
+      : removeSet.size;
 
     // Commit — CAPTURE the result and INSPECT userErrors (was fire-and-forget: the root-cause bug).
     const commitRes = await shopifyFetch(`mutation commit($id:ID!,$notify:Boolean!,$note:String){
@@ -5509,13 +5560,26 @@ app.post('/orders/:id/edit', requireAuth, async (req, res) => {
         order{id} userErrors{field message}}}`,
       { id: calcId, notify: false, note: staffNote || null });
     const cErrs = commitRes.data?.orderEditCommit?.userErrors || [];
-    if (cErrs.length) throw new Error('commit: ' + cErrs.map(e => e.message).join('; '));
+    if (cErrs.length) {
+      // NO-OP IS NOT A FAILURE: a batch that nets no change (e.g. qty re-saved to its current value,
+      // or only removes of already-removed lines) makes Shopify reject the commit with "There must be
+      // at least one change to be made." Treat that as success — the order is already in the desired
+      // state. Any OTHER commit userError is a real failure.
+      if (cErrs.every(e => /at least one change/i.test(e.message || ''))) {
+        console.log(`[order-edit] BATCH /edit order=${numId} commit was a NO-OP — treating as success`);
+        logOrderEdit(orderId, session.email, staffNote, changes);
+        auditLog(session.email, 'order_edit', orderId, null, changes);
+        return res.redirect(`/orders/${numId}?success=order_edited`);
+      }
+      throw new Error('commit: ' + cErrs.map(e => e.message).join('; '));
+    }
 
-    // Verify the committed line delta actually applied (additions must increase the live count).
-    if (expectedAdds > 0 && preState) {
+    // Verify the committed line delta actually applied. Net expected active-line delta = adds - removes.
+    if ((expectedAdds > 0 || expectedRemoves > 0) && preState) {
       const postState = await readCommittedLineState(orderId).catch(() => null);
-      if (postState && postState.lineCount < preState.lineCount + expectedAdds) {
-        throw new Error(`commit reported success but only ${postState.lineCount - preState.lineCount} of ${expectedAdds} added lines persisted`);
+      const expectedNet = preState.lineCount + expectedAdds - expectedRemoves;
+      if (postState && postState.lineCount < expectedNet) {
+        throw new Error(`commit reported success but live line count is ${postState.lineCount}, expected ${expectedNet} (adds=${expectedAdds}, removes=${expectedRemoves})`);
       }
     }
     logOrderEdit(orderId, session.email, staffNote, changes);
@@ -5525,7 +5589,7 @@ app.post('/orders/:id/edit', requireAuth, async (req, res) => {
     }
     res.redirect(`/orders/${numId}?success=order_edited`);
   } catch (err) {
-    console.error('order edit error:', err.message);
+    console.error(`[order-edit] BATCH /edit FAIL order=${numId} reason=${err.message}\n${err && err.stack ? err.stack : ''}`);
     // Surface the REAL Shopify reason in the banner (renderOrderDetail plumbs ?msg= into flashMsg).
     res.redirect(`/orders/${numId}?error=edit_failed&msg=${encodeURIComponent(String(err.message || '').slice(0, 300))}`);
   }
