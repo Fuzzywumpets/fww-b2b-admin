@@ -1139,10 +1139,17 @@ function renderOrderHistoryCard(history) {
       </div>
     </div>`;
   }).join('');
-  return `<div class="card" id="order-history-card">
-    <div class="card-header"><h2>Order History</h2></div>
-    ${rows || '<p class="text-muted small-text">No history yet.</p>'}
-  </div>`;
+  const count = (history || []).length;
+  // COLLAPSE: default-collapsed <details> with a count badge so the noisy audit timeline
+  // doesn't push the customer-facing chat box / visible-note box below the fold. id stays
+  // #order-history-card (inline JS / tests key off it). No `open` attr = collapsed by default.
+  return `<details class="card" id="order-history-card">
+    <summary class="card-header" style="cursor:pointer;display:flex;align-items:center;justify-content:space-between;list-style:none">
+      <h2>Order History <span class="badge badge-muted" style="margin-left:6px">${count}</span></h2>
+      <span class="text-muted" style="font-size:11px">click to expand</span>
+    </summary>
+    <div style="margin-top:10px">${rows || '<p class="text-muted small-text">No history yet.</p>'}</div>
+  </details>`;
 }
 
 // WHAT: extracts the trailing numeric id from a Shopify gid (gid://shopify/Order/1001 → '1001') by taking the last '/'-segment.
@@ -2242,9 +2249,9 @@ function renderOrderDetail(session, order, flash, flashMsg) {
   </script>`;
 
 
-// WHAT: client JS for the order-detail customer-comms panel — submitVisibleNote() POSTs /api/orders/:id/visible-note and re-renders the list; loadCustomerReplies() GETs /api/orders/:id/customer-messages (Re:amaze threads).
-// CHANGE-GUARD: the client re-render escapes only '<' (n.body.replace(/</g,'<')) — weaker than server-side h(); do not echo attacker-controlled HTML attributes here. Endpoint paths are hardcoded and parsed from location.pathname.split('/').pop() for the order id — keep the /orders/:id URL shape.
-// INVARIANT(S): mbody() coerces message objects/strings and truncates (300/200 chars) for preview; threads come from Re:amaze via the server, this only renders them.
+// WHAT: client JS for the order-detail customer-comms panel — submitVisibleNote() POSTs /api/orders/:id/visible-note and re-renders the visible-notes list; loadCustomerReplies() renders the Re:amaze CHAT BOX: it GETs /api/orders/:id/customer-messages for the thread list, then per thread GETs /api/orders/:id/conversations/:slug/messages and renders us/them bubbles.
+// CHANGE-GUARD: bubbles render the portal's pre-cleaned `text` (HTML/header/quote-scrubbed) via esc() only — never inject raw `body`/HTML into the DOM. us=staff=RIGHT bubble, them=customer=LEFT bubble; each shows ONLY text + atDisplay. Endpoint paths are parsed from location.pathname.split('/').pop() for the order id — keep the /orders/:id URL shape. The 'Open in Re:amaze' deep link must survive.
+// INVARIANT(S): messages arrive newest-first from Re:amaze and are re-sorted oldest-first for top-to-bottom reading; threads/messages come from the server, this only renders them; the visible-notes re-render still escapes only '<' (weaker than h()) — do not echo attacker-controlled HTML attributes.
   const visibleNotesScript = `
     <script>
     async function submitVisibleNote(e, orderId) {
@@ -2280,7 +2287,6 @@ function renderOrderDetail(session, order, flash, flashMsg) {
         btn.disabled = false;
       }
     }
-    function mbody(m){ return String((m && m.body !== undefined) ? m.body : (m || '')).replace(/</g,'&lt;'); }
     // Second build (Build B): brand for the Re:amaze STAFF inbox URL, injected server-side
     // (never read process.env in client JS, never hardcode the brand). The staff URL
     // (https://<brand>.reamaze.com/admin/conversations/<slug>) opens the live agent conversation;
@@ -2295,27 +2301,76 @@ function renderOrderDetail(session, order, flash, flashMsg) {
     async function loadCustomerReplies(orderId) {
       const el = document.getElementById('customer-replies-list');
       if (!el) return;
+      function esc(s){ return String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+      function bubbleHtml(m){
+        var them = (m && m.sender === 'them');
+        // them = customer = LEFT; us = staff = RIGHT.
+        var align = them ? 'flex-start' : 'flex-end';
+        var bg = them ? '#ffffff' : '#eaf5c8';
+        var border = them ? '1px solid #e3e3e3' : '1px solid #cfe08a';
+        var radius = them ? '12px 12px 12px 2px' : '12px 12px 2px 12px';
+        var who = them ? 'Customer' : 'Us';
+        var when = esc(m && (m.atDisplay || m.at) || '');
+        return '<div style="display:flex;justify-content:' + align + ';margin-bottom:8px">'
+          + '<div style="max-width:78%;background:' + bg + ';border:' + border + ';border-radius:' + radius + ';padding:8px 11px">'
+          +   '<div style="font-size:13px;line-height:1.45;white-space:pre-wrap;word-break:break-word">' + esc(m && m.text || '') + '</div>'
+          +   '<div style="font-size:10px;color:var(--muted,#888);margin-top:4px;text-align:' + (them ? 'left' : 'right') + '">' + esc(who) + ' \u00b7 ' + when + '</div>'
+          + '</div>'
+        + '</div>';
+      }
       try {
         const r = await fetch('/api/orders/' + orderId + '/customer-messages');
         const j = await r.json();
         const threads = j.threads || [];
         if (!threads.length) { el.innerHTML = '<p class="text-muted small-text">No customer replies yet. Replies to notes will appear here.</p>'; return; }
-        el.innerHTML = threads.map(function(t){
+        // Render a chat thread per conversation: header (subject + Re:amaze link) + a messages container we fill async.
+        el.innerHTML = threads.map(function(t, i){
           var staffUrl = reamazeStaffUrl(t);
-          var clickAttrs = staffUrl ? ' style="border-left:3px solid var(--lime,#9BBC0E);padding:8px 12px;margin-bottom:8px;background:#f9fdf0;border-radius:0 4px 4px 0;cursor:pointer" onclick="openReamaze(' + JSON.stringify(staffUrl).replace(/"/g,'&quot;') + ')" title="Open in Re:amaze staff inbox"'
-                                   : ' style="border-left:3px solid var(--lime,#9BBC0E);padding:8px 12px;margin-bottom:8px;background:#f9fdf0;border-radius:0 4px 4px 0"';
-          return '<div' + clickAttrs + '>'
-          + '<div style="font-weight:600;font-size:13px">' + String(t.subject||'(no subject)').replace(/</g,'&lt;') + '</div>'
-          + (t.lastCustomerMessage ? '<div style="font-size:13px;margin-top:4px"><b>Customer:</b> ' + mbody(t.lastCustomerMessage).slice(0,300) + '</div>' : '')
-          + (t.lastStaffMessage ? '<div style="font-size:12px;color:#777;margin-top:2px"><b>Us:</b> ' + mbody(t.lastStaffMessage).slice(0,200) + '</div>' : '')
-          + (staffUrl ? '<a href="' + staffUrl.replace(/"/g,'&quot;') + '" target="_blank" rel="noopener" style="font-size:11px" onclick="event.stopPropagation()">Open in Re:amaze ↗</a>' : '')
-          + '</div>'; }).join('');
+          var link = staffUrl ? '<a href="' + esc(staffUrl) + '" target="_blank" rel="noopener" style="font-size:11px;white-space:nowrap" onclick="event.stopPropagation()">Open in Re:amaze \u2197</a>' : '';
+          return '<div class="chat-thread" style="border:1px solid #ececec;border-radius:8px;margin-bottom:14px;overflow:hidden">'
+            + '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 11px;background:#f7f7f4;border-bottom:1px solid #ececec">'
+            +   '<div style="font-weight:600;font-size:13px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(t.subject || '(no subject)') + '</div>'
+            +   link
+            + '</div>'
+            + '<div class="chat-messages" id="chat-msgs-' + i + '" data-slug="' + esc(t.slug || '') + '" style="padding:11px;background:#fbfbf9;max-height:420px;overflow-y:auto">'
+            +   '<p class="text-muted small-text" style="margin:0">Loading conversation\u2026</p>'
+            + '</div>'
+          + '</div>';
+        }).join('');
+        // Fetch each thread's clean messages and render bubbles (oldest-first, top-to-bottom).
+        for (let i = 0; i < threads.length; i++) {
+          const slug = threads[i].slug;
+          const box = document.getElementById('chat-msgs-' + i);
+          if (!box) continue;
+          if (!slug) { box.innerHTML = '<p class="text-muted small-text" style="margin:0">No conversation detail available.</p>'; continue; }
+          try {
+            const mr = await fetch('/api/orders/' + orderId + '/conversations/' + encodeURIComponent(slug) + '/messages');
+            const mj = await mr.json();
+            var msgs = (mj && mj.messages) || [];
+            // Re:amaze returns newest-first; show oldest-first so the thread reads top-to-bottom like chat.
+            msgs = msgs.slice().sort(function(a,b){ return new Date(a.at||a.createdAt||0) - new Date(b.at||b.createdAt||0); });
+            box.innerHTML = msgs.length ? msgs.map(bubbleHtml).join('') : '<p class="text-muted small-text" style="margin:0">No messages in this thread yet.</p>';
+            box.scrollTop = box.scrollHeight;
+          } catch (e) {
+            box.innerHTML = '<p class="text-muted small-text" style="margin:0">Could not load this conversation.</p>';
+          }
+        }
       } catch(e) { el.innerHTML = '<p class="text-muted small-text">Could not load replies.</p>'; }
     }
     document.addEventListener('DOMContentLoaded', function(){ loadCustomerReplies(location.pathname.split('/').pop()); });
     </script>`;
 
   return layout({ title: order.name || 'Order', session, activePath: '/orders', content: `
+    <style>
+      /* COLLAPSE: style the default-collapsed audit/internal-note cards. Hide the native
+         disclosure triangle (we render our own 'click to expand' affordance) and add a
+         subtle hover so the summary reads as clickable. Scoped to details.card only. */
+      details.card > summary { list-style: none; }
+      details.card > summary::-webkit-details-marker { display: none; }
+      details.card > summary::marker { content: ''; }
+      details.card > summary:hover { background: var(--gray-50, #f7f7f4); border-radius: 4px; }
+      details.card[open] > summary { margin-bottom: 0.25rem; }
+    </style>
     ${visibleNotesScript}
     ${editModeScript}
     <div class="breadcrumb-row"><a href="/orders" class="breadcrumb">← Orders</a></div>
@@ -3079,13 +3134,16 @@ function renderOrderDetail(session, order, flash, flashMsg) {
             <button type="button" class="btn btn-secondary" onclick="downloadInvoiceCsv(${h(numId)})">Download CSV</button>
           </div>
         </div>
-        <div class="card">
-          <div class="card-header"><h2>Order Note (internal)</h2></div>
-          <form method="POST" action="/orders/${h(numId)}/note">
+        <details class="card" id="internal-notes-card">
+          <summary class="card-header" style="cursor:pointer;display:flex;align-items:center;justify-content:space-between;list-style:none">
+            <h2>Internal notes <span class="badge badge-muted" style="margin-left:6px">${order.note && String(order.note).trim() ? 1 : 0}</span></h2>
+            <span class="text-muted" style="font-size:11px">click to expand</span>
+          </summary>
+          <form method="POST" action="/orders/${h(numId)}/note" style="margin-top:10px">
             <textarea name="note" class="textarea" rows="3" placeholder="Add a note for this order…">${h(order.note||'')}</textarea>
             <div style="margin-top:0.5rem"><button type="submit" class="btn btn-secondary btn-sm">Save Note</button></div>
           </form>
-        </div>
+        </details>
         ${renderOrderHistoryCard(orderHistory)}
         <div class="card" id="visible-notes-card">
           <div class="card-header"><h2>Note visible to customer</h2></div>
@@ -6547,6 +6605,23 @@ app.get('/api/orders/:id/customer-messages', requireAuth, async (req, res) => {
   const result = await callPortalInternal('POST', '/__internal__/customer-messages', { orderId: shopifyId });
   if (!result.ok) return res.status(500).json({ error: result.error || 'failed' });
   res.json({ threads: result.threads || [], customerEmail: result.customerEmail || null });
+});
+
+// WHAT: chat-box feed — proxies one Re:amaze thread's CLEAN per-message data to the portal-internal
+//   twin GET /__internal__/conversations/:slug/messages so the order-detail chat box can render
+//   us/them bubbles with timestamps and NO HTML / headers / quoted history. Mirrors the
+//   customer-messages proxy above (requireAuth + callPortalInternal with the shared internal bearer).
+// CHANGE-GUARD: read-only; MOCK returns an empty thread; real portal failure returns 500. The slug is
+//   passed through verbatim from the customer-messages thread list — front-end must encode it. The
+//   portal returns text already HTML/header/quote-scrubbed; do NOT re-inject raw body[] into the DOM.
+// INVARIANT(S): shape = { ok, messages:[{ text, sender:'us'|'them', at, atDisplay, ... }] }; depends on
+//   the portal-internal contract (B2B_PORTAL_INTERNAL_TOKEN) being set — else callPortalInternal returns ok:false.
+app.get('/api/orders/:id/conversations/:slug/messages', requireAuth, async (req, res) => {
+  if (MOCK) return res.json({ ok: true, messages: [], mock: true });
+  const slug = encodeURIComponent(req.params.slug);
+  const result = await callPortalInternal('GET', `/__internal__/conversations/${slug}/messages`, null);
+  if (!result.ok) return res.status(500).json({ ok: false, error: result.error || 'failed' });
+  res.json({ ok: true, messages: result.messages || [] });
 });
 
 // ── Phase 14C: Tax exempt admin review page ───────────────────────────────────
