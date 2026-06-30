@@ -22,6 +22,48 @@ const FONT_PATHS = {
 };
 const LOGO_PATH = join(ASSETS, 'logo.png');
 
+// ── Shared invoice line math (ORDER-LEVEL + LINE-LEVEL discount aware) ─────────
+// WHAT: returns a line item's post-ALL-discounts total for its CURRENT (post-edit) quantity.
+// WHY: discountedUnitPriceSet/discountedTotalSet bake in LINE-level (targetSelection EXPLICIT)
+//   discounts only. ORDER/CART-level discounts (a discountAllocation whose
+//   discountApplication.targetSelection === 'ALL', e.g. SparkLayer 50% ACROSS on #37637) are NOT
+//   reflected in those price sets — so we must subtract them here, or the invoice doubles
+//   (1825.82 vs the real 912.91). Per-line-discounted orders (#37639) carry NO 'ALL' allocation,
+//   so they are unchanged (cartAlloc 0) and stay correct.
+// HOW: start from discountedTotalSet (line total after LINE discounts, computed on the ORIGINAL
+//   quantity q), subtract the sum of cart-level ('ALL') allocations (also computed on q), then
+//   prorate to the current quantity (cq/q). Falls back to discountedUnitPrice*q when
+//   discountedTotalSet is absent (mock fixtures / partial-invoice snapshots that predate this field).
+// INVARIANT(S): a line with currentQuantity 0 (removed in an edit) contributes 0; quantity is the
+//   ORIGINAL Shopify quantity the discountedTotalSet/allocations were computed against; presentment
+//   money only. Keep this the single source of truth shared by buildInvoiceCsv (CSV) and the PDF row
+//   loop so the two documents never disagree.
+function liNum(s) { return parseFloat(s?.presentmentMoney?.amount ?? 0) || 0; }
+export function lineItemCurrentQty(item) {
+  return item.currentQuantity != null ? item.currentQuantity : (item.quantity || 0);
+}
+export function lineItemCartDiscount(item) {
+  return (item.discountAllocations || [])
+    .filter(a => a?.discountApplication?.targetSelection === 'ALL')
+    .reduce((s, a) => s + liNum(a.allocatedAmountSet), 0);
+}
+export function lineItemTrueTotal(item) {
+  const cq = lineItemCurrentQty(item);
+  if (cq <= 0) return 0;
+  const q  = item.quantity || cq || 1;
+  const du = liNum(item.discountedUnitPriceSet) || liNum(item.originalUnitPriceSet);
+  const dt = liNum(item.discountedTotalSet) || (du * q);   // fallback when discountedTotalSet absent
+  const cartAlloc = lineItemCartDiscount(item);
+  return (dt - cartAlloc) * (cq / q);
+}
+// Per-unit price to DISPLAY (post-all-discounts). For order-level discounts this is below the
+// list/discountedUnitPrice; for line-level it equals discountedUnitPrice.
+export function lineItemTrueUnit(item) {
+  const cq = lineItemCurrentQty(item);
+  if (cq <= 0) return 0;
+  return lineItemTrueTotal(item) / cq;
+}
+
 function registerBrandFonts(doc) {
   for (const [name, path] of Object.entries(FONT_PATHS)) {
     if (existsSync(path)) {
@@ -156,16 +198,16 @@ export async function generateInvoicePdf(order, opts = {}) {
     }
 
     for (const item of lineItems) {
+      // ORDER-LEVEL discount + post-edit qty: skip lines removed in an edit (currentQuantity 0) and
+      // key qty/unit/total off the post-ALL-discounts current line math (shared with buildInvoiceCsv).
+      const qty = lineItemCurrentQty(item);
+      if (qty <= 0) continue;
       if (y > 680) {
         doc.addPage();
         y = 50;
       }
-      const unitPrice = parseFloat(
-        item.discountedUnitPriceSet?.presentmentMoney?.amount
-        ?? item.originalUnitPriceSet?.presentmentMoney?.amount
-        ?? 0
-      );
-      const rowTotal = unitPrice * (item.quantity || 0);
+      const unitPrice = lineItemTrueUnit(item);
+      const rowTotal = lineItemTrueTotal(item);
       // Use fixed height: 1 line per row, truncate overflow. height:14 + ellipsis prevents wrap.
       const variantTitle = (item.variant?.title && item.variant.title !== 'Default Title') ? item.variant.title : null;
       const rowH = variantTitle ? 32 : 20;
@@ -179,7 +221,7 @@ export async function generateInvoicePdf(order, opts = {}) {
       doc.fontSize(8.5);
       doc.text(fitText(item.variant?.sku, 20), 285, y, { width: 90, height: 14, lineBreak: false, ellipsis: true });
       doc.fontSize(9.5);
-      doc.text(String(item.quantity || 0), 385, y, { width: 40, height: 14, align: 'right', lineBreak: false });
+      doc.text(String(qty), 385, y, { width: 40, height: 14, align: 'right', lineBreak: false });
       doc.text(fmt(unitPrice), 430, y, { width: 65, height: 14, align: 'right', lineBreak: false });
       doc.text(fmt(rowTotal), 500, y, { width: 62, height: 14, align: 'right', lineBreak: false });
       doc.moveTo(50, y + rowH - 4).lineTo(562, y + rowH - 4).lineWidth(0.5).strokeColor('#E5E5E5').stroke();
@@ -194,9 +236,16 @@ export async function generateInvoicePdf(order, opts = {}) {
       ship  = parseFloat(opts.shipping) || 0;
       total = parseFloat(opts.total) || 0;
     } else {
-      sub   = parseFloat(order.subtotalPriceSet?.presentmentMoney?.amount || 0);
+      // HARD REQUIREMENT: invoice subtotal MUST equal Shopify's currentSubtotalPriceSet (the post-edit,
+      // post-ALL-discounts truth — 912.91 for #37637, NOT the frozen 1825.82). Prefer current* and fall
+      // back to the frozen subtotal/total only when current* is absent (older orders / mock fixtures
+      // that don't carry the current sets). Using Shopify's authoritative aggregate also guarantees
+      // EXACT equality even where summing rounded per-line totals would drift by a cent.
+      const curSub = order.currentSubtotalPriceSet?.presentmentMoney?.amount;
+      const curTot = order.currentTotalPriceSet?.presentmentMoney?.amount;
+      sub   = parseFloat(curSub ?? order.subtotalPriceSet?.presentmentMoney?.amount ?? 0) || 0;
       ship  = parseFloat(order.totalShippingPriceSet?.presentmentMoney?.amount || 0);
-      total = parseFloat(order.totalPriceSet?.presentmentMoney?.amount || 0);
+      total = parseFloat(curTot ?? order.totalPriceSet?.presentmentMoney?.amount ?? 0) || 0;
     }
 
     doc.fontSize(10).font('Inter').fillColor(BLACK);

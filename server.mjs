@@ -41,7 +41,7 @@ import {
   listImpersonationsForCustomer,
   getOrderByName,
 } from './db.mjs';
-import { generateInvoicePdf } from './pdf.mjs';
+import { generateInvoicePdf, lineItemTrueTotal, lineItemTrueUnit, lineItemCurrentQty } from './pdf.mjs';
 import { renderLabelSheet, expandItems, TEMPLATES as LABEL_TEMPLATES, DEFAULT_FIELDS } from './labels.mjs';
 import { isInsider, resolveXeroContact, syncCustomerToXero, getXeroSyncStatus } from './lib/xero-customer-sync.mjs';
 
@@ -650,6 +650,44 @@ const MOCK_ORDERS = [
     billingAddress:  { firstName: 'John', lastName: 'Doe', address1: '123 Main St', address2: '', city: 'Chicago', province: 'IL', zip: '60601', country: 'US' },
     fulfillments: [],
     transactions: [{ id: 'tx8', status: 'PENDING', kind: 'AUTHORIZATION', gateway: 'manual', createdAt: '2026-05-27T10:00:00Z', amountSet: { presentmentMoney: { amount: '110.00', currencyCode: 'USD' } } }],
+  },
+  // ORDER-LEVEL discount fixture (#1009): mirrors live #37637 (SparkLayer 50% ACROSS). The discount is a
+  // CART/ORDER-level allocation (discountApplication.targetSelection 'ALL') — so per-line
+  // discountedUnitPriceSet == originalUnitPriceSet (the LIST price; the discount is NOT baked into the
+  // price sets) and the only evidence of the discount is discountAllocations. discountedTotalSet is also
+  // the pre-cart-discount line total. List 100 + 60 = 160; 50% across → allocations 50 + 30 = 80, so the
+  // true post-ALL-discounts subtotal (and currentSubtotalPriceSet) is 80.00 — NOT 160.00. A correct
+  // invoice must show per-line wholesale 50.00 / 30.00 and Line Totals 50.00 / 30.00 (Σ = 80.00); the
+  // pre-fix bug summed the list prices to 160.00 (~2x). No edits here (currentQuantity == quantity).
+  {
+    id: 'gid://shopify/Order/1009', name: '#1009', processedAt: '2026-05-28T10:00:00Z',
+    customer: { id: 'gid://shopify/Customer/103', displayName: 'Doggo Depot', email: 'wholesale@doggo.com' },
+    displayFinancialStatus: 'PENDING', displayFulfillmentStatus: 'UNFULFILLED',
+    totalPriceSet:           { presentmentMoney: { amount: '80.00', currencyCode: 'USD' } },
+    subtotalPriceSet:        { presentmentMoney: { amount: '80.00', currencyCode: 'USD' } },  // already net of cart discount
+    currentTotalPriceSet:    { presentmentMoney: { amount: '80.00', currencyCode: 'USD' } },
+    currentSubtotalPriceSet: { presentmentMoney: { amount: '80.00', currencyCode: 'USD' } },
+    sourceName: 'web', tags: ['sparklayer', 'b2b'], note: '',
+    lineItems: { edges: [
+      { node: { id: 'li1009a', title: 'Across Discount Collar', quantity: 1, currentQuantity: 1, variant: { id: 'v501', sku: 'ADC-001', price: '100.00', inventoryQuantity: 9, selectedOptions: [] },
+          discountedUnitPriceSet: { presentmentMoney: { amount: '100.00', currencyCode: 'USD' } },
+          originalUnitPriceSet:   { presentmentMoney: { amount: '100.00', currencyCode: 'USD' } },
+          discountedTotalSet:     { presentmentMoney: { amount: '100.00', currencyCode: 'USD' } },
+          discountAllocations: [{ allocatedAmountSet: { presentmentMoney: { amount: '50.00', currencyCode: 'USD' } }, discountApplication: { targetSelection: 'ALL' } }] } },
+      { node: { id: 'li1009b', title: 'Across Discount Leash', quantity: 1, currentQuantity: 1, variant: { id: 'v502', sku: 'ADL-002', price: '60.00', inventoryQuantity: 6, selectedOptions: [] },
+          discountedUnitPriceSet: { presentmentMoney: { amount: '60.00', currencyCode: 'USD' } },
+          originalUnitPriceSet:   { presentmentMoney: { amount: '60.00', currencyCode: 'USD' } },
+          discountedTotalSet:     { presentmentMoney: { amount: '60.00', currencyCode: 'USD' } },
+          discountAllocations: [{ allocatedAmountSet: { presentmentMoney: { amount: '30.00', currencyCode: 'USD' } }, discountApplication: { targetSelection: 'ALL' } }] } },
+    ]},
+    totalShippingPriceSet: { presentmentMoney: { amount: '0.00', currencyCode: 'USD' } },
+    totalTaxSet:           { presentmentMoney: { amount: '0.00', currencyCode: 'USD' } },
+    totalOutstandingSet:   { presentmentMoney: { amount: '80.00', currencyCode: 'USD' } },
+    totalReceivedSet:      { presentmentMoney: { amount: '0.00', currencyCode: 'USD' } },
+    shippingAddress: { firstName: 'Bob', lastName: 'Brown', address1: '789 Oak St', address2: '', city: 'Austin', province: 'TX', zip: '78701', country: 'US' },
+    billingAddress:  { firstName: 'Bob', lastName: 'Brown', address1: '789 Oak St', address2: '', city: 'Austin', province: 'TX', zip: '78701', country: 'US' },
+    fulfillments: [],
+    transactions: [{ id: 'tx9', status: 'PENDING', kind: 'AUTHORIZATION', gateway: 'manual', createdAt: '2026-05-28T10:00:00Z', amountSet: { presentmentMoney: { amount: '80.00', currencyCode: 'USD' } } }],
   },
 ];
 
@@ -1815,10 +1853,12 @@ async function getOrderDetail(numericId) {
         note tags
         shippingAddress{firstName lastName address1 address2 city province zip country}
         billingAddress{firstName lastName address1 address2 city province zip country}
-        lineItems(first:50){edges{node{id title quantity currentQuantity
+        lineItems(first:250){edges{node{id title quantity currentQuantity
           variant{id title sku barcode selectedOptions{name value} price inventoryQuantity product{id title}}
           discountedUnitPriceSet{presentmentMoney{amount currencyCode}}
           originalUnitPriceSet{presentmentMoney{amount currencyCode}}
+          discountedTotalSet{presentmentMoney{amount currencyCode}}
+          discountAllocations{allocatedAmountSet{presentmentMoney{amount currencyCode}} discountApplication{targetSelection}}
         }}}
         fulfillments{status trackingInfo{number url company} createdAt}
         transactions(first:10){id status kind gateway createdAt
@@ -4964,9 +5004,14 @@ function buildInvoiceCsv(order, cols) {
     // (where currentQuantity is absent). Lines fully removed in an edit (currentQuantity 0) are SKIPPED
     // entirely — Shopify retains them on the order but they're no longer part of it. getOrderDetail
     // (the only feeder of this fn) already selects currentQuantity per line.
-    const currentQty = item.currentQuantity != null ? item.currentQuantity : (item.quantity || 0);
+    const currentQty = lineItemCurrentQty(item);
     if (currentQty <= 0) continue;
-    const wholesale = parseFloat(item.discountedUnitPriceSet?.presentmentMoney?.amount ?? item.originalUnitPriceSet?.presentmentMoney?.amount ?? 0);
+    // ORDER-LEVEL discount fix: wholesale (unit) + Line Total must be net of ALL discounts incl
+    // order/cart-level (targetSelection ALL) ones, so Σ Line Total == currentSubtotalPriceSet. The
+    // shared lineItemTrue* helpers (pdf.mjs) own this math; the CSV and PDF must agree. For #37637
+    // (50% ACROSS) wholesale drops from 45.99→22.99; for per-line-discounted #37639 it is unchanged.
+    const wholesale = lineItemTrueUnit(item);
+    const lineTotal = lineItemTrueTotal(item);
     const retail    = parseFloat(item.originalUnitPriceSet?.presentmentMoney?.amount ?? 0);
     const opts = item.variant?.selectedOptions || [];
     const row = [];
@@ -4979,7 +5024,7 @@ function buildInvoiceCsv(order, cols) {
     if (cols.includes('retail'))   row.push(retail.toFixed(2));
     if (cols.includes('wholesale'))row.push(wholesale.toFixed(2));
     if (cols.includes('qty'))      row.push(String(currentQty));
-    if (cols.includes('total'))    row.push((wholesale * currentQty).toFixed(2));
+    if (cols.includes('total'))    row.push(lineTotal.toFixed(2));
     rows.push(row);
   }
   return rows.map(r => r.map(v => `"${String(v).replace(/"/g, '""')}"`).join(',')).join('\r\n');
@@ -5036,10 +5081,11 @@ app.post('/orders/:id/partial-invoice', requireAuth, async (req, res) => {
     ? allLineItems  // simplified: treat all items as fulfilled for billing
     : allLineItems;
 
-  const subtotal = lineItems.reduce((sum, item) => {
-    const price = parseFloat(item.discountedUnitPriceSet?.presentmentMoney?.amount ?? item.originalUnitPriceSet?.presentmentMoney?.amount ?? 0);
-    return sum + price * (item.quantity || 0);
-  }, 0);
+  // ORDER-LEVEL discount fix: the partial-invoice subtotal + the stored per-line snapshot must be net of
+  // ALL discounts (incl order/cart-level). Sum the shared lineItemTrueTotal (post-ALL-discounts, current
+  // qty) and snapshot the post-discount unit + current qty so the re-download path (which reconstructs
+  // from the flat {unitPrice,quantity} shape, without discountedTotalSet/allocations) renders identically.
+  const subtotal = lineItems.reduce((sum, item) => sum + lineItemTrueTotal(item), 0);
   const shippingAmt = shipping_handling === 'first'
     ? parseFloat(order.totalShippingPriceSet?.presentmentMoney?.amount || 0)
     : 0;
@@ -5054,7 +5100,9 @@ app.post('/orders/:id/partial-invoice', requireAuth, async (req, res) => {
     total,
     shipping: shippingAmt,
     tax: taxAmt,
-    lineItemsJson: JSON.stringify(lineItems.map(i => ({ id: i.id, title: i.title, quantity: i.quantity, unitPrice: parseFloat(i.discountedUnitPriceSet?.presentmentMoney?.amount || 0) }))),
+    lineItemsJson: JSON.stringify(lineItems
+      .filter(i => lineItemCurrentQty(i) > 0)
+      .map(i => ({ id: i.id, title: i.title, quantity: lineItemCurrentQty(i), unitPrice: lineItemTrueUnit(i) }))),
     createdBy: session.email,
   });
   auditLog(session.email, 'partial_invoice_created', orderGid, null, { invoiceId: invId, letter, type, total });
