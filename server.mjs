@@ -479,7 +479,7 @@ const MOCK_ORDERS = [
     totalPriceSet: { presentmentMoney: { amount: '450.00', currencyCode: 'USD' } },
     sourceName: 'web', tags: ['b2b-portal'], note: '',
     lineItems: { edges: [
-      { node: { id: 'li1', title: 'Elite Collar', quantity: 5, variant: { id: 'v301', sku: 'EC-001-S-NV', price: '36.00', inventoryQuantity: 24 },
+      { node: { id: 'li1', title: 'Elite Collar', quantity: 5, variant: { id: 'v301', sku: 'EC-001-S-NV', title: 'Small / Navy', selectedOptions: [{ name: 'Size', value: 'Small' }, { name: 'Color', value: 'Navy' }], price: '36.00', inventoryQuantity: 24 },
           discountedUnitPriceSet: { presentmentMoney: { amount: '18.00', currencyCode: 'USD' } },
           originalUnitPriceSet:   { presentmentMoney: { amount: '36.00', currencyCode: 'USD' } } } },
       { node: { id: 'li2', title: 'Luxe Leash', quantity: 2, variant: { id: 'v302', sku: 'LL-005', price: '75.00', inventoryQuantity: 5 },
@@ -501,7 +501,7 @@ const MOCK_ORDERS = [
     totalPriceSet: { presentmentMoney: { amount: '285.50', currencyCode: 'USD' } },
     sourceName: 'web', tags: ['b2b-portal'], note: 'Ship by Friday',
     lineItems: { edges: [
-      { node: { id: 'li3', title: 'Simplicity Collar', quantity: 10, variant: { id: 'v303', sku: 'SC-002-M-RD', price: '22.00', inventoryQuantity: 7 },
+      { node: { id: 'li3', title: 'Simplicity Collar', quantity: 10, variant: { id: 'v303', sku: 'SC-002-M-RD', title: 'Medium / Red', selectedOptions: [{ name: 'Size', value: 'Medium' }, { name: 'Color', value: 'Red' }], price: '22.00', inventoryQuantity: 7 },
           discountedUnitPriceSet: { presentmentMoney: { amount: '11.00', currencyCode: 'USD' } },
           originalUnitPriceSet:   { presentmentMoney: { amount: '22.00', currencyCode: 'USD' } } } },
     ]},
@@ -519,7 +519,7 @@ const MOCK_ORDERS = [
     totalPriceSet: { presentmentMoney: { amount: '1200.00', currencyCode: 'USD' } },
     sourceName: 'web', tags: ['b2b-portal'], note: '',
     lineItems: { edges: [
-      { node: { id: 'li4', title: 'Elite Collar Bundle XL', quantity: 20, variant: { id: 'v304', sku: 'ECB-010-XL', price: '60.00', inventoryQuantity: 8 },
+      { node: { id: 'li4', title: 'Elite Collar Bundle XL', quantity: 20, variant: { id: 'v304', sku: 'ECB-010-XL', title: 'XL', selectedOptions: [{ name: 'Size', value: 'XL' }], price: '60.00', inventoryQuantity: 8 },
           discountedUnitPriceSet: { presentmentMoney: { amount: '60.00', currencyCode: 'USD' } },
           originalUnitPriceSet:   { presentmentMoney: { amount: '60.00', currencyCode: 'USD' } } } },
     ]},
@@ -538,7 +538,7 @@ const MOCK_ORDERS = [
     totalPriceSet: { presentmentMoney: { amount: '675.00', currencyCode: 'USD' } },
     sourceName: 'web', tags: ['b2b-portal'], note: 'Partial ship OK',
     lineItems: { edges: [
-      { node: { id: 'li5', title: 'Everyday Collar', quantity: 15, variant: { id: 'v305', sku: 'EC-003-L-BK', price: '30.00', inventoryQuantity: 12 },
+      { node: { id: 'li5', title: 'Everyday Collar', quantity: 15, variant: { id: 'v305', sku: 'EC-003-L-BK', title: 'Large / Black', selectedOptions: [{ name: 'Size', value: 'Large' }, { name: 'Color', value: 'Black' }], price: '30.00', inventoryQuantity: 12 },
           discountedUnitPriceSet: { presentmentMoney: { amount: '30.00', currencyCode: 'USD' } },
           originalUnitPriceSet:   { presentmentMoney: { amount: '30.00', currencyCode: 'USD' } } } },
       { node: { id: 'li6', title: 'Leash Set', quantity: 5, variant: { id: 'v306', sku: 'LS-007', price: '45.00', inventoryQuantity: 3 },
@@ -561,7 +561,7 @@ const MOCK_ORDERS = [
     totalPriceSet: { presentmentMoney: { amount: '540.00', currencyCode: 'USD' } },
     sourceName: 'web', tags: ['sparklayer', 'b2b'], note: 'SparkLayer historical order',
     lineItems: { edges: [
-      { node: { id: 'li7', title: 'Elite Collar', quantity: 9, variant: { id: 'v301', sku: 'EC-001-S-NV', price: '36.00', inventoryQuantity: 24 },
+      { node: { id: 'li7', title: 'Elite Collar', quantity: 9, variant: { id: 'v301', sku: 'EC-001-S-NV', title: 'Small / Navy', selectedOptions: [{ name: 'Size', value: 'Small' }, { name: 'Color', value: 'Navy' }], price: '36.00', inventoryQuantity: 24 },
           discountedUnitPriceSet: { presentmentMoney: { amount: '18.00', currencyCode: 'USD' } },
           originalUnitPriceSet:   { presentmentMoney: { amount: '36.00', currencyCode: 'USD' } } } },
     ]},
@@ -1934,6 +1934,21 @@ function deriveCurrentOrderTotals(order) {
   return { subtotal, total, lineCount };
 }
 
+// WHAT: human-readable variant label so the order page surfaces size/colour/etc. instead of
+//   leaving the variant buried in the SKU. Prefers Shopify's selectedOptions
+//   ("Size: XS · Color: Royal Blue"), falls back to the variant title, and ignores the
+//   "Default Title" placeholder single-variant products carry. Returns '' when there's nothing
+//   meaningful to show (so the caller can omit the sub-line entirely).
+function variantLabel(variant) {
+  if (!variant) return '';
+  const opts = (variant.selectedOptions || [])
+    .filter(o => o && o.value && o.value !== 'Default Title' && (o.name || '').toLowerCase() !== 'title')
+    .map(o => `${o.name}: ${o.value}`);
+  if (opts.length) return opts.join(' · ');
+  const t = (variant.title || '').trim();
+  return t && t !== 'Default Title' ? t : '';
+}
+
 // WHAT: the large order-detail page — status timeline, editable line items, fulfillments, transactions, address, Xero/partial-invoice state, and all the modal JS (edit/discount/fulfill/backorder/invoice/cancel/ship).
 // CHANGE-GUARD: reads several SQLite stores by gid (getXeroMap, getPartialInvoices, getBackordersForOrder) — those keys must match shopifyOrderGid(numId). The edit form posts qtys[]/prices[]/removes/addCustomLines to /orders/:id/edit; serializeCustomLines() must run before submit (onclick on Save). Re-test edit/ship/cancel modals after any markup change since the inline JS selects elements by hardcoded ids.
 // INVARIANT(S): flash strings map 1:1 to alert banners — adding a server flash value needs a branch here or it renders silently; client-side ship rates JS sorts by amount and posts to <path>/ship/rates then /ship/label; line-item product links resolve via variant.product.id or the MOCK_VARIANT_PRODUCT fallback.
@@ -2026,6 +2041,8 @@ function renderOrderDetail(session, order, flash, flashMsg) {
     const titleCell = productNum
       ? `<a href="/products/${productNum}" class="link">${h(item.title)}</a>`
       : h(item.title);
+    const vLabel = variantLabel(item.variant);
+    const variantSub = vLabel ? `<div class="variant-sub">${h(vLabel)}</div>` : '';
     const bo = backorderMap.get(item.id);
     const boBadge = bo ? `<span class="badge badge-warning" title="ETA: ${bo.eta_date || 'unknown'}">⚠ Backorder</span>` : '';
     // Second build (Build 4): the per-line Backorder control read like a STATUS ("Backorder" on
@@ -2037,6 +2054,7 @@ function renderOrderDetail(session, order, flash, flashMsg) {
       onclick="toggleBackorderModal('${h(item.id)}','${h(item.title).replace(/'/g,"\\'")}','${currentQty}',true)">⚑ Mark backordered</button>`;
     return `<tr data-removed="0" data-li-id="${h(item.id)}" data-existing="1">
       <td>${titleCell} ${boBadge}${boBtn}
+        ${variantSub}
         <span class="row-save-chip" data-state="idle" style="display:none;margin-left:8px;font-size:11px;vertical-align:middle"></span>
         <input type="hidden" name="removes" value="${h(item.id)}" disabled id="remove_${h(item.id)}">
       </td>
