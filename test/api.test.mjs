@@ -293,6 +293,47 @@ await test('GET /orders/1001/invoice.csv (UNEDITED) regression — frozen quanti
   assert.equal(luxe[totalIdx], '75.00', 'Luxe Leash total = 2 x $37.50 = 75.00');
 });
 
+// ORDER-LEVEL discount (2026-06-29): invoice line totals must be NET of order/cart-level discounts
+// (discountApplication.targetSelection 'ALL') so Σ Line Total == currentSubtotalPriceSet. Fixture #1009
+// mirrors live #37637 (50% ACROSS): list 100 + 60 with cart allocations 50 + 30, so post-ALL-discounts
+// wholesale = 50.00 / 30.00 and Line Total = 50.00 / 30.00 (Σ = 80.00 = currentSubtotal). The pre-fix bug
+// emitted the LIST prices (100.00 + 60.00 = 160.00, ~2x). Guards against regressing the order-level path.
+await test('GET /orders/1009/invoice.csv (ORDER-LEVEL discount) Line Totals net cart discount; Σ == currentSubtotal', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/orders/1009/invoice.csv`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200, 'invoice.csv should 200');
+  const text = await res.text();
+  const rows = parseCsvBody(text);
+  assert.equal(rows.length, 3, `expected header + 2 data rows, got ${rows.length}`);
+  const header = rows[0];
+  const data = rows.slice(1);
+  const qtyIdx   = header.indexOf('Qty');
+  const totalIdx = header.indexOf('Line Total');
+  const whIdx    = header.indexOf('Wholesale Price');
+  const skuIdx   = header.indexOf('SKU');
+  assert.ok(qtyIdx >= 0 && totalIdx >= 0 && whIdx >= 0 && skuIdx >= 0, `missing columns ${JSON.stringify(header)}`);
+  const collar = data.find(r => r[skuIdx] === 'ADC-001');
+  const leash  = data.find(r => r[skuIdx] === 'ADL-002');
+  assert.ok(collar && leash, 'both order-level-discounted lines present');
+  // post-ALL-discounts: 100 list - 50 alloc = 50 ; 60 list - 30 alloc = 30
+  assert.equal(collar[whIdx], '50.00', `collar wholesale should be 50.00 (list 100 - 50 cart alloc), got ${collar[whIdx]}`);
+  assert.equal(collar[totalIdx], '50.00', `collar Line Total should be 50.00, got ${collar[totalIdx]}`);
+  assert.equal(leash[whIdx], '30.00', `leash wholesale should be 30.00 (list 60 - 30 cart alloc), got ${leash[whIdx]}`);
+  assert.equal(leash[totalIdx], '30.00', `leash Line Total should be 30.00, got ${leash[totalIdx]}`);
+  // Σ Line Total must equal the order's currentSubtotalPriceSet (80.00), NOT the list-price sum (160.00).
+  const sumTotals = data.reduce((s, r) => s + parseFloat(r[totalIdx]), 0);
+  assert.equal(sumTotals.toFixed(2), '80.00', `Σ Line Total should equal currentSubtotal 80.00 (not 160.00), got ${sumTotals.toFixed(2)}`);
+});
+
+// ORDER-LEVEL discount: the full-order invoice PDF must also render (200 + application/pdf) for an
+// order-level-discounted order — exercises the shared lineItemTrue* helpers + currentSubtotal totals path.
+await test('GET /orders/1009/invoice.pdf (ORDER-LEVEL discount) returns PDF', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/orders/1009/invoice.pdf`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  assert.ok(res.headers.get('content-type')?.includes('application/pdf'), 'content-type application/pdf');
+});
+
 // CURRENT-FIELDS (2026-06-29): orders-list line summary must reflect CURRENT qty (currentQuantity,
 // fallback frozen quantity) and skip removed (currentQuantity 0) lines. #1008 summary should read
 // "Edited Partial Collar x1, Untouched Leash x1" — NOT "x2", and must not mention "Removed Harness".
