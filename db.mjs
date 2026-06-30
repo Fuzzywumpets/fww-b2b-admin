@@ -323,6 +323,17 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_products_cache_handle ON products_cache(handle);
 `);
 
+// MIGRATION (2026-06-29): orders_cache stores BOTH the frozen original totals (total_price/subtotal_price)
+// and the CURRENT post-edit totals (current_total/current_subtotal). Edited orders (e.g. #37639) keep the
+// frozen amount in total_price but the LIST must show current_total. These columns are nullable: when null,
+// renderOrdersList falls back to the frozen total — so un-resynced and never-edited orders are unaffected.
+// Idempotent: PRAGMA reveals existing columns; ALTER only runs for missing ones (safe across restarts).
+{
+  const cols = new Set(db.prepare(`PRAGMA table_info(orders_cache)`).all().map(c => c.name));
+  if (!cols.has('current_total'))    db.exec(`ALTER TABLE orders_cache ADD COLUMN current_total REAL`);
+  if (!cols.has('current_subtotal')) db.exec(`ALTER TABLE orders_cache ADD COLUMN current_subtotal REAL`);
+}
+
 export default db;
 
 export function createSession(sid, email, displayName, picture) {
@@ -842,6 +853,12 @@ export function listOrdersFromCache(filters = {}) {
     displayFinancialStatus: r.financial_status || r.display_financial_status,
     displayFulfillmentStatus: r.fulfillment_status || r.display_fulfillment_status,
     totalPriceSet: { presentmentMoney: { amount: String(r.total_price || 0), currencyCode: r.currency || 'USD' } },
+    // CURRENT-TOTALS (2026-06-29): frozen total_price stays in totalPriceSet (ORIGINAL); current_total carries
+    // the post-edit truth. null column => omit the set entirely so renderOrdersList falls back to frozen.
+    currentTotalPriceSet: r.current_total != null
+      ? { presentmentMoney: { amount: String(r.current_total), currencyCode: r.currency || 'USD' } } : null,
+    currentSubtotalPriceSet: r.current_subtotal != null
+      ? { presentmentMoney: { amount: String(r.current_subtotal), currencyCode: r.currency || 'USD' } } : null,
     sourceName: r.source_name,
     note: r.note,
     tags: (r.tags || '').split(',').filter(Boolean),
@@ -879,8 +896,8 @@ export function upsertOrderCache(o) {
      display_fulfillment_status, total_price, subtotal_price, total_tax, total_shipping,
      total_discounts, total_refunded, currency, tags, source_name, channel_name, note,
      shipping_address_json, billing_address_json, customer_email, customer_phone,
-     fulfillments_json, refunds_json, metafields_json, synced_at)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+     fulfillments_json, refunds_json, metafields_json, current_total, current_subtotal, synced_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
   `).run(
     o.shopify_id, o.gid, o.name || null, o.customer_shopify_id || null,
     o.created_at || null, o.updated_at || null, o.processed_at || null,
@@ -897,6 +914,10 @@ export function upsertOrderCache(o) {
     o.fulfillments_json ? JSON.stringify(o.fulfillments_json) : null,
     o.refunds_json ? JSON.stringify(o.refunds_json) : null,
     o.metafields_json ? JSON.stringify(o.metafields_json) : null,
+    // CURRENT-TOTALS (2026-06-29): post-edit truth from the order query (poller/webhook). null when the
+    // caller didn't supply them (older sync paths / backfill) — listOrdersFromCache then falls back to frozen.
+    o.current_total != null ? o.current_total : null,
+    o.current_subtotal != null ? o.current_subtotal : null,
     Date.now()
   );
 }

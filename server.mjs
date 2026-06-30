@@ -1654,6 +1654,16 @@ async function getOrdersData(filters) {
   }
 }
 
+// WHAT: the LIST total for one order row — prefers the CURRENT (post-edit) total, falling back to the frozen
+// original. On an EDITED order (e.g. #37639) totalPriceSet is FROZEN at $921.72 while currentTotalPriceSet is
+// the truth ($601.24); on an unedited or un-resynced order currentTotalPriceSet is absent and we use the frozen
+// total. Mirrors the cache fields populated by listOrdersFromCache and the live currentTotalPriceSet on Shopify.
+function listRowTotalAmount(o) {
+  const cur = o.currentTotalPriceSet?.presentmentMoney?.amount;
+  if (cur != null && cur !== '') return cur;
+  return o.totalPriceSet?.presentmentMoney?.amount;
+}
+
 // WHAT: renders the orders table + filter bar + bulk-select form (mark-paid) + pagination.
 // CHANGE-GUARD: the bulk form POSTs /orders/bulk with checked `ids`; the inline select-all/upd() script wires the bulk bar — keep input name="ids" stable. 'Sync now' button only shows when data._fromCache. Re-test bulk mark-paid after table column changes.
 // INVARIANT(S): all order/customer fields h()-escaped; pagination 'Next 50' uses endCursor copied into the after param and only renders when hasNextPage (live path only); colspan on the empty row (10) must match the header column count.
@@ -1680,7 +1690,7 @@ function renderOrdersList(session, data, filters) {
       <td>${o.customer ? `<a href="/customers/${shopifyNumericId(o.customer.id)}">${h(o.customer.displayName)}</a><br><small>${h(o.customer.email)}</small>` : '—'}</td>
       <td class="text-muted">${fmtDate(o.processedAt)}</td>
       <td class="text-muted small-text">${h(lineItemSummary)}</td>
-      <td class="text-right mono">${fmtMoney(o.totalPriceSet?.presentmentMoney?.amount)}</td>
+      <td class="text-right mono">${fmtMoney(listRowTotalAmount(o), o.totalPriceSet?.presentmentMoney?.currencyCode)}</td>
       <td><span class="badge badge-${h(status)}">${h(o.displayFinancialStatus)}</span></td>
       <td><span class="badge badge-ff-${h(fstatus)}">${h(o.displayFulfillmentStatus)}</span></td>
       <td><a href="/orders/${h(numId)}" class="table-action">View →</a></td>
@@ -9882,6 +9892,10 @@ app.post('/webhooks/shopify', express.raw({ type: 'application/json' }), (req, r
           display_fulfillment_status: o.fulfillment_status?.toUpperCase(),
           total_price: parseFloat(o.total_price) || 0,
           subtotal_price: parseFloat(o.subtotal_price) || 0,
+          // CURRENT-TOTALS (2026-06-29): the REST orders webhook returns CURRENT (post-edit) totals in
+          // total_price/subtotal_price, so they double as current_total/current_subtotal for the list.
+          current_total: o.total_price != null ? parseFloat(o.total_price) || 0 : null,
+          current_subtotal: o.subtotal_price != null ? parseFloat(o.subtotal_price) || 0 : null,
           total_tax: parseFloat(o.total_tax) || 0,
           total_shipping: parseFloat(o.total_shipping_price_set?.shop_money?.amount || o.total_shipping_price || 0),
           total_discounts: parseFloat(o.total_discounts) || 0,
@@ -9948,6 +9962,8 @@ async function syncRecentFromShopify() {
             displayFinancialStatus displayFulfillmentStatus
             totalPriceSet{shopMoney{amount}}
             subtotalPriceSet{shopMoney{amount}}
+            currentTotalPriceSet{shopMoney{amount}}
+            currentSubtotalPriceSet{shopMoney{amount}}
             totalTaxSet{shopMoney{amount}}
             customer{id email firstName lastName}
             tags sourceName note
@@ -9972,6 +9988,10 @@ async function syncRecentFromShopify() {
         display_fulfillment_status: o.displayFulfillmentStatus,
         total_price: parseFloat(o.totalPriceSet?.shopMoney?.amount) || 0,
         subtotal_price: parseFloat(o.subtotalPriceSet?.shopMoney?.amount) || 0,
+        // CURRENT-TOTALS (2026-06-29): post-edit truth — totalPriceSet/subtotalPriceSet stay FROZEN at the
+        // original on an edited order, so the LIST must carry the current* totals to show e.g. #37639's $601.24.
+        current_total: o.currentTotalPriceSet?.shopMoney?.amount != null ? parseFloat(o.currentTotalPriceSet.shopMoney.amount) : null,
+        current_subtotal: o.currentSubtotalPriceSet?.shopMoney?.amount != null ? parseFloat(o.currentSubtotalPriceSet.shopMoney.amount) : null,
         total_tax: parseFloat(o.totalTaxSet?.shopMoney?.amount) || 0,
         currency: 'USD',
         tags: o.tags || [], source_name: o.sourceName || null, note: o.note || null,
