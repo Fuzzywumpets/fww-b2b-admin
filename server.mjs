@@ -5485,9 +5485,11 @@ app.post('/orders/:id/edit', requireAuth, async (req, res) => {
   // Real mode: use Shopify orderEdit* mutation suite
   try {
     const orderId = `gid://shopify/Order/${numId}`;
-    // orderEditBegin + fetch CalculatedLineItem IDs in one round-trip.
     // Build map original_li_id -> calc_li_id by matching variant + title.
-    const beginResult = await shopifyFetch(`
+    // orderEditBegin (starts a CalculatedOrder edit session) and the read of the original line
+    // items are independent — run them concurrently to save a round-trip.
+    const [beginResult, origRes] = await Promise.all([
+      shopifyFetch(`
       mutation begin($id:ID!){orderEditBegin(id:$id){
         calculatedOrder{
           id
@@ -5500,15 +5502,16 @@ app.post('/orders/:id/edit', requireAuth, async (req, res) => {
         }
         userErrors{field message}
       }}
-    `, { id: orderId });
+    `, { id: orderId }),
+      // Original order line items, to pair original IDs with variant/title
+      shopifyFetch(`query($id:ID!){order(id:$id){lineItems(first:100){edges{node{id title variant{id} originalUnitPriceSet{presentmentMoney{amount}} discountedUnitPriceSet{presentmentMoney{amount}}}}}}}`, { id: orderId }),
+    ]);
     const calcOrder = beginResult.data?.orderEditBegin?.calculatedOrder;
     const calcId = calcOrder?.id;
     if (!calcId) {
       const errs = beginResult.data?.orderEditBegin?.userErrors || [];
       throw new Error(errs.map(e => e.message).join(', ') || 'orderEditBegin failed');
     }
-    // Fetch original order line items to pair original IDs with variant/title
-    const origRes = await shopifyFetch(`query($id:ID!){order(id:$id){lineItems(first:100){edges{node{id title variant{id} originalUnitPriceSet{presentmentMoney{amount}} discountedUnitPriceSet{presentmentMoney{amount}}}}}}}`, { id: orderId });
     const origItems = origRes.data?.order?.lineItems?.edges?.map(e => e.node) || [];
     const calcItems = calcOrder.lineItems?.edges?.map(e => e.node) || [];
     // Map original_li_id -> calc_li_id
@@ -5538,16 +5541,25 @@ app.post('/orders/:id/edit', requireAuth, async (req, res) => {
         discountIdMap[orig.id] = { discountAppId: discApp.id, retailPrice, wholesalePrice };
       }
     }
-    // Apply qty changes and removes using calculated line item IDs
+    // Apply qty changes using calculated line item IDs. The edit form submits a qty field for
+    // EVERY line, so skip lines whose quantity already equals the calculated order's current
+    // quantity — otherwise a large order fires one Shopify mutation per line on every Save, even
+    // when nothing changed (the 30s+ "Save changes" hang, especially after incremental auto-save
+    // already persisted the edits — every line then re-sends its unchanged qty). Removes always fire.
+    const calcQtyById = new Map(calcItems.map(c => [c.id, c.quantity]));
+    let qtyWrites = 0, qtySkipped = 0;
     for (const [origLiId, newQty] of Object.entries(qtysMap)) {
       if (removeSet.has(origLiId)) continue;
       const calcLiId = idMap[origLiId];
       if (!calcLiId) { console.warn('[order-edit] no calc map for', origLiId); continue; }
+      if (calcQtyById.get(calcLiId) === newQty) { qtySkipped++; continue; }  // unchanged — skip the round-trip
+      qtyWrites++;
       await shopifyFetch(`mutation setQty($id:ID!,$li:ID!,$qty:Int!,$r:Boolean!){
         orderEditSetQuantity(id:$id,lineItemId:$li,quantity:$qty,restock:$r){
           calculatedOrder{id} userErrors{field message}}}`,
         { id: calcId, li: calcLiId, qty: newQty, r: false });
     }
+    if (qtySkipped) console.log(`[order-edit] BATCH /edit order=${numId} qty: ${qtyWrites} changed, ${qtySkipped} unchanged (skipped)`);
     for (const origLiId of removeSet) {
       const calcLiId = idMap[origLiId];
       if (!calcLiId) { console.warn('[order-edit] no calc map for remove', origLiId); continue; }
