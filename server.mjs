@@ -3204,19 +3204,23 @@ function renderOrderDetail(session, order, flash, flashMsg) {
               <label><input type="checkbox" value="qty" checked> Qty</label>
               <label><input type="checkbox" value="total" checked> Line total</label>
             </div>
+            <a href="/orders/${h(numId)}/invoice" class="btn btn-primary" style="margin-right:8px">View invoice PDF</a>
             <button type="button" class="btn btn-secondary" onclick="downloadInvoiceCsv(${h(numId)})">Download CSV</button>
           </div>
         </div>
-        <details class="card" id="internal-notes-card">
-          <summary class="card-header" style="cursor:pointer;display:flex;align-items:center;justify-content:space-between;list-style:none">
-            <h2>Internal notes <span class="badge badge-muted" style="margin-left:6px">${order.note && String(order.note).trim() ? 1 : 0}</span></h2>
-            <span class="text-muted" style="font-size:11px">click to expand</span>
-          </summary>
+        <div class="card" id="internal-notes-card">
+          <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
+            <h2>Internal order note <span class="badge badge-muted" style="margin-left:6px">${order.note && String(order.note).trim() ? 1 : 0}</span></h2>
+            <span class="text-muted" style="font-size:11px">staff only · not shown to customer or on invoice</span>
+          </div>
           <form method="POST" action="/orders/${h(numId)}/note" style="margin-top:10px">
-            <textarea name="note" class="textarea" rows="3" placeholder="Add a note for this order…">${h(order.note||'')}</textarea>
-            <div style="margin-top:0.5rem"><button type="submit" class="btn btn-secondary btn-sm">Save Note</button></div>
+            <textarea name="note" class="textarea" rows="3" placeholder="Add a note for this order (e.g. how it was created)…">${h(order.note||'')}</textarea>
+            <div style="margin-top:0.5rem;display:flex;gap:8px;align-items:center">
+              <button type="submit" class="btn btn-secondary btn-sm">Save note</button>
+              ${order.note && String(order.note).trim() ? `<button type="button" class="btn btn-ghost btn-sm" style="color:#a32d2d" onclick="if(confirm('Delete this internal note?')){this.form.note.value='';this.form.submit();}">Delete</button>` : ''}
+            </div>
           </form>
-        </details>
+        </div>
         ${renderOrderHistoryCard(orderHistory)}
         <div class="card" id="visible-notes-card">
           <div class="card-header"><h2>Note visible to customer</h2></div>
@@ -3908,7 +3912,7 @@ function renderCustomerDetail(session, customer, recentOrders, notes, _dropshipC
                       '<td class="text-muted">' + fmtDate(o.processedAt) + '</td>' +
                       '<td class="text-right mono">' + fmtMoney(o.total) + '</td>' +
                       '<td><span class="badge badge-' + (o.financialStatus||'').toLowerCase() + '">' + (o.financialStatus||'—') + '</span></td>' +
-                      '<td><a href="/orders/' + o.id + '/invoice.pdf" class="link text-muted small-text">invoice</a></td>';
+                      '<td><a href="/orders/' + o.id + '/invoice" class="link text-muted small-text">invoice</a></td>';
                     tbody.appendChild(tr);
                   });
                   document.getElementById('spend-orders-table').style.display='';
@@ -5082,6 +5086,33 @@ app.get('/orders/:id/invoice.pdf', requireAuth, async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+// WHAT: HTML viewer wrapping an order's invoice PDF so there is ALWAYS a "← Back to order"
+// path — the raw /invoice.pdf opens in the browser's bare PDF viewer, which traps the user
+// (alexa 2026-07-01). Embeds the PDF in an iframe; ?letter=X shows a partial invoice. The raw
+// PDF stays available at /invoice.pdf (iframe src + "Open / print" link).
+app.get('/orders/:id/invoice', requireAuth, async (req, res) => {
+  const numId = req.params.id;
+  const order = await getOrderDetail(numId);
+  if (!order) return res.status(404).send(layout({ title: '404', session: req.adminSession, activePath: '/orders',
+    content: '<div class="page-header"><h1>Order not found</h1></div><a href="/orders" class="btn btn-secondary">← Orders</a>' }));
+  const letter = String(req.query.letter || '').replace(/[^A-Za-z]/g, '').toUpperCase();
+  const orderLabel = order.name || ('#' + numId);
+  const pdfUrl = letter
+    ? `/orders/${encodeURIComponent(numId)}/partial-invoice/${letter}.pdf`
+    : `/orders/${encodeURIComponent(numId)}/invoice.pdf`;
+  const content = `
+    <div class="page-header" style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:12px">
+      <a href="/orders/${h(numId)}" class="btn btn-secondary">← Back to order ${h(orderLabel)}</a>
+      <div style="display:flex;align-items:center;gap:8px">
+        <h1 style="margin:0;font-size:16px">Invoice ${h(orderLabel)}${letter ? ('-' + h(letter)) : ''}</h1>
+        <a href="${h(pdfUrl)}" target="_blank" rel="noopener" class="btn btn-ghost btn-sm">Open / print ↗</a>
+      </div>
+    </div>
+    <iframe title="Invoice PDF" src="${h(pdfUrl)}" style="width:100%;height:82vh;border:1px solid var(--border,#e2e2dd);border-radius:8px;background:#fff"></iframe>
+  `;
+  res.send(layout({ title: `Invoice ${orderLabel}`, session: req.adminSession, activePath: '/orders', content }));
 });
 
 // ── Phase 16E: Partial invoices ──────────────────────────────────────────────
@@ -10206,7 +10237,7 @@ app.get('/invoices', requireAuth, (req, res) => {
       <td class="text-right mono">${fmtMoney(o.total_price)}</td>
       <td><span class="badge badge-${(o.financial_status||'').toLowerCase()}">${h(o.display_financial_status||o.financial_status||'—')}</span></td>
       <td>${hasXero ? `<span class="badge badge-success">Xero ✓</span> <small class="text-muted">${(xero?.xero_invoice_id||'').slice(0,8)}…</small>` : '<span class="badge badge-secondary">No Xero</span>'}</td>
-      <td>${partialInvs.length ? partialInvs.map(p => `<a href="/orders/${h(ordNum)}/invoice.pdf?letter=${p.invoice_letter}" target="_blank" rel="noopener" class="link">#${ordNum}-${p.invoice_letter}</a>`).join(' ') : `<a href="/orders/${h(ordNum)}/invoice.pdf" target="_blank" rel="noopener" class="link btn btn-ghost btn-xs">PDF</a>`}</td>
+      <td>${partialInvs.length ? partialInvs.map(p => `<a href="/orders/${h(ordNum)}/invoice?letter=${p.invoice_letter}" target="_blank" rel="noopener" class="link">#${ordNum}-${p.invoice_letter}</a>`).join(' ') : `<a href="/orders/${h(ordNum)}/invoice" target="_blank" rel="noopener" class="link btn btn-ghost btn-xs">PDF</a>`}</td>
     </tr>`;
   });
 
