@@ -102,9 +102,9 @@ await test('Dashboard shows user email in header', async () => {
   assert.ok(html.includes('testuser@fuzzywumpets.com'));
 });
 
-await test('GET /auth/logout clears session and redirects to /login', async () => {
+await test('POST /auth/logout clears session and redirects to /login', async () => {
   const cookie = await seedSession();
-  const res = await fetch(`${BASE}/auth/logout`, { headers: { Cookie: cookie }, redirect: 'manual' });
+  const res = await fetch(`${BASE}/auth/logout`, { method: 'POST', headers: { Cookie: cookie }, redirect: 'manual' });
   assert.equal(res.status, 302);
   assert.ok(res.headers.get('location')?.includes('/login'));
   const cleared = res.headers.get('set-cookie') || '';
@@ -113,7 +113,7 @@ await test('GET /auth/logout clears session and redirects to /login', async () =
 
 await test('GET / after logout redirects to /login (session invalidated)', async () => {
   const cookie = await seedSession();
-  await fetch(`${BASE}/auth/logout`, { headers: { Cookie: cookie }, redirect: 'manual' });
+  await fetch(`${BASE}/auth/logout`, { method: 'POST', headers: { Cookie: cookie }, redirect: 'manual' });
   const res = await fetch(`${BASE}/`, { headers: { Cookie: cookie }, redirect: 'manual' });
   assert.equal(res.status, 302);
   assert.ok(res.headers.get('location')?.includes('/login'));

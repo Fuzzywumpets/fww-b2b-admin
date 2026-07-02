@@ -78,8 +78,29 @@ const PORTAL_BASE_URL       = MOCK ? `http://127.0.0.1:8793` : 'https://b2b.fuzz
 const SHOPIFY_WEBHOOK_SECRET = process.env.SHOPIFY_WEBHOOK_SECRET || (MOCK ? 'test-shopify-webhook-secret' : '');
 
 const app = express();
-app.use(express.json());
+// Capture the exact raw bytes of every JSON body so the Shopify webhook route can verify its
+// HMAC over the ORIGINAL payload (not a re-serialization). SECURITY: without this, express.json
+// parses+re-stringifies before the webhook handler runs and the HMAC never matches → all real
+// Shopify webhooks were being rejected.
+app.use(express.json({ verify: (req, _res, buf) => { req.rawBody = buf; } }));
 app.use(express.urlencoded({ extended: true }));
+
+// Baseline Content-Security-Policy + hardening headers (defense-in-depth). Inline scripts/handlers
+// still require 'unsafe-inline' today, but this blocks external script/exfil hosts, object/base-uri
+// injection, and framing/clickjacking. Nonce-based lockdown of inline scripts is follow-up work.
+app.use((_req, res, next) => {
+  res.setHeader('Content-Security-Policy',
+    "default-src 'self'; " +
+    "script-src 'self' 'unsafe-inline'; " +
+    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; " +
+    "font-src 'self' https://fonts.gstatic.com; " +
+    "img-src 'self' data: https:; " +
+    "connect-src 'self'; " +
+    "object-src 'none'; base-uri 'none'; frame-ancestors 'none'");
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'same-origin');
+  next();
+});
 
 // ── Portal integration (read portal SQLite + call portal internal API) ────────
 
@@ -1050,6 +1071,26 @@ function h(str) {
     .replace(/"/g, '&quot;').replace(/'/g, '&#x27;');
 }
 
+// WHAT: JSON serializer SAFE to embed inside an inline <script>. h() is NOT enough here — a value
+// containing </script> or a JS-string-breaking char must be neutralized at the script/JS layer.
+// Escapes < > & and the JS line separators U+2028/U+2029 as \uXXXX (still valid JSON to JSON.parse).
+function jsonForScript(obj) {
+  return JSON.stringify(obj).replace(/[<>&\u2028\u2029]/g, ch => '\\u' + ch.charCodeAt(0).toString(16).padStart(4, '0'));
+}
+
+// WHAT: returns the URL only if it is a safe http(s) scheme, else '#'. Blocks javascript:/data:/vbscript:
+// in href/src sinks (h() prevents attribute breakout but does NOT validate the scheme). Still h() the result.
+function safeUrl(u) {
+  const s = String(u == null ? '' : u).trim();
+  return /^https?:\/\//i.test(s) ? s : '#';
+}
+
+// WHAT: admin allowlist read FRESH from env on every call, so /settings/allowlist/add (which updates
+// process.env after a Doppler write) takes effect immediately instead of after a process restart.
+function currentAllowedEmails() {
+  return (process.env.B2B_ADMIN_ALLOWED_EMAILS || '').split(',').map(s => s.trim()).filter(Boolean);
+}
+
 function fmtMoney(amount, currency = 'USD') {
   return new Intl.NumberFormat('en-US', { style: 'currency', currency }).format(Number(amount) || 0);
 }
@@ -1249,7 +1290,7 @@ function layout({ title, session, activePath = '/', content, extraHead = '' }) {
       </nav>
       <div class="header-user">
         <span class="user-email">${h(session?.email || '')}</span>
-        <a href="/auth/logout" class="btn-signout">Sign out</a>
+        <a href="/login" id="signout-link" class="btn-signout" role="button">Sign out</a>
       </div>
     </div>
   </header>
@@ -1276,6 +1317,11 @@ function layout({ title, session, activePath = '/', content, extraHead = '' }) {
   </div>
   <script>
   (function() {
+    // Sign out is a POST (CSRF-safe via SameSite=Lax, same as every other mutation) issued as a
+    // fetch so no <form> element is added to the DOM (a hidden header form would be the first
+    // 'form' match and break tests/UX that key off the page's primary form).
+    var _so = document.getElementById('signout-link');
+    if (_so) _so.addEventListener('click', function(e){ e.preventDefault(); fetch('/auth/logout', { method: 'POST' }).then(function(){ location.href = '/login'; }).catch(function(){ location.href = '/login'; }); });
     var gDown = false, gTimer = null;
     document.addEventListener('keydown', function(e) {
       var tag = (e.target.tagName || '').toUpperCase();
@@ -2050,9 +2096,12 @@ function renderOrderDetail(session, order, flash, flashMsg) {
     // every line in edit mode), making every line look backordered. Relabel/restyle it as a clear
     // ACTION — a small muted "⚑ Mark backordered" link — WITHOUT changing behavior (still opens
     // toggleBackorderModal). Keeps the edit-remove-btn class so the edit-mode toggle reveals it.
+    // SECURITY: data-* attributes (read by a delegated listener) instead of an inline onclick — item.title
+    // is attacker-controllable free text and an inline handler is a JS-string-injection sink (h() does not
+    // make a value safe inside a JS string context; the browser decodes &#x27; back to a quote).
     const boBtn = `<button type="button" class="edit-remove-btn bo-action-btn" title="Flag this line as backordered"
       style="display:none;margin-left:6px;background:none;border:none;padding:0;font-size:11px;color:var(--muted);cursor:pointer;text-decoration:underline;text-underline-offset:2px"
-      onclick="toggleBackorderModal('${h(item.id)}','${h(item.title).replace(/'/g,"\\'")}','${currentQty}',true)">⚑ Mark backordered</button>`;
+      data-li-id="${h(item.id)}" data-li-title="${h(item.title)}" data-li-qty="${currentQty}">⚑ Mark backordered</button>`;
     return `<tr data-removed="0" data-li-id="${h(item.id)}" data-existing="1">
       <td>${titleCell} ${boBadge}${boBtn}
         ${variantSub}
@@ -2088,7 +2137,7 @@ function renderOrderDetail(session, order, flash, flashMsg) {
         <div class="fulfillment-row">
           <span class="badge badge-ff-${h((f.status||'').toLowerCase())}">${h(f.status)}</span>
           <span class="text-muted">${fmtDate(f.createdAt)}</span>
-          ${(f.trackingInfo || []).map(t => `<a href="${t.url ? h(t.url) : '#'}" target="_blank" rel="noopener" class="tracking-link">${h(t.company || '')} ${h(t.number || '')}</a>`).join('')}
+          ${(f.trackingInfo || []).map(t => `<a href="${h(safeUrl(t.url))}" target="_blank" rel="noopener noreferrer" class="tracking-link">${h(t.company || '')} ${h(t.number || '')}</a>`).join('')}
         </div>`).join('')
     : '<p class="text-muted small-text">No fulfillments yet</p>';
 
@@ -2196,6 +2245,12 @@ function renderOrderDetail(session, order, flash, flashMsg) {
       m.style.display = 'none';
     }
   }
+  // Delegated listener for line "Mark backordered" buttons — reads data-* attrs (safe: attribute
+  // context) instead of an inline onclick that would concatenate the attacker-controlled title into JS.
+  document.addEventListener('click', function(e){
+    var b = e.target.closest && e.target.closest('.bo-action-btn');
+    if (b) { toggleBackorderModal(b.getAttribute('data-li-id'), b.getAttribute('data-li-title'), b.getAttribute('data-li-qty'), true); }
+  });
   function toggleInvoiceModal(show) {
     document.getElementById('invoice-modal').style.display = show ? 'flex' : 'none';
   }
@@ -3699,7 +3754,12 @@ async function getB2bConfig(numericId) {
 // CHANGE-GUARD: empty string '' is treated as a delete/reset, NOT as a stored empty value — re-test the per-field 'Reset'/'Clear' submit buttons (they POST name=field value=''). boolean coercion accepts true/'true'/'on'; integers go through parseInt — verify discount_pct stays within the 0-95 UI bound (server does NOT re-validate the range).
 // INVARIANT(S): metafieldsSet and metafieldsDelete are TWO separate mutations — a set+delete in one save is non-atomic; userErrors from either are not surfaced to the caller (swallowed).
 async function applyB2bConfigUpdate(numericId, body) {
-  const { discount_pct, dropship_enabled, dropship_margin_pct, allow_order_on_invoice, catalog_access_tags } = body;
+  // SECURITY: clamp percent fields server-side (0–95). The UI's min/max is not authoritative — a direct
+  // POST could otherwise persist e.g. discount_pct=999. undefined (absent) / null / '' semantics preserved.
+  const _clampPct = (v) => { const n = parseInt(v, 10); return Number.isFinite(n) ? Math.min(95, Math.max(0, n)) : v; };
+  const discount_pct        = (body.discount_pct == null || body.discount_pct === '') ? body.discount_pct : _clampPct(body.discount_pct);
+  const dropship_margin_pct = (body.dropship_margin_pct == null || body.dropship_margin_pct === '') ? body.dropship_margin_pct : _clampPct(body.dropship_margin_pct);
+  const { dropship_enabled, allow_order_on_invoice, catalog_access_tags } = body;
   const gid = shopifyCustomerGid(numericId);
   if (MOCK) {
     const cur = { ...(mockB2bConfigOverrides.get(numericId) || {}) };
@@ -4022,12 +4082,16 @@ function renderCustomerDetail(session, customer, recentOrders, notes, _dropshipC
                   if (diff < 86400000) return Math.floor(diff/3600000) + 'h ago';
                   return new Date(ts).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
                 }
+                // SECURITY: activity fields (path, user-agent, event type) are customer-controlled and
+                // go into innerHTML — escape every one. Without esc(), a browsed path / UA header of
+                // "<img src=x onerror=...>" would run in the admin session.
+                function esc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#x27;'); }
                 var rows = d.rows.map(function(r) {
                   var icon = EVENT_ICONS[r.eventType] || '•';
-                  var label = r.eventSubtype ? r.eventType + ':' + r.eventSubtype : r.eventType;
-                  var path = r.path ? '<span style="color:#888;font-size:11px;margin-left:6px">' + r.path.slice(0,60) + '</span>' : '';
+                  var label = esc(r.eventSubtype ? r.eventType + ':' + r.eventSubtype : r.eventType);
+                  var path = r.path ? '<span style="color:#888;font-size:11px;margin-left:6px">' + esc(r.path.slice(0,60)) + '</span>' : '';
                   var ua = '';
-                  if (r.eventData) { try { var ed = JSON.parse(r.eventData); if(ed.ua) ua = '<span style="color:#aaa;font-size:10px;margin-left:6px">' + ed.ua.slice(0,40) + '…</span>'; } catch(e){} }
+                  if (r.eventData) { try { var ed = JSON.parse(r.eventData); if(ed.ua) ua = '<span style="color:#aaa;font-size:10px;margin-left:6px">' + esc(ed.ua.slice(0,40)) + '…</span>'; } catch(e){} }
                   return '<tr>' +
                     '<td style="font-size:16px;line-height:1;padding-right:8px">' + icon + '</td>' +
                     '<td style="font-size:13px">' + label + path + ua + '</td>' +
@@ -4221,17 +4285,20 @@ function renderCustomerDetail(session, customer, recentOrders, notes, _dropshipC
             fetch('/api/admin/customers/${h(numId)}/xero-status')
               .then(function(r){ return r.json(); })
               .then(function(d){
+                // SECURITY: d.xeroName is synced from the Shopify customer/company name (attacker-controlled)
+                // and goes into innerHTML — escape it (and the contact id) or "<img onerror>" runs here.
+                var esc = function(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#x27;'); };
                 var html = '';
                 if(d.state === 'synced'){
                   html = '<span style="color:var(--lime);font-weight:600">✓ Synced</span>' +
-                    ' <a href="https://go.xero.com/Contacts/View/'+encodeURIComponent(d.xeroContactId)+'" target="_blank" class="text-muted small-text" style="font-size:11px" title="'+d.xeroContactId+'">' +
-                    d.xeroContactId.slice(0,8)+'…</a>' +
-                    (d.xeroName ? '<br><span class="text-muted small-text">'+d.xeroName+'</span>' : '') +
+                    ' <a href="https://go.xero.com/Contacts/View/'+encodeURIComponent(d.xeroContactId)+'" target="_blank" class="text-muted small-text" style="font-size:11px" title="'+esc(d.xeroContactId)+'">' +
+                    esc(String(d.xeroContactId).slice(0,8))+'…</a>' +
+                    (d.xeroName ? '<br><span class="text-muted small-text">'+esc(d.xeroName)+'</span>' : '') +
                     '<br><form method="POST" action="/api/admin/customers/${h(numId)}/xero-sync" style="margin-top:6px"><button class="btn btn-ghost btn-xs" type="submit">↻ Re-sync</button></form>';
                 } else if(d.state === 'merged'){
                   html = '<span style="color:var(--lime);font-weight:600">⚭ Merged contact</span>' +
-                    '<br><span class="text-muted small-text">Invoices for this customer post to <strong>'+d.xeroName+'</strong>.</span>' +
-                    (d.primaryShopifyId ? '<br><a href="/customers/'+d.primaryShopifyId+'" class="small-text">View primary →</a>' : '');
+                    '<br><span class="text-muted small-text">Invoices for this customer post to <strong>'+esc(d.xeroName)+'</strong>.</span>' +
+                    (d.primaryShopifyId ? '<br><a href="/customers/'+encodeURIComponent(d.primaryShopifyId)+'" class="small-text">View primary →</a>' : '');
                 } else if(d.state === 'insider'){
                   html = '<span style="color:#999">⊘ Insider — sync not applicable</span>';
                 } else {
@@ -4254,7 +4321,9 @@ function renderCustomerDetail(session, customer, recentOrders, notes, _dropshipC
 // CHANGE-GUARD: B2B price is computed client-side as listPrice*(1-discountPct/100) using selectedCustomer.discountPct (default 50) — re-test that the discount comes from the customer's effective config, not a hardcoded 50, and that price overrides typed by the user survive submit. The hidden line_items field is JSON.stringify(lineItems); submitNewOrder re-parses it.
 // INVARIANT(S): submit is gated (disabled) until a customer AND >=1 line item with qty>0 exist; variantId dedupe increments qty rather than adding a row; custom items carry isCustom:true / sku 'CUSTOM' and are sent as titled price lines (no variant).
 function renderNewOrderForm(session, prefillCustomer) {
-  const customerJson = prefillCustomer ? JSON.stringify({ id: shopifyNumericId(prefillCustomer.id), name: prefillCustomer.displayName, email: prefillCustomer.email }) : 'null';
+  // jsonForScript (not JSON.stringify): displayName/email come from Shopify (customer-controlled);
+  // a name of `</script>…` would otherwise break out of the inline <script> below.
+  const customerJson = prefillCustomer ? jsonForScript({ id: shopifyNumericId(prefillCustomer.id), name: prefillCustomer.displayName, email: prefillCustomer.email }) : 'null';
   return layout({ title: 'New Order', session, activePath: '/orders',
     extraHead: `<style>
       .order-form-grid{display:grid;grid-template-columns:1fr 320px;gap:1rem;}
@@ -4768,7 +4837,7 @@ app.get('/auth/google/callback', async (req, res) => {
     const user = await userRes.json();
     if (!user.email_verified) return res.redirect('/login?error=Google+email+not+verified');
     const emailLower = (user.email || '').toLowerCase();
-    if (!ALLOWED_EMAILS.some(e => e.toLowerCase() === emailLower))
+    if (!currentAllowedEmails().some(e => e.toLowerCase() === emailLower))
       return res.status(403).send(renderUnauthorized(user.email));
     const sid = crypto.randomBytes(32).toString('hex');
     createSession(sid, user.email, user.name || user.email, user.picture || '');
@@ -4783,7 +4852,9 @@ app.get('/auth/google/callback', async (req, res) => {
 // WHAT: Destroy the server-side session (deleteSession) + audit-log the logout, then expire the cookie and redirect to /login.
 // CHANGE-GUARD: must both deleteSession AND clear the cookie — clearing only the cookie leaves a live session id reusable.
 // INVARIANT(S): tolerant of a missing/already-dead session (no-op then expire cookie).
-app.get('/auth/logout', (req, res) => {
+// POST (not GET) so a cross-site link/image cannot force-logout an admin (SameSite=Lax sends the
+// cookie on top-level GET navigations). The header "Sign out" is now a POST form button.
+app.post('/auth/logout', (req, res) => {
   const sid = getCookie(req, COOKIE_NAME);
   if (sid) {
     const session = getSession(sid);
@@ -7351,7 +7422,10 @@ function getStyleFromTags(tags) {
 // INVARIANT(S): does NOT prefix a BOM (callers add '﻿' themselves) and does NOT guard against CSV-injection (leading =,+,-,@) — see bugs[].
 function csvLine(cells) {
   return cells.map(c => {
-    const s = c == null ? '' : String(c);
+    let s = c == null ? '' : String(c);
+    // Neutralize spreadsheet formula injection: Excel/Sheets execute cells starting with = + - @ (or
+    // a control char). Prefix with a single quote so the value is treated as text.
+    if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;
     return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
   }).join(',') + '\n';
 }
@@ -8195,7 +8269,7 @@ app.get('/settings', requireAuth, (req, res) => {
 app.post('/settings', requireAuth, (req, res) => {
   const { b2b_discount_pct, order_minimum, payment_terms, catalog_private_tags } = req.body;
   try {
-    if (b2b_discount_pct    !== undefined) setSetting('b2b_discount_pct',    String(Number(b2b_discount_pct) || 50));
+    if (b2b_discount_pct    !== undefined) { const _d = Math.round(Number(b2b_discount_pct)); setSetting('b2b_discount_pct', String(Number.isFinite(_d) ? Math.min(95, Math.max(0, _d)) : 50)); }
     if (order_minimum       !== undefined) setSetting('order_minimum',        String(Number(order_minimum)    || 0));
     if (payment_terms       !== undefined) setSetting('payment_terms',        String(payment_terms).slice(0, 100));
     if (catalog_private_tags !== undefined) setSetting('catalog_private_tags', String(catalog_private_tags || '').slice(0, 500));
@@ -9309,7 +9383,7 @@ function renderLeadDetail(session, { lead, notes, history, flash }) {
             <div class="kv-list">
               <div class="kv-row"><span>Email</span><strong><a href="mailto:${h(lead.email)}" class="link">${h(lead.email)}</a></strong></div>
               ${lead.phone ? `<div class="kv-row"><span>Phone</span><strong>${h(lead.phone)}</strong></div>` : ''}
-              ${lead.website ? `<div class="kv-row"><span>Website</span><strong><a href="${h(lead.website)}" target="_blank" class="link">${h(lead.website)}</a></strong></div>` : ''}
+              ${lead.website ? `<div class="kv-row"><span>Website</span><strong><a href="${h(safeUrl(lead.website))}" target="_blank" rel="noopener noreferrer" class="link">${h(lead.website)}</a></strong></div>` : ''}
               ${lead.business_type ? `<div class="kv-row"><span>Type</span><strong>${h(lead.business_type)}</strong></div>` : ''}
               ${lead.source ? `<div class="kv-row"><span>Source</span><strong>${h(lead.source)}${lead.source_detail ? ' — ' + h(lead.source_detail) : ''}</strong></div>` : ''}
               ${lead.estimated_monthly_volume_usd ? `<div class="kv-row"><span>Est. volume</span><strong>${fmtMoney(lead.estimated_monthly_volume_usd)}/mo</strong></div>` : ''}
@@ -9848,7 +9922,9 @@ app.post('/api/admin/customers/:id/impersonate', requireAuth, async (req, res) =
       const r = await shopifyFetch('query($id:ID!){customer(id:$id){id displayName email tags}}', { id: shopifyCustomerGid(numId) });
       const c = r.data?.customer;
       if (!c) return res.status(404).json({ ok: false, error: 'Customer not found' });
-      if ((c.tags || []).some(t => ALLOWED_EMAILS.includes(t))) {
+      // Block impersonating an insider/admin: compare the customer's EMAIL to the admin allowlist
+      // (the old check compared customer TAGS to admin emails — they never intersect, so it never fired).
+      if (c.email && currentAllowedEmails().some(e => e.toLowerCase() === c.email.toLowerCase())) {
         return res.status(403).json({ ok: false, error: 'Cannot impersonate insider accounts' });
       }
       customerEmail = c.email || '';
@@ -10114,14 +10190,21 @@ app.get('/customers/:id/activity', requireAuth, async (req, res) => {
 // CHANGE-GUARD: must mount express.raw BEFORE the global express.json (which it does, being defined late) or the rawBody HMAC will be over re-serialized JSON and never match; re-test signature rejection on tamper.
 // INVARIANT(S): SECURITY — verification is skipped when the x-shopify-hmac-sha256 header is absent even though a secret is set (see bugs[]); comparison is plain !== (not timing-safe); cache upsert errors are swallowed so a 200 does NOT mean the row persisted.
 // WHAT: POST /webhooks/shopify — HMAC-verifies Shopify webhooks then upserts customers/orders/products into the local SQLite cache via setImmediate (returns 200 immediately).
-// CHANGE-GUARD: SECURITY — verification is SKIPPED when the x-shopify-hmac-sha256 header is absent even though SHOPIFY_WEBHOOK_SECRET is set (the `if (SECRET && sig)` guard lets a header-less request through to the !MOCK 401, but a present-but-empty header path and the plain `!==` comparison are both weak — see bugs[]); comparison is NOT timing-safe; this express.raw mount must run BEFORE the global express.json or rawBody is re-serialized JSON and HMAC never matches.
+// SECURITY (fixed 2026-07-02): HMAC is verified over req.rawBody — the EXACT bytes captured by the
+// global express.json({verify}) hook — NOT a re-serialization. The old code mounted express.raw here,
+// but the app-level express.json runs first (registration order), so req.body was already a parsed
+// object and the HMAC was computed over Buffer.from(JSON.stringify(...)) → it never matched Shopify's
+// signature and ALL real webhooks were rejected. A missing signature now fails closed; compare is timing-safe.
 // INVARIANT(S): cache upserts run in setImmediate AFTER the 200 is sent, and their errors are swallowed (console.error only) — a 200 does NOT mean the row persisted; topic prefixes 'customers/', 'orders/', 'products/(create|update)' route the upsert; money fields use shop_money/total_*; tags are normalized from array-or-CSV; every dispatch is auditLog'd webhook:<topic>.
-app.post('/webhooks/shopify', express.raw({ type: 'application/json' }), (req, res) => {
-  const rawBody = Buffer.isBuffer(req.body) ? req.body : Buffer.from(JSON.stringify(req.body));
+app.post('/webhooks/shopify', (req, res) => {
+  const rawBody = req.rawBody || (Buffer.isBuffer(req.body) ? req.body : Buffer.from(JSON.stringify(req.body || {})));
   const sig = req.headers['x-shopify-hmac-sha256'];
-  if (SHOPIFY_WEBHOOK_SECRET && sig) {
+  if (SHOPIFY_WEBHOOK_SECRET) {
+    if (!sig) return res.status(401).json({ error: 'missing signature' });
     const expected = crypto.createHmac('sha256', SHOPIFY_WEBHOOK_SECRET).update(rawBody).digest('base64');
-    if (sig !== expected) return res.status(401).json({ error: 'HMAC mismatch' });
+    const a = Buffer.from(String(sig));
+    const b = Buffer.from(expected);
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return res.status(401).json({ error: 'HMAC mismatch' });
   } else if (!MOCK) {
     return res.status(401).json({ error: 'No webhook secret configured' });
   }
