@@ -9946,7 +9946,7 @@ app.post('/labels/print',   requireAuth, (req, res) => handleLabelsPdf(req, res,
 // ── Phase 6: Exports ──────────────────────────────────────────────────────────
 
 // WHAT: loads full product+variant detail (images, inventory, timestamps) for CSV/image exports via Shopify nodes(ids:) or MOCK_PRODUCTS.
-// CHANGE-GUARD: images first:30 and variants first:50 — exports silently drop overflow beyond those caps; the gid mapping `gid://shopify/Product/<id>` must match what getAllB2bProductIds returns (numeric ids).
+// CHANGE-GUARD: images first:30 and variants first:50 — exports silently drop overflow beyond those caps; the gid mapping `gid://shopify/Product/<id>` must match what getAllB2bProductIds returns (numeric ids). Shopify's nodes(ids:) rejects >250 ids, so gids are fetched in sequential batches of 250 and concatenated.
 // INVARIANT(S): null nodes filtered out; b2b_price in the CSV is later derived as price*0.5 (hardcoded 50%, NOT the per-customer/global discount) — see /exports/csv.
 async function getProductsForExport(ids) {
   if (MOCK) {
@@ -9954,18 +9954,22 @@ async function getProductsForExport(ids) {
     return MOCK_PRODUCTS;
   }
   const gids = ids.map(id => `gid://shopify/Product/${id}`);
-  const result = await shopifyFetch(`
-    query($ids:[ID!]!){nodes(ids:$ids){... on Product{
-      id handle title vendor productType tags
-      featuredImage{url altText}
-      images(first:30){edges{node{url altText}}}
-      variants(first:50){edges{node{
-        id title sku barcode price compareAtPrice inventoryQuantity inventoryPolicy
+  const out = [];
+  for (let i = 0; i < gids.length; i += 250) {
+    const result = await shopifyFetch(`
+      query($ids:[ID!]!){nodes(ids:$ids){... on Product{
+        id handle title vendor productType tags
+        featuredImage{url altText}
+        images(first:30){edges{node{url altText}}}
+        variants(first:50){edges{node{
+          id title sku barcode price compareAtPrice inventoryQuantity inventoryPolicy
+          createdAt updatedAt
+        }}}
         createdAt updatedAt
-      }}}
-      createdAt updatedAt
-    }}}`, { ids: gids });
-  return (result.data?.nodes || []).filter(Boolean);
+      }}}`, { ids: gids.slice(i, i + 250) });
+    out.push(...(result.data?.nodes || []).filter(Boolean));
+  }
+  return out;
 }
 
 // WHAT: paginates all product ids in the B2B publication (publication_id:<B2B_PUB_ID tail>) for select-all on the export pages.
