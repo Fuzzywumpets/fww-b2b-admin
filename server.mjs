@@ -40,6 +40,7 @@ import {
   getTopCustomersAllTime,
   listImpersonationsForCustomer,
   getOrderByName,
+  getOrderInternalNote, setOrderInternalNote,
 } from './db.mjs';
 import { generateInvoicePdf, lineItemTrueTotal, lineItemTrueUnit, lineItemCurrentQty } from './pdf.mjs';
 import { renderLabelSheet, expandItems, TEMPLATES as LABEL_TEMPLATES, DEFAULT_FIELDS } from './labels.mjs';
@@ -1856,7 +1857,7 @@ async function getOrderDetail(numericId) {
         totalOutstandingSet{presentmentMoney{amount currencyCode}}
         totalReceivedSet{presentmentMoney{amount currencyCode}}
         note tags
-        shippingAddress{firstName lastName address1 address2 city province zip country}
+        shippingAddress{firstName lastName address1 address2 city province zip country phone}
         billingAddress{firstName lastName address1 address2 city province zip country}
         lineItems(first:250){edges{node{id title quantity currentQuantity
           variant{id title sku barcode selectedOptions{name value} price inventoryQuantity product{id title}}
@@ -2121,6 +2122,8 @@ function renderOrderDetail(session, order, flash, flashMsg) {
     ? `<div class="alert alert-warning">Payment amount is invalid${flashMsg ? `: ${h(flashMsg)}` : ' — must be greater than 0 and no more than the outstanding balance.'}</div>`
     : flash === 'note_saved'
     ? `<div class="alert alert-success">Note saved.</div>`
+    : flash === 'address_saved'
+    ? `<div class="alert alert-success">Shipping address updated.</div>`
     : flash === 'chase_invoice_queued'
     ? `<div class="alert alert-success">Chase invoice intent logged. Wire Chase API to send the real link.</div>`
     : flash === 'order_edited'
@@ -3208,16 +3211,29 @@ function renderOrderDetail(session, order, flash, flashMsg) {
             <button type="button" class="btn btn-secondary" onclick="downloadInvoiceCsv(${h(numId)})">Download CSV</button>
           </div>
         </div>
-        <div class="card" id="internal-notes-card">
+        <div class="card" id="customer-notes-card">
           <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
-            <h2>Internal order note <span class="badge badge-muted" style="margin-left:6px">${order.note && String(order.note).trim() ? 1 : 0}</span></h2>
-            <span class="text-muted" style="font-size:11px">staff only · not shown to customer or on invoice</span>
+            <h2>Customer notes <span class="badge badge-muted" style="margin-left:6px">${order.note && String(order.note).trim() ? 1 : 0}</span></h2>
+            <span class="text-muted" style="font-size:11px">prints on the order invoice</span>
           </div>
           <form method="POST" action="/orders/${h(numId)}/note" style="margin-top:10px">
-            <textarea name="note" class="textarea" rows="3" placeholder="Add a note for this order (e.g. how it was created)…">${h(order.note||'')}</textarea>
+            <textarea name="note" class="textarea" rows="3" placeholder="Add a customer note for this order…">${h(order.note||'')}</textarea>
             <div style="margin-top:0.5rem;display:flex;gap:8px;align-items:center">
               <button type="submit" class="btn btn-secondary btn-sm">Save note</button>
-              ${order.note && String(order.note).trim() ? `<button type="button" class="btn btn-ghost btn-sm" style="color:#a32d2d" onclick="if(confirm('Delete this internal note?')){this.form.note.value='';this.form.submit();}">Delete</button>` : ''}
+              ${order.note && String(order.note).trim() ? `<button type="button" class="btn btn-ghost btn-sm" style="color:#a32d2d" onclick="if(confirm('Delete this customer note?')){this.form.note.value='';this.form.submit();}">Delete</button>` : ''}
+            </div>
+          </form>
+        </div>
+        <div class="card" id="internal-note-card">
+          <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
+            <h2>Internal note <span class="badge badge-muted" style="margin-left:6px">${order.internalNote && String(order.internalNote).trim() ? 1 : 0}</span></h2>
+            <span class="text-muted" style="font-size:11px">staff only · never on the invoice or synced to Shopify</span>
+          </div>
+          <form method="POST" action="/orders/${h(numId)}/internal-note" style="margin-top:10px">
+            <textarea name="note" class="textarea" rows="3" placeholder="Private staff note (e.g. how the order was created, SparkLayer unreachable)…">${h(order.internalNote||'')}</textarea>
+            <div style="margin-top:0.5rem;display:flex;gap:8px;align-items:center">
+              <button type="submit" class="btn btn-secondary btn-sm">Save internal note</button>
+              ${order.internalNote && String(order.internalNote).trim() ? `<button type="button" class="btn btn-ghost btn-sm" style="color:#a32d2d" onclick="if(confirm('Delete this internal note?')){this.form.note.value='';this.form.submit();}">Delete</button>` : ''}
             </div>
           </form>
         </div>
@@ -3252,6 +3268,27 @@ function renderOrderDetail(session, order, flash, flashMsg) {
         <div class="card">
           <div class="card-header"><h2>Shipping Address</h2></div>
           <p class="address-block">${addrHtml}</p>
+          <details style="margin-top:8px">
+            <summary style="cursor:pointer;font-size:13px;color:var(--link,#2086ba)">✏️ Edit shipping address</summary>
+            <form method="POST" action="/orders/${h(numId)}/shipping-address" style="margin-top:10px;display:grid;gap:6px">
+              <div style="display:flex;gap:6px">
+                <input name="firstName" class="filter-input" placeholder="First name" value="${h(addr?.firstName||'')}" style="flex:1">
+                <input name="lastName" class="filter-input" placeholder="Last name" value="${h(addr?.lastName||'')}" style="flex:1">
+              </div>
+              <input name="address1" class="filter-input" placeholder="Address line 1" value="${h(addr?.address1||'')}">
+              <input name="address2" class="filter-input" placeholder="Address line 2 (optional)" value="${h(addr?.address2||'')}">
+              <div style="display:flex;gap:6px">
+                <input name="city" class="filter-input" placeholder="City" value="${h(addr?.city||'')}" style="flex:2">
+                <input name="province" class="filter-input" placeholder="State" value="${h(addr?.province||'')}" style="flex:1">
+                <input name="zip" class="filter-input" placeholder="ZIP" value="${h(addr?.zip||'')}" style="flex:1">
+              </div>
+              <div style="display:flex;gap:6px">
+                <input name="country" class="filter-input" placeholder="Country" value="${h(addr?.country||'')}" style="flex:1">
+                <input name="phone" class="filter-input" placeholder="Phone (optional)" value="${h(addr?.phone||'')}" style="flex:1">
+              </div>
+              <div><button type="submit" class="btn btn-primary btn-sm">Save address</button></div>
+            </form>
+          </details>
         </div>
         <div class="card">
           <div class="card-header"><h2>Transactions</h2></div>
@@ -4896,6 +4933,8 @@ app.get('/orders/:id', requireAuth, async (req, res) => {
   // Attach visible notes from portal db (readonly)
   const shopifyId = order.id.startsWith('gid://') ? order.id : `gid://shopify/Order/${order.id}`;
   order.visibleNotes = getVisibleNotesForOrder(shopifyId);
+  // Staff-only internal note (admin-local, keyed by numeric order id) — never synced/invoiced
+  order.internalNote = getOrderInternalNote(req.params.id)?.body || '';
   res.send(renderOrderDetail(req.adminSession, order, req.query.success || req.query.error || '', req.query.msg || ''));
 });
 
@@ -4976,6 +5015,52 @@ app.post('/orders/:id/note', requireAuth, async (req, res) => {
   }
   auditLog(req.adminSession.email, 'update_note', shopifyOrderGid(numId), null, { note });
   res.redirect(`/orders/${numId}?success=note_saved`);
+});
+
+// WHAT: Save the staff-only INTERNAL order note (admin-local order_internal_notes table).
+// Never synced to Shopify, never on the invoice. Empty body clears it (delete).
+app.post('/orders/:id/internal-note', requireAuth, async (req, res) => {
+  const numId = req.params.id;
+  const note  = String(req.body.note || '').slice(0, 4000);
+  setOrderInternalNote(numId, note, req.adminSession.email);
+  auditLog(req.adminSession.email, note.trim() ? 'update_internal_note' : 'delete_internal_note', shopifyOrderGid(numId), null, null);
+  res.redirect(`/orders/${numId}?success=note_saved`);
+});
+
+// WHAT: Update the order's shipping address via Shopify orderUpdate (OrderInput.shippingAddress).
+// CHANGE-GUARD: province/country are passed as the values the form was prefilled with (Shopify
+// returns names like "Illinois"/"United States"); Shopify resolves names or codes. address2/phone
+// may be empty (optional). MOCK mode stores the address on the in-memory override.
+app.post('/orders/:id/shipping-address', requireAuth, async (req, res) => {
+  const numId = req.params.id;
+  const b = req.body || {};
+  const addr = {
+    firstName: String(b.firstName || '').trim(),
+    lastName:  String(b.lastName  || '').trim(),
+    address1:  String(b.address1  || '').trim(),
+    address2:  String(b.address2  || '').trim(),
+    city:      String(b.city      || '').trim(),
+    province:  String(b.province  || '').trim(),
+    zip:       String(b.zip       || '').trim(),
+    country:   String(b.country   || '').trim(),
+    phone:     String(b.phone     || '').trim(),
+  };
+  if (MOCK) {
+    const prev = mockOrderOverrides.get(numId) || {};
+    mockOrderOverrides.set(numId, { ...prev, shippingAddress: addr });
+  } else {
+    try {
+      const r = await shopifyFetch(`mutation orderUpdate($input:OrderInput!){
+        orderUpdate(input:$input){ order{ id shippingAddress{ address1 city province zip } } userErrors{ field message } }
+      }`, { input: { id: shopifyOrderGid(numId), shippingAddress: addr } });
+      const ue = r.data?.orderUpdate?.userErrors || [];
+      if (ue.length) return res.redirect(`/orders/${numId}?error=${encodeURIComponent(ue[0].message)}`);
+    } catch (err) {
+      return res.redirect(`/orders/${numId}?error=${encodeURIComponent(err.message)}`);
+    }
+  }
+  auditLog(req.adminSession.email, 'update_shipping_address', shopifyOrderGid(numId), null, { address: `${addr.address1}, ${addr.city} ${addr.province} ${addr.zip}` });
+  res.redirect(`/orders/${numId}?success=address_saved`);
 });
 
 // WHAT: STUB — logs intent to send a Chase Pay invoice link; returns success without calling any real Chase API.

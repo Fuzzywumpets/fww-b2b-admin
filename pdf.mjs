@@ -272,10 +272,16 @@ export async function generateInvoicePdf(order, opts = {}) {
       doc.fontSize(10).font('Inter').fillColor(BLACK).text(opts.paymentTerms, 50, y, { width: 512 });
     }
 
-    // ─── Order notes ───────────────────────────────────────────────
-    // The Shopify order `note` is INTERNAL-only and is deliberately NOT printed on the
-    // customer invoice (alexa 2026-07-01). If a customer-facing invoice note is ever needed,
-    // add a separate opts.invoiceNote field rather than resurrecting order.note here.
+    // ─── Customer notes (order.note) — prints on the customer invoice (alexa 2026-07-01) ──
+    // This is the "Customer notes" field from the order page. The staff-only "Internal note"
+    // (order_internal_notes table) is separate and is NOT passed to the PDF.
+    if (order.note) {
+      y += 32;
+      doc.fontSize(8).font('Inter-Bold').fillColor(BLACK).opacity(0.6).text('NOTES', 50, y);
+      doc.opacity(1);
+      y += 12;
+      doc.fontSize(10).font('Inter').fillColor(BLACK).text(order.note, 50, y, { width: 512 });
+    }
 
     // ─── Footer — y=720 sits inside the default bottom margin (742) so no auto-page-break ──
     doc.fontSize(8).font('Inter').fillColor(BLACK).opacity(0.6).text(

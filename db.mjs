@@ -46,6 +46,13 @@ db.exec(`
     updated_by TEXT NOT NULL
   );
 
+  CREATE TABLE IF NOT EXISTS order_internal_notes (
+    order_id   TEXT PRIMARY KEY,
+    body       TEXT NOT NULL DEFAULT '',
+    updated_at INTEGER NOT NULL,
+    updated_by TEXT NOT NULL DEFAULT ''
+  );
+
   CREATE TABLE IF NOT EXISTS dropship_config_cache (
     customer_id TEXT PRIMARY KEY,
     enabled INTEGER NOT NULL DEFAULT 0,
@@ -400,6 +407,17 @@ export function setCustomerNotes(customerId, body, email) {
     INSERT OR REPLACE INTO customer_notes (customer_id, body, updated_at, updated_by)
     VALUES (?, ?, ?, ?)
   `).run(customerId, body, Date.now(), email);
+}
+
+// Order-level INTERNAL note (staff-only) — never synced to Shopify, never on the invoice.
+export function getOrderInternalNote(orderId) {
+  return db.prepare('SELECT * FROM order_internal_notes WHERE order_id = ?').get(String(orderId)) || null;
+}
+export function setOrderInternalNote(orderId, body, email) {
+  db.prepare(`
+    INSERT OR REPLACE INTO order_internal_notes (order_id, body, updated_at, updated_by)
+    VALUES (?, ?, ?, ?)
+  `).run(String(orderId), String(body).slice(0, 4000), Date.now(), email || '');
 }
 
 export function getDropshipCache(customerId) {
