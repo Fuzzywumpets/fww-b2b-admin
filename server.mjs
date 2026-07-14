@@ -73,6 +73,33 @@ const PORTAL_INTERNAL_TOKEN = process.env.B2B_PORTAL_INTERNAL_TOKEN || '';
 const PORTAL_INTERNAL_URL   = process.env.B2B_PORTAL_INTERNAL_URL || 'http://127.0.0.1:8793';
 const XERO_BRIDGE_URL       = 'https://fww-xero-bridge.alex-037.workers.dev/xero';
 const XERO_BEARER           = process.env.XERO_BRIDGE_BEARER || '';
+// ─────────────────────────────────────────────────────────────────────────────
+// [XERO-DISABLED] TEMPORARY XERO WRITE KILL-SWITCH — added 2026-07-14 by request.
+// Alex is cleaning up bad/garbage data on the Xero side and will do a clean
+// re-pull once it's fixed. Until then, ALL Xero WRITE + SYNC operations are
+// disconnected: they must NOT reach Xero, must NOT enqueue xero_pending retry
+// rows, must NOT write local xero-map / mapping-file entries (that queue + those
+// files are themselves "garbage" we don't want to accumulate), and must NOT throw
+// — a B2B action (create order, mark paid, manual sync, customer sync) still
+// succeeds for the user.
+//
+// ⚠️  SILENT-PASS WARNING FOR THE NEXT REVIEWER  ⚠️
+// While this is false, the Xero steps RETURN SUCCESS-SHAPED RESULTS WITHOUT DOING
+// ANYTHING. Logs/UI may say the Xero step "synced/skipped/completed" even though
+// NO invoice, payment, or contact was pushed to Xero, and NOTHING was queued for
+// later — re-enabling will NOT backfill the gap. What is actually NOT happening
+// while this is off:
+//   • submitNewOrder  → NO ACCREC invoice created in Xero
+//   • /orders/:id/mark-paid → NO Xero invoice + NO payment recorded
+//   • /orders/:id/xero/sync (manual button) → NO invoice (reports "xero_synced")
+//   • /api/admin/xero/sync (drain queue) → processes nothing
+//   • customer xero-sync / b2b-tag / lead-convert → NO Xero contact created
+// Reads (GET: account list, sync-status lookups) are left ALIVE — they don't
+// create garbage. Backstop below in xeroRequest() blocks any write we missed.
+// TO RE-ENABLE: flip this to true, then manually re-sync affected orders/customers
+// (there is no automatic catch-up). Grep tag: [XERO-DISABLED]
+// ─────────────────────────────────────────────────────────────────────────────
+const XERO_WRITES_ENABLED   = false;
 const IMPERSONATION_SECRET  = process.env.B2B_IMPERSONATION_SECRET || (MOCK ? 'test-impersonation-secret-mock' : '');
 const PORTAL_BASE_URL       = MOCK ? `http://127.0.0.1:8793` : 'https://b2b.fuzzyreporting.com';
 const SHOPIFY_WEBHOOK_SECRET = process.env.SHOPIFY_WEBHOOK_SECRET || (MOCK ? 'test-shopify-webhook-secret' : '');
@@ -294,6 +321,15 @@ async function xeroRequest(method, xeroPath, body = null) {
   if (MOCK || !XERO_BEARER) {
     return { ok: true, body: xeroMockResponse(method, xeroPath, body) };
   }
+  // [XERO-DISABLED] Backstop: while writes are off, NEVER let a mutating request
+  // reach the bridge. Any non-GET short-circuits to a synthetic success (same
+  // shape as MOCK) so callers don't throw. GETs (reads) pass through untouched.
+  // This is defense-in-depth — the high-level fns below also short-circuit first,
+  // so this only fires for a write path we didn't explicitly gate.
+  if (!XERO_WRITES_ENABLED && String(method).toUpperCase() !== 'GET') {
+    console.warn(`[XERO-DISABLED] blocked ${method} ${xeroPath} — writes are off; returning synthetic success (nothing sent to Xero).`);
+    return { ok: true, body: xeroMockResponse(method, xeroPath, body) };
+  }
   const payload = { method, path: xeroPath };
   if (body) payload.body = body;
   const resp = await fetch(XERO_BRIDGE_URL, {
@@ -341,6 +377,11 @@ function addDays(isoString, days) {
 // INVARIANT(S): customer.id is a gid; numId derived via shopifyNumericId; throws if the create returns no ContactID.
 async function ensureXeroContact(customer) {
   // customer: { id (GID), displayName, email }
+  // [XERO-DISABLED] Writes off: never create a Xero contact. Returns null; the only
+  // caller (createXeroInvoice) already short-circuits before reaching here, so this
+  // is belt-and-suspenders. (Contact writes triggered elsewhere go through the
+  // lib syncCustomerToXero path, which the xeroRequest backstop neutralizes.)
+  if (!XERO_WRITES_ENABLED) return null;
   // Phase 21G: resolve from mapping / live before creating to avoid duplicates
   const numId = shopifyNumericId(customer.id || '');
   if (numId) {
@@ -362,6 +403,13 @@ async function ensureXeroContact(customer) {
 // INVARIANT(S): writes setXeroMap(orderId, InvoiceID, contactId, 'synced') on success — the get/set around this is NOT atomic, so two concurrent syncs of the same order can each pass the 'synced' check and create duplicate invoices; InvoiceNumber = order.name (e.g. #1001) must be unique in Xero.
 async function createXeroInvoice(order, accountMap) {
   // order: Shopify order object with lineItems, customer, etc.
+  // [XERO-DISABLED] Writes off: do NOT create an invoice, do NOT touch the local
+  // xero-map. Return null so callers treat it as "no invoice id" and skip cleanly
+  // (e.g. mark-paid skips the payment record). No throw, no pending-queue row.
+  if (!XERO_WRITES_ENABLED) {
+    console.warn(`[XERO-DISABLED] createXeroInvoice skipped for order ${shopifyNumericId(order.id)} — no invoice pushed to Xero.`);
+    return null;
+  }
   const orderId   = shopifyNumericId(order.id);
   const existing  = getXeroMap(orderId);
   if (existing?.xero_invoice_id && existing.status === 'synced') return existing.xero_invoice_id;
@@ -425,6 +473,12 @@ async function createXeroInvoice(order, accountMap) {
 // CHANGE-GUARD: there is NO idempotency key — calling this twice (e.g. retry queue + manual) records TWO payments and over-allocates the invoice. Re-test the retry path does not double-pay.
 // INVARIANT(S): amount is presentment currency major units (dollars), accountCode is a BANK account code (chase_checking/stripe_clearing), date defaults to today if absent; throws if no PaymentID returned.
 async function recordXeroPayment(orderId, xeroInvoiceId, amount, date, accountCode) {
+  // [XERO-DISABLED] Writes off: do NOT record a payment against any Xero invoice.
+  // Return null (no PaymentID) without throwing; callers only audit-log on success.
+  if (!XERO_WRITES_ENABLED) {
+    console.warn(`[XERO-DISABLED] recordXeroPayment skipped for order ${orderId} — no payment sent to Xero.`);
+    return null;
+  }
   const payDate = date ? toXeroDate(date) : new Date().toISOString().slice(0, 10);
   const res = await xeroRequest('PUT', '/api.xro/2.0/Payments', {
     Payments: [{
@@ -443,6 +497,14 @@ async function recordXeroPayment(orderId, xeroInvoiceId, amount, date, accountCo
 // CHANGE-GUARD: re-throws after queuing, so the HTTP handler must catch and render the 'xero_failed' flash. actorEmail must come from req.adminSession.email (never client input) for a trustworthy audit trail.
 // INVARIANT(S): every outcome is audit-logged (xero:invoice_synced / xero:invoice_failed) keyed by the order gid; failures are durably retryable via addXeroPending.
 async function syncOrderToXero(numId, actorEmail) {
+  // [XERO-DISABLED] Writes off: report a benign "skipped" success WITHOUT creating
+  // an invoice and WITHOUT enqueuing a pending-retry row. Callers (submitNewOrder
+  // fire-and-forget, and POST /orders/:id/xero/sync) treat this as done. NOTE: the
+  // manual-sync endpoint will still flash "xero_synced" — nothing actually synced.
+  if (!XERO_WRITES_ENABLED) {
+    console.warn(`[XERO-DISABLED] syncOrderToXero skipped for order ${numId} — no invoice pushed, nothing queued.`);
+    return { ok: true, skipped: 'xero_writes_disabled', xeroInvoiceId: null };
+  }
   const order = await getOrderDetail(numId);
   if (!order) throw new Error('Order not found: ' + numId);
   const accountMap = getXeroAccountMap();
@@ -462,6 +524,12 @@ async function syncOrderToXero(numId, actorEmail) {
 // CHANGE-GUARD: SERIAL by design (await in a for-of) — do not parallelize, since concurrent create_invoice for the same order would race the non-atomic getXeroMap/setXeroMap and duplicate invoices. retries>=3 → skipped (NOT failed), so a poison action lingers in the queue forever; verify a sweep/alert exists.
 // INVARIANT(S): payload_json is the persisted action args; unknown action_type is marked failed; markXeroPendingDone/Failed must be called exactly once per processed action.
 async function retryXeroPending() {
+  // [XERO-DISABLED] Writes off: don't drain the queue (every action is a Xero
+  // write). Leave pending rows untouched and report zero work — no throw.
+  if (!XERO_WRITES_ENABLED) {
+    console.warn('[XERO-DISABLED] retryXeroPending skipped — queue left intact, nothing sent to Xero.');
+    return { done: 0, failed: 0, skipped: 0, disabled: true };
+  }
   const pending = getXeroPending('pending');
   const accountMap = getXeroAccountMap();
   const results = { done: 0, failed: 0, skipped: 0 };
@@ -7064,7 +7132,9 @@ app.post('/customers/:id/tags/add', requireAuth, async (req, res) => {
   auditLog(req.adminSession.email, 'add_tag', gid, null, { tag });
   // Phase 21C: when b2b tag is added, trigger Xero sync (non-blocking)
   if (tag === 'b2b') {
-    syncCustomerToXero(req.params.id, { email: '' }, xeroRequest, { dryRun: MOCK })
+    // [XERO-DISABLED] dryRun when writes off: PUT is blocked by the xeroRequest
+    // backstop, and dryRun stops a fake mapping-file entry from being persisted.
+    syncCustomerToXero(req.params.id, { email: '' }, xeroRequest, { dryRun: MOCK || !XERO_WRITES_ENABLED })
       .then(r => { if (r.created) auditLog(req.adminSession.email, 'xero:customer_sync', gid, null, { xeroContactId: r.xeroContactId, via: 'tag_add' }); })
       .catch(e => console.error('[xero-sync] tag add sync failed:', e.message));
   }
@@ -9605,11 +9675,12 @@ app.post('/leads/:id/convert', requireAuth, async (req, res) => {
   // Phase 21C: sync new B2B customer to Xero (non-blocking)
   const numIdForXero = shopifyCustomerId ? shopifyCustomerId.split('/').pop() : null;
   if (numIdForXero) {
+    // [XERO-DISABLED] dryRun when writes off — see xeroRequest backstop note.
     syncCustomerToXero(numIdForXero, {
       email: email, firstName: name.split(' ')[0] || name,
       lastName: name.split(' ').slice(1).join(' ') || '',
       displayName: name,
-    }, xeroRequest, { dryRun: MOCK }).then(r => {
+    }, xeroRequest, { dryRun: MOCK || !XERO_WRITES_ENABLED }).then(r => {
       if (r.created) auditLog(req.adminSession.email, 'xero:customer_sync', shopifyCustomerId, null, { xeroContactId: r.xeroContactId, via: 'lead_convert' });
     }).catch(e => console.error('[xero-sync] lead convert sync failed:', e.message));
   }
@@ -9878,7 +9949,9 @@ app.post('/api/admin/customers/:id/xero-sync', requireAuth, async (req, res) => 
       customer = r.data?.customer;
     }
     if (!customer) return res.status(404).json({ ok: false, error: 'Customer not found' });
-    const result = await syncCustomerToXero(numId, customer, xeroRequest, { dryRun: MOCK });
+    // [XERO-DISABLED] dryRun when writes off — PUT blocked by xeroRequest backstop;
+    // dryRun prevents a fake local mapping-file entry. Reports ok/created to the UI.
+    const result = await syncCustomerToXero(numId, customer, xeroRequest, { dryRun: MOCK || !XERO_WRITES_ENABLED });
     if (result.skipped) return res.json({ ok: true, skipped: result.skipped });
     auditLog(req.adminSession.email, 'xero:customer_sync', shopifyCustomerGid(numId), null, { xeroContactId: result.xeroContactId, created: result.created });
     res.json({ ok: true, ...result });
