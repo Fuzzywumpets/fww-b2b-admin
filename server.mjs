@@ -46,7 +46,7 @@ import { generateInvoicePdf, lineItemTrueTotal, lineItemTrueUnit, lineItemCurren
 import { renderLabelSheet, expandItems, TEMPLATES as LABEL_TEMPLATES, DEFAULT_FIELDS } from './labels.mjs';
 import { isInsider, resolveXeroContact, syncCustomerToXero, getXeroSyncStatus } from './lib/xero-customer-sync.mjs';
 // fww-error-sink monitoring (injected 2026-06-30): error-logging shim only. To disable, remove this import, the installGlobalHandlers() call, and the expressErrorMiddleware() app.use. See fww-error-sink RUNBOOK.
-import { installGlobalHandlers, expressErrorMiddleware } from './fww-logsink.mjs';
+import { installGlobalHandlers, expressErrorMiddleware, reportEvent } from './fww-logsink.mjs';
 installGlobalHandlers();
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -4800,7 +4800,16 @@ async function submitNewOrder(req, session) {
         draftOrderCreate(input:$input){ draftOrder{id invoiceUrl} userErrors{field message} }
       }`, { input: draftInput });
     const ue = createRes.data?.draftOrderCreate?.userErrors || [];
-    if (ue.length) return { error: ue.map(e => e.message).join('; ') };
+    if (ue.length) {
+      // Shopify rejected the draft (bad shippingLine, invalid variant, etc.). This is a
+      // RETURNED error, not a throw, so the express error-middleware won't see it — log it
+      // explicitly to runs/serverlog.log AND push to fww-error-sink so a failed order
+      // create is never silent. Grep tag: [order-create].
+      const msg = ue.map(e => e.message).join('; ');
+      console.error(`[order-create] draftOrderCreate FAILED: ${msg} | customer=${customer_id} ship_cost=${ship_cost || 0} lines=${lineItemsParsed.length}`);
+      reportEvent({ kind: 'error', severity: 'error', message: 'draftOrderCreate failed: ' + msg, context: { stage: 'draftOrderCreate', actor: session.email, customer_id, ship_cost: ship_cost || null, lineCount: lineItemsParsed.length, userErrors: ue } });
+      return { error: msg };
+    }
     const draftId = createRes.data?.draftOrderCreate?.draftOrder?.id;
 
     const completeRes = await shopifyFetch(`
@@ -4810,10 +4819,18 @@ async function submitNewOrder(req, session) {
         }
       }`, { id: draftId, paymentPending: true });
     const ue2 = completeRes.data?.draftOrderComplete?.userErrors || [];
-    if (ue2.length) return { error: ue2.map(e => e.message).join('; ') };
+    if (ue2.length) {
+      // Draft created but COMPLETE failed — the draft may be orphaned in Shopify. Log +
+      // report so it's recoverable (draftId is the handle). Grep tag: [order-create].
+      const msg2 = ue2.map(e => e.message).join('; ');
+      console.error(`[order-create] draftOrderComplete FAILED: ${msg2} | draft=${draftId} customer=${customer_id}`);
+      reportEvent({ kind: 'error', severity: 'error', message: 'draftOrderComplete failed: ' + msg2, context: { stage: 'draftOrderComplete', actor: session.email, customer_id, draftId, userErrors: ue2 } });
+      return { error: msg2 };
+    }
     const order = completeRes.data?.draftOrderComplete?.draftOrder?.order;
     const numId = shopifyNumericId(order?.id);
     auditLog(session.email, 'create_order', order?.id, null, { customer_id, lineItemCount: lineItemsParsed.length });
+    console.log(`[order-create] OK order=${order?.name || numId} id=${numId} customer=${customer_id} lines=${lineItemsParsed.length} ship_cost=${ship_cost || 0}`);
 
     // Phase 18: push to Xero as Authorised ACCREC invoice (fire-and-forget; queue on failure)
     if (numId) {
@@ -4835,7 +4852,11 @@ async function submitNewOrder(req, session) {
 
     return { orderId: numId, orderName: order?.name, ok: true };
   } catch (err) {
-    console.error('submitNewOrder error:', err.message);
+    // Thrown/network failure (shopifyFetch threw, etc.). submitNewOrder catches its own
+    // throw and RETURNS {error}, so the express error-middleware never sees it — report
+    // here so it still reaches fww-error-sink. Grep tag: [order-create].
+    console.error(`[order-create] threw: ${err.message} | customer=${customer_id} ship_cost=${ship_cost || 0}`);
+    reportEvent({ kind: 'error', severity: 'error', message: 'submitNewOrder threw: ' + err.message, context: { actor: session.email, customer_id, ship_cost: ship_cost || null, stack: err.stack } });
     return { error: err.message };
   }
 }
