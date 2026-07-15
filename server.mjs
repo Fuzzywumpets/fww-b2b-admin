@@ -420,6 +420,11 @@ async function createXeroInvoice(order, accountMap) {
   // and DROP lines removed in an edit (currentQuantity 0). getOrderDetail (the only feeder of this fn) now
   // selects currentQuantity; it falls back to `quantity` when the field is absent (unedited orders / webhook
   // shapes that omit it) so unedited orders invoice exactly as before.
+  // [XERO-DISABLED] TODO(when re-enabled): orders from /orders/new can now carry a Shopify
+  // shippingLine (shipping cost). This LineItems build covers PRODUCTS + order discounts only —
+  // it does NOT add shipping, so the invoice would under-bill by the shipping amount. Add a
+  // shipping LineItem from order.totalShippingPriceSet.presentmentMoney.amount (when > 0),
+  // AccountCode = accountMap.sales_revenue (or a dedicated freight code), before the total math.
   const lineItems = (order.lineItems?.edges || [])
     .map(e => e.node)
     .filter(li => (li.currentQuantity != null ? li.currentQuantity : (li.quantity || 0)) > 0)
@@ -4452,6 +4457,7 @@ function renderNewOrderForm(session, prefillCustomer) {
             <div class="form-row"><label>Province/State</label><input type="text" name="ship_province" class="input" id="ship-province"></div>
             <div class="form-row"><label>ZIP</label><input type="text" name="ship_zip" class="input" id="ship-zip"></div>
             <div class="form-row"><label>Country</label><input type="text" name="ship_country" class="input" id="ship-country" value="US"></div>
+            <div class="form-row" style="margin-top:0.5rem;border-top:1px solid var(--border,#e5e7eb);padding-top:0.5rem"><label>Shipping Cost</label><input type="number" name="ship_cost" class="input" id="ship-cost" min="0" step="0.01" placeholder="0.00" title="Charged to the customer as a Shopify shipping line"></div>
           </div>
           <div class="card" style="margin-top:1rem">
             <div class="card-header"><h2>Submit</h2></div>
@@ -4488,13 +4494,21 @@ function renderNewOrderForm(session, prefillCustomer) {
         submitError.textContent = !selectedCustomer ? 'Select a customer first.' : lineItems.length===0 ? 'Add at least one line item.' : '';
       }
 
+      function shipCost(){ var el=document.getElementById('ship-cost'); return el ? (parseFloat(el.value)||0) : 0; }
       function updateTotals(){
-        var total = lineItems.reduce(function(s,l){ return s + parseFloat(l.price||0)*parseInt(l.qty||0,10); }, 0);
-        document.getElementById('order-totals').innerHTML = total>0
-          ? '<div class="totals-row totals-total"><span>Est. Total</span><span>'+fmt(total)+'</span></div>' : '';
+        var subtotal = lineItems.reduce(function(s,l){ return s + parseFloat(l.price||0)*parseInt(l.qty||0,10); }, 0);
+        var ship = shipCost();
+        var html='';
+        if(subtotal>0 || ship>0){
+          html += '<div class="totals-row"><span>Subtotal</span><span>'+fmt(subtotal)+'</span></div>';
+          if(ship>0) html += '<div class="totals-row"><span>Shipping</span><span>'+fmt(ship)+'</span></div>';
+          html += '<div class="totals-row totals-total"><span>Est. Total</span><span>'+fmt(subtotal+ship)+'</span></div>';
+        }
+        document.getElementById('order-totals').innerHTML = html;
         lineItemsHidden.value = JSON.stringify(lineItems);
         updateSubmitBtn();
       }
+      (function(){ var sc=document.getElementById('ship-cost'); if(sc) sc.addEventListener('input', updateTotals); })();
 
       function fmt(n){ return new Intl.NumberFormat('en-US',{style:'currency',currency:'USD'}).format(n); }
 
@@ -4583,8 +4597,15 @@ function renderNewOrderForm(session, prefillCustomer) {
         updateSubmitBtn();
       });
 
-      setupAutocomplete('product-search','product-results','/api/products/search',function(p){
-        // p: {id, label, sublabel, variantId, sku, price}
+      // Grouped nested-variant product picker — ported 2026-07-14 from the order-EDIT
+      // "add item" modal (renderOrderDetail). Type a product name → dropdown shows each
+      // PRODUCT as a header with its variants nested as checkboxes (width→size sub-group
+      // when a Width option exists); check any number across products, then "Add selected"
+      // adds them all at once. Uses /api/products/search?grouped=1. This REPLACED the old
+      // flat one-row-per-variant setupAutocomplete picker (which never nested variants —
+      // the nesting only ever existed in the edit modal until now).
+      function addVariantToOrder(p){
+        // p: {variantId,label,sku,price}. Dedupe → qty++, else push at wholesale.
         var exists = lineItems.findIndex(function(l){ return l.variantId===p.variantId; });
         if(exists>=0){ lineItems[exists].qty++; }
         else {
@@ -4592,8 +4613,79 @@ function renderNewOrderForm(session, prefillCustomer) {
           var wsPrice = (parseFloat(p.price||0) * (1 - disc/100)).toFixed(2);
           lineItems.push({ variantId:p.variantId, title:p.label, sku:p.sku||'', listPrice:parseFloat(p.price||0), price:wsPrice, qty:1 });
         }
-        renderLineItems(); updateTotals();
-      });
+      }
+      (function(){
+        var input = document.getElementById('product-search');
+        var box   = document.getElementById('product-results');
+        if(!input || !box) return;
+        var t=null, lastSeq=0, groupedFlat=null;
+        function hide(){ box.hidden=true; box.innerHTML=''; groupedFlat=null; }
+        var SIZE_RANK=(function(){ var order=['XXS','2XS','XS','XSM','S','SM','SMALL','M','MED','MEDIUM','L','LG','LARGE','XL','XLG','XLARGE','XXL','2XL','XXLG','XXLARGE','XXXL','3XL']; var m={}; order.forEach(function(k,i){m[k]=i;}); return m; })();
+        function sizeRank(v){ var k=String(v||'').toUpperCase().replace(/\\s+/g,''); return SIZE_RANK[k]!=null?SIZE_RANK[k]:Infinity; }
+        function widthVal(w){ var s=String(w||'').replace(/["”]/g,'').trim(); var f=s.match(/^(\\d+)\\s*\\/\\s*(\\d+)$/); if(f) return parseInt(f[1],10)/parseInt(f[2],10); var n=parseFloat(s); return isNaN(n)?Infinity:n; }
+        function optVal(v,nameLc){ var o=(v.selectedOptions||[]).find(function(x){return String(x.name||'').toLowerCase()===nameLc;}); return o?o.value:null; }
+        function hasOption(v,nameLc){ return (v.selectedOptions||[]).some(function(x){return String(x.name||'').toLowerCase()===nameLc;}); }
+        function variantRow(key,v,indent){
+          var size=optVal(v,'size');
+          var shown=size!=null?size:(v.variantTitle==='Default Title'?'Add this item':v.variantTitle);
+          var oos=(v.inventoryQuantity!=null && v.inventoryQuantity<=0);
+          return '<label class="np-var-opt" style="display:flex;align-items:center;gap:8px;padding:5px 10px 5px '+indent+'px;cursor:pointer;font-size:13px">'+
+            '<input type="checkbox" class="np-var-cb" data-key="'+key+'" style="margin:0">'+
+            '<span>'+esc(shown)+(oos?' <span style="color:#b91c1c;font-size:11px">(out of stock)</span>':'')+'</span>'+
+            '<span style="margin-left:auto;color:var(--muted);font-size:11px">'+esc(v.sku||'—')+'</span>'+
+          '</label>';
+        }
+        function render(products){
+          if(!Array.isArray(products)||!products.length){ box.innerHTML='<div style="padding:8px 10px;color:var(--muted);font-size:13px">No matches</div>'; box.hidden=false; groupedFlat=null; return; }
+          var flat=[]; var html='';
+          products.forEach(function(p){
+            html+='<div style="padding:7px 10px;background:#f3f4f6;border-bottom:1px solid #e5e7eb;font-weight:600;font-size:13px;color:#111827">'+esc(p.productTitle)+(p.variantsTruncated?' <span style="font-weight:400;color:#b45309;font-size:11px">(showing first 25 sizes)</span>':'')+'</div>';
+            var vs=(p.variants||[]).slice();
+            var anyWidth=vs.some(function(v){return hasOption(v,'width');});
+            function pushKey(v){ var key=flat.length; flat.push({variantId:v.variantId,label:v.label,sku:v.sku,price:v.price}); return key; }
+            if(anyWidth){
+              var byWidth={}; vs.forEach(function(v){ var w=optVal(v,'width')||'—'; (byWidth[w]=byWidth[w]||[]).push(v); });
+              Object.keys(byWidth).sort(function(a,b){return widthVal(a)-widthVal(b)||a.localeCompare(b);}).forEach(function(w){
+                html+='<div style="padding:4px 10px 4px 18px;font-size:12px;font-weight:600;color:#4b5563">'+esc(w)+'</div>';
+                byWidth[w].sort(function(a,b){return sizeRank(optVal(a,'size'))-sizeRank(optVal(b,'size'))||String(optVal(a,'size')||a.variantTitle).localeCompare(String(optVal(b,'size')||b.variantTitle));}).forEach(function(v){ html+=variantRow(pushKey(v),v,34); });
+              });
+            } else {
+              vs.sort(function(a,b){return sizeRank(optVal(a,'size'))-sizeRank(optVal(b,'size'))||String(optVal(a,'size')||a.variantTitle).localeCompare(String(optVal(b,'size')||b.variantTitle));}).forEach(function(v){ html+=variantRow(pushKey(v),v,22); });
+            }
+          });
+          html+='<div style="position:sticky;bottom:0;background:#fff;border-top:1px solid #e5e7eb;padding:8px 10px;display:flex;align-items:center;gap:8px">'+
+                '<button type="button" id="np-add-selected" class="btn btn-primary btn-sm">Add selected</button>'+
+                '<span id="np-sel-count" style="color:var(--muted);font-size:12px">0 selected</span></div>';
+          box.innerHTML=html; box.hidden=false; groupedFlat=flat;
+          var countEl=box.querySelector('#np-sel-count');
+          function refreshCount(){ var n=box.querySelectorAll('.np-var-cb:checked').length; if(countEl) countEl.textContent=n+' selected'; }
+          Array.prototype.forEach.call(box.querySelectorAll('.np-var-cb'),function(cb){ cb.addEventListener('change',refreshCount); });
+          box.querySelectorAll('label.np-var-opt').forEach(function(l){ l.addEventListener('mousedown',function(ev){ ev.preventDefault(); }); });
+          var addBtn=box.querySelector('#np-add-selected');
+          if(addBtn){
+            addBtn.addEventListener('mousedown',function(ev){ ev.preventDefault(); });
+            addBtn.addEventListener('click',function(){
+              var chosen=Array.prototype.map.call(box.querySelectorAll('.np-var-cb:checked'),function(cb){ return (groupedFlat||[])[parseInt(cb.dataset.key,10)]; }).filter(Boolean);
+              if(!chosen.length) return;
+              chosen.forEach(function(p){ addVariantToOrder(p); });
+              input.value=''; hide(); renderLineItems(); updateTotals(); input.focus();
+            });
+          }
+        }
+        input.addEventListener('input',function(){
+          var q=input.value.trim();
+          if(t) clearTimeout(t);
+          if(q.length<2){ hide(); return; }
+          var seq=++lastSeq;
+          t=setTimeout(function(){
+            fetch('/api/products/search?grouped=1&q='+encodeURIComponent(q),{credentials:'same-origin'})
+              .then(function(r){return r.json();})
+              .then(function(products){ if(seq!==lastSeq) return; render(products); })
+              .catch(function(){ hide(); });
+          },220);
+        });
+        document.addEventListener('click',function(ev){ if(ev.target!==input && !box.contains(ev.target)) hide(); });
+      })();
 
       // Add custom (non-catalog) line item
       window.addCustomItem = function() {
@@ -4635,7 +4727,7 @@ function renderNewOrderForm(session, prefillCustomer) {
 // CHANGE-GUARD: CRITICAL Shopify quirk encoded here — when variantId is present Shopify IGNORES originalUnitPrice, so wholesale price is applied as a per-line appliedDiscount PERCENTAGE computed from (listPrice-price)/listPrice; custom/variant-less lines use originalUnitPrice directly. Changing this re-introduces full-retail B2B orders. Re-test both line types end-to-end against Shopify (not just HTTP 200).
 // INVARIANT(S): two sequential mutations (create then complete) — userErrors from EITHER abort with {error}; tags ['b2b-portal','b2b-manual-order'] are required for the order to appear in /orders (which filters tag:b2b-portal). Xero sync runs after an 800ms delay so the order/tags are queryable; insider check uses isInsider(customer_id).
 async function submitNewOrder(req, session) {
-  const { customer_id, line_items, note, po_number,
+  const { customer_id, line_items, note, po_number, ship_cost,
           ship_first, ship_last, ship_addr1, ship_addr2,
           ship_city, ship_province, ship_zip, ship_country } = req.body;
   let lineItemsParsed = [];
@@ -4655,7 +4747,7 @@ async function submitNewOrder(req, session) {
   const orderNote = [note || '', po_number ? `PO: ${po_number}` : ''].filter(Boolean).join('\n');
 
   if (MOCK) {
-    auditLog(session.email, 'create_draft_order', `mock-customer-${customer_id}`, null, { customer_id, lineItemsParsed, shippingAddress });
+    auditLog(session.email, 'create_draft_order', `mock-customer-${customer_id}`, null, { customer_id, lineItemsParsed, shippingAddress, shippingCost: ship_cost || null });
     return { orderId: 'MOCK-9999', orderName: '#MOCK-9999', ok: true };
   }
 
@@ -4684,6 +4776,22 @@ async function submitNewOrder(req, session) {
         };
       }),
       shippingAddress,
+      // Shipping cost entered on the New Order form → Shopify shippingLine. On Admin API
+      // 2024-10 ShippingLineInput.price is DEPRECATED in favour of
+      // priceWithCurrency: MoneyInput { amount, currencyCode } (verified via schema
+      // introspection + live draftOrderCreate round-trips 2026-07-14). Shopify honors this
+      // amount directly (no appliedDiscount dance like variant line items).
+      // GOTCHA (verified live): Shopify SILENTLY DROPS the shippingLine (no userError,
+      // shippingLine→null) unless the draft has at least one SHIPPABLE line. Fine here:
+      // variant lines are physical (requiresShipping defaults true) and custom lines set
+      // requiresShipping:true above. If a fully non-shippable order ever charges shipping,
+      // it would vanish — revisit then.
+      // [XERO-DISABLED] When Xero writes are re-enabled, createXeroInvoice must also add
+      // this shipping amount as an invoice LineItem or the Xero invoice under-bills — see
+      // the [XERO-DISABLED] TODO in createXeroInvoice.
+      shippingLine: (parseFloat(ship_cost) > 0)
+        ? { title: 'Shipping', priceWithCurrency: { amount: parseFloat(ship_cost).toFixed(2), currencyCode: 'USD' } }
+        : undefined,
       note: orderNote || null,
       tags: ['b2b-portal', 'b2b-manual-order'],
     };
