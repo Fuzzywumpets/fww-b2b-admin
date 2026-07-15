@@ -3679,7 +3679,7 @@ async function getCustomerDetail(numericId) {
         id email displayName phone tags numberOfOrders
         amountSpent{amount currencyCode}
         addresses(first:5){id firstName lastName address1 city province zip country}
-        defaultAddress{id firstName lastName address1 city province zip country phone}
+        defaultAddress{id firstName lastName address1 address2 city province zip country phone}
         metafields(first:20,namespace:"b2b"){edges{node{id namespace key value type}}}
       }}`, { id: shopifyCustomerGid(numericId) });
     return result.data?.customer || null;
@@ -4396,7 +4396,7 @@ function renderCustomerDetail(session, customer, recentOrders, notes, _dropshipC
 function renderNewOrderForm(session, prefillCustomer) {
   // jsonForScript (not JSON.stringify): displayName/email come from Shopify (customer-controlled);
   // a name of `</script>…` would otherwise break out of the inline <script> below.
-  const customerJson = prefillCustomer ? jsonForScript({ id: shopifyNumericId(prefillCustomer.id), name: prefillCustomer.displayName, email: prefillCustomer.email }) : 'null';
+  const customerJson = prefillCustomer ? jsonForScript({ id: shopifyNumericId(prefillCustomer.id), name: prefillCustomer.displayName, email: prefillCustomer.email, address: prefillCustomer.defaultAddress || null }) : 'null';
   return layout({ title: 'New Order', session, activePath: '/orders',
     extraHead: `<style>
       .order-form-grid{display:grid;grid-template-columns:1fr 320px;gap:1rem;}
@@ -4492,9 +4492,25 @@ function renderNewOrderForm(session, prefillCustomer) {
           '<strong>'+esc(selectedCustomer.name)+'</strong> &lt;'+esc(selectedCustomer.email)+'&gt; '+
           '<button type="button" onclick="clearCustomer()" class="btn btn-ghost btn-xs">×</button>';
         document.getElementById('customer-search').hidden = true;
+        fillShipAddr(selectedCustomer.address); // prefill path (+ New Order from a customer)
       }
 
       function esc(s){ var d=document.createElement('div'); d.textContent=s||''; return d.innerHTML; }
+
+      // Fill the Shipping Address card from a customer's default address. Shared by BOTH the
+      // ?customer= prefill path (above) and the search-and-select path (below). Null/undefined = no-op.
+      function fillShipAddr(a){
+        if(!a) return;
+        document.getElementById('ship-first').value=a.firstName||'';
+        document.getElementById('ship-last').value=a.lastName||'';
+        document.getElementById('ship-addr1').value=a.address1||'';
+        document.getElementById('ship-addr2').value=a.address2||'';
+        document.getElementById('ship-city').value=a.city||'';
+        document.getElementById('ship-province').value=a.province||'';
+        document.getElementById('ship-zip').value=a.zip||'';
+        document.getElementById('ship-country').value=a.country||'US';
+        document.getElementById('default-addr-msg').textContent='Auto-filled from customer default address.';
+      }
 
       function updateSubmitBtn(){
         var ok = selectedCustomer && lineItems.length>0 && lineItems.every(function(l){return l.qty>0;});
@@ -4589,19 +4605,7 @@ function renderNewOrderForm(session, prefillCustomer) {
           '<strong>'+esc(c.label)+'</strong> &lt;'+esc(c.sublabel||'')+'&gt; '+
           '<button type="button" onclick="clearCustomer()" class="btn btn-ghost btn-xs">×</button>';
         document.getElementById('customer-search').hidden=true;
-        // Fill shipping address from customer default
-        if(c.address){
-          var a=c.address;
-          document.getElementById('ship-first').value=a.firstName||'';
-          document.getElementById('ship-last').value=a.lastName||'';
-          document.getElementById('ship-addr1').value=a.address1||'';
-          document.getElementById('ship-addr2').value=a.address2||'';
-          document.getElementById('ship-city').value=a.city||'';
-          document.getElementById('ship-province').value=a.province||'';
-          document.getElementById('ship-zip').value=a.zip||'';
-          document.getElementById('ship-country').value=a.country||'US';
-          document.getElementById('default-addr-msg').textContent='Auto-filled from customer default address.';
-        }
+        fillShipAddr(c.address); // search-and-select path
         updateSubmitBtn();
       });
 
