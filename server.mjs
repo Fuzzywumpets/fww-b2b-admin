@@ -4465,7 +4465,11 @@ function renderNewOrderForm(session, prefillCustomer) {
           </div>
           <div class="card" style="margin-top:1rem">
             <div class="card-header"><h2>Submit</h2></div>
-            <p class="text-muted small-text" style="margin-bottom:0.75rem">Order will be created as a draft and completed with payment pending.</p>
+            <p class="text-muted small-text" style="margin-bottom:0.75rem">Order will be created as a pending (unpaid) order.</p>
+            <label style="display:flex;align-items:flex-start;gap:8px;margin-bottom:0.75rem;cursor:pointer;font-size:13px">
+              <input type="checkbox" name="notify_customer" id="notify-customer" style="margin-top:2px">
+              <span>Email order confirmation to the customer <span class="text-muted">(off by default — leave unchecked to create the order silently)</span></span>
+            </label>
             <button type="submit" id="submit-btn" class="btn btn-primary" style="width:100%" disabled>Create Order</button>
             <p id="submit-error" class="text-muted small-text" style="margin-top:0.5rem;color:var(--red)"></p>
           </div>
@@ -4727,11 +4731,27 @@ function renderNewOrderForm(session, prefillCustomer) {
   ` });
 }
 
-// WHAT: Create a Shopify draft order then draftOrderComplete(paymentPending:true) from the manual order form; fire-and-forget pushes an Authorised ACCREC invoice to Xero (skipped for insiders), queuing on failure.
-// CHANGE-GUARD: CRITICAL Shopify quirk encoded here — when variantId is present Shopify IGNORES originalUnitPrice, so wholesale price is applied as a per-line appliedDiscount PERCENTAGE computed from (listPrice-price)/listPrice; custom/variant-less lines use originalUnitPrice directly. Changing this re-introduces full-retail B2B orders. Re-test both line types end-to-end against Shopify (not just HTTP 200).
-// INVARIANT(S): two sequential mutations (create then complete) — userErrors from EITHER abort with {error}; tags ['b2b-portal','b2b-manual-order'] are required for the order to appear in /orders (which filters tag:b2b-portal). Xero sync runs after an 800ms delay so the order/tags are queryable; insider check uses isInsider(customer_id).
+// WHAT: Create a Shopify order via orderCreate (financialStatus PENDING) from the manual order form,
+// with per-order customer-notification control (options.sendReceipt, default OFF via the Notify-customer
+// checkbox). Fire-and-forget Xero invoice push (currently a [XERO-DISABLED] no-op; skipped for insiders).
+// CHANGE-GUARD: Switched 2026-07-14 from draftOrderCreate+draftOrderComplete to orderCreate SPECIFICALLY
+// so we can suppress the customer order-confirmation email — draftOrderComplete had NO notify toggle and
+// always emailed. Key differences, all verified live via real orderCreate round-trips (test:true, deleted):
+//   • orderCreate HONORS priceSet directly EVEN WITH a variantId → we set the wholesale price outright.
+//     NO appliedDiscount %, NO double-discount, NO full-retail regression. (Trade-off: the line records
+//     the wholesale price directly, not "list − 50%" with a strikethrough.)
+//   • title is REQUIRED on every line (orderCreate won't pull it from the variant).
+//   • requiresShipping:true on ALL lines so shippingLines is retained (Shopify silently drops shipping
+//     when no line is shippable — verified). FWW is 100% physical so this is always correct.
+//   • inventoryBehaviour:BYPASS so a made-to-order sale (999 stock) can never fail on inventory.
+// Re-verify wholesale pricing + variant linkage + shipping end-to-end against Shopify (not just HTTP 200)
+// if you touch the line-item build.
+// INVARIANT(S): single orderCreate mutation; userErrors abort with {error} (logged [order-create] + sent
+// to error-sink); tags ['b2b-portal','b2b-manual-order'] required for the order to appear in /orders
+// (filters tag:b2b-portal); sendReceipt=false UNLESS the Notify-customer box is ticked; insider check uses
+// isInsider(customer_id); Xero sync (no-op while [XERO-DISABLED]) runs 800ms later so tags are queryable.
 async function submitNewOrder(req, session) {
-  const { customer_id, line_items, note, po_number, ship_cost,
+  const { customer_id, line_items, note, po_number, ship_cost, notify_customer,
           ship_first, ship_last, ship_addr1, ship_addr2,
           ship_city, ship_province, ship_zip, ship_country } = req.body;
   let lineItemsParsed = [];
@@ -4741,6 +4761,27 @@ async function submitNewOrder(req, session) {
     return { error: 'Missing customer or line items' };
   }
 
+  // Server-side validation BEFORE building the order. orderCreate honors priceSet directly, so a
+  // missing/garbage price would create a $0 or NaN line (the OLD draft flow fell back to the variant's
+  // list price — orderCreate does not). Trusted staff may set any NON-NEGATIVE price (B2B override is
+  // intended); we only reject NaN / negative / missing prices, bad quantities, catalog lines with no
+  // valid variant, and untitled lines — with a clear user-facing error instead of mis-pricing.
+  for (let i = 0; i < lineItemsParsed.length; i++) {
+    const li = lineItemsParsed[i] || {};
+    const label = li.title || li.sku || `line ${i + 1}`;
+    const price = parseFloat(li.price);
+    const qty   = parseInt(li.qty, 10);
+    if (!Number.isFinite(price) || price < 0)   return { error: `Invalid price on "${label}".` };
+    if (!Number.isInteger(qty) || qty < 1)      return { error: `Invalid quantity on "${label}".` };
+    if (!String(li.title || '').trim())         return { error: `A line item is missing a title.` };
+    if (!li.isCustom && !/^\d+$/.test(String(li.variantId || '')))
+      return { error: `Catalog line "${label}" is missing a valid product variant.` };
+  }
+  // Shipping is optional; blank/0 → no shipping line. Reject malformed/negative rather than under/over-charge.
+  const shipCostRaw = ship_cost == null ? '' : String(ship_cost).trim();
+  const shipCostNum = shipCostRaw === '' ? 0 : parseFloat(shipCostRaw);
+  if (!Number.isFinite(shipCostNum) || shipCostNum < 0) return { error: 'Invalid shipping cost.' };
+
   const shippingAddress = {
     firstName: ship_first || '', lastName: ship_last || '',
     address1: ship_addr1 || '', address2: ship_addr2 || '',
@@ -4749,92 +4790,77 @@ async function submitNewOrder(req, session) {
   };
 
   const orderNote = [note || '', po_number ? `PO: ${po_number}` : ''].filter(Boolean).join('\n');
+  // Notify-customer checkbox: unchecked → field absent; checked → 'on'. Default (absent) = do NOT
+  // email the customer (this is the whole reason we moved off draftOrderComplete).
+  const sendReceipt = notify_customer === 'on' || notify_customer === 'true' || notify_customer === true;
 
   if (MOCK) {
-    auditLog(session.email, 'create_draft_order', `mock-customer-${customer_id}`, null, { customer_id, lineItemsParsed, shippingAddress, shippingCost: ship_cost || null });
+    auditLog(session.email, 'create_order', `mock-customer-${customer_id}`, null, { customer_id, lineItemsParsed, shippingAddress, shippingCost: ship_cost || null, sendReceipt });
     return { orderId: 'MOCK-9999', orderName: '#MOCK-9999', ok: true };
   }
 
   try {
     const gidCustomer = shopifyCustomerGid(customer_id);
-    const draftInput = {
-      customerId: gidCustomer,
+    const orderInput = {
+      financialStatus: 'PENDING',
+      customer: { toAssociate: { id: gidCustomer } },
       lineItems: lineItemsParsed.map(li => {
-        if (li.isCustom || !li.variantId) {
-          return {
-            title: li.title || 'Custom item',
-            originalUnitPrice: String(li.price || 0),
-            quantity: parseInt(li.qty, 10),
-            taxable: false,
-            requiresShipping: true,
-          };
-        }
-        return {
-          variantId: `gid://shopify/ProductVariant/${li.variantId}`,
+        const line = {
+          title: li.title, // validated non-empty above
           quantity: parseInt(li.qty, 10),
-          // NOTE: Shopify ignores originalUnitPrice when variantId is present.
-          // Must use appliedDiscount to set wholesale price on variant-linked items.
-          appliedDiscount: li.price && li.listPrice && parseFloat(li.price) < parseFloat(li.listPrice)
-            ? { value: parseFloat((((parseFloat(li.listPrice) - parseFloat(li.price)) / parseFloat(li.listPrice)) * 100).toFixed(2)), valueType: 'PERCENTAGE' }
-            : undefined,
+          // priceSet = the exact per-unit price the customer pays (wholesale). orderCreate honors
+          // this DIRECTLY even for variant-linked lines — no appliedDiscount %, no double-discount.
+          priceSet: { shopMoney: { amount: parseFloat(li.price).toFixed(2), currencyCode: 'USD' } },
+          requiresShipping: true, // FWW is all physical; guarantees shippingLines is retained
         };
+        if (li.isCustom) {
+          line.taxable = false; // custom (non-catalog) line — no variant
+        } else {
+          line.variantId = `gid://shopify/ProductVariant/${li.variantId}`; // validated present above
+          if (li.sku) line.sku = li.sku;
+        }
+        return line;
       }),
       shippingAddress,
-      // Shipping cost entered on the New Order form → Shopify shippingLine. On Admin API
-      // 2024-10 ShippingLineInput.price is DEPRECATED in favour of
-      // priceWithCurrency: MoneyInput { amount, currencyCode } (verified via schema
-      // introspection + live draftOrderCreate round-trips 2026-07-14). Shopify honors this
-      // amount directly (no appliedDiscount dance like variant line items).
-      // GOTCHA (verified live): Shopify SILENTLY DROPS the shippingLine (no userError,
-      // shippingLine→null) unless the draft has at least one SHIPPABLE line. Fine here:
-      // variant lines are physical (requiresShipping defaults true) and custom lines set
-      // requiresShipping:true above. If a fully non-shippable order ever charges shipping,
-      // it would vanish — revisit then.
-      // [XERO-DISABLED] When Xero writes are re-enabled, createXeroInvoice must also add
-      // this shipping amount as an invoice LineItem or the Xero invoice under-bills — see
-      // the [XERO-DISABLED] TODO in createXeroInvoice.
-      shippingLine: (parseFloat(ship_cost) > 0)
-        ? { title: 'Shipping', priceWithCurrency: { amount: parseFloat(ship_cost).toFixed(2), currencyCode: 'USD' } }
+      // Shipping cost → orderCreate shippingLines[] (PLURAL; priceSet: MoneyBagInput{shopMoney{...}}).
+      // Verified live that shippingLines is retained when a shippable line exists (requiresShipping above).
+      // [XERO-DISABLED] When Xero writes are re-enabled, createXeroInvoice must also add this shipping
+      // amount as an invoice LineItem or the Xero invoice under-bills — see the TODO in createXeroInvoice.
+      shippingLines: (shipCostNum > 0)
+        ? [{ title: 'Shipping', priceSet: { shopMoney: { amount: shipCostNum.toFixed(2), currencyCode: 'USD' } } }]
         : undefined,
       note: orderNote || null,
       tags: ['b2b-portal', 'b2b-manual-order'],
     };
-    const createRes = await shopifyFetch(`
-      mutation draftOrderCreate($input:DraftOrderInput!){
-        draftOrderCreate(input:$input){ draftOrder{id invoiceUrl} userErrors{field message} }
-      }`, { input: draftInput });
-    const ue = createRes.data?.draftOrderCreate?.userErrors || [];
+    // sendReceipt=false → NO customer email (default). inventoryBehaviour:BYPASS → never fail on stock.
+    const options = { sendReceipt, inventoryBehaviour: 'BYPASS' };
+
+    const res = await shopifyFetch(`
+      mutation orderCreate($order:OrderCreateOrderInput!,$options:OrderCreateOptionsInput){
+        orderCreate(order:$order,options:$options){ order{id name} userErrors{field message} }
+      }`, { order: orderInput, options });
+    const ue = res.data?.orderCreate?.userErrors || [];
     if (ue.length) {
-      // Shopify rejected the draft (bad shippingLine, invalid variant, etc.). This is a
-      // RETURNED error, not a throw, so the express error-middleware won't see it — log it
-      // explicitly to runs/serverlog.log AND push to fww-error-sink so a failed order
-      // create is never silent. Grep tag: [order-create].
+      // Shopify rejected the order (bad price/variant/shipping, etc.). This is a RETURNED error, not a
+      // throw, so the express error-middleware won't see it — log it explicitly to runs/serverlog.log
+      // AND push to fww-error-sink so a failed create is never silent. Grep tag: [order-create].
       const msg = ue.map(e => e.message).join('; ');
-      console.error(`[order-create] draftOrderCreate FAILED: ${msg} | customer=${customer_id} ship_cost=${ship_cost || 0} lines=${lineItemsParsed.length}`);
-      reportEvent({ kind: 'error', severity: 'error', message: 'draftOrderCreate failed: ' + msg, context: { stage: 'draftOrderCreate', actor: session.email, customer_id, ship_cost: ship_cost || null, lineCount: lineItemsParsed.length, userErrors: ue } });
+      console.error(`[order-create] orderCreate FAILED: ${msg} | customer=${customer_id} ship_cost=${ship_cost || 0} lines=${lineItemsParsed.length} notify=${sendReceipt}`);
+      reportEvent({ kind: 'error', severity: 'error', message: 'orderCreate failed: ' + msg, context: { stage: 'orderCreate', actor: session.email, customer_id, ship_cost: ship_cost || null, lineCount: lineItemsParsed.length, sendReceipt, userErrors: ue } });
       return { error: msg };
     }
-    const draftId = createRes.data?.draftOrderCreate?.draftOrder?.id;
-
-    const completeRes = await shopifyFetch(`
-      mutation draftOrderComplete($id:ID!,$paymentPending:Boolean!){
-        draftOrderComplete(id:$id,paymentPending:$paymentPending){
-          draftOrder{order{id name}} userErrors{field message}
-        }
-      }`, { id: draftId, paymentPending: true });
-    const ue2 = completeRes.data?.draftOrderComplete?.userErrors || [];
-    if (ue2.length) {
-      // Draft created but COMPLETE failed — the draft may be orphaned in Shopify. Log +
-      // report so it's recoverable (draftId is the handle). Grep tag: [order-create].
-      const msg2 = ue2.map(e => e.message).join('; ');
-      console.error(`[order-create] draftOrderComplete FAILED: ${msg2} | draft=${draftId} customer=${customer_id}`);
-      reportEvent({ kind: 'error', severity: 'error', message: 'draftOrderComplete failed: ' + msg2, context: { stage: 'draftOrderComplete', actor: session.email, customer_id, draftId, userErrors: ue2 } });
-      return { error: msg2 };
+    const order = res.data?.orderCreate?.order;
+    if (!order?.id) {
+      // No userErrors but no order back — treat as failure so we never log false success or leave
+      // the operator thinking an order exists. (shopifyFetch already throws on top-level GraphQL
+      // errors; this guards the null-payload edge.) Grep tag: [order-create].
+      console.error(`[order-create] orderCreate returned NO order | customer=${customer_id} lines=${lineItemsParsed.length}`);
+      reportEvent({ kind: 'error', severity: 'error', message: 'orderCreate returned no order', context: { stage: 'orderCreate', actor: session.email, customer_id } });
+      return { error: 'Order was not created (Shopify returned no order). Nothing was charged.' };
     }
-    const order = completeRes.data?.draftOrderComplete?.draftOrder?.order;
-    const numId = shopifyNumericId(order?.id);
-    auditLog(session.email, 'create_order', order?.id, null, { customer_id, lineItemCount: lineItemsParsed.length });
-    console.log(`[order-create] OK order=${order?.name || numId} id=${numId} customer=${customer_id} lines=${lineItemsParsed.length} ship_cost=${ship_cost || 0}`);
+    const numId = shopifyNumericId(order.id);
+    auditLog(session.email, 'create_order', order.id, null, { customer_id, lineItemCount: lineItemsParsed.length, sendReceipt });
+    console.log(`[order-create] OK order=${order?.name || numId} id=${numId} customer=${customer_id} lines=${lineItemsParsed.length} ship_cost=${ship_cost || 0} notify=${sendReceipt}`);
 
     // Phase 18: push to Xero as Authorised ACCREC invoice (fire-and-forget; queue on failure)
     if (numId) {
