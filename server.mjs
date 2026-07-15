@@ -4850,7 +4850,14 @@ async function submitNewOrder(req, session) {
         ? [{ title: 'Shipping', priceSet: { shopMoney: { amount: shipCostNum.toFixed(2), currencyCode: 'USD' } } }]
         : undefined,
       note: orderNote || null,
-      tags: ['b2b-portal', 'b2b-manual-order'],
+      // [notify handshake] sendReceipt:false only suppresses Shopify's NATIVE order confirmation — it
+      // does NOT stop external automations (a workflow/app sends the customer an invoice ~1 min after
+      // creation; verified via the order event log). So when "Notify customer" is OFF we also TAG the
+      // order 'no-customer-email'. The automation that emails the invoice must add a condition to SKIP
+      // orders carrying this tag for the toggle to actually silence the customer. Grep: no-customer-email.
+      tags: sendReceipt
+        ? ['b2b-portal', 'b2b-manual-order']
+        : ['b2b-portal', 'b2b-manual-order', 'no-customer-email'],
     };
     // sendReceipt=false → NO customer email (default). inventoryBehaviour:BYPASS → never fail on stock.
     const options = { sendReceipt, inventoryBehaviour: 'BYPASS' };
