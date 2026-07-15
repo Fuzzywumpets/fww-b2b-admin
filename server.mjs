@@ -4431,6 +4431,11 @@ function renderNewOrderForm(session, prefillCustomer) {
               <thead><tr><th>Product</th><th>SKU</th><th>Qty</th><th>List Price</th><th>B2B Price</th><th></th></tr></thead>
               <tbody id="line-items-body"><tr id="empty-row"><td colspan="6" class="empty-state">Add line items above</td></tr></tbody>
             </table>
+            <div style="display:flex;align-items:center;justify-content:flex-end;gap:10px;margin:0.6rem 0;padding-top:0.6rem;border-top:1px solid var(--border,#e5e7eb)">
+              <label for="ship-cost" style="font-weight:600;margin:0">Shipping charge</label>
+              <span style="color:var(--muted)">$</span>
+              <input type="number" name="ship_cost" class="input" id="ship-cost" min="0" step="0.01" placeholder="0.00" style="width:110px;text-align:right" title="Optional — added to the order as a Shopify shipping line and included in the total">
+            </div>
             <div class="totals-block" id="order-totals" style="margin-top:0"></div>
           </div>
           <div class="card" style="margin-top:1rem">
@@ -4457,7 +4462,6 @@ function renderNewOrderForm(session, prefillCustomer) {
             <div class="form-row"><label>Province/State</label><input type="text" name="ship_province" class="input" id="ship-province"></div>
             <div class="form-row"><label>ZIP</label><input type="text" name="ship_zip" class="input" id="ship-zip"></div>
             <div class="form-row"><label>Country</label><input type="text" name="ship_country" class="input" id="ship-country" value="US"></div>
-            <div class="form-row" style="margin-top:0.5rem;border-top:1px solid var(--border,#e5e7eb);padding-top:0.5rem"><label>Shipping Cost</label><input type="number" name="ship_cost" class="input" id="ship-cost" min="0" step="0.01" placeholder="0.00" title="Charged to the customer as a Shopify shipping line"></div>
           </div>
           <div class="card" style="margin-top:1rem">
             <div class="card-header"><h2>Submit</h2></div>
