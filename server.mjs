@@ -3679,7 +3679,7 @@ async function getCustomerDetail(numericId) {
         id email displayName phone tags numberOfOrders
         amountSpent{amount currencyCode}
         addresses(first:5){id firstName lastName address1 city province zip country}
-        defaultAddress{id firstName lastName address1 address2 city province zip country phone}
+        defaultAddress{id firstName lastName address1 address2 city province provinceCode zip country phone}
         metafields(first:20,namespace:"b2b"){edges{node{id namespace key value type}}}
       }}`, { id: shopifyCustomerGid(numericId) });
     return result.data?.customer || null;
@@ -4424,8 +4424,18 @@ function renderNewOrderForm(session, prefillCustomer) {
           <div class="card" style="margin-top:1rem">
             <div class="card-header"><h2>Line Items</h2></div>
             <div style="position:relative;margin-bottom:0.75rem">
-              <div style="display:flex;gap:8px;align-items:center"><input type="text" id="product-search" class="input" placeholder="Search product by title or SKU…" autocomplete="off" style="flex:1"><button type="button" class="btn btn-ghost btn-sm" onclick="addCustomItem()">+ Custom item</button></div>
+              <div style="display:flex;gap:8px;align-items:center"><input type="text" id="product-search" class="input" placeholder="Search product by title or SKU…" autocomplete="off" style="flex:1"><button type="button" class="btn btn-secondary btn-sm" onclick="toggleCustomItemForm()">+ Custom item</button></div>
               <div id="product-results" class="autocomplete-dropdown" hidden></div>
+              <div id="custom-item-form" hidden style="margin-top:8px;padding:10px;border:1px solid var(--border,#e5e7eb);border-radius:6px;background:var(--gray-50,#f9fafb)">
+                <div style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap">
+                  <div style="flex:2;min-width:150px"><label class="text-muted small-text">Custom item title</label><input type="text" id="ci-title" class="input" placeholder="e.g. Custom collar — Bree"></div>
+                  <div style="width:90px"><label class="text-muted small-text">Unit price</label><input type="number" id="ci-price" class="input" min="0" step="0.01" placeholder="0.00"></div>
+                  <div style="width:64px"><label class="text-muted small-text">Qty</label><input type="number" id="ci-qty" class="input" min="1" step="1" value="1"></div>
+                  <button type="button" class="btn btn-primary btn-sm" onclick="addCustomItem()">Add</button>
+                  <button type="button" class="btn btn-ghost btn-sm" onclick="toggleCustomItemForm(false)">Cancel</button>
+                </div>
+                <div id="ci-error" class="text-muted small-text" style="color:var(--red);margin-top:4px"></div>
+              </div>
             </div>
             <table class="data-table" id="line-items-table">
               <thead><tr><th>Product</th><th>SKU</th><th>Qty</th><th>List Price</th><th>B2B Price</th><th></th></tr></thead>
@@ -4459,7 +4469,7 @@ function renderNewOrderForm(session, prefillCustomer) {
             <div class="form-row"><label>Address 1</label><input type="text" name="ship_addr1" class="input" id="ship-addr1"></div>
             <div class="form-row"><label>Address 2</label><input type="text" name="ship_addr2" class="input" id="ship-addr2"></div>
             <div class="form-row"><label>City</label><input type="text" name="ship_city" class="input" id="ship-city"></div>
-            <div class="form-row"><label>Province/State</label><input type="text" name="ship_province" class="input" id="ship-province"></div>
+            <div class="form-row"><label>Province/State</label><select name="ship_province" class="input" id="ship-province"><option value="">—</option>${['AL','AK','AZ','AR','CA','CO','CT','DE','DC','FL','GA','HI','ID','IL','IN','IA','KS','KY','LA','ME','MD','MA','MI','MN','MS','MO','MT','NE','NV','NH','NJ','NM','NY','NC','ND','OH','OK','OR','PA','RI','SC','SD','TN','TX','UT','VT','VA','WA','WV','WI','WY'].map(s=>`<option value="${s}">${s}</option>`).join('')}</select></div>
             <div class="form-row"><label>ZIP</label><input type="text" name="ship_zip" class="input" id="ship-zip"></div>
             <div class="form-row"><label>Country</label><input type="text" name="ship_country" class="input" id="ship-country" value="US"></div>
           </div>
@@ -4506,7 +4516,8 @@ function renderNewOrderForm(session, prefillCustomer) {
         document.getElementById('ship-addr1').value=a.address1||'';
         document.getElementById('ship-addr2').value=a.address2||'';
         document.getElementById('ship-city').value=a.city||'';
-        document.getElementById('ship-province').value=a.province||'';
+        // ship-province is a <select> of state codes; prefer provinceCode, else a 2-letter province.
+        document.getElementById('ship-province').value = a.provinceCode || (a.province && a.province.length===2 ? String(a.province).toUpperCase() : '');
         document.getElementById('ship-zip').value=a.zip||'';
         document.getElementById('ship-country').value=a.country||'US';
         document.getElementById('default-addr-msg').textContent='Auto-filled from customer default address.';
@@ -4700,25 +4711,30 @@ function renderNewOrderForm(session, prefillCustomer) {
       })();
 
       // Add custom (non-catalog) line item
+      // Inline custom-item form (replaced the old prompt()-based flow, which browsers block
+      // after the first dialog). Toggle reveals title/price/qty inputs right in the card.
+      window.toggleCustomItemForm = function(show){
+        var f = document.getElementById('custom-item-form');
+        var open = (show === undefined) ? f.hidden : show;
+        f.hidden = !open;
+        if(open){ document.getElementById('ci-title').focus(); }
+        else {
+          document.getElementById('ci-title').value='';
+          document.getElementById('ci-price').value='';
+          document.getElementById('ci-qty').value='1';
+          document.getElementById('ci-error').textContent='';
+        }
+      };
       window.addCustomItem = function() {
-        var title = prompt('Custom item title (e.g. "Custom collar — Bree"):');
-        if (!title) return;
-        var priceStr = prompt('Unit price for "' + title + '" (in USD):');
-        if (priceStr == null) return;
-        var price = parseFloat(priceStr);
-        if (isNaN(price) || price < 0) { alert('Invalid price'); return; }
-        var qtyStr = prompt('Quantity:', '1');
-        if (qtyStr == null) return;
-        var qty = parseInt(qtyStr, 10);
-        if (isNaN(qty) || qty < 1) { alert('Invalid quantity'); return; }
-        lineItems.push({
-          isCustom: true,
-          title: title,
-          sku: 'CUSTOM',
-          listPrice: price,
-          price: price.toFixed(2),
-          qty: qty
-        });
+        var title = (document.getElementById('ci-title').value||'').trim();
+        var price = parseFloat(document.getElementById('ci-price').value);
+        var qty   = parseInt(document.getElementById('ci-qty').value, 10);
+        var err   = document.getElementById('ci-error');
+        if(!title){ err.textContent='Enter a title.'; return; }
+        if(!Number.isFinite(price) || price < 0){ err.textContent='Enter a valid price.'; return; }
+        if(!Number.isInteger(qty) || qty < 1){ err.textContent='Enter a valid quantity.'; return; }
+        lineItems.push({ isCustom:true, title:title, sku:'CUSTOM', listPrice:price, price:price.toFixed(2), qty:qty });
+        toggleCustomItemForm(false);
         renderLineItems();
         updateTotals();
       };
@@ -7513,7 +7529,7 @@ app.get('/api/customers/search', requireAuth, async (req, res) => {
     : await (async () => {
         try {
           const r = await shopifyFetch(`query($q:String!){ customers(first:10,query:$q){
-            edges{node{id displayName email defaultAddress{firstName lastName address1 address2 city province zip country} metafields(first:25,namespace:"b2b"){edges{node{key value}}}}}}}`,
+            edges{node{id displayName email defaultAddress{firstName lastName address1 address2 city province provinceCode zip country} metafields(first:25,namespace:"b2b"){edges{node{key value}}}}}}}`,
             { q: `tag:b2b ${q}` });
           return r.data?.customers?.edges?.map(e => e.node) || [];
         } catch { return []; }
