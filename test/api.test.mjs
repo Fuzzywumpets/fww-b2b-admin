@@ -167,6 +167,21 @@ await test('GET /orders/new returns new order form', async () => {
   assert.ok(html.includes('product-search'), 'Missing product search');
 });
 
+// REGRESSION GUARD (2026-07-15): the Province/State control was changed from a free-text input to a
+// <select>, but was seeded with US states ONLY. Several wholesale accounts are Ontario (howlers.ca,
+// pattiwalsh23, c.a.beaudet01). Assigning an unlisted value to a <select> yields "" — so their
+// province was silently blanked and the order shipped a province-less address. Keep both countries.
+await test('GET /orders/new province select covers US + Canada (Ontario regression)', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/orders/new`, { headers: { Cookie: cookie } });
+  const html = await res.text();
+  assert.ok(html.includes('<optgroup label="Canada">'), 'Missing Canada optgroup — Ontario customers lose their province');
+  assert.ok(html.includes('<option value="ON">'), 'Missing Ontario (ON) option');
+  assert.ok(html.includes('<optgroup label="United States">'), 'Missing United States optgroup');
+  assert.ok(html.includes('<option value="CA">'), 'Missing California (CA) option');
+  assert.ok(html.includes('<option value="IL">'), 'Missing Illinois (IL) option');
+});
+
 await test('GET /orders/1001 returns order detail', async () => {
   const cookie = await seedSession();
   const res = await fetch(`${BASE}/orders/1001`, { headers: { Cookie: cookie } });

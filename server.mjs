@@ -4495,7 +4495,11 @@ function renderNewOrderForm(session, prefillCustomer) {
             <div class="form-row"><label>Address 1</label><input type="text" name="ship_addr1" class="input" id="ship-addr1"></div>
             <div class="form-row"><label>Address 2</label><input type="text" name="ship_addr2" class="input" id="ship-addr2"></div>
             <div class="form-row"><label>City</label><input type="text" name="ship_city" class="input" id="ship-city"></div>
-            <div class="form-row"><label>Province/State</label><select name="ship_province" class="input" id="ship-province"><option value="">—</option>${['AL','AK','AZ','AR','CA','CO','CT','DE','DC','FL','GA','HI','ID','IL','IN','IA','KS','KY','LA','ME','MD','MA','MI','MN','MS','MO','MT','NE','NV','NH','NJ','NM','NY','NC','ND','OH','OK','OR','PA','RI','SC','SD','TN','TX','UT','VT','VA','WA','WV','WI','WY'].map(s=>`<option value="${s}">${s}</option>`).join('')}</select></div>
+            ${/* CANADA MATTERS: several wholesale accounts are Ontario (howlers.ca, etc). A US-only
+                 list made fillShipAddr fall back to blank for them and shipped a province-less
+                 address. Keep both countries here, and see fillShipAddr — unknown codes are injected
+                 rather than dropped. */''}
+            <div class="form-row"><label>Province/State</label><select name="ship_province" class="input" id="ship-province"><option value="">—</option><optgroup label="United States">${['AL','AK','AZ','AR','CA','CO','CT','DE','DC','FL','GA','HI','ID','IL','IN','IA','KS','KY','LA','ME','MD','MA','MI','MN','MS','MO','MT','NE','NV','NH','NJ','NM','NY','NC','ND','OH','OK','OR','PA','RI','SC','SD','TN','TX','UT','VT','VA','WA','WV','WI','WY'].map(s=>`<option value="${s}">${s}</option>`).join('')}</optgroup><optgroup label="Canada">${['AB','BC','MB','NB','NL','NS','NT','NU','ON','PE','QC','SK','YT'].map(s=>`<option value="${s}">${s}</option>`).join('')}</optgroup></select></div>
             <div class="form-row"><label>ZIP</label><input type="text" name="ship_zip" class="input" id="ship-zip"></div>
             <div class="form-row"><label>Country</label><input type="text" name="ship_country" class="input" id="ship-country" value="US"></div>
           </div>
@@ -4542,8 +4546,16 @@ function renderNewOrderForm(session, prefillCustomer) {
         document.getElementById('ship-addr1').value=a.address1||'';
         document.getElementById('ship-addr2').value=a.address2||'';
         document.getElementById('ship-city').value=a.city||'';
-        // ship-province is a <select> of state codes; prefer provinceCode, else a 2-letter province.
-        document.getElementById('ship-province').value = a.provinceCode || (a.province && a.province.length===2 ? String(a.province).toUpperCase() : '');
+        // ship-province is a <select> of US+CA codes; prefer provinceCode, else a 2-letter province.
+        // NEVER silently drop it: if the customer's code isn't one of our options (any other
+        // country), inject it — assigning an unknown value to a <select> yields "" and would ship a
+        // province-less address. This regressed 3+ Ontario wholesale accounts.
+        var pv = a.provinceCode || (a.province && a.province.length === 2 ? String(a.province).toUpperCase() : '');
+        var selP = document.getElementById('ship-province');
+        if (pv && !Array.prototype.some.call(selP.options, function(o){ return o.value === pv; })) {
+          selP.appendChild(new Option(pv, pv));
+        }
+        selP.value = pv;
         document.getElementById('ship-zip').value=a.zip||'';
         document.getElementById('ship-country').value=a.country||'US';
         document.getElementById('default-addr-msg').textContent='Auto-filled from customer default address.';
