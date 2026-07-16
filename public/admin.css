@@ -74,11 +74,17 @@ body {
   letter-spacing: 0.8px;
 }
 
+/* flex-wrap: the 12 nav links are ~835px and previously could not wrap, so the header alone forced
+   the WHOLE APP to scroll horizontally on any viewport under ~1170px (measured doc=1170 @768px) —
+   every page, not just the order form. Wrapping costs nothing at desktop width (still one line) and
+   removes the page-level h-scroll when the desktop window is narrowed. */
 .header-nav {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 2px;
   flex: 1;
+  min-width: 0;
 }
 
 .nav-link {

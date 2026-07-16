@@ -4422,7 +4422,12 @@ function renderNewOrderForm(session, prefillCustomer) {
       #line-items-table tbody tr td{padding:0.35rem 0.5rem;}
       .price-override{width:90px;}
       .qty-input{width:60px;}
-      @media(max-width:700px){.order-form-grid{grid-template-columns:1fr;}}
+      /* The line-items table (6 cols) has a natural min-width that used to force PAGE-level
+         horizontal scroll; keep the overflow inside the card instead. */
+      .line-items-scroll{overflow-x:auto;}
+      /* Stack at <=1100px, not 700px: the 2-col grid is 1fr + a fixed 320px rail, and the table
+         floors the left column ~=850px, so 701-1100px overflowed (measured 1170px wide @768). */
+      @media(max-width:1100px){.order-form-grid{grid-template-columns:1fr;}}
     </style>`,
     content: `
     <div class="breadcrumb-row"><a href="/orders" class="breadcrumb">← Orders</a></div>
@@ -4456,10 +4461,12 @@ function renderNewOrderForm(session, prefillCustomer) {
                 <div id="ci-error" class="text-muted small-text" style="color:var(--red);margin-top:4px"></div>
               </div>
             </div>
-            <table class="data-table" id="line-items-table">
-              <thead><tr><th>Product</th><th>SKU</th><th>Qty</th><th>List Price</th><th>B2B Price</th><th></th></tr></thead>
-              <tbody id="line-items-body"><tr id="empty-row"><td colspan="6" class="empty-state">Add line items above</td></tr></tbody>
-            </table>
+            <div class="line-items-scroll">
+              <table class="data-table" id="line-items-table">
+                <thead><tr><th>Product</th><th>SKU</th><th>Qty</th><th>List Price</th><th>B2B Price</th><th></th></tr></thead>
+                <tbody id="line-items-body"><tr id="empty-row"><td colspan="6" class="empty-state">Add line items above</td></tr></tbody>
+              </table>
+            </div>
             <div style="display:flex;align-items:center;justify-content:flex-end;gap:10px;margin:0.6rem 0;padding-top:0.6rem;border-top:1px solid var(--border,#e5e7eb)">
               <label for="ship-cost" style="font-weight:600;margin:0">Shipping charge</label>
               <span style="color:var(--muted)">$</span>
@@ -4759,9 +4766,21 @@ function renderNewOrderForm(session, prefillCustomer) {
       };
 
       // Form submit: validate
+      var submitting = false;
       document.getElementById('order-form').addEventListener('submit',function(e){
         if(!selectedCustomer||lineItems.length===0){ e.preventDefault(); updateSubmitBtn(); return; }
+        submitting = true; // a real submit — don't warn on the success redirect
         lineItemsHidden.value=JSON.stringify(lineItems);
+      });
+
+      // Nothing on this page is persisted server-side until "Create Order", so a reload/close used
+      // to wipe the entire in-progress order (customer + lines + shipping) with NO warning — which
+      // bit hard while the desktop shell was being force-reloaded to dodge stale pages. Warn once
+      // there's real work to lose. (renderOrderDetail's autosave controller guards the same way.)
+      window.addEventListener('beforeunload', function(e){
+        if (submitting) return;
+        if (!selectedCustomer && lineItems.length === 0) return;
+        e.preventDefault(); e.returnValue = ''; return '';
       });
 
       updateSubmitBtn();
