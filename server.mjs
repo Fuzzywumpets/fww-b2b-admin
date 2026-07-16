@@ -115,7 +115,23 @@ app.use(express.urlencoded({ extended: true }));
 // Baseline Content-Security-Policy + hardening headers (defense-in-depth). Inline scripts/handlers
 // still require 'unsafe-inline' today, but this blocks external script/exfil hosts, object/base-uri
 // injection, and framing/clickjacking. Nonce-based lockdown of inline scripts is follow-up work.
-app.use((_req, res, next) => {
+//
+// frame-ancestors 'self' (NOT 'none') — REGRESSION FIX 2026-07-15: 'none' forbids EVERY page from
+// framing our responses, INCLUDING our own same-origin pages. That silently broke the invoice viewer
+// (/orders/:id/invoice embeds <iframe src=".../invoice.pdf">): the PDF response carried
+// frame-ancestors 'none', so the iframe rendered BLANK and the only way to see the invoice was the
+// "Open / print ↗" link — which opens a bare PDF window with no back button and TRAPS the user in
+// the Electron desktop shell (only escape = quit the app). 'self' still blocks external framing /
+// clickjacking, which is the actual threat. Re-test the invoice iframe if you touch this.
+//
+// Cache-Control: no-store — the FWW Admin desktop shell is Electron/Chromium and was caching our
+// HTML on DISK (we previously sent no cache headers at all). That cache SURVIVES quitting the app,
+// so shipped fixes (invoice back-button, inline custom-item form, notify checkbox) kept appearing
+// "missing" for days against a stale page. Dynamic responses must never be cached. NOTE: this
+// header would otherwise also hit express.static's assets (setHeader here WINS over static's
+// default), so real assets are explicitly skipped below and keep normal ETag/304 revalidation.
+// Generated PDFs are deliberately NOT skipped — they change with the order.
+app.use((req, res, next) => {
   res.setHeader('Content-Security-Policy',
     "default-src 'self'; " +
     "script-src 'self' 'unsafe-inline'; " +
@@ -123,9 +139,12 @@ app.use((_req, res, next) => {
     "font-src 'self' https://fonts.gstatic.com; " +
     "img-src 'self' data: https:; " +
     "connect-src 'self'; " +
-    "object-src 'none'; base-uri 'none'; frame-ancestors 'none'");
+    "object-src 'none'; base-uri 'none'; frame-ancestors 'self'");
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('Referrer-Policy', 'same-origin');
+  if (!/\.(?:css|js|mjs|png|jpe?g|gif|svg|ico|webp|woff2?|ttf|map)$/i.test(req.path)) {
+    res.setHeader('Cache-Control', 'no-store');
+  }
   next();
 });
 
