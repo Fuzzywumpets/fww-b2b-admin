@@ -2702,7 +2702,7 @@ function renderOrderDetail(session, order, flash, flashMsg) {
           </div>
           <div id="edit-save-bar" style="display:none;padding:12px 0;border-top:1px solid var(--border);margin-top:8px">
             <input type="text" name="staffNote" placeholder="Staff note (optional)" class="filter-input" style="width:60%;margin-right:8px">
-            <button type="submit" class="btn btn-primary" onclick="serializeCustomLines()">Save changes</button>
+            <button type="submit" id="edit-save-btn" class="btn btn-primary" onclick="serializeCustomLines()">Save changes</button>
             <button type="button" class="btn btn-ghost" onclick="toggleEditMode(false)" style="margin-left:4px">Cancel</button>
           </div>
           </form>
@@ -2744,7 +2744,12 @@ function renderOrderDetail(session, order, flash, flashMsg) {
                 rows.forEach(function(r){
                   // Phase 16H: skip rows already persisted by incremental auto-save — otherwise the
                   // batch Save path (no idemKey dedupe) would double-add them.
-                  if (r.dataset.committedLiId) return;
+                  // P0 fix (2026-07-21): ALSO skip rows whose incremental commit is still IN FLIGHT.
+                  // committedLiId is only stamped on success, so during the multi-second Shopify
+                  // round trip the row looked uncommitted and the batch path re-added it. That
+                  // window widened when custom lines moved to an explicit Add button, because
+                  // Add-then-Save became the natural finishing gesture.
+                  if (r.dataset.committedLiId || r.dataset.committing) return;
                   var title = r.querySelector('.ncl-title')?.value?.trim();
                   var qty   = parseInt(r.querySelector('.ncl-qty')?.value, 10);
                   var price = parseFloat(r.querySelector('.ncl-price')?.value);
@@ -2755,7 +2760,7 @@ function renderOrderDetail(session, order, flash, flashMsg) {
                 var crows = document.querySelectorAll('tr.catalog-line-new');
                 var cout = [];
                 crows.forEach(function(r){
-                  if (r.dataset.committedLiId) return; // already saved incrementally — don't re-add
+                  if (r.dataset.committedLiId || r.dataset.committing) return; // saved, or mid-flight — don't re-add
                   var qty   = parseInt(r.querySelector('.cl-qty')?.value, 10);
                   var price = parseFloat(r.querySelector('.cl-price')?.value);
                   if (r.dataset.variantId && qty > 0 && price >= 0) cout.push({
@@ -2923,10 +2928,33 @@ function renderOrderDetail(session, order, flash, flashMsg) {
                 function uuid(){ try { return crypto.randomUUID(); } catch(e){ return 'k-'+Date.now()+'-'+Math.random().toString(16).slice(2); } }
                 var inflight = 0, anyFailed = false;
                 var pill = document.getElementById('autosave-pill');
+                // Edits that are SCHEDULED but not yet sent. debouncedLine waits 500ms before it
+                // increments inflight, so for that window inflight is 0 — the pill would read
+                // "All changes saved" and the Save button would be enabled while a typed quantity
+                // was still sitting in a timer. Clicking Save there navigates away and the write is
+                // abandoned; the row is ALSO skipped by serializeCustomLines (it has a
+                // committedLiId), so the quantity reaches the server through neither path. That is
+                // the exact silent-loss this whole change exists to kill, so pending edits must
+                // count as unsaved work everywhere inflight does.
+                function pendingLineEdits(){
+                  var n = 0;
+                  if (typeof linePending === 'object' && linePending) {
+                    for (var k in linePending) if (linePending[k]) n++;
+                  }
+                  return n;
+                }
+                function unsettledWrites(){ return inflight + pendingLineEdits(); }
+
                 function setPill(){
+                  var busy = unsettledWrites();
+                  var saveBtn = document.getElementById('edit-save-btn');
+                  if (saveBtn){
+                    saveBtn.disabled = busy > 0;
+                    saveBtn.title = busy > 0 ? 'Waiting for in-progress changes to save…' : '';
+                  }
                   if (!pill) return;
                   if (anyFailed) { pill.textContent = 'Changes not saved — review'; pill.dataset.state='failed'; pill.style.background='#fdecec'; pill.style.color='#c00'; }
-                  else if (inflight > 0) { pill.textContent = 'Saving ' + inflight + ' change' + (inflight===1?'':'s') + '…'; pill.dataset.state='saving'; pill.style.background='#fff6e6'; pill.style.color='#b45309'; }
+                  else if (busy > 0) { pill.textContent = 'Saving ' + busy + ' change' + (busy===1?'':'s') + '…'; pill.dataset.state='saving'; pill.style.background='#fff6e6'; pill.style.color='#b45309'; }
                   else { pill.textContent = 'All changes saved'; pill.dataset.state='saved'; pill.style.background='#e8f5ea'; pill.style.color='#1b7a3d'; }
                 }
                 function recomputeFailed(){ anyFailed = document.querySelectorAll('.row-save-chip[data-state="failed"]').length > 0; }
@@ -2943,15 +2971,22 @@ function renderOrderDetail(session, order, flash, flashMsg) {
                   recomputeFailed(); setPill();
                 }
                 window.addEventListener('beforeunload', function(e){
-                  if (inflight > 0 || anyFailed){ e.preventDefault(); e.returnValue=''; return ''; }
+                  // unsettledWrites() (not inflight) so a qty still sitting in the 500ms debounce
+                  // also warns — otherwise navigating away in that window loses it silently.
+                  if (unsettledWrites() > 0 || anyFailed){ e.preventDefault(); e.returnValue=''; return ''; }
                 });
 
                 // POST helper. Returns {ok, json} ; ok=false on 422/5xx/network.
+                // A 30s ceiling is REQUIRED, not a nicety: inflight gates the batch Save button, so
+                // a request that never settles would leave Save disabled forever and the operator
+                // unable to save at all. Aborting resolves the promise, so inflight always drains.
                 function post(path, body){
-                  return fetch(path, { method:'POST', credentials:'same-origin',
-                    headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) })
+                  var opts = { method:'POST', credentials:'same-origin',
+                    headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) };
+                  try { if (window.AbortSignal && AbortSignal.timeout) opts.signal = AbortSignal.timeout(30000); } catch (e) {}
+                  return fetch(path, opts)
                     .then(function(r){ return r.json().then(function(j){ return { ok:r.ok, json:j }; }, function(){ return { ok:false, json:{ errors:['bad response'] } }; }); })
-                    .catch(function(){ return { ok:false, json:{ errors:['network error'] } }; });
+                    .catch(function(e){ return { ok:false, json:{ errors:[(e && e.name === 'TimeoutError') ? 'timed out — not saved' : 'network error'] } }; });
                 }
                 function totals(order){
                   if (!order) return;
@@ -2969,8 +3004,14 @@ function renderOrderDetail(session, order, flash, flashMsg) {
                 }
 
                 // Generic single-action runner with per-row chip + idemKey + retry.
+                // NB: run() owns dataset.committing for the whole attempt, INCLUDING the chip-retry
+                // and the 409 auto-rekey. Setting it at the call sites instead left the retry path
+                // uncovered — a retried row was visible to serializeCustomLines again, reopening the
+                // batch-Save double-add this change exists to close.
                 function run(tr, idemKey, path, body, onOk, rekeyed){
-                  setChip(tr, 'saving'); inflight++; setPill();
+                  setChip(tr, 'saving'); inflight++;
+                  if (tr && tr.dataset) tr.dataset.committing = '1';
+                  setPill();
                   return post(path, body).then(function(res){
                     inflight--;
                     if (res.ok && res.json && res.json.ok){
@@ -2989,23 +3030,91 @@ function renderOrderDetail(session, order, flash, flashMsg) {
                       var msg = (res.json && res.json.errors) ? res.json.errors.join('; ') : 'Save failed';
                       setChip(tr, 'failed', msg);
                       var c = chipOf(tr);
-                      if (c) c.onclick = function(){ run(tr, idemKey, path, body, onOk); }; // retry, SAME idemKey
+                      // RETURN the retry so callers can still chain off it. Without this the retry
+                      // was fire-and-forget: any continuation attached to the ORIGINAL run()
+                      // promise had already settled on the failure, so work queued between the
+                      // failure and the retry (see flushDirty) was never performed.
+                      if (c) c.onclick = function(){ return run(tr, idemKey, path, body, onOk); }; // retry, SAME idemKey
                       reconcile();
                     }
+                    // Cleared on BOTH settle paths (success and failure). On failure the row must
+                    // become visible to the batch Save again — that is the recovery route for a
+                    // line the incremental path could not commit. The rekey branch returns above
+                    // WITHOUT clearing, so the nested attempt keeps ownership of the flag.
+                    if (tr && tr.dataset) delete tr.dataset.committing;
                     setPill();
                   });
                 }
 
+                // Send ONE field to its per-line editor. P0 fix (2026-07-21): the previous
+                // reroute fired qty AND price on every edit. The redundant write is a Shopify
+                // no-op that the server deliberately reports as success, and both writes paint the
+                // SAME row chip — so a genuinely failed qty save was repainted green by the no-op
+                // price save that landed after it, and the global pill then cleared. Only ever send
+                // the field the operator actually changed.
+                function rerouteField(tr, el, which){
+                  var liId = tr.dataset.committedLiId; if (!liId || !el) return;
+                  if (which === 'qty'){
+                    var q = parseInt(el.value, 10);
+                    if (q > 0) window.__autosave.qtyChange(tr, liId, q);
+                  } else {
+                    var pr = parseFloat(el.value);
+                    if (pr >= 0) window.__autosave.priceChange(tr, liId, pr);
+                  }
+                }
+                // Wire a row's qty/price inputs so edits AFTER the line is committed are persisted.
+                // P0 fix (2026-07-21): catalog picker rows had NO listener on .cl-qty/.cl-price and
+                // no name attribute, and serializeCustomLines skips a row once committedLiId is set
+                // — so setting qty 12 after the auto-add was dropped by BOTH the incremental and the
+                // batch path. The order shipped 1 while the pill read "All changes saved".
+                // Edits typed while the add is still IN FLIGHT are held as dirty and flushed on
+                // commit, rather than landing on an unset committedLiId and vanishing.
+                function wireRowEdits(tr, qtyEl, priceEl){
+                  [[qtyEl, 'qty'], [priceEl, 'price']].forEach(function(pair){
+                    var el = pair[0], which = pair[1];
+                    if (!el || el.dataset.rrWired) return;
+                    el.dataset.rrWired = '1';
+                    el.addEventListener('change', function(){
+                      if (tr.dataset.committedLiId) rerouteField(tr, el, which);
+                      else tr.dataset.dirty = (tr.dataset.dirty ? tr.dataset.dirty + ',' : '') + which;
+                    });
+                  });
+                }
+                function flushDirty(tr, qtyEl, priceEl){
+                  var d = tr.dataset.dirty; if (!d || !tr.dataset.committedLiId) return;
+                  delete tr.dataset.dirty;
+                  if (d.indexOf('qty') !== -1) rerouteField(tr, qtyEl, 'qty');
+                  if (d.indexOf('price') !== -1) rerouteField(tr, priceEl, 'price');
+                }
+
                 window.__autosave = {
                   // Add-from-picker: persist immediately; stamp committed liId onto the row.
+                  // Auto-commit on pick is INTENTIONAL and covered by a UI test ("auto-saves
+                  // WITHOUT manual Save") — do not convert this to an explicit Add button. It is
+                  // safe here (unlike a custom line) because the row is created with a real variant
+                  // and its correct wholesale price already filled in, so the committed value is
+                  // never a placeholder. What was missing was the post-commit wiring below.
                   addCatalogLine: function(p, tr, wholesale, listPrice){
                     var qtyEl = tr.querySelector('.cl-qty'), priceEl = tr.querySelector('.cl-price');
                     var idemKey = tr.dataset.idemKey || (tr.dataset.idemKey = uuid());
                     var body = { idemKey: idemKey, variantId: p.variantId, title: p.label || '', sku: p.sku || '',
                       qty: parseInt(qtyEl ? qtyEl.value : '1', 10) || 1,
                       listPrice: parseFloat(listPrice) || 0, price: parseFloat(priceEl ? priceEl.value : wholesale) };
+                    wireRowEdits(tr, qtyEl, priceEl);
+                    // run() sets dataset.committing for the whole attempt (incl. retry/rekey),
+                    // which is what hides this row from serializeCustomLines mid-flight.
+                    // Clear dirty FIRST: the blur that precedes this call already fired a change
+                    // event, and the request payload above carries those exact values — leaving
+                    // dirty set made flushDirty re-send them as a redundant /line/price every add.
+                    delete tr.dataset.dirty;
+                    // flushDirty lives in onOk, NOT in a .then on this promise. onOk fires on
+                    // whichever attempt actually commits — including a chip retry, which is a
+                    // fresh run() this promise knows nothing about. Attached to .then it silently
+                    // skipped the retry path: a qty typed after a failed add was never sent, while
+                    // the row showed the new value and a green chip.
                     run(tr, idemKey, '/orders/' + ORDER_ID + '/line/add', body, function(j){
                       if (j.line && j.line.liId){ tr.dataset.committedLiId = j.line.liId; }
+                      flushDirty(tr, qtyEl, priceEl);
                     });
                   },
                   // Custom row: EXPLICIT commit only (Add button or Enter) — NEVER on a typing pause.
@@ -3026,15 +3135,12 @@ function renderOrderDetail(session, order, flash, flashMsg) {
                       if (titleEl && !titleEl.readOnly){ titleEl.readOnly = true; titleEl.title = 'Saved — to rename, remove this line and add a new one.'; }
                       if (addBtn){ addBtn.remove(); addBtn = null; }
                     }
-                    function reroute(){
-                      var liId = tr.dataset.committedLiId;
-                      var q = parseInt(qtyEl && qtyEl.value, 10);
-                      var pr = parseFloat(priceEl && priceEl.value);
-                      if (q > 0) window.__autosave.qtyChange(tr, liId, q);
-                      if (pr >= 0) window.__autosave.priceChange(tr, liId, pr);
-                    }
                     function commit(){
-                      if (tr.dataset.committedLiId){ reroute(); return; }
+                      // Already committed: persistence is handled entirely by the per-field change
+                      // handlers (wireRowEdits). This used to call a reroute() that posted BOTH qty
+                      // and price; the redundant write is a server-side no-op reported as success,
+                      // and it repainted a genuinely failed sibling save green on the shared chip.
+                      if (tr.dataset.committedLiId) return;
                       if (saving) return; // single-flight: the in-flight submit carries final values
                       var title = (titleEl && titleEl.value || '').trim();
                       var qty = parseInt(qtyEl && qtyEl.value, 10);
@@ -3050,9 +3156,19 @@ function renderOrderDetail(session, order, flash, flashMsg) {
                       // the server 409s with IDEM_PAYLOAD_MISMATCH and run() auto-rekeys this row.
                       var idemKey = tr.dataset.idemKey || (tr.dataset.idemKey = uuid());
                       saving = true;
+                      // run() owns dataset.committing (hides the row from the batch Save for the
+                      // whole attempt). Clear dirty first — the blur from clicking Add already
+                      // fired change events, and the payload below carries those same values, so
+                      // leaving dirty set re-sent them as a redundant /line/price after every add.
+                      delete tr.dataset.dirty;
                       if (addBtn){ addBtn.disabled = true; addBtn.textContent = 'Adding…'; }
                       run(tr, idemKey, '/orders/' + ORDER_ID + '/line/custom', { idemKey: idemKey, title: title, qty: qty, price: price }, function(j){
                         if (j.line && j.line.liId){ tr.dataset.committedLiId = j.line.liId; lockCommitted(); }
+                        // In onOk (not .then) so a chip RETRY also flushes — see addCatalogLine.
+                        // Values typed while the add was in flight would otherwise be stranded: the
+                        // change listener saw no committedLiId and the inputs never change again,
+                        // so no later event could ever flush them.
+                        flushDirty(tr, qtyEl, priceEl);
                       }).then(function(){
                         saving = false;
                         if (addBtn && !tr.dataset.committedLiId){ addBtn.disabled = false; addBtn.textContent = 'Add'; }
@@ -3060,10 +3176,21 @@ function renderOrderDetail(session, order, flash, flashMsg) {
                     }
                     [titleEl, qtyEl, priceEl].forEach(function(el){
                       if (!el) return;
-                      el.addEventListener('keydown', function(e){ if (e.key === 'Enter'){ e.preventDefault(); commit(); } });
-                      // Committed rows: field changes flow straight to the per-line editors.
-                      el.addEventListener('change', function(){ if (tr.dataset.committedLiId) reroute(); });
+                      el.addEventListener('keydown', function(e){
+                        if (e.key !== 'Enter') return;
+                        e.preventDefault();
+                        // On a COMMITTED row, blur instead of commit(): blurring fires the change
+                        // handler, which routes only the field that actually changed. Calling
+                        // commit() here fell through to reroute(), which posted BOTH qty and price
+                        // — and the redundant no-op write repainted a failed save green.
+                        if (tr.dataset.committedLiId) { el.blur(); return; }
+                        commit();
+                      });
                     });
+                    // qty/price route to the per-line editors once committed, and are held as dirty
+                    // while the add is still in flight. Title is intentionally NOT wired — it locks
+                    // on commit (Shopify cannot rename a committed line).
+                    wireRowEdits(tr, qtyEl, priceEl);
                     if (addBtn) addBtn.addEventListener('click', function(){ commit(); });
                   },
                   // Existing-line qty change (debounced, single-flight, last-write-wins).
@@ -3088,6 +3215,9 @@ function renderOrderDetail(session, order, flash, flashMsg) {
                   linePending[key] = { tr: tr, extra: extra, path: path, liId: liId };
                   if (lineTimers[key]) clearTimeout(lineTimers[key]);
                   lineTimers[key] = setTimeout(function(){ flushLine(key); }, 500);
+                  // Reflect the pending edit IMMEDIATELY so Save is disabled for the debounce
+                  // window too — not just once the request is actually in flight.
+                  setChip(tr, 'saving'); setPill();
                 }
                 function flushLine(key){
                   if (lineInflight[key]) return; // will re-fire after current resolves

@@ -1346,6 +1346,253 @@ await test('REGRESSION: discount does NOT commit on blur, and a correction is NO
     `correction to a SMALLER % was discarded: was ${afterFirst[0].amt}, now ${afterSecond[0].amt}`);
 });
 
+// ── REGRESSION: catalog-row qty loss + batch-Save double-add (2026-07-21) ────
+console.log('\nUI tests — REGRESSION: catalog row edits + Save race:');
+
+// Catalog picker rows auto-commit at qty 1 (INTENTIONAL — see the auto-save test above), but had
+// NO listener on .cl-qty/.cl-price and no name attribute, and serializeCustomLines skips a row once
+// committedLiId is set. So a qty typed after the auto-add was dropped by BOTH paths: the order
+// shipped 1 while the pill read "All changes saved".
+await test('REGRESSION: qty typed on a committed catalog row PERSISTS (was silently dropped)', async (page, ctx) => {
+  const errors = [];
+  page.on('pageerror', e => errors.push('pageerror: ' + e.message));
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/orders/1001`);
+  await page.waitForSelector('#edit-btn');
+  await page.click('#edit-btn');
+  await page.waitForSelector('#edit-product-search', { state: 'visible' });
+  await page.fill('#edit-product-search', 'pinpoint');
+  await page.waitForSelector('#edit-product-results .edit-var-cb', { timeout: 5000 });
+  await page.locator('#edit-product-results .edit-var-cb').nth(0).check();
+  await page.click('#edit-add-selected');
+
+  const row = page.locator('#edit-form tr.catalog-line-new').first();
+  await row.waitFor();
+  await page.waitForFunction(() => document.querySelector('#edit-form tr.catalog-line-new')?.dataset.committedLiId, { timeout: 8000 });
+  const liId = await row.evaluate(el => el.dataset.committedLiId);
+
+  // Real keystrokes: correct the quantity from the auto-committed 1 to 12.
+  await row.locator('.cl-qty').click({ clickCount: 3 });
+  await row.locator('.cl-qty').type('12', { delay: 25 });
+  // NB: wait for the actual /line/qty round trip. The pill is NOT a valid signal here — the
+  // per-line editor debounces 500ms before it increments `inflight`, so the pill still reads
+  // "saved" from the previous state and asserting on it races the write.
+  const qtyResp = page.waitForResponse(r => /\/line\/qty$/.test(new URL(r.url()).pathname), { timeout: 10000 });
+  await page.keyboard.press('Tab');           // fire change
+  await qtyResp;
+  await page.waitForTimeout(150);
+
+  const state = await page.evaluate(async () => (await (await fetch('/api/orders/1001/line-state', { credentials: 'same-origin' })).json()));
+  const line = (state.lines || []).find(l => l.liId === liId);
+  assert.ok(line, `committed catalog line ${liId} missing from server state`);
+  assert.equal(line.currentQuantity, 12,
+    `SILENT QTY LOSS: typed 12, server holds ${line.currentQuantity} — the order would ship the wrong amount`);
+  assert.equal(errors.length, 0, 'no page errors; got: ' + errors.join(' | '));
+});
+
+// serializeCustomLines skipped a row only on committedLiId, which is stamped ON SUCCESS — so during
+// the multi-second round trip the row looked uncommitted and the batch Save re-sent it through the
+// no-idempotency batch path, adding the SAME line twice.
+await test('REGRESSION: batch Save during an in-flight Add does NOT double-add', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/orders/1008`);
+  await page.waitForSelector('#edit-btn');
+  await page.click('#edit-btn');
+
+  // Hold the incremental commit open so the in-flight window is deterministic.
+  let release;
+  const held = new Promise(r => { release = r; });
+  await page.route('**/line/custom', async route => {
+    await held;
+    await route.continue();
+  });
+
+  await page.click('button[onclick="addCustomLineRow()"]');
+  await page.waitForSelector('tr.custom-line-new .ncl-title', { timeout: 4000 });
+  await page.type('tr.custom-line-new .ncl-title', 'Race fee', { delay: 15 });
+  await page.click('tr.custom-line-new .ncl-price', { clickCount: 3 });
+  await page.type('tr.custom-line-new .ncl-price', '30', { delay: 15 });
+  await page.click('tr.custom-line-new .ncl-add');
+
+  // Mid-flight: the row must be hidden from the serializer AND the Save button disabled.
+  await page.waitForFunction(() => document.querySelector('tr.custom-line-new')?.dataset.committing === '1', { timeout: 4000 });
+  const serialized = await page.evaluate(() => {
+    window.serializeCustomLines();
+    return document.getElementById('addCustomLinesInput').value;
+  });
+  assert.equal(serialized, '[]',
+    `DOUBLE-ADD: an in-flight row was serialized into the batch payload (${serialized}) — Save would re-add it`);
+  const saveDisabled = await page.$eval('#edit-save-btn', b => b.disabled);
+  assert.equal(saveDisabled, true, 'Save must be disabled while an incremental write is in flight');
+
+  release();
+  await page.waitForFunction(() => document.querySelector('tr.custom-line-new')?.dataset.committedLiId, { timeout: 10000 });
+
+  const state = await page.evaluate(async () => (await (await fetch('/api/orders/1008/line-state', { credentials: 'same-origin' })).json()));
+  const fees = (state.lines || []).filter(l => l.title === 'Race fee' && (l.currentQuantity || 0) > 0);
+  assert.equal(fees.length, 1, `expected exactly 1 "Race fee" line, got ${fees.length}`);
+  const reEnabled = await page.$eval('#edit-save-btn', b => b.disabled);
+  assert.equal(reEnabled, false, 'Save must re-enable once writes settle');
+});
+
+// Edits typed DURING the in-flight add previously landed on an unset committedLiId and were
+// stranded forever — the inputs never change again, so no later event could flush them.
+await test('REGRESSION: qty typed WHILE the add is in flight is flushed after commit', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/orders/1001`);
+  await page.waitForSelector('#edit-btn');
+  await page.click('#edit-btn');
+
+  let release;
+  const held = new Promise(r => { release = r; });
+  await page.route('**/line/add', async route => { await held; await route.continue(); });
+
+  await page.waitForSelector('#edit-product-search', { state: 'visible' });
+  await page.fill('#edit-product-search', 'pinpoint');
+  await page.waitForSelector('#edit-product-results .edit-var-cb', { timeout: 5000 });
+  await page.locator('#edit-product-results .edit-var-cb').nth(0).check();
+  await page.click('#edit-add-selected');
+
+  const row = page.locator('#edit-form tr.catalog-line-new').first();
+  await row.waitFor();
+  // Type while still in flight — committedLiId is not set yet.
+  await row.locator('.cl-qty').click({ clickCount: 3 });
+  await row.locator('.cl-qty').type('7', { delay: 15 });
+  await page.keyboard.press('Tab');
+  await page.waitForFunction(() => document.querySelector('#edit-form tr.catalog-line-new')?.dataset.dirty, { timeout: 4000 });
+
+  // Same caveat as above — wait for the flushed /line/qty round trip, not the pill.
+  const flushed = page.waitForResponse(r => /\/line\/qty$/.test(new URL(r.url()).pathname), { timeout: 15000 });
+  release();
+  await page.waitForFunction(() => document.querySelector('#edit-form tr.catalog-line-new')?.dataset.committedLiId, { timeout: 10000 });
+  await flushed;
+  await page.waitForTimeout(150);
+
+  const liId = await row.evaluate(el => el.dataset.committedLiId);
+  const state = await page.evaluate(async () => (await (await fetch('/api/orders/1001/line-state', { credentials: 'same-origin' })).json()));
+  const line = (state.lines || []).find(l => l.liId === liId);
+  assert.ok(line, 'committed line missing from server state');
+  assert.equal(line.currentQuantity, 7,
+    `in-flight edit stranded: typed 7 while adding, server holds ${line.currentQuantity}`);
+});
+
+// REGRESSION (found by adversarial review of the catalog fix — 5 of 6 reviewers independently):
+// debouncedLine waits 500ms BEFORE it increments `inflight`. Gating the Save button on inflight
+// alone therefore left a 500ms window where the pill read "All changes saved" and Save was
+// ENABLED while a typed quantity sat in a timer. Clicking Save there navigates away, abandoning
+// the write — and serializeCustomLines skips the row because it has a committedLiId, so the
+// quantity reaches the server through NEITHER path. Same silent loss this change exists to kill.
+await test('REGRESSION: Save is blocked during the 500ms debounce, not just while in flight', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/orders/1001`);
+  await page.waitForSelector('#edit-btn');
+  await page.click('#edit-btn');
+  await page.waitForSelector('#edit-product-search', { state: 'visible' });
+  await page.fill('#edit-product-search', 'pinpoint');
+  await page.waitForSelector('#edit-product-results .edit-var-cb', { timeout: 5000 });
+  await page.locator('#edit-product-results .edit-var-cb').nth(0).check();
+  await page.click('#edit-add-selected');
+
+  const row = page.locator('#edit-form tr.catalog-line-new').first();
+  await row.waitFor();
+  await page.waitForFunction(() => document.querySelector('#edit-form tr.catalog-line-new')?.dataset.committedLiId, { timeout: 8000 });
+  // Settle fully so any residual busy-state is gone before we measure.
+  await page.waitForFunction(() => document.getElementById('edit-save-btn') && !document.getElementById('edit-save-btn').disabled, { timeout: 8000 });
+
+  // Type a qty and inspect the window BEFORE the debounce fires (no request yet).
+  await row.locator('.cl-qty').click({ clickCount: 3 });
+  await row.locator('.cl-qty').type('9', { delay: 10 });
+  await page.keyboard.press('Tab');
+
+  const during = await page.evaluate(() => ({
+    saveDisabled: document.getElementById('edit-save-btn')?.disabled,
+    pill: document.getElementById('autosave-pill')?.dataset.state,
+  }));
+  assert.equal(during.saveDisabled, true,
+    'SILENT LOSS WINDOW: Save was clickable while a typed qty was still only scheduled — submitting here abandons the write');
+  assert.equal(during.pill, 'saving', `pill should show unsaved work during the debounce, got "${during.pill}"`);
+
+  // And it must recover — a permanently disabled Save would be its own outage.
+  await page.waitForResponse(r => /\/line\/qty$/.test(new URL(r.url()).pathname), { timeout: 10000 });
+  await page.waitForFunction(() => {
+    const b = document.getElementById('edit-save-btn');
+    const p = document.getElementById('autosave-pill');
+    return b && !b.disabled && p && p.dataset.state === 'saved';
+  }, { timeout: 10000 });
+
+  const liId = await row.evaluate(el => el.dataset.committedLiId);
+  const state = await page.evaluate(async () => (await (await fetch('/api/orders/1001/line-state', { credentials: 'same-origin' })).json()));
+  const line = (state.lines || []).find(l => l.liId === liId);
+  assert.equal(line?.currentQuantity, 9, `qty did not persist: server holds ${line?.currentQuantity}`);
+});
+
+// REGRESSION (reconciler follow-up, 2026-07-21): flushDirty used to hang off the ORIGINAL run()
+// promise, which had already settled when the Add failed. A chip RETRY is a fresh run() that the
+// old promise knew nothing about, so a quantity typed between the failure and the retry was never
+// sent: the row displayed the new number with a green chip while the server held the original.
+// Worse, re-typing the same number fires no change event, so the operator could not dislodge it.
+await test('REGRESSION: qty typed after a FAILED add is flushed by the chip retry', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+
+  // Fail the first /line/add, let everything after it through.
+  let failOnce = true;
+  await page.route('**/line/add', async route => {
+    if (failOnce) {
+      failOnce = false;
+      await route.fulfill({ status: 422, contentType: 'application/json', body: JSON.stringify({ ok: false, errors: ['simulated failure'] }) });
+      return;
+    }
+    await route.continue();
+  });
+
+  await page.goto(`${BASE}/orders/1001`);
+  await page.waitForSelector('#edit-btn');
+  await page.click('#edit-btn');
+  await page.waitForSelector('#edit-product-search', { state: 'visible' });
+  await page.fill('#edit-product-search', 'pinpoint');
+  await page.waitForSelector('#edit-product-results .edit-var-cb', { timeout: 5000 });
+  await page.locator('#edit-product-results .edit-var-cb').nth(0).check();
+  await page.click('#edit-add-selected');
+
+  const row = page.locator('#edit-form tr.catalog-line-new').first();
+  await row.waitFor();
+  // The add failed — chip red, no committed id.
+  await page.waitForFunction(() => {
+    const c = document.querySelector('#edit-form tr.catalog-line-new .row-save-chip');
+    return c && c.dataset.state === 'failed';
+  }, { timeout: 10000 });
+  assert.equal(await row.evaluate(el => el.dataset.committedLiId || null), null, 'failed add must not stamp a committed id');
+
+  // Operator corrects the quantity BEFORE retrying.
+  await row.locator('.cl-qty').click({ clickCount: 3 });
+  await row.locator('.cl-qty').type('12', { delay: 15 });
+  await page.keyboard.press('Tab');
+  await page.waitForFunction(() => document.querySelector('#edit-form tr.catalog-line-new')?.dataset.dirty, { timeout: 4000 });
+
+  // Retry via the chip. The corrected qty must be flushed by whichever attempt commits.
+  const qtyReq = page.waitForRequest(r => /\/line\/qty$/.test(new URL(r.url()).pathname) && r.method() === 'POST', { timeout: 15000 });
+  await page.click('#edit-form tr.catalog-line-new .row-save-chip');
+  await page.waitForFunction(() => document.querySelector('#edit-form tr.catalog-line-new')?.dataset.committedLiId, { timeout: 15000 });
+  const req = await qtyReq;
+  assert.equal(JSON.parse(req.postData() || '{}').qty, 12, 'the retry must carry the CORRECTED quantity');
+
+  await page.waitForFunction(() => {
+    const p = document.getElementById('autosave-pill');
+    return p && p.dataset.state === 'saved';
+  }, { timeout: 10000 });
+
+  const liId = await row.evaluate(el => el.dataset.committedLiId);
+  const state = await page.evaluate(async () => (await (await fetch('/api/orders/1001/line-state', { credentials: 'same-origin' })).json()));
+  const line = (state.lines || []).find(l => l.liId === liId);
+  assert.equal(line?.currentQuantity, 12,
+    `SILENT LOSS: row shows 12 with a green chip but server holds ${line?.currentQuantity}`);
+});
+
 await browser.close();
 
 console.log(`\n  ${passed} passed, ${failed} failed`);
