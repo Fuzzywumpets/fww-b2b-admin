@@ -1297,6 +1297,55 @@ await test('REGRESSION: lost response on Add → retry REPLAYS, does not double-
   assert.equal(Number(fees[0].unitPrice), 42, `price wrong: got ${fees[0].unitPrice}`);
 });
 
+// REGRESSION (order-discount latch, 2026-07-21): the discount bar used to commit on BLUR behind a
+// one-way latch, so a half-typed value committed and every correction was silently discarded — no
+// request, no error, inputs still editable. Real keystrokes, asserting server truth.
+await test('REGRESSION: discount does NOT commit on blur, and a correction is NOT silently discarded', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/orders/1008`);
+  await page.waitForSelector('#edit-form', { timeout: 8000 });
+  await page.click('#edit-btn');
+  await page.waitForSelector('#edit-discount-bar', { state: 'visible', timeout: 4000 });
+
+  // NB: no eval() — the page's CSP is script-src 'self' 'unsafe-inline' (no 'unsafe-eval'),
+  // so a stringified predicate throws. Inline the filter.
+  const readDisc = () => page.evaluate(async () => {
+    const r = await fetch('/api/orders/1008/line-state', { credentials: 'same-origin' });
+    const s = await r.json();
+    return (s.lines || [])
+      .filter(l => (l.title || '').startsWith('Order discount: ') && (l.currentQuantity || 0) > 0)
+      .map(l => ({ title: l.title, amt: Math.abs(l.unitPrice * l.currentQuantity) }));
+  });
+
+  // Type a WRONG percentage and tab away — the old build committed right here.
+  await page.type('#edit-discount-bar input[name="discountPct"]', '10', { delay: 25 });
+  await page.type('#edit-discount-bar input[name="discountReason"]', 'Bulk deal', { delay: 25 });
+  await page.keyboard.press('Tab');
+  await page.waitForTimeout(1200);
+  assert.equal((await readDisc()).length, 0, 'discount committed on BLUR — the premature-commit bug is back');
+
+  // Correct it to 20 BEFORE applying, then apply explicitly.
+  await page.click('#edit-discount-bar input[name="discountPct"]', { clickCount: 3 });
+  await page.type('#edit-discount-bar input[name="discountPct"]', '20', { delay: 25 });
+  await page.click('#discount-apply-btn');
+  await page.waitForFunction(() => document.getElementById('discount-chip')?.dataset.state === 'saved', { timeout: 10000 });
+
+  const afterFirst = await readDisc();
+  assert.equal(afterFirst.length, 1, `expected 1 discount line, got ${afterFirst.length}`);
+
+  // Now CORRECT an already-applied discount — the old latch swallowed this entirely.
+  await page.click('#edit-discount-bar input[name="discountPct"]', { clickCount: 3 });
+  await page.type('#edit-discount-bar input[name="discountPct"]', '5', { delay: 25 });
+  await page.click('#discount-apply-btn');
+  await page.waitForFunction(() => document.getElementById('discount-chip')?.dataset.state === 'saved', { timeout: 10000 });
+
+  const afterSecond = await readDisc();
+  assert.equal(afterSecond.length, 1, `DOUBLE-DISCOUNT: expected exactly 1 active discount line, got ${afterSecond.length}`);
+  assert.ok(afterSecond[0].amt < afterFirst[0].amt,
+    `correction to a SMALLER % was discarded: was ${afterFirst[0].amt}, now ${afterSecond[0].amt}`);
+});
+
 await browser.close();
 
 console.log(`\n  ${passed} passed, ${failed} failed`);

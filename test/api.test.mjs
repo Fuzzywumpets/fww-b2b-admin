@@ -670,6 +670,49 @@ await test('REGRESSION companion: reused idemKey + IDENTICAL payload still repla
   assert.equal(r2.json.replayed, true, 'identical retry is a replay');
 });
 
+// REGRESSION (order-discount latch, 2026-07-21): an "order discount" in this app is a NEGATIVE
+// custom LINE ITEM, not a Shopify discount. So re-applying a corrected % must REPLACE the prior
+// discount line — never stack a second one on top (that would double-discount the customer).
+await test('REGRESSION: re-applying a corrected discount REPLACES, never stacks a second discount line', async () => {
+  const cookie = await seedSession();
+  const isDisc = l => (l.title || '').startsWith('Order discount: ');
+
+  const r1 = await postJson('/orders/1001/discount/order', cookie, { idemKey: uuid(), discountPct: 10, discountFixed: '', discountReason: 'first pass' });
+  assert.equal(r1.status, 200, 'first discount should apply');
+  const s1 = await (await fetch(`${BASE}/api/orders/1001/line-state`, { headers: { Cookie: cookie } })).json();
+  const d1 = (s1.lines || []).filter(l => isDisc(l) && (l.currentQuantity || 0) > 0);
+  assert.equal(d1.length, 1, `expected 1 discount line after first apply, got ${d1.length}`);
+
+  // Operator realises 10% was wrong and re-applies at 20%.
+  const r2 = await postJson('/orders/1001/discount/order', cookie, { idemKey: uuid(), discountPct: 20, discountFixed: '', discountReason: 'corrected' });
+  assert.equal(r2.status, 200, 'corrected discount must be accepted, not silently discarded');
+  const s2 = await (await fetch(`${BASE}/api/orders/1001/line-state`, { headers: { Cookie: cookie } })).json();
+  const d2 = (s2.lines || []).filter(l => isDisc(l) && (l.currentQuantity || 0) > 0);
+  assert.equal(d2.length, 1, `DOUBLE-DISCOUNT: expected exactly 1 active discount line, got ${d2.length}`);
+  assert.ok(/corrected/.test(d2[0].title), `surviving discount should be the corrected one, got "${d2[0].title}"`);
+});
+
+await test('REGRESSION: the % basis EXCLUDES an existing discount line (no discount-on-discounted)', async () => {
+  const cookie = await seedSession();
+  const isDisc = l => (l.title || '').startsWith('Order discount: ');
+  // NOTE: uses 1001, never 1007 — a UI test asserts 1007 is pristine, and the mock order state is
+  // shared across the whole run, so touching 1007 here fails a test in a different file.
+  const base = await (await fetch(`${BASE}/api/orders/1001/line-state`, { headers: { Cookie: cookie } })).json();
+  const goods = (base.lines || []).filter(l => !isDisc(l) && (l.currentQuantity || 0) > 0)
+    .reduce((s, l) => s + l.unitPrice * l.currentQuantity, 0);
+
+  await postJson('/orders/1001/discount/order', cookie, { idemKey: uuid(), discountPct: 10, discountFixed: '', discountReason: 'r1' });
+  await postJson('/orders/1001/discount/order', cookie, { idemKey: uuid(), discountPct: 10, discountFixed: '', discountReason: 'r2' });
+
+  const st = await (await fetch(`${BASE}/api/orders/1001/line-state`, { headers: { Cookie: cookie } })).json();
+  const disc = (st.lines || []).filter(l => isDisc(l) && (l.currentQuantity || 0) > 0);
+  assert.equal(disc.length, 1, `expected 1 discount line, got ${disc.length}`);
+  const applied = Math.abs(disc[0].unitPrice * disc[0].currentQuantity);
+  const expected = goods * 0.10;
+  assert.ok(Math.abs(applied - expected) < 0.02,
+    `second 10% must be computed on the GOODS subtotal (${expected.toFixed(2)}), not the already-discounted total — got ${applied.toFixed(2)}`);
+});
+
 await test('REGRESSION: line/qty reused key + different qty also 409s (guard covers every action route)', async () => {
   const cookie = await seedSession();
   const base = await (await fetch(`${BASE}/api/orders/1001/line-state`, { headers: { Cookie: cookie } })).json();

@@ -2696,6 +2696,8 @@ function renderOrderDetail(session, order, flash, flashMsg) {
                 <input type="number" name="discountFixed" placeholder="0.00" min="0" step="0.01" class="filter-input" style="width:80px" oninput="if(this.value)this.form.discountPct.value=''">
               </label>
               <input type="text" name="discountReason" placeholder="Reason (required for discount)" class="filter-input" style="width:220px">
+              <button type="button" id="discount-apply-btn" class="btn btn-primary btn-sm" title="Apply this discount to the order">Apply discount</button>
+              <span id="discount-chip" class="row-save-chip" data-state="idle" style="font-size:11px;vertical-align:middle"></span>
             </div>
           </div>
           <div id="edit-save-bar" style="display:none;padding:12px 0;border-top:1px solid var(--border);margin-top:8px">
@@ -3135,30 +3137,79 @@ function renderOrderDetail(session, order, flash, flashMsg) {
                 }
                 wireExisting();
 
-                // Order-level discount bar: persist on blur once reason + a value are present.
+                // Order-level discount bar — EXPLICIT apply only.
+                // P0 fix (2026-07-21): this used to commit on the BLUR of any field, behind a
+                // one-way "saved" latch. Two failures compounded, the same pair that cost $80 on a
+                // custom line: (1) tabbing out of the reason box with the % still half-typed
+                // committed a real discount at the wrong value; (2) the early-return on "saved"
+                // silently swallowed every correction — no request, no chip, no error, while the
+                // inputs stayed editable and invited the correction being discarded.
+                // Now: nothing commits until "Apply discount" is clicked (or Enter), the state is
+                // visible in a chip, corrections re-apply, and the SERVER replaces the prior
+                // discount line rather than stacking a second one.
                 (function(){
                   var bar = document.getElementById('edit-discount-bar'); if (!bar) return;
                   var pctEl = bar.querySelector('input[name="discountPct"]');
                   var fixedEl = bar.querySelector('input[name="discountFixed"]');
                   var reasonEl = bar.querySelector('input[name="discountReason"]');
-                  var saved = false;
-                  function trySave(){
-                    if (saved) return;
+                  var btn = document.getElementById('discount-apply-btn');
+                  var chip = document.getElementById('discount-chip');
+                  var applying = false, lastTuple = null, lastKey = null;
+
+                  function setDiscChip(state, msg){
+                    if (!chip) return;
+                    chip.dataset.state = state;
+                    if (state === 'saving'){ chip.style.display='inline'; chip.style.color='#888'; chip.textContent='Applying…'; }
+                    else if (state === 'saved'){ chip.style.display='inline'; chip.style.color='#0a0'; chip.title = msg||''; chip.textContent='✓ Applied' + (msg ? ' — ' + msg : ''); }
+                    else if (state === 'failed'){ chip.style.display='inline'; chip.style.color='#c00'; chip.style.cursor='pointer'; chip.title = msg||''; chip.textContent='⚠ Not applied'; }
+                    else { chip.style.display='none'; chip.textContent=''; }
+                  }
+                  function apply(){
+                    if (applying) return;
                     var pct = parseFloat(pctEl && pctEl.value) || 0;
                     var fixed = parseFloat(fixedEl && fixedEl.value) || 0;
                     var reason = (reasonEl && reasonEl.value || '').trim();
-                    if (!reason || (!(pct>0) && !(fixed>0))) return;
-                    saved = true;
-                    var idemKey = uuid();
-                    inflight++; setPill();
+                    if (!reason){ setDiscChip('failed','A reason is required'); if (reasonEl) reasonEl.focus(); return; }
+                    if (!(pct>0) && !(fixed>0)){ setDiscChip('failed','Enter a % or a $ amount'); if (pctEl) pctEl.focus(); return; }
+                    if (pct > 100){ setDiscChip('failed','Percentage cannot exceed 100'); if (pctEl) pctEl.focus(); return; }
+                    // Key per distinct VALUE-tuple: an unchanged re-click replays safely (no
+                    // double-apply if a response was lost); changed values mint a new key so the
+                    // correction is a genuinely new action the server will replace with.
+                    var tuple = pct + '|' + fixed + '|' + reason;
+                    if (tuple !== lastTuple){ lastTuple = tuple; lastKey = uuid(); }
+                    var idemKey = lastKey;
+                    applying = true;
+                    if (btn){ btn.disabled = true; btn.textContent = 'Applying…'; }
+                    setDiscChip('saving'); inflight++; setPill();
                     post('/orders/' + ORDER_ID + '/discount/order', { idemKey: idemKey, discountPct: pct||'', discountFixed: fixed||'', discountReason: reason }).then(function(res){
-                      inflight--;
-                      if (res.ok && res.json && res.json.ok){ totals(res.json.order); }
-                      else { saved = false; anyFailed = true; }
+                      inflight--; applying = false;
+                      if (btn){ btn.disabled = false; btn.textContent = 'Apply discount'; }
+                      if (res.ok && res.json && res.json.ok){
+                        totals(res.json.order);
+                        setDiscChip('saved', (res.json.warnings && res.json.warnings.length) ? res.json.warnings.join(' ') : '');
+                      } else if (res.json && res.json.code === 'IDEM_PAYLOAD_MISMATCH'){
+                        // Stale key vs new values — rekey and let the operator re-apply.
+                        lastTuple = null; lastKey = null;
+                        setDiscChip('failed', 'Please click Apply again');
+                        if (chip) chip.onclick = apply;
+                      } else {
+                        anyFailed = true;
+                        var msg = (res.json && res.json.errors) ? res.json.errors.join('; ') : 'Apply failed';
+                        setDiscChip('failed', msg);
+                        if (chip) chip.onclick = apply;
+                        reconcile();
+                      }
                       setPill();
                     });
                   }
-                  [pctEl, fixedEl, reasonEl].forEach(function(el){ if (el) el.addEventListener('blur', trySave); });
+                  if (btn) btn.addEventListener('click', apply);
+                  [pctEl, fixedEl, reasonEl].forEach(function(el){
+                    if (!el) return;
+                    el.addEventListener('keydown', function(e){ if (e.key === 'Enter'){ e.preventDefault(); apply(); } });
+                    // Editing after an apply clears the green chip so stale "Applied" never lingers
+                    // over values that are no longer what the order carries.
+                    el.addEventListener('input', function(){ if (chip && chip.dataset.state === 'saved') setDiscChip('idle'); });
+                  });
                 })();
 
                 setPill();
@@ -6687,7 +6738,20 @@ app.post('/orders/:id/line/remove', requireAuth, async (req, res) => {
   }
 });
 
+// WHAT: title prefix that marks a line item as the app's order-level discount. This app does NOT
+// use a real Shopify discount — an "order discount" is a NEGATIVE-priced custom line item. That is
+// why it can be replaced/removed at all (a true orderEditAddDiscount CANNOT be removed once
+// committed), and why re-posting without removing the old one would STACK a second discount.
+// CHANGE-GUARD: the prefix is the ONLY way a discount line is identified. If you change it, existing
+// orders' discount lines become invisible to the replace logic and the next apply will DOUBLE-DISCOUNT.
+// INVARIANT(S): a staff-authored custom line literally titled "Order discount: …" would be treated
+// as one and replaced — acceptable, but do not advertise that title elsewhere in the UI.
+const ORDER_DISCOUNT_PREFIX = 'Order discount: ';
+const isOrderDiscountLine = (title) => String(title || '').startsWith(ORDER_DISCOUNT_PREFIX);
+
 // POST /orders/:id/discount/order — incremental order-level discount (negative custom item).
+// REPLACE semantics (2026-07-21): removes any existing discount line, then adds the new one, ALL
+// inside one orderEditBegin/commit. Re-applying a corrected % must never stack a second discount.
 app.post('/orders/:id/discount/order', requireAuth, async (req, res) => {
   const numId = req.params.id;
   const session = req.adminSession;
@@ -6707,11 +6771,20 @@ app.post('/orders/:id/discount/order', requireAuth, async (req, res) => {
 
   if (MOCK) {
     const out = mockIncrementalEdit({ numId, idemKey, action: 'discount/order', payload, editedBy: session.email, editFn: (edges) => {
+      // Mirror the live REPLACE semantics: zero prior discount lines, and compute the basis with
+      // them EXCLUDED. If the mock stacked while prod replaced, the tests would validate fiction.
+      for (const e of edges) {
+        if (isOrderDiscountLine(e.node.title)) { e.node.currentQuantity = 0; e.node.quantity = 0; }
+      }
       let sub = 0;
-      for (const e of edges) { const cq = e.node.currentQuantity != null ? e.node.currentQuantity : e.node.quantity; sub += parseFloat(e.node.discountedUnitPriceSet?.presentmentMoney?.amount || 0) * (cq || 0); }
+      for (const e of edges) {
+        if (isOrderDiscountLine(e.node.title)) continue;
+        const cq = e.node.currentQuantity != null ? e.node.currentQuantity : e.node.quantity;
+        sub += parseFloat(e.node.discountedUnitPriceSet?.presentmentMoney?.amount || 0) * (cq || 0);
+      }
       const amt = pct > 0 ? sub * pct / 100 : fixed;
       edges.push({ node: {
-        id: `gid://shopify/LineItem/idem-${idemKey}`, title: `Order discount: ${payload.discountReason}`, quantity: 1, currentQuantity: 1, variant: null,
+        id: `gid://shopify/LineItem/idem-${idemKey}`, title: `${ORDER_DISCOUNT_PREFIX}${payload.discountReason}`, quantity: 1, currentQuantity: 1, variant: null,
         discountedUnitPriceSet: { presentmentMoney: { amount: (-amt).toFixed(2), currencyCode: 'USD' } },
         originalUnitPriceSet:   { presentmentMoney: { amount: (-amt).toFixed(2), currencyCode: 'USD' } },
       } });
@@ -6723,16 +6796,50 @@ app.post('/orders/:id/discount/order', requireAuth, async (req, res) => {
   }
 
   try {
-    const result = await runOrderEdit(orderId, idemKey, session.email, 'discount/order', payload, async (calcId) => {
-      const totResult = await shopifyFetch(`query($id:ID!){order(id:$id){subtotalPriceSet{presentmentMoney{amount}}}}`, { id: orderId });
-      const subTotal = parseFloat(totResult.data?.order?.subtotalPriceSet?.presentmentMoney?.amount || 0);
-      const discAmt = pct > 0 ? subTotal * pct / 100 : fixed;
+    let expectedAmt = 0;
+    const result = await runOrderEdit(orderId, idemKey, session.email, 'discount/order', payload, async (calcId, ctx) => {
+      // 1) Zero any EXISTING discount line(s) first — otherwise a corrected % stacks a second
+      //    negative line and the customer is double-discounted.
+      const priorCalcIds = (ctx.calcItems || []).filter(i => isOrderDiscountLine(i.title)).map(i => i.id);
+      for (const li of priorCalcIds) {
+        const rmRes = await shopifyFetch(`mutation setQty($id:ID!,$li:ID!,$qty:Int!,$r:Boolean!){
+          orderEditSetQuantity(id:$id,lineItemId:$li,quantity:$qty,restock:$r){ calculatedOrder{id} userErrors{field message}}}`,
+          { id: calcId, li, qty: 0, r: false });
+        const rmErrs = rmRes.data?.orderEditSetQuantity?.userErrors || [];
+        if (rmErrs.length) throw new OrderEditError(rmErrs.map(e => e.message));
+      }
+      if (priorCalcIds.length) ctx.warnings.push(`replaced ${priorCalcIds.length} existing discount line${priorCalcIds.length === 1 ? '' : 's'}`);
+
+      // 2) Compute the basis from AUTHORITATIVE per-line state, EXCLUDING discount lines.
+      //    order.subtotalPriceSet was wrong twice over: it lags after rapid edits (eventually
+      //    consistent) AND it already nets out any existing discount line, so a % re-apply
+      //    computed against an ALREADY-DISCOUNTED subtotal.
+      const st = await readCommittedLineState(orderId);
+      const basis = (st.lines || [])
+        .filter(l => !isOrderDiscountLine(l.title) && (l.currentQuantity || 0) > 0)
+        .reduce((sum, l) => sum + (l.unitPrice * l.currentQuantity), 0);
+      const discAmt = pct > 0 ? basis * pct / 100 : fixed;
+      if (!(discAmt > 0)) throw new OrderEditError('computed discount is zero — nothing to apply');
+      if (discAmt > basis) throw new OrderEditError(`discount ${fmtMoney(discAmt)} exceeds the order subtotal ${fmtMoney(basis)}`);
+      expectedAmt = discAmt;
+
       const addRes = await shopifyFetch(`mutation addItem($id:ID!,$title:String!,$price:MoneyInput!,$qty:Int!){
         orderEditAddCustomItem(id:$id,title:$title,price:$price,quantity:$qty,taxable:false,requiresShipping:false){
           calculatedOrder{id} userErrors{field message}}}`,
-        { id: calcId, title: `Order discount: ${payload.discountReason}`, price: { amount: `-${discAmt.toFixed(2)}`, currencyCode: 'USD' }, qty: 1 });
+        { id: calcId, title: `${ORDER_DISCOUNT_PREFIX}${payload.discountReason}`, price: { amount: `-${discAmt.toFixed(2)}`, currencyCode: 'USD' }, qty: 1 });
       const addErrs = addRes.data?.orderEditAddCustomItem?.userErrors || [];
       if (addErrs.length) throw new OrderEditError(addErrs.map(e => e.message));
+    }, (lineState) => {
+      // VERIFY-OR-FAIL: exactly ONE active discount line, at the amount we intended. Catches both a
+      // failed replace (two discounts = double-discount) and a silently no-op'd add.
+      const active = (lineState.lines || []).filter(l => isOrderDiscountLine(l.title) && (l.currentQuantity || 0) > 0);
+      if (active.length !== 1) {
+        throw new OrderEditError(`expected exactly 1 discount line after apply, found ${active.length} — the order may be double-discounted; review it in Shopify`);
+      }
+      const applied = Math.abs(active[0].unitPrice * active[0].currentQuantity);
+      if (Math.abs(applied - expectedAmt) > 0.01) {
+        throw new OrderEditError(`discount landed at ${fmtMoney(applied)} but ${fmtMoney(expectedAmt)} was intended — please re-check the order`);
+      }
     });
     logOrderEdit(orderId, session.email, null, { action: 'discount/order', payload });
     auditLog(session.email, 'order_edit_discount', orderId, null, payload);
