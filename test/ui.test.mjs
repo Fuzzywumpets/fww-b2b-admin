@@ -1240,6 +1240,63 @@ await test('committed custom row: price edit re-routes to line/price (not silent
   assert.equal(Number(fee.unitPrice), 25, `post-commit price edit dropped: got ${fee.unitPrice}, expected 25`);
 });
 
+// REGRESSION (caught by adversarial review of the 30d3709 fix itself, 2026-07-21):
+// the custom-line idemKey MUST stay row-scoped (sticky). A fresh uuid per Add click means that
+// when Shopify commits but the HTTP response is lost, the retry stages a SECOND real money line
+// that Shopify cannot delete. This drops the response of the first Add AFTER the server has
+// processed it — exactly that scenario — and asserts the retry replays instead of double-adding.
+await test('REGRESSION: lost response on Add → retry REPLAYS, does not double-add a money line', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+
+  let dropOnce = true;
+  await page.route('**/line/custom', async route => {
+    if (dropOnce) {
+      dropOnce = false;
+      await route.fetch();          // server DOES receive + commit it
+      await route.abort('failed');  // ...but the browser never sees the response
+      return;
+    }
+    await route.continue();
+  });
+
+  await page.goto(`${BASE}/orders/1007`);
+  await page.waitForSelector('#edit-form', { timeout: 8000 });
+  await page.click('#edit-btn');
+  await page.click('button[onclick="addCustomLineRow()"]');
+  await page.waitForSelector('tr.custom-line-new .ncl-title', { timeout: 4000 });
+  await page.type('tr.custom-line-new .ncl-title', 'Lost response fee', { delay: 20 });
+  await page.click('tr.custom-line-new .ncl-price', { clickCount: 3 });
+  await page.type('tr.custom-line-new .ncl-price', '42', { delay: 20 });
+
+  const keyBefore = await page.$eval('tr.custom-line-new', tr => tr.dataset.idemKey || null);
+  await page.click('tr.custom-line-new .ncl-add');
+  await page.waitForFunction(() => {
+    const c = document.querySelector('tr.custom-line-new .row-save-chip');
+    return c && c.dataset.state === 'failed';
+  }, { timeout: 10000 });
+
+  // The row must have STAMPED a key on the first attempt and must REUSE it on retry.
+  const keyAfter = await page.$eval('tr.custom-line-new', tr => tr.dataset.idemKey || null);
+  assert.ok(keyAfter, 'row did not stamp a sticky idemKey — a fresh key per click double-adds');
+  assert.equal(keyBefore, null, 'key should be minted at first submit, not at row creation');
+
+  await page.click('tr.custom-line-new .ncl-add'); // operator retries the "failed" line
+  await page.waitForFunction(() => document.querySelector('tr.custom-line-new')?.dataset.committedLiId, { timeout: 10000 });
+
+  const retryKey = await page.$eval('tr.custom-line-new', tr => tr.dataset.idemKey || null);
+  assert.equal(retryKey, keyAfter, `retry minted a NEW key (${retryKey} != ${keyAfter}) — this is the double-add regression`);
+
+  // Server truth: exactly ONE such line, at the right price.
+  const state = await page.evaluate(async () => {
+    const r = await fetch('/api/orders/1007/line-state', { credentials: 'same-origin' });
+    return r.json();
+  });
+  const fees = (state.lines || []).filter(l => l.title === 'Lost response fee' && (l.currentQuantity || 0) > 0);
+  assert.equal(fees.length, 1, `DOUBLE-ADD: expected 1 "Lost response fee" line, got ${fees.length}`);
+  assert.equal(Number(fees[0].unitPrice), 42, `price wrong: got ${fees[0].unitPrice}`);
+});
+
 await browser.close();
 
 console.log(`\n  ${passed} passed, ${failed} failed`);

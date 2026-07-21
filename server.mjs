@@ -3040,7 +3040,13 @@ function renderOrderDetail(session, order, flash, flashMsg) {
                       if (!title){ setChip(tr, 'failed', 'Title required'); if (titleEl) titleEl.focus(); return; }
                       if (!(qty > 0)){ setChip(tr, 'failed', 'Qty must be at least 1'); if (qtyEl) qtyEl.focus(); return; }
                       if (!(price >= 0)){ setChip(tr, 'failed', 'Price required'); if (priceEl) priceEl.focus(); return; }
-                      var idemKey = uuid(); // fresh per submission — never reused across different payloads
+                      // Row-scoped (STICKY) key, matching addCatalogLine. This is the double-add
+                      // guard: if Shopify commits but the HTTP response is lost, the chip reads
+                      // "Not saved" and the operator clicks Add again — the sticky key replays the
+                      // committed ledger row instead of staging a SECOND real money line (which
+                      // Shopify cannot delete). Reusing it across a CORRECTED payload is now safe:
+                      // the server 409s with IDEM_PAYLOAD_MISMATCH and run() auto-rekeys this row.
+                      var idemKey = tr.dataset.idemKey || (tr.dataset.idemKey = uuid());
                       saving = true;
                       if (addBtn){ addBtn.disabled = true; addBtn.textContent = 'Adding…'; }
                       run(tr, idemKey, '/orders/' + ORDER_ID + '/line/custom', { idemKey: idemKey, title: title, qty: qty, price: price }, function(j){
