@@ -1165,6 +1165,81 @@ await test('Customer detail: B2B Customer Settings card has outstanding section'
   assert.ok(html.includes('B2B Customer Settings'), 'Customer detail should have B2B Customer Settings card');
 });
 
+// ── REGRESSION: $80-shipping custom-line loss (2026-07-21) ───────────────────
+// Reproduces Alex's exact keystroke sequence: type a partial title, PAUSE past the old 600ms
+// debounce, finish the title, enter the price, commit. On the pre-fix build the pause committed
+// "UPS world" × 1 @ $0.00 and the corrected data was replay-swallowed; this asserts the server
+// truth (line-state) ends with exactly ONE custom line carrying the FULL title and price.
+console.log('\nUI tests — REGRESSION: custom-line explicit commit (real keystrokes):');
+
+await test('slow-typed custom line commits ONCE, with full title and $80 price', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/orders/1007`);
+  await page.waitForSelector('#edit-form', { timeout: 8000 });
+  await page.click('#edit-btn'); // custom-line controls live behind edit mode
+  await page.click('button[onclick="addCustomLineRow()"]');
+  await page.waitForSelector('tr.custom-line-new .ncl-title', { timeout: 4000 });
+
+  // Real keystrokes with a mid-title pause LONGER than the old debounce window.
+  await page.type('tr.custom-line-new .ncl-title', 'UPS world', { delay: 25 });
+  await page.waitForTimeout(900); // old build: premature $0 commit fired here
+  await page.type('tr.custom-line-new .ncl-title', 'wide saver', { delay: 25 });
+  await page.click('tr.custom-line-new .ncl-price', { clickCount: 3 });
+  await page.type('tr.custom-line-new .ncl-price', '80', { delay: 25 });
+  await page.waitForTimeout(900); // old build: second flush replay-swallowed here
+
+  // The row must NOT have auto-committed during either pause.
+  const premature = await page.$eval('tr.custom-line-new', tr => tr.dataset.committedLiId || null);
+  assert.equal(premature, null, `row auto-committed during a typing pause (liId=${premature}) — the premature-$0 bug is back`);
+
+  // Explicit commit via the Add button.
+  await page.click('tr.custom-line-new .ncl-add');
+  await page.waitForFunction(() => {
+    const tr = document.querySelector('tr.custom-line-new');
+    return tr && tr.dataset.committedLiId;
+  }, { timeout: 8000 });
+
+  // Assert SERVER truth, not UI chrome: exactly one UPS line, full title, price 80.
+  const state = await page.evaluate(async () => {
+    const r = await fetch('/api/orders/1007/line-state', { credentials: 'same-origin' });
+    return r.json();
+  });
+  const ups = (state.lines || []).filter(l => (l.title || '').startsWith('UPS'));
+  assert.equal(ups.length, 1, `expected exactly 1 UPS line, got ${ups.length}: ${JSON.stringify(ups.map(l => l.title))}`);
+  assert.equal(ups[0].title, 'UPS worldwide saver', `title truncated: "${ups[0].title}"`);
+  assert.equal(Number(ups[0].unitPrice), 80, `price lost: got ${ups[0].unitPrice}, expected 80`);
+});
+
+await test('committed custom row: price edit re-routes to line/price (not silently dropped)', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/orders/1008`);
+  await page.waitForSelector('#edit-form', { timeout: 8000 });
+  await page.click('#edit-btn'); // custom-line controls live behind edit mode
+  await page.click('button[onclick="addCustomLineRow()"]');
+  await page.waitForSelector('tr.custom-line-new .ncl-title', { timeout: 4000 });
+  await page.type('tr.custom-line-new .ncl-title', 'Handling fee', { delay: 20 });
+  await page.click('tr.custom-line-new .ncl-price', { clickCount: 3 });
+  await page.type('tr.custom-line-new .ncl-price', '10', { delay: 20 });
+  await page.click('tr.custom-line-new .ncl-add');
+  await page.waitForFunction(() => document.querySelector('tr.custom-line-new')?.dataset.committedLiId, { timeout: 8000 });
+
+  // Now CORRECT the price on the committed row — pre-fix this was silently ignored.
+  await page.click('tr.custom-line-new .ncl-price', { clickCount: 3 });
+  await page.type('tr.custom-line-new .ncl-price', '25', { delay: 20 });
+  await page.keyboard.press('Tab'); // real focus move fires the change event
+  await page.waitForTimeout(1200); // let the per-line debounce (500ms) flush
+
+  const state = await page.evaluate(async () => {
+    const r = await fetch('/api/orders/1008/line-state', { credentials: 'same-origin' });
+    return r.json();
+  });
+  const fee = (state.lines || []).find(l => l.title === 'Handling fee');
+  assert.ok(fee, 'Handling fee line missing from server state');
+  assert.equal(Number(fee.unitPrice), 25, `post-commit price edit dropped: got ${fee.unitPrice}, expected 25`);
+});
+
 await browser.close();
 
 console.log(`\n  ${passed} passed, ${failed} failed`);

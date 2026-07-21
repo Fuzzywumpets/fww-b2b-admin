@@ -112,6 +112,18 @@ const app = express();
 app.use(express.json({ verify: (req, _res, buf) => { req.rawBody = buf; } }));
 app.use(express.urlencoded({ extended: true }));
 
+// WHAT: slow-request tripwire — any response slower than 1s logs method/path/status/ms, so a
+// "the app feels broken" report (e.g. the 10s-login complaint, 2026-07-21) yields journalctl data
+// instead of guesses. Path only (no query) — never log tokens/codes from OAuth redirects.
+app.use((req, res, next) => {
+  const t0 = process.hrtime.bigint();
+  res.on('finish', () => {
+    const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+    if (ms > 1000) console.log(`[slow-req] ${req.method} ${req.path} ${res.statusCode} ${Math.round(ms)}ms`);
+  });
+  next();
+});
+
 // Baseline Content-Security-Policy + hardening headers (defense-in-depth). Inline scripts/handlers
 // still require 'unsafe-inline' today, but this blocks external script/exfil hosts, object/base-uri
 // injection, and framing/clickjacking. Nonce-based lockdown of inline scripts is follow-up work.
@@ -2710,7 +2722,8 @@ function renderOrderDetail(session, order, flash, flashMsg) {
                   '<td><span class="text-muted">CUSTOM</span></td>' +
                   '<td class="text-right"><input type="number" class="filter-input ncl-qty" value="1" min="1" step="1" style="width:60px;text-align:right"></td>' +
                   '<td class="text-right"><input type="number" class="filter-input ncl-price" value="0.00" min="0" step="0.01" style="width:80px;text-align:right"></td>' +
-                  '<td class="text-right"><button type="button" class="btn btn-ghost btn-sm" onclick="removeCustomLineRow(this)" title="Remove this new line">\u00D7</button></td>';
+                  '<td class="text-right" style="white-space:nowrap"><button type="button" class="btn btn-primary btn-sm ncl-add" title="Add this line to the order">Add</button> ' +
+                    '<button type="button" class="btn btn-ghost btn-sm" onclick="removeCustomLineRow(this)" title="Remove this new line">\u00D7</button></td>';
                 tbody.appendChild(tr);
                 tr.querySelector('.ncl-title').focus();
                 // Phase 16H: incremental auto-save \u2014 persist on blur once title/qty/price are valid.
@@ -2954,7 +2967,7 @@ function renderOrderDetail(session, order, flash, flashMsg) {
                 }
 
                 // Generic single-action runner with per-row chip + idemKey + retry.
-                function run(tr, idemKey, path, body, onOk){
+                function run(tr, idemKey, path, body, onOk, rekeyed){
                   setChip(tr, 'saving'); inflight++; setPill();
                   return post(path, body).then(function(res){
                     inflight--;
@@ -2962,6 +2975,14 @@ function renderOrderDetail(session, order, flash, flashMsg) {
                       setChip(tr, 'saved', (res.json.warnings && res.json.warnings.length) ? res.json.warnings.join(' ') : '');
                       totals(res.json.order);
                       if (onOk) onOk(res.json);
+                    } else if (res.json && res.json.code === 'IDEM_PAYLOAD_MISMATCH' && !rekeyed){
+                      // The server refused to replay a stale save-token against NEW data (the
+                      // $80-shipping loss class). Mint a fresh key and resubmit exactly once.
+                      var nk = uuid();
+                      if (tr && tr.dataset && tr.dataset.idemKey === body.idemKey) tr.dataset.idemKey = nk;
+                      body.idemKey = nk;
+                      setPill();
+                      return run(tr, nk, path, body, onOk, true);
                     } else {
                       var msg = (res.json && res.json.errors) ? res.json.errors.join('; ') : 'Save failed';
                       setChip(tr, 'failed', msg);
@@ -2985,32 +3006,57 @@ function renderOrderDetail(session, order, flash, flashMsg) {
                       if (j.line && j.line.liId){ tr.dataset.committedLiId = j.line.liId; }
                     });
                   },
-                  // Custom row: persist once title && qty>0 && price>=0; once committed it
-                  // becomes an existing line keyed by committedLiId (qty/price edits re-route there).
-                  // P0 fix (2026-06-29): DEBOUNCE the save. The old code fired on the blur of ANY field,
-                  // so leaving the title box (with qty still at its default 1 and price at 0.00) committed
-                  // a premature "1 × $0.00" line and stamped an idemKey — then the corrected qty/price
-                  // blurs were DEDUPED as replays and ignored, so the custom line saved as garbage and
-                  // looked broken. Debouncing 600ms after the LAST edit lets the user fill all three
-                  // fields; only the final values are committed (one idemKey assigned at flush time).
+                  // Custom row: EXPLICIT commit only (Add button or Enter) — NEVER on a typing pause.
+                  // P0 fix (2026-07-21, $80-shipping loss): the 6/29 debounce auto-save still fired
+                  // mid-entry (any pause >600ms committed a half-typed title with the pristine $0.00
+                  // price), and the row-scoped idemKey then deduped the corrected resubmit as a
+                  // replay — the fixed data was silently dropped and the UI said "saved". A committed
+                  // Shopify line can never be renamed, so premature commits are unrecoverable; the only
+                  // safe design is no implicit commit at all. The main batch Save still picks up
+                  // uncommitted rows (serializeCustomLines), so an un-clicked row is never lost.
+                  // After commit: qty/price edits re-route through the per-line editors (fresh idemKey
+                  // per flush); the title input locks.
                   wireCustomRow: function(tr){
                     var titleEl = tr.querySelector('.ncl-title'), qtyEl = tr.querySelector('.ncl-qty'), priceEl = tr.querySelector('.ncl-price');
-                    var t = null;
-                    function flush(){
-                      if (tr.dataset.committedLiId) return; // already saved
+                    var addBtn = tr.querySelector('.ncl-add');
+                    var saving = false;
+                    function lockCommitted(){
+                      if (titleEl && !titleEl.readOnly){ titleEl.readOnly = true; titleEl.title = 'Saved — to rename, remove this line and add a new one.'; }
+                      if (addBtn){ addBtn.remove(); addBtn = null; }
+                    }
+                    function reroute(){
+                      var liId = tr.dataset.committedLiId;
+                      var q = parseInt(qtyEl && qtyEl.value, 10);
+                      var pr = parseFloat(priceEl && priceEl.value);
+                      if (q > 0) window.__autosave.qtyChange(tr, liId, q);
+                      if (pr >= 0) window.__autosave.priceChange(tr, liId, pr);
+                    }
+                    function commit(){
+                      if (tr.dataset.committedLiId){ reroute(); return; }
+                      if (saving) return; // single-flight: the in-flight submit carries final values
                       var title = (titleEl && titleEl.value || '').trim();
                       var qty = parseInt(qtyEl && qtyEl.value, 10);
                       var price = parseFloat(priceEl && priceEl.value);
-                      if (!title || !(qty > 0) || !(price >= 0)) return;
-                      var idemKey = tr.dataset.idemKey || (tr.dataset.idemKey = uuid());
+                      if (!title){ setChip(tr, 'failed', 'Title required'); if (titleEl) titleEl.focus(); return; }
+                      if (!(qty > 0)){ setChip(tr, 'failed', 'Qty must be at least 1'); if (qtyEl) qtyEl.focus(); return; }
+                      if (!(price >= 0)){ setChip(tr, 'failed', 'Price required'); if (priceEl) priceEl.focus(); return; }
+                      var idemKey = uuid(); // fresh per submission — never reused across different payloads
+                      saving = true;
+                      if (addBtn){ addBtn.disabled = true; addBtn.textContent = 'Adding…'; }
                       run(tr, idemKey, '/orders/' + ORDER_ID + '/line/custom', { idemKey: idemKey, title: title, qty: qty, price: price }, function(j){
-                        if (j.line && j.line.liId){ tr.dataset.committedLiId = j.line.liId; }
+                        if (j.line && j.line.liId){ tr.dataset.committedLiId = j.line.liId; lockCommitted(); }
+                      }).then(function(){
+                        saving = false;
+                        if (addBtn && !tr.dataset.committedLiId){ addBtn.disabled = false; addBtn.textContent = 'Add'; }
                       });
                     }
-                    function schedule(){ if (t) clearTimeout(t); t = setTimeout(flush, 600); }
-                    // Re-arm the debounce on every edit; also flush promptly when the row loses focus
-                    // entirely (user tabbed/clicked away) so a finished line saves without waiting.
-                    [titleEl, qtyEl, priceEl].forEach(function(el){ if (el){ el.addEventListener('input', schedule); el.addEventListener('blur', schedule); } });
+                    [titleEl, qtyEl, priceEl].forEach(function(el){
+                      if (!el) return;
+                      el.addEventListener('keydown', function(e){ if (e.key === 'Enter'){ e.preventDefault(); commit(); } });
+                      // Committed rows: field changes flow straight to the per-line editors.
+                      el.addEventListener('change', function(){ if (tr.dataset.committedLiId) reroute(); });
+                    });
+                    if (addBtn) addBtn.addEventListener('click', function(){ commit(); });
                   },
                   // Existing-line qty change (debounced, single-flight, last-write-wins).
                   qtyChange: function(tr, liId, qty){
@@ -5139,15 +5185,21 @@ app.get('/auth/google/callback', async (req, res) => {
   if (!state || state !== storedState)
     return res.redirect('/login?error=Invalid+OAuth+state+%E2%80%94+please+try+again');
   try {
+    // Per-step timing: if login ever feels slow, journalctl shows WHICH leg ate the time.
+    const tTok = Date.now();
     const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
       method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({ grant_type: 'authorization_code', code, redirect_uri: REDIRECT_URI, client_id: GOOGLE_CLIENT_ID, client_secret: GOOGLE_CLIENT_SECRET }),
+      signal: AbortSignal.timeout(10000),
     });
     if (!tokenRes.ok) return res.redirect('/login?error=OAuth+token+exchange+failed');
     const tokens = await tokenRes.json();
-    const userRes = await fetch('https://openidconnect.googleapis.com/v1/userinfo', { headers: { Authorization: `Bearer ${tokens.access_token}` } });
+    const tUser = Date.now();
+    const userRes = await fetch('https://openidconnect.googleapis.com/v1/userinfo', { headers: { Authorization: `Bearer ${tokens.access_token}` }, signal: AbortSignal.timeout(10000) });
     if (!userRes.ok) return res.redirect('/login?error=Failed+to+fetch+user+info');
     const user = await userRes.json();
+    const tokMs = tUser - tTok, userMs = Date.now() - tUser;
+    if (tokMs + userMs > 1000) console.log(`[auth-timing] token-exchange=${tokMs}ms userinfo=${userMs}ms`);
     if (!user.email_verified) return res.redirect('/login?error=Google+email+not+verified');
     const emailLower = (user.email || '').toLowerCase();
     if (!currentAllowedEmails().some(e => e.toLowerCase() === emailLower))
@@ -5716,6 +5768,35 @@ class OrderEditError extends Error {
   }
 }
 
+// WHAT: replay guard — an idemKey may only replay the SAME action+payload it committed. A reused
+// key carrying DIFFERENT data is a distinct submission wrongly deduped: silently replaying drops
+// the new data ($80-shipping loss, 2026-07-21 — premature "UPS world"×1@$0 committed, then the
+// corrected "UPS worldwide saver"@$80 replayed the $0 result and reported ok). 409s with
+// IDEM_PAYLOAD_MISMATCH so the client mints a fresh key and resubmits.
+// INVARIANT(S): comparison is exact-JSON (same call site builds the payload object, so key order
+// is deterministic); legacy rows with null payload_json always pass (never break an old retry).
+function assertReplayPayloadMatches(existing, action, payload) {
+  if (!existing || existing.payload_json == null) return;
+  let same = false;
+  try { same = existing.action === action && existing.payload_json === JSON.stringify(payload); } catch { same = false; }
+  if (!same) {
+    console.error(`[order-edit] IDEM_PAYLOAD_MISMATCH idem=${existing.idem_key} stored action=${existing.action} — refusing to replay a different payload`);
+    const err = new OrderEditError(['This change reused a save-token from an earlier edit — retrying with a fresh one.']);
+    err.code = 'IDEM_PAYLOAD_MISMATCH';
+    throw err;
+  }
+}
+
+// WHAT: shared error→HTTP mapping for the incremental order-edit routes.
+// IDEM_PAYLOAD_MISMATCH → 409 + code (client auto-rekeys and resubmits once); anything else → 422.
+function editErrorResponse(res, idemKey, err, label) {
+  const msgs = err instanceof OrderEditError ? err.userMessages : [err.message];
+  console.error(`[${label}] failed:`, msgs.join('; '));
+  const body = { ok: false, idemKey, errors: msgs };
+  if (err.code) body.code = err.code;
+  return res.status(err.code === 'IDEM_PAYLOAD_MISMATCH' ? 409 : 422).json(body);
+}
+
 // Per-order serialization: chain of promises keyed by orderId so concurrent rapid edits
 // (5 qty changes + an add fired at once) run one-at-a-time and never race a begin/commit.
 const orderEditLocks = new Map(); // orderId -> Promise (tail of the chain)
@@ -5792,6 +5873,7 @@ async function runOrderEdit(orderId, idemKey, editedBy, action, payload, stageFn
   // 1) DEDUPE FIRST — never re-stage a committed action (kills the double-add hazard).
   const existing = getEditAction(idemKey);
   if (existing && existing.status === 'committed') {
+    assertReplayPayloadMatches(existing, action, payload);
     try { return { ...JSON.parse(existing.result_json || '{}'), replayed: true }; }
     catch { return { replayed: true }; }
   }
@@ -5800,6 +5882,7 @@ async function runOrderEdit(orderId, idemKey, editedBy, action, payload, stageFn
     // Re-check inside the lock (a concurrent request with the same key may have just committed).
     const again = getEditAction(idemKey);
     if (again && again.status === 'committed') {
+      assertReplayPayloadMatches(again, action, payload);
       try { return { ...JSON.parse(again.result_json || '{}'), replayed: true }; }
       catch { return { replayed: true }; }
     }
@@ -5886,6 +5969,7 @@ async function runOrderEdit(orderId, idemKey, editedBy, action, payload, stageFn
 function mockIncrementalEdit({ numId, idemKey, action, payload, editFn, editedBy }) {
   const existing = getEditAction(idemKey);
   if (existing && existing.status === 'committed') {
+    assertReplayPayloadMatches(existing, action, payload);
     try { return { ...JSON.parse(existing.result_json || '{}'), replayed: true }; }
     catch { return { replayed: true }; }
   }
@@ -6296,6 +6380,11 @@ app.post('/orders/:id/line/add', requireAuth, async (req, res) => {
   const lp = parseFloat(listPrice) || 0;
   const pr = Math.max(0, parseFloat(price) || 0);
   const payload = { variantId: String(variantId), title: String(title || ''), sku: String(sku || ''), qty: q, listPrice: lp, price: pr };
+  const dup = getEditAction(idemKey);
+  if (dup && dup.status === 'committed') {
+    try { assertReplayPayloadMatches(dup, 'line/add', payload); }
+    catch (err) { return editErrorResponse(res, idemKey, err, 'line/add'); }
+  }
 
   if (MOCK) {
     const out = mockIncrementalEdit({ numId, idemKey, action: 'line/add', payload, editedBy: session.email, editFn: (edges) => {
@@ -6360,9 +6449,7 @@ app.post('/orders/:id/line/add', requireAuth, async (req, res) => {
     auditLog(session.email, 'order_edit_line_add', orderId, null, payload);
     return res.json({ ok: true, idemKey, replayed: !!result.replayed, warnings: result.warnings || [], line: { liId: line?.liId, title: line?.title || payload.title, sku: line?.sku || payload.sku, qty: line?.currentQuantity ?? q, unitPrice: line?.unitPrice ?? pr }, order: result.order });
   } catch (err) {
-    const msgs = err instanceof OrderEditError ? err.userMessages : [err.message];
-    console.error('[line/add] failed:', msgs.join('; '));
-    return res.status(422).json({ ok: false, idemKey, errors: msgs });
+    return editErrorResponse(res, idemKey, err, 'line/add');
   }
 });
 
@@ -6377,6 +6464,11 @@ app.post('/orders/:id/line/custom', requireAuth, async (req, res) => {
   const pr = parseFloat(price);
   if (!title || !(q > 0) || !(pr >= 0)) return res.status(400).json({ ok: false, errors: ['title, qty>0 and price>=0 required'] });
   const payload = { title: String(title).slice(0, 200), qty: q, price: pr };
+  const dup = getEditAction(idemKey);
+  if (dup && dup.status === 'committed') {
+    try { assertReplayPayloadMatches(dup, 'line/custom', payload); }
+    catch (err) { return editErrorResponse(res, idemKey, err, 'line/custom'); }
+  }
 
   if (MOCK) {
     const out = mockIncrementalEdit({ numId, idemKey, action: 'line/custom', payload, editedBy: session.email, editFn: (edges) => {
@@ -6409,9 +6501,7 @@ app.post('/orders/:id/line/custom', requireAuth, async (req, res) => {
     auditLog(session.email, 'order_edit_line_custom', orderId, null, payload);
     return res.json({ ok: true, idemKey, replayed: !!result.replayed, warnings: result.warnings || [], line: { liId: line?.liId, title: payload.title, sku: '', qty: line?.currentQuantity ?? q, unitPrice: line?.unitPrice ?? pr }, order: result.order });
   } catch (err) {
-    const msgs = err instanceof OrderEditError ? err.userMessages : [err.message];
-    console.error('[line/custom] failed:', msgs.join('; '));
-    return res.status(422).json({ ok: false, idemKey, errors: msgs });
+    return editErrorResponse(res, idemKey, err, 'line/custom');
   }
 });
 
@@ -6426,6 +6516,11 @@ app.post('/orders/:id/line/qty', requireAuth, async (req, res) => {
   const q = parseInt(qty, 10);
   if (!liId || !(q >= 0)) return res.status(400).json({ ok: false, errors: ['liId and qty>=0 required'] });
   const payload = { liId: String(liId), qty: q };
+  const dup = getEditAction(idemKey);
+  if (dup && dup.status === 'committed') {
+    try { assertReplayPayloadMatches(dup, 'line/qty', payload); }
+    catch (err) { return editErrorResponse(res, idemKey, err, 'line/qty'); }
+  }
 
   if (MOCK) {
     const out = mockIncrementalEdit({ numId, idemKey, action: 'line/qty', payload, editedBy: session.email, editFn: (edges) => {
@@ -6461,9 +6556,7 @@ app.post('/orders/:id/line/qty', requireAuth, async (req, res) => {
     auditLog(session.email, 'order_edit_line_qty', orderId, null, payload);
     return res.json({ ok: true, idemKey, replayed: !!result.replayed, warnings: result.warnings || [], line: { liId: payload.liId, currentQuantity: l?.currentQuantity ?? q }, order: result.order });
   } catch (err) {
-    const msgs = err instanceof OrderEditError ? err.userMessages : [err.message];
-    console.error('[line/qty] failed:', msgs.join('; '));
-    return res.status(422).json({ ok: false, idemKey, errors: msgs });
+    return editErrorResponse(res, idemKey, err, 'line/qty');
   }
 });
 
@@ -6478,6 +6571,11 @@ app.post('/orders/:id/line/price', requireAuth, async (req, res) => {
   const pr = parseFloat(price);
   if (!liId || !(pr >= 0)) return res.status(400).json({ ok: false, errors: ['liId and price>=0 required'] });
   const payload = { liId: String(liId), price: pr };
+  const dup = getEditAction(idemKey);
+  if (dup && dup.status === 'committed') {
+    try { assertReplayPayloadMatches(dup, 'line/price', payload); }
+    catch (err) { return editErrorResponse(res, idemKey, err, 'line/price'); }
+  }
 
   if (MOCK) {
     const out = mockIncrementalEdit({ numId, idemKey, action: 'line/price', payload, editedBy: session.email, editFn: (edges) => {
@@ -6526,9 +6624,7 @@ app.post('/orders/:id/line/price', requireAuth, async (req, res) => {
     auditLog(session.email, 'order_edit_line_price', orderId, null, payload);
     return res.json({ ok: true, idemKey, replayed: !!result.replayed, warnings: result.warnings || [], line: { liId: payload.liId, unitPrice: l?.unitPrice ?? pr }, order: result.order });
   } catch (err) {
-    const msgs = err instanceof OrderEditError ? err.userMessages : [err.message];
-    console.error('[line/price] failed:', msgs.join('; '));
-    return res.status(422).json({ ok: false, idemKey, errors: msgs });
+    return editErrorResponse(res, idemKey, err, 'line/price');
   }
 });
 
@@ -6542,6 +6638,11 @@ app.post('/orders/:id/line/remove', requireAuth, async (req, res) => {
   if (!idemKey) return res.status(400).json({ ok: false, errors: ['idemKey required'] });
   if (!liId) return res.status(400).json({ ok: false, errors: ['liId required'] });
   const payload = { liId: String(liId) };
+  const dup = getEditAction(idemKey);
+  if (dup && dup.status === 'committed') {
+    try { assertReplayPayloadMatches(dup, 'line/remove', payload); }
+    catch (err) { return editErrorResponse(res, idemKey, err, 'line/remove'); }
+  }
 
   if (MOCK) {
     const out = mockIncrementalEdit({ numId, idemKey, action: 'line/remove', payload, editedBy: session.email, editFn: (edges) => {
@@ -6576,9 +6677,7 @@ app.post('/orders/:id/line/remove', requireAuth, async (req, res) => {
     auditLog(session.email, 'order_edit_line_remove', orderId, null, payload);
     return res.json({ ok: true, idemKey, replayed: !!result.replayed, warnings: result.warnings || [], line: { liId: payload.liId, currentQuantity: l?.currentQuantity ?? 0 }, order: result.order });
   } catch (err) {
-    const msgs = err instanceof OrderEditError ? err.userMessages : [err.message];
-    console.error('[line/remove] failed:', msgs.join('; '));
-    return res.status(422).json({ ok: false, idemKey, errors: msgs });
+    return editErrorResponse(res, idemKey, err, 'line/remove');
   }
 });
 
@@ -6594,6 +6693,11 @@ app.post('/orders/:id/discount/order', requireAuth, async (req, res) => {
   const fixed = parseFloat(discountFixed) || 0;
   if (!(pct > 0) && !(fixed > 0)) return res.status(422).json({ ok: false, errors: ['a discount % or $ amount is required'] });
   const payload = { discountPct: pct || null, discountFixed: fixed || null, discountReason: String(discountReason).slice(0, 200) };
+  const dup = getEditAction(idemKey);
+  if (dup && dup.status === 'committed') {
+    try { assertReplayPayloadMatches(dup, 'discount/order', payload); }
+    catch (err) { return editErrorResponse(res, idemKey, err, 'discount/order'); }
+  }
 
   if (MOCK) {
     const out = mockIncrementalEdit({ numId, idemKey, action: 'discount/order', payload, editedBy: session.email, editFn: (edges) => {
@@ -6628,9 +6732,7 @@ app.post('/orders/:id/discount/order', requireAuth, async (req, res) => {
     auditLog(session.email, 'order_edit_discount', orderId, null, payload);
     return res.json({ ok: true, idemKey, replayed: !!result.replayed, warnings: result.warnings || [], order: result.order });
   } catch (err) {
-    const msgs = err instanceof OrderEditError ? err.userMessages : [err.message];
-    console.error('[discount/order] failed:', msgs.join('; '));
-    return res.status(422).json({ ok: false, idemKey, errors: msgs });
+    return editErrorResponse(res, idemKey, err, 'discount/order');
   }
 });
 
@@ -6647,14 +6749,14 @@ app.get('/api/orders/:id/line-state', requireAuth, async (req, res) => {
       const cq = e.node.currentQuantity != null ? e.node.currentQuantity : e.node.quantity;
       const up = parseFloat(e.node.discountedUnitPriceSet?.presentmentMoney?.amount || 0);
       subtotal += up * (cq || 0);
-      return { liId: e.node.id, currentQuantity: cq, unitPrice: up };
+      return { liId: e.node.id, title: e.node.title || '', currentQuantity: cq, unitPrice: up };
     });
     const ship = parseFloat(order.totalShippingPriceSet?.presentmentMoney?.amount || 0);
     return res.json({ ok: true, lines, subtotal, total: subtotal + ship, lineCount: lines.filter(l => (l.currentQuantity || 0) > 0).length });
   }
   try {
     const st = await readCommittedLineState(orderId);
-    return res.json({ ok: true, lines: st.lines.map(l => ({ liId: l.liId, currentQuantity: l.currentQuantity, unitPrice: l.unitPrice })), subtotal: st.subtotal, total: st.total, lineCount: st.lineCount });
+    return res.json({ ok: true, lines: st.lines.map(l => ({ liId: l.liId, title: l.title || '', currentQuantity: l.currentQuantity, unitPrice: l.unitPrice })), subtotal: st.subtotal, total: st.total, lineCount: st.lineCount });
   } catch (err) {
     console.error('[line-state] failed:', err.message);
     return res.status(502).json({ ok: false, error: err.message });

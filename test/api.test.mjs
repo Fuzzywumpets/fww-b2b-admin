@@ -644,6 +644,44 @@ await test('POST /orders/1001/line/custom rejects missing fields with 4xx', asyn
   assert.equal(r.json.ok, false);
 });
 
+// REGRESSION ($80-shipping loss, 2026-07-21): a reused idemKey carrying DIFFERENT data was
+// silently deduped as a replay — the premature "UPS world"×1@$0 commit won and the corrected
+// "UPS worldwide saver"@$80 was dropped while the UI reported saved. The ledger must refuse to
+// replay a key against a payload it did not commit.
+await test('REGRESSION: reused idemKey + DIFFERENT payload → 409 IDEM_PAYLOAD_MISMATCH (never silently dropped)', async () => {
+  const cookie = await seedSession();
+  const k = uuid();
+  const r1 = await postJson('/orders/1001/line/custom', cookie, { idemKey: k, title: 'UPS world', qty: 1, price: 0 });
+  assert.equal(r1.status, 200, 'first commit succeeds');
+  const r2 = await postJson('/orders/1001/line/custom', cookie, { idemKey: k, title: 'UPS worldwide saver', qty: 1, price: 80 });
+  assert.equal(r2.status, 409, `different payload on same key must 409, got ${r2.status}`);
+  assert.equal(r2.json.code, 'IDEM_PAYLOAD_MISMATCH');
+  assert.equal(r2.json.ok, false);
+});
+
+await test('REGRESSION companion: reused idemKey + IDENTICAL payload still replays ok (true retry unharmed)', async () => {
+  const cookie = await seedSession();
+  const k = uuid();
+  const body = { idemKey: k, title: 'Rush fee retry', qty: 1, price: 5 };
+  const r1 = await postJson('/orders/1001/line/custom', cookie, body);
+  assert.equal(r1.status, 200);
+  const r2 = await postJson('/orders/1001/line/custom', cookie, body);
+  assert.equal(r2.status, 200, 'identical retry must replay, not 409');
+  assert.equal(r2.json.replayed, true, 'identical retry is a replay');
+});
+
+await test('REGRESSION: line/qty reused key + different qty also 409s (guard covers every action route)', async () => {
+  const cookie = await seedSession();
+  const base = await (await fetch(`${BASE}/api/orders/1001/line-state`, { headers: { Cookie: cookie } })).json();
+  const liId = base.lines[0].liId;
+  const k = uuid();
+  const r1 = await postJson('/orders/1001/line/qty', cookie, { idemKey: k, liId, qty: 3 });
+  assert.equal(r1.status, 200);
+  const r2 = await postJson('/orders/1001/line/qty', cookie, { idemKey: k, liId, qty: 7 });
+  assert.equal(r2.status, 409, `different qty on same key must 409, got ${r2.status}`);
+  assert.equal(r2.json.code, 'IDEM_PAYLOAD_MISMATCH');
+});
+
 await test('POST /orders/:id/line/* requires idemKey (400 without it)', async () => {
   const cookie = await seedSession();
   const r = await postJson('/orders/1001/line/add', cookie, { variantId: '350', qty: 1 });
