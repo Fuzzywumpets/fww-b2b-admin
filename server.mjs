@@ -1544,6 +1544,7 @@ async function shopifyFetch(query, variables = {}) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${SHOPIFY_BEARER}` },
     body: JSON.stringify({ query, variables }),
+    signal: AbortSignal.timeout(15000),
   });
   if (!res.ok) throw new Error(`shopify-bridge ${res.status}: ${await res.text()}`);
   const json = await res.json();
@@ -1555,7 +1556,13 @@ async function shopifyFetch(query, variables = {}) {
 // WHAT: assembles the dashboard model — open orders, week count, top customers, low-stock B2B variants, 12-mo revenue, pending-Xero-review list.
 // CHANGE-GUARD: live path issues TWO parallel shopifyFetch calls (orders tag:b2b-portal last 90d, products published) via Promise.all; the orders query is capped at first:50 with NO pagination, so >50 recent B2B orders silently truncate the open/week counts. Re-verify counts when volume grows.
 // INVARIANT(S): top customers prefer the all-time cache (getTopCustomersAllTime) and only fall back to the 90-day live spend map when the cache is empty; low-stock threshold is inventoryQuantity<10 and only for variants on the B2B publication; whole function is wrapped so any error returns a safe zeroed shape with .error set.
+const DASHBOARD_CACHE_TTL_MS = 60_000;
+let dashboardCache = { data: null, ts: 0 };
+
 async function getDashboardData() {
+  if (!MOCK && dashboardCache.data && (Date.now() - dashboardCache.ts) < DASHBOARD_CACHE_TTL_MS) {
+    return dashboardCache.data;
+  }
   if (MOCK) {
     return {
       openOrdersCount: 2,
@@ -1628,7 +1635,9 @@ async function getDashboardData() {
     const pendingReview = getCustomersPendingXeroReview();
     let monthly = [];
     try { const rd = getReportsDataFromCache(); monthly = rd.monthly || []; } catch(e) {}
-    return { openOrdersCount: openOrders.length, openOrders: openOrders.slice(0, 5), weekOrdersCount: weekOrders.length, topCustomers, lowStockItems: lowStockItems.sort((a,b)=>a.qty-b.qty).slice(0,10), pendingReview, monthly };
+    const result = { openOrdersCount: openOrders.length, openOrders: openOrders.slice(0, 5), weekOrdersCount: weekOrders.length, topCustomers, lowStockItems: lowStockItems.sort((a,b)=>a.qty-b.qty).slice(0,10), pendingReview, monthly };
+    dashboardCache = { data: result, ts: Date.now() };
+    return result;
   } catch (err) {
     console.error('getDashboardData error:', err.message);
     return { error: err.message, openOrdersCount:0, openOrders:[], weekOrdersCount:0, topCustomers:[], lowStockItems:[], pendingReview:[] };
