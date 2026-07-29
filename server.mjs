@@ -5217,6 +5217,9 @@ function getCustomersPendingXeroReview() {
   // B2B customers not yet mapped to a Xero contact (and not insiders).
   // Helps surface manual-review queue on the dashboard.
   try {
+    // SYNC: this literal list must match INSIDER_IDS in lib/xero-customer-sync.mjs:18 exactly —
+    // no shared import enforces it. Drift means a customer shows in this review queue while
+    // their orders still skip Xero (or vice versa).
     const INSIDERS = new Set(['4742401425601', '5163530813633']);
     const mapPath = path.join(__dirname, 'data', 'shopify_to_xero_mapping.json');
     let mapped = new Set();
