@@ -5,15 +5,20 @@ name: Desktop Shell — Build & Release
 #   owner/repo into resources/app-update.yml inside the installer, and the INSTALLED
 #   app reads it to find its update feed. If publish.repo and the repo this workflow
 #   releases into ever disagree, already-installed clients silently stop updating.
-# CHANGE-GUARD: tags are `desktop-v*`, NOT `v*` — this repo also ships the b2badmin
-#   server, so a bare `v*` filter would fire a desktop build on unrelated server tags.
-#   Bump desktop/package.json's "version" to match the tag or electron-updater will
-#   not see the release as newer.
+# CHANGE-GUARD: the tag MUST be `v<version>` matching desktop/package.json's "version".
+#   Two publishers write to the release on a tag build: electron-builder's own GitHub
+#   publisher (it uploads the hyphen-named .exe, its .blockmap, and the latest.yml that
+#   electron-updater actually reads) and the softprops step below. electron-builder
+#   derives its release tag from `v${version}` and ignores the git tag name, so a tag
+#   that is not exactly `v${version}` splits the assets across TWO releases and leaves
+#   latest.yml pointing at an .exe that isn't on the same release — a broken update feed.
+#   This repo has no other tags and no tag-driven server release, so `v*` is uncontended;
+#   if the server ever gains tags, prefix them rather than re-prefixing this.
 
 on:
   push:
     tags:
-      - 'desktop-v*'
+      - 'v*'
   workflow_dispatch:
 
 permissions:
@@ -50,7 +55,7 @@ jobs:
           path: desktop/dist/*.exe
 
       - name: Create Release
-        if: startsWith(github.ref, 'refs/tags/desktop-v')
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           files: |
