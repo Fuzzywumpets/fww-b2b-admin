@@ -82,24 +82,45 @@ jobs:
 
       # An unsigned build would still publish happily and then trip exactly the warnings
       # this signing exists to remove, so fail loudly instead of shipping one.
+      # Runs on EVERY build (not just tags) — a workflow_dispatch build that silently
+      # came out unsigned would hide a broken secret until the next release.
+      # SYNC: EXPECTED_THUMBPRINT must equal the thumbprint in
+      #   desktop/install-codesign-cert.ps1 and the cert behind WINDOWS_CSC_LINK. A
+      #   thumbprint is a public fingerprint, not a secret, so it is pinned in the clear
+      #   on purpose — pinning it is what makes this a real identity check.
       - name: Verify the installer is signed
-        if: startsWith(github.ref, 'refs/tags/v')
         shell: pwsh
         run: |
-          $exe = Get-ChildItem dist/*.exe | Select-Object -First 1
-          $sig = Get-AuthenticodeSignature $exe.FullName
-          "Installer : $($exe.Name)"
-          "Status    : $($sig.Status)"
-          "Signer    : $($sig.SignerCertificate.Subject)"
-          if ($sig.Status -eq 'NotSigned') {
-            Write-Error "Installer is NOT signed - check the WINDOWS_CSC_* repo secrets."
-            exit 1
+          $EXPECTED_THUMBPRINT = '2CDFA8AEDA884BDEDC14B7B6AF91EB31B15A9928'
+
+          $exes = @(Get-ChildItem dist/*.exe -ErrorAction SilentlyContinue)
+          if ($exes.Count -eq 0) { Write-Error "No installer produced in dist/."; exit 1 }
+
+          $failed = $false
+          foreach ($exe in $exes) {
+            $sig = Get-AuthenticodeSignature $exe.FullName
+            "--- $($exe.Name)"
+            "    Status     : $($sig.Status)"
+            "    Thumbprint : $($sig.SignerCertificate.Thumbprint)"
+            "    Subject    : $($sig.SignerCertificate.Subject)"
+
+            # Require Valid outright. NotSigned is only one of several bad states —
+            # HashMismatch, NotTrusted and UnknownError all mean a broken installer and
+            # must not reach a release either.
+            if ($sig.Status -ne 'Valid') {
+              Write-Error "  $($exe.Name): signature status is '$($sig.Status)', expected 'Valid'."
+              $failed = $true
+              continue
+            }
+            # Exact thumbprint, not a subject substring: 'CN=Fuzzywumpets Impostor Ltd'
+            # would satisfy a substring match on 'CN=Fuzzywumpets'.
+            if ($sig.SignerCertificate.Thumbprint -ne $EXPECTED_THUMBPRINT) {
+              Write-Error "  $($exe.Name): signed by unexpected cert $($sig.SignerCertificate.Thumbprint), expected $EXPECTED_THUMBPRINT."
+              $failed = $true
+            }
           }
-          if ($sig.SignerCertificate.Subject -notmatch 'CN=Fuzzywumpets') {
-            Write-Error "Signed by an unexpected certificate: $($sig.SignerCertificate.Subject)"
-            exit 1
-          }
-          "OK - signed by the expected certificate."
+          if ($failed) { exit 1 }
+          "OK - all $($exes.Count) installer(s) validly signed by the expected certificate."
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
