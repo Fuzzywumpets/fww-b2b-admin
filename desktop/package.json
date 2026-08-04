@@ -27,7 +27,7 @@
     "publish": {
       "provider": "github",
       "owner": "Fuzzywumpets",
-      "repo": "fww-b2b-admin"
+      "repo": "fww-b2b-admin-desktop"
     },
     "win": {
       "target": [

@@ -1,10 +1,18 @@
 name: Desktop Shell — Build & Release
 
-# WHAT: Builds + releases the Electron desktop shell that lives in desktop/.
-# DEPENDS: desktop/package.json's build.publish block — electron-builder bakes that
-#   owner/repo into resources/app-update.yml inside the installer, and the INSTALLED
-#   app reads it to find its update feed. If publish.repo and the repo this workflow
-#   releases into ever disagree, already-installed clients silently stop updating.
+# WHAT: Builds the Electron desktop shell that lives in desktop/, and publishes the release to the
+#   SEPARATE PUBLIC repo Fuzzywumpets/fww-b2b-admin-desktop.
+# CHANGE-GUARD: the release does NOT go to this repo, and must not be "simplified" to do so. This
+#   repo is PRIVATE, and electron-updater fetches releases.atom unauthenticated — against a private
+#   repo GitHub answers 404 and every installed client breaks with "Could not check for updates."
+#   That is not hypothetical: it shipped in 1.0.2 and broke the only install. The source lives here;
+#   only the published artifacts live in the public repo.
+# DEPENDS: desktop/package.json's build.publish block — electron-builder bakes that owner/repo into
+#   resources/app-update.yml inside the installer, and the INSTALLED app reads it to find its update
+#   feed. It must name the PUBLIC repo, and must match what this workflow releases into, or
+#   already-installed clients silently stop updating.
+# DEPENDS: repo secret RELEASE_TOKEN — a cross-repo token, because the default GITHUB_TOKEN is scoped
+#   to this repo only and cannot create a release in the desktop repo.
 # CHANGE-GUARD: the tag MUST be `v<version>` matching desktop/package.json's "version".
 #   Two publishers write to the release on a tag build: electron-builder's own GitHub
 #   publisher (it uploads the hyphen-named .exe, its .blockmap, and the latest.yml that
@@ -76,7 +84,9 @@ jobs:
       - name: Build NSIS installer
         run: npm run dist
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # RELEASE_TOKEN, not GITHUB_TOKEN: electron-builder's own publisher uploads into the
+          # separate public desktop repo, which the repo-scoped default token cannot write to.
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
           CSC_LINK: ${{ secrets.WINDOWS_CSC_LINK }}
           CSC_KEY_PASSWORD: ${{ secrets.WINDOWS_CSC_KEY_PASSWORD }}
 
@@ -128,13 +138,24 @@ jobs:
           name: installer-windows
           path: desktop/dist/*.exe
 
+      # SYNC: `repository` here and desktop/package.json's build.publish must name the SAME repo, and
+      #   it must be the PUBLIC one — see the CHANGE-GUARD at the top. generate_release_notes is off
+      #   because the tag lives in THIS repo while the release lives in the other one, so there is no
+      #   commit range for the target repo to generate notes from.
       - name: Create Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
+          repository: Fuzzywumpets/fww-b2b-admin-desktop
+          token: ${{ secrets.RELEASE_TOKEN }}
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          body: |
+            Desktop shell ${{ github.ref_name }}.
+
+            Source lives in the private repo `Fuzzywumpets/fww-b2b-admin` under `desktop/`;
+            only the built installer is published here so `electron-updater` can read the feed
+            without authentication.
           files: |
             desktop/dist/*.exe
             desktop/dist/*.yml
-          generate_release_notes: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

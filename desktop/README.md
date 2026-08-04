@@ -60,16 +60,20 @@ GitHub Actions (`.github/workflows/desktop-build.yml`, at the **repo root** — 
 only runs workflows from there) builds on `windows-latest` and attaches `*.exe` +
 `latest.yml` to the release. Installed apps pick the update up on their next launch.
 
-### One-time cutover: installs older than the repo merge need a manual reinstall
+### Releases are published to a different repo, on purpose
 
-The shell used to live in its own repo (`fww-b2b-admin-desktop`) and shipped with
-`resources/app-update.yml` pointing at **that** repo. That pointer is baked into the
-installer at build time, so a client installed before this merge keeps polling the
-old repo forever and will never see a release published here.
+Source lives here (private `fww-b2b-admin`), but every release is published to the
+**public** [`Fuzzywumpets/fww-b2b-admin-desktop`](https://github.com/Fuzzywumpets/fww-b2b-admin-desktop).
 
-Anyone still on **v1.0.1 or earlier must reinstall once** from this repo's Releases
-page. After that single reinstall, auto-update follows this repo normally. (As of the
-merge the only known install was Alex's PC.)
+That split is load-bearing. `electron-updater` fetches `releases.atom` **unauthenticated**;
+against a private repo GitHub answers **404**, and every installed client dies with
+"Could not check for updates." Version 1.0.2 shipped pointing at this private repo and
+did exactly that. Do not "tidy up" by pointing releases back here.
+
+Because the public repo is also where the shell *originally* published, clients on
+**v1.0.1 keep auto-updating with no reinstall**. Only **v1.0.2** is orphaned — its
+baked-in `app-update.yml` names the private repo — so a 1.0.2 install needs one manual
+update to 1.0.3, after which it is back on the working feed.
 
 ## Install
 
@@ -82,7 +86,7 @@ powershell -ExecutionPolicy Bypass -File .\install-codesign-cert.ps1
 ```
 
 Then download the latest `FWW-B2B-Admin-Setup-x.y.z.exe` from the
-[Releases page](https://github.com/Fuzzywumpets/fww-b2b-admin/releases) and run it.
+[Releases page](https://github.com/Fuzzywumpets/fww-b2b-admin-desktop/releases) and run it.
 (The release also carries a dot-separated `FWW.B2B.Admin.Setup.x.y.z.exe` — identical
 bytes, an artifact of the two publishers. Either works; the hyphenated one is what
 `latest.yml` and the auto-updater reference.)
