@@ -1,0 +1,64 @@
+{
+  "name": "fww-b2b-admin-desktop",
+  "version": "1.0.1",
+  "description": "Fuzzywumpets B2B Admin — desktop shell with auto-update",
+  "author": "Fuzzywumpets",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --win",
+    "dist:dir": "electron-builder --win --dir",
+    "icons": "powershell -ExecutionPolicy Bypass -File tools/make-icons.ps1 && node tools/make-ico.js",
+    "postinstall": "electron-builder install-app-deps"
+  },
+  "dependencies": {
+    "electron-store": "^8.2.0",
+    "electron-updater": "^6.3.0"
+  },
+  "devDependencies": {
+    "electron": "^36.0.0",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "com.fuzzywumpets.b2badmin",
+    "productName": "FWW B2B Admin",
+    "copyright": "Copyright © 2026 Fuzzywumpets",
+    "icon": "assets/icon.png",
+    "publish": {
+      "provider": "github",
+      "owner": "fuzzyalex84",
+      "repo": "fww-b2b-admin-desktop"
+    },
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "assets/icon.ico",
+      "requestedExecutionLevel": "asInvoker"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "allowElevation": true,
+      "installerIcon": "assets/icon.ico",
+      "uninstallerIcon": "assets/icon.ico",
+      "installerHeaderIcon": "assets/icon.ico",
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "FWW B2B Admin",
+      "runAfterFinish": true,
+      "deleteAppDataOnUninstall": false,
+      "license": null
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "assets/**"
+    ]
+  }
+}
