@@ -14,13 +14,38 @@ const ADMIN_URL = 'https://b2badmin.fuzzywumpets.com/';
 const APP_NAME  = 'FWW B2B Admin';
 const ICON_PATH = path.join(__dirname, 'assets', 'icon.png');
 
-// Hosts allowed to open as in-app popups (the Google OAuth flow). Anything else
+// Origins allowed to open as in-app popups (the Google OAuth flow). Anything else
 // opens in the user's default browser.
-const AUTH_HOSTS = [
+//
+// CHANGE-GUARD: compared as EXACT origins via httpsOrigin() + Set.has(), never with
+//   startsWith(). A prefix test accepts `https://accounts.google.com.evil.com`, which
+//   is a real bypass — in-app windows share the authenticated persist:b2badmin
+//   session, so whatever opens there inherits the admin's logged-in cookies.
+const AUTH_ORIGINS = new Set([
   'https://b2badmin.fuzzywumpets.com',
   'https://accounts.google.com',
   'https://b2badmin.fuzzyreporting.com',
-];
+]);
+
+// PDFs are only ever served BY the admin — Google is an OAuth origin, not a document
+// source, so it is deliberately absent here.
+// DEPENDS: isAdminPdfUrl() and both navigation interceptors gate on this.
+const PDF_ORIGINS = new Set([
+  'https://b2badmin.fuzzywumpets.com',
+  'https://b2badmin.fuzzyreporting.com',
+]);
+
+// WHAT: Returns the URL's origin only if it parses AND is https, else null.
+// INVARIANT(S): never throws on a malformed URL; a non-https scheme (file:, data:,
+//   javascript:) always yields null, so every caller's Set.has() check fails closed.
+function httpsOrigin(url) {
+  try {
+    const u = new URL(url);
+    return u.protocol === 'https:' ? u.origin : null;
+  } catch (_) {
+    return null;
+  }
+}
 
 // ─── Persistent settings (window bounds only) ────────────────────────────────
 
@@ -49,8 +74,14 @@ let pdfWindows = [];
 // return; the MAIN window is never navigated away to a chromeless inline PDF (which had
 // no back button and forced an app restart).
 
-function isPdfUrl(url) {
-  return /\.pdf($|[?#])/i.test(url || '');
+// WHAT: True only for an https PDF served by an admin origin.
+// CHANGE-GUARD: the `.pdf` regex alone is just a filename heuristic — an attacker-supplied
+//   link ending in `.pdf` would otherwise be loaded into a window holding the admin's
+//   session. The origin check is the actual security boundary; do not drop it and keep
+//   only the regex.
+function isAdminPdfUrl(url) {
+  if (!/\.pdf($|[?#])/i.test(url || '')) return false;
+  return PDF_ORIGINS.has(httpsOrigin(url));
 }
 
 function openPdfWindow(url) {
@@ -186,8 +217,8 @@ function createMainWindow() {
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     // Invoice / packing-label PDFs -> dedicated in-app window (shares the authed
     // session); never a chromeless popup or the signed-out system browser.
-    if (isPdfUrl(url)) { openPdfWindow(url); return { action: 'deny' }; }
-    if (AUTH_HOSTS.some((h) => url.startsWith(h))) return { action: 'allow' };
+    if (isAdminPdfUrl(url)) { openPdfWindow(url); return { action: 'deny' }; }
+    if (AUTH_ORIGINS.has(httpsOrigin(url))) return { action: 'allow' };
     shell.openExternal(url);
     return { action: 'deny' };
   });
@@ -196,10 +227,19 @@ function createMainWindow() {
   // otherwise navigate the MAIN window to the inline PDF, stranding the user with no
   // back button (the reported "have to restart the app" bug). Intercept ONLY PDF
   // navigations and open them in their own window; leave all normal admin nav alone.
+  // SYNC: mirrors the PDF branch in setWindowOpenHandler above — both entry points must
+  //   apply the SAME origin check, or one becomes a way around the other.
   mainWindow.webContents.on('will-navigate', (event, url) => {
-    if (isPdfUrl(url)) {
+    if (isAdminPdfUrl(url)) {
       event.preventDefault();
       openPdfWindow(url);
+      return;
+    }
+    // A `.pdf` link from anywhere else must not render in the MAIN window either —
+    // that window holds the admin session. Hand it to the system browser instead.
+    if (/\.pdf($|[?#])/i.test(url || '')) {
+      event.preventDefault();
+      shell.openExternal(url);
     }
   });
 
