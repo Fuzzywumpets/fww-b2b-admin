@@ -40,13 +40,20 @@ npm run icons      # regenerates assets/icon*.png + assets/icon.ico (green B2B s
 ## Release (triggers auto-update for everyone)
 
 CI builds the Windows NSIS installer and publishes a GitHub Release whenever a
-**`desktop-v*`** tag is pushed — note the prefix: this repo also ships the b2badmin
-server, so a bare `v*` tag must not fire a desktop build.
+**`v*`** tag is pushed.
+
+**The tag must be exactly `v<version>` from `desktop/package.json`.** Two publishers
+write to the release: electron-builder's own GitHub publisher (which uploads the
+hyphen-named `.exe`, its `.blockmap`, and the `latest.yml` that electron-updater
+actually reads) and the `softprops` step. electron-builder derives its release tag
+from `v${version}` and ignores the git tag name — so a mismatched tag scatters the
+assets across two releases and leaves `latest.yml` pointing at an `.exe` that isn't
+on the same release, i.e. a broken update feed.
 
 ```bash
 # bump "version" in desktop/package.json first, then:
-git tag desktop-v1.0.2
-git push origin desktop-v1.0.2
+git tag v1.0.2
+git push origin v1.0.2
 ```
 
 GitHub Actions (`.github/workflows/desktop-build.yml`, at the **repo root** — GitHub
