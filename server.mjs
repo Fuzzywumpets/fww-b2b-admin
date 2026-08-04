@@ -20,7 +20,7 @@ import {
   getCustomerNotes, setCustomerNotes, getDropshipCache, setDropshipCache,
   getSetting, setSetting, getGlobalSettings, getAuditLog, getAuditLogCount,
   logLabelBatch, logExportBatch,
-  createLead, getLeads, getLeadCounts, getLead, updateLead,
+  createLead, getLeads, getLeadCounts, getLead, updateLead, upsertPortalLead,
   addLeadNote, getLeadNotes, addLeadStatusHistory, getLeadStatusHistory,
   upsertBackorder, getBackordersForOrder, getOpenBackorders, fulfillBackorder, logOrderEdit,
   getEditAction, putEditAction,
@@ -205,6 +205,34 @@ function getPendingTaxCertsFromPortal() {
       status: r.status, uploadedAt: r.uploaded_at,
     }));
   } catch (_) { return []; }
+}
+
+// WHAT: pulls wholesale applications from the PORTAL's wholesale_leads table into this app's
+//   `leads` table, so applications submitted on fuzzywumpets.com appear in the tool staff use.
+// WHY: these are two separate databases. Before this existed, admin.db.leads was empty while real
+//   applications sat unread in portal.db.wholesale_leads — an application could be invisible here
+//   indefinitely.
+// CHANGE-GUARD: called on every /leads render, so it MUST stay cheap and idempotent — upsertPortalLead
+//   owns the "never clobber staff edits" rule, do not add field-refresh logic here. Failures are
+//   swallowed to a no-op for the same reason every other portal reader does: a portal outage must
+//   degrade to "no new leads", never a 500 on the Leads page.
+// INVARIANT(S): read-only against the portal db; returns a count of newly-ingested rows for logging;
+//   MOCK short-circuits to 0 (getPortalDb returns null there).
+function syncPortalWholesaleLeads() {
+  const db = getPortalDb();
+  if (!db) return 0;
+  try {
+    const rows = db.prepare('SELECT * FROM wholesale_leads ORDER BY submitted_at ASC').all();
+    let ingested = 0;
+    for (const row of rows) {
+      if (!row.email) continue;
+      try {
+        if (upsertPortalLead(row).action === 'inserted') ingested += 1;
+      } catch (_) { /* one bad row must not stop the rest */ }
+    }
+    if (ingested) console.log(`[leads] ingested ${ingested} wholesale application(s) from the portal`);
+    return ingested;
+  } catch (_) { return 0; }
 }
 
 // WHAT: paginated activity-log reader for one customer; builds a dynamic WHERE over customer_activity with optional from/to/type/q, returns rows + total + lastLogin + lastCart.
@@ -9978,6 +10006,39 @@ function renderLeadDetail(session, { lead, notes, history, flash }) {
     ? `<a href="/leads/${lead.id}/convert" class="btn btn-primary">Convert to Customer</a>`
     : '';
 
+  // WHAT: renders the wholesale application as the applicant submitted it.
+  // WHY: everything the portal collects that has no first-class column here lives in
+  //   application_data_json — a column that, before this, was written by nothing and rendered by
+  //   nothing. An ingested application would have been invisible on the page, which is precisely
+  //   the failure this whole feature exists to fix.
+  // CHANGE-GUARD: every value goes through h(). These are UNAUTHENTICATED public-form fields and
+  //   are the classic stored-XSS sink in this file. The exemption document is linked through our
+  //   own proxy route — never a portal URL and never an on-disk path.
+  let application = null;
+  try { application = lead.application_data_json ? JSON.parse(lead.application_data_json) : null; }
+  catch (_) { application = null; }
+  const appRow = (label, value) => (value
+    ? `<div class="kv-row"><span>${h(label)}</span><strong>${h(String(value))}</strong></div>` : '');
+  const applicationHtml = !(application || lead.fein) ? '' : `<div class="card">
+          <div class="card-header"><h2>Wholesale Application</h2></div>
+          <div class="kv-list">
+            ${appRow('FEIN', lead.fein)}
+            ${appRow('Resale tax ID', lead.sales_tax_id)}
+            ${appRow('Mailing address', application && application.address)}
+            ${appRow('Products of interest', application && application.products)}
+            ${application && application.submittedAt ? `<div class="kv-row"><span>Submitted</span><strong class="text-muted">${fmtDate(new Date(application.submittedAt).toISOString())}</strong></div>` : ''}
+            <div class="kv-row"><span>Sales tax exemption</span><strong>${
+              application && application.hasTaxExemptDoc
+                ? `<a href="/leads/${lead.id}/tax-doc" target="_blank" rel="noopener noreferrer" class="link">View document →</a>`
+                : '<span class="text-muted">Not provided</span>'
+            }</strong></div>
+          </div>
+          ${application && application.notes ? `<div style="margin-top:0.75rem">
+            <div class="field-label">About the business</div>
+            <div style="white-space:pre-wrap">${h(application.notes)}</div>
+          </div>` : ''}
+        </div>`;
+
   return layout({ title: (lead.business_name || lead.email) + ' — Lead', session, activePath: '/leads',
     extraHead: `<style>
       .timeline-item{padding:0.6rem 0;border-bottom:1px solid #f0f0f0;}
@@ -10017,6 +10078,8 @@ function renderLeadDetail(session, { lead, notes, history, flash }) {
             <button type="submit" class="btn btn-secondary btn-sm">Update</button>
           </form>
         </div>` : ''}
+
+        ${applicationHtml}
 
         <!-- Timeline -->
         <div class="card">
@@ -10112,6 +10175,9 @@ function renderLeadConvert(session, { lead, flash, settings }) {
 // CHANGE-GUARD: status='all' is normalized to null before getLeads(); q is trimmed and passed as search||undefined; flash maps ?flash=created|saved to messages — add new flash codes in both this map and the writers.
 // INVARIANT(S): read-only; getLeads/getLeadCounts back the table and chips.
 app.get('/leads', requireAuth, (req, res) => {
+  // Pull anything new off the portal's public application form before rendering, so a wholesale
+  // application submitted on fuzzywumpets.com shows up here without any manual step.
+  syncPortalWholesaleLeads();
   const status = req.query.status && req.query.status !== 'all' ? req.query.status : null;
   const q      = String(req.query.q || '').trim();
   const leads  = getLeads({ status, search: q || undefined });
@@ -10155,6 +10221,34 @@ app.get('/leads/:id', requireAuth, (req, res) => {
   const history = getLeadStatusHistory(lead.id);
   const flash   = req.query.flash === 'created' ? 'Lead created.' : req.query.flash === 'saved' ? 'Saved.' : req.query.flash === 'status_changed' ? 'Status updated.' : null;
   res.send(renderLeadDetail(req.adminSession, { lead, notes, history, flash }));
+});
+
+// WHAT: GET /leads/:id/tax-doc — streams the applicant's optional sales-tax-exemption PDF by
+//   proxying the portal's bearer-gated /__internal__/leads/:id/tax-doc.
+// WHY: the file lives on the portal's filesystem and this process has no session there. Proxying
+//   (rather than reading the path out of the portal db and opening it directly) keeps the
+//   filesystem layout entirely on the portal's side and avoids a path-traversal surface here.
+// CHANGE-GUARD: requireAuth-gated like every other lead route — this is applicant tax paperwork and
+//   must never be publicly reachable. The PORTAL lead id is used, not this table's id; they are
+//   different numbers and swapping them serves the wrong applicant's document. callPortalInternal is
+//   deliberately NOT used: it parses the response as JSON and would corrupt a PDF body.
+// INVARIANT(S): 404s when the lead is unknown, was never ingested from the portal, or the portal
+//   has no document for it; never echoes an applicant-supplied filename.
+app.get('/leads/:id/tax-doc', requireAuth, async (req, res) => {
+  const lead = getLead(req.params.id);
+  if (!lead || !lead.portal_lead_id) return res.status(404).send('Not found');
+  if (!PORTAL_INTERNAL_TOKEN) return res.status(503).send('Portal link not configured');
+  try {
+    const r = await fetch(`${PORTAL_INTERNAL_URL}/__internal__/leads/${lead.portal_lead_id}/tax-doc`, {
+      headers: { Authorization: `Bearer ${PORTAL_INTERNAL_TOKEN}` },
+    });
+    if (!r.ok) return res.status(404).send('Not found');
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename="lead-${lead.id}-tax-exemption.pdf"`);
+    res.send(Buffer.from(await r.arrayBuffer()));
+  } catch (_) {
+    res.status(502).send('Could not reach the portal');
+  }
 });
 
 // WHAT: POST /leads/:id/status — transitions a lead, recording status history, a system note, and an audit entry.
