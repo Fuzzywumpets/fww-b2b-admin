@@ -158,7 +158,9 @@ function buildAppMenu() {
     {
       label: 'Help',
       submenu: [
-        { label: 'Check for Updates', click: () => { try { autoUpdater.checkForUpdates(); } catch (_) {} } },
+        // SYNC: this item exists in BOTH the Help menu and the tray menu — keep them
+//   pointed at the same handler so one path can't go silent while the other reports.
+{ label: 'Check for Updates', click: () => checkForUpdatesInteractive() },
         { label: 'About', click: () => {
           dialog.showMessageBox(mainWindow, {
             type: 'info', title: APP_NAME,
@@ -261,7 +263,9 @@ function createTray() {
     { label: APP_NAME, enabled: false },
     { type: 'separator' },
     { label: 'Open', click: () => { mainWindow?.show(); mainWindow?.focus(); } },
-    { label: 'Check for Updates', click: () => { try { autoUpdater.checkForUpdates(); } catch (_) {} } },
+    // SYNC: this item exists in BOTH the Help menu and the tray menu — keep them
+//   pointed at the same handler so one path can't go silent while the other reports.
+{ label: 'Check for Updates', click: () => checkForUpdatesInteractive() },
     { type: 'separator' },
     { label: 'Quit', click: () => { quitting = true; app.quit(); } },
   ]));
@@ -278,6 +282,48 @@ ipcMain.handle('app:version', () => app.getVersion());
 // the background, and offers to restart. Anything not installed at restart is
 // applied automatically on next quit.
 
+// WHAT: True while a check the USER explicitly asked for is in flight.
+// DEPENDS: the update-not-available / error handlers below, which stay silent for the
+//   automatic launch + 4-hourly checks (nagging every 4 hours is worse than useless) and
+//   only surface a dialog when this is set. checkForUpdatesInteractive() is the ONLY
+//   thing that should set it.
+let manualUpdateCheck = false;
+
+// WHAT: The "Check for Updates" menu/tray action — same check as the background one, but
+//   it always reports an outcome.
+// CHANGE-GUARD: previously this called autoUpdater.checkForUpdates() bare, and because
+//   there was no update-not-available handler, "you're up to date", "you're offline" and
+//   "the release feed 404s" were all indistinguishable from a dead menu item. Any rewrite
+//   must keep every branch terminating in visible feedback.
+function checkForUpdatesInteractive() {
+  if (!app.isPackaged) {
+    dialog.showMessageBox(mainWindow, {
+      type: 'info', title: APP_NAME, buttons: ['OK'],
+      message: 'Updates are disabled in development.',
+      detail: 'This is an unpackaged dev build, so there is no installed version to update.',
+    });
+    return;
+  }
+  manualUpdateCheck = true;
+  // CHANGE-GUARD: the call must happen INSIDE .then(), not as an argument to
+  //   Promise.resolve(...). As an argument it is evaluated first, so a synchronous
+  //   throw escapes the .catch() entirely — and the click handlers have no try/catch
+  //   of their own, so it would reach the main process unhandled with no feedback.
+  Promise.resolve()
+    .then(() => autoUpdater.checkForUpdates())
+    .catch((e) => {
+      // The 'error' handler below normally fires and owns the dialog; this catch only
+      // covers a throw/rejection that never emits an event, so it must not double-report.
+      if (!manualUpdateCheck) return;
+      manualUpdateCheck = false;
+      dialog.showMessageBox(mainWindow, {
+        type: 'error', title: 'Update Check Failed', buttons: ['OK'],
+        message: 'Could not check for updates.',
+        detail: String(e?.message || e),
+      });
+    });
+}
+
 function setupAutoUpdater() {
   if (!app.isPackaged) return; // skip in dev
 
@@ -286,11 +332,29 @@ function setupAutoUpdater() {
 
   autoUpdater.on('update-available', (info) => {
     console.log(`[updater] update available: ${info.version}`);
+    // CHANGE-GUARD: do NOT clear manualUpdateCheck here. This is not a terminal state —
+    //   the download still has to succeed, and clearing now would make a failure during
+    //   that download silent for a check the user explicitly asked for, which is the
+    //   exact bug this whole function exists to fix. ('update-not-available' cannot also
+    //   fire for the same check, so there is no "up to date" message to suppress.)
     mainWindow?.webContents.send('updater:status', { type: 'available', version: info.version });
+  });
+
+  autoUpdater.on('update-not-available', () => {
+    console.log('[updater] no update available');
+    if (!manualUpdateCheck) return;
+    manualUpdateCheck = false;
+    dialog.showMessageBox(mainWindow, {
+      type: 'info', title: APP_NAME, buttons: ['OK'],
+      message: `${APP_NAME} ${app.getVersion()} is up to date.`,
+      detail: 'You already have the latest released version.',
+    });
   });
 
   autoUpdater.on('update-downloaded', (info) => {
     console.log(`[updater] update downloaded: ${info.version}`);
+    // Terminal state for a manual check — the restart prompt below IS its feedback.
+    manualUpdateCheck = false;
     const choice = dialog.showMessageBoxSync(mainWindow, {
       type: 'info',
       title: 'Update Ready',
@@ -302,7 +366,18 @@ function setupAutoUpdater() {
     if (choice === 0) { quitting = true; autoUpdater.quitAndInstall(); }
   });
 
-  autoUpdater.on('error', (e) => console.error('[updater] error:', e.message));
+  autoUpdater.on('error', (e) => {
+    console.error('[updater] error:', e.message);
+    // Background checks fail quietly (offline laptops shouldn't pop dialogs); a check the
+    // user clicked must say so, or it looks identical to a broken menu item.
+    if (!manualUpdateCheck) return;
+    manualUpdateCheck = false;
+    dialog.showMessageBox(mainWindow, {
+      type: 'error', title: 'Update Check Failed', buttons: ['OK'],
+      message: 'Could not check for updates.',
+      detail: String(e?.message || e),
+    });
+  });
 
   // Check on startup, then every 4 hours while open.
   autoUpdater.checkForUpdates().catch(() => {});
