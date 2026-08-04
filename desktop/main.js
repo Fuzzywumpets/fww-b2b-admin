@@ -305,17 +305,23 @@ function checkForUpdatesInteractive() {
     return;
   }
   manualUpdateCheck = true;
-  Promise.resolve(autoUpdater.checkForUpdates()).catch((e) => {
-    // The 'error' handler below normally fires and owns the dialog; this catch only
-    // covers a synchronous/rejected call that never emits, so it must not double-report.
-    if (!manualUpdateCheck) return;
-    manualUpdateCheck = false;
-    dialog.showMessageBox(mainWindow, {
-      type: 'error', title: 'Update Check Failed', buttons: ['OK'],
-      message: 'Could not check for updates.',
-      detail: String(e?.message || e),
+  // CHANGE-GUARD: the call must happen INSIDE .then(), not as an argument to
+  //   Promise.resolve(...). As an argument it is evaluated first, so a synchronous
+  //   throw escapes the .catch() entirely — and the click handlers have no try/catch
+  //   of their own, so it would reach the main process unhandled with no feedback.
+  Promise.resolve()
+    .then(() => autoUpdater.checkForUpdates())
+    .catch((e) => {
+      // The 'error' handler below normally fires and owns the dialog; this catch only
+      // covers a throw/rejection that never emits an event, so it must not double-report.
+      if (!manualUpdateCheck) return;
+      manualUpdateCheck = false;
+      dialog.showMessageBox(mainWindow, {
+        type: 'error', title: 'Update Check Failed', buttons: ['OK'],
+        message: 'Could not check for updates.',
+        detail: String(e?.message || e),
+      });
     });
-  });
 }
 
 function setupAutoUpdater() {
@@ -326,7 +332,11 @@ function setupAutoUpdater() {
 
   autoUpdater.on('update-available', (info) => {
     console.log(`[updater] update available: ${info.version}`);
-    manualUpdateCheck = false; // update-downloaded will report; don't also say "up to date"
+    // CHANGE-GUARD: do NOT clear manualUpdateCheck here. This is not a terminal state —
+    //   the download still has to succeed, and clearing now would make a failure during
+    //   that download silent for a check the user explicitly asked for, which is the
+    //   exact bug this whole function exists to fix. ('update-not-available' cannot also
+    //   fire for the same check, so there is no "up to date" message to suppress.)
     mainWindow?.webContents.send('updater:status', { type: 'available', version: info.version });
   });
 
@@ -343,6 +353,8 @@ function setupAutoUpdater() {
 
   autoUpdater.on('update-downloaded', (info) => {
     console.log(`[updater] update downloaded: ${info.version}`);
+    // Terminal state for a manual check — the restart prompt below IS its feedback.
+    manualUpdateCheck = false;
     const choice = dialog.showMessageBoxSync(mainWindow, {
       type: 'info',
       title: 'Update Ready',
