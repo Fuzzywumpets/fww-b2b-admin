@@ -26,8 +26,8 @@
     "icon": "assets/icon.png",
     "publish": {
       "provider": "github",
-      "owner": "fuzzyalex84",
-      "repo": "fww-b2b-admin-desktop"
+      "owner": "Fuzzywumpets",
+      "repo": "fww-b2b-admin"
     },
     "win": {
       "target": [

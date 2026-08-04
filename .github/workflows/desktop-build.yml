@@ -1,0 +1,61 @@
+name: Desktop Shell — Build & Release
+
+# WHAT: Builds + releases the Electron desktop shell that lives in desktop/.
+# DEPENDS: desktop/package.json's build.publish block — electron-builder bakes that
+#   owner/repo into resources/app-update.yml inside the installer, and the INSTALLED
+#   app reads it to find its update feed. If publish.repo and the repo this workflow
+#   releases into ever disagree, already-installed clients silently stop updating.
+# CHANGE-GUARD: tags are `desktop-v*`, NOT `v*` — this repo also ships the b2badmin
+#   server, so a bare `v*` filter would fire a desktop build on unrelated server tags.
+#   Bump desktop/package.json's "version" to match the tag or electron-updater will
+#   not see the release as newer.
+
+on:
+  push:
+    tags:
+      - 'desktop-v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    working-directory: desktop
+
+jobs:
+  build-win:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build NSIS installer
+        run: npm run dist
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer-windows
+          path: desktop/dist/*.exe
+
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/desktop-v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            desktop/dist/*.exe
+            desktop/dist/*.yml
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
