@@ -73,5 +73,36 @@ merge the only known install was Alex's PC.)
 
 ## Install
 
-Download the latest `FWW B2B Admin Setup x.y.z.exe` from the
+**First time on a machine — install the signing certificate once**, or Windows will
+show SmartScreen / "unknown publisher" warnings and may refuse the download outright:
+
+```powershell
+# elevated PowerShell, from this directory
+powershell -ExecutionPolicy Bypass -File .\install-codesign-cert.ps1
+```
+
+Then download the latest `FWW-B2B-Admin-Setup-x.y.z.exe` from the
 [Releases page](https://github.com/Fuzzywumpets/fww-b2b-admin/releases) and run it.
+(The release also carries a dot-separated `FWW.B2B.Admin.Setup.x.y.z.exe` — identical
+bytes, an artifact of the two publishers. Either works; the hyphenated one is what
+`latest.yml` and the auto-updater reference.)
+
+## Code signing
+
+Builds are signed with a **self-signed** certificate (`CN=Fuzzywumpets`, valid to
+2036). That is deliberate: these are internal tools installed on machines we control,
+so a self-signed cert removes the warnings for free, where a public CA cert would cost
+$300-600/yr for trust we don't need.
+
+The tradeoff is real and worth stating: the certificate only suppresses warnings on
+machines where `install-codesign-cert.ps1` has been run, and running it means Windows
+trusts **anything** signed with the matching private key. That key lives only in
+Doppler (`fww-shared`/`prd`: `WINDOWS_CSC_LINK`, `WINDOWS_CSC_KEY_PASSWORD`,
+`WINDOWS_CSC_THUMBPRINT`) and in this repo's Actions secrets. If it leaks, rotate the
+cert and re-run the install script on every machine.
+
+**SYNC:** the certificate's CN and `build.win.publisherName` in `package.json` must
+match. `electron-updater` compares the downloaded installer's certificate subject
+against `publisherName` and refuses an update that doesn't match — so changing one
+without the other silently breaks auto-update for everyone already installed. CI fails
+the build if the installer comes out unsigned or signed by an unexpected certificate.

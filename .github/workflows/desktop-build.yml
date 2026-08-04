@@ -62,10 +62,44 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # DEPENDS: repo secrets WINDOWS_CSC_LINK (base64 PFX) + WINDOWS_CSC_KEY_PASSWORD.
+      #   electron-builder picks CSC_LINK/CSC_KEY_PASSWORD up from the environment with no
+      #   config needed. Master copies live in Doppler (fww-shared/prd) under the same
+      #   names, alongside WINDOWS_CSC_THUMBPRINT.
+      # CHANGE-GUARD: the cert is SELF-SIGNED, so it only suppresses Windows' unknown-
+      #   publisher warnings on machines that have it in Trusted Root (see
+      #   desktop/install-codesign-cert.ps1). It must also stay in sync with
+      #   desktop/package.json's win.publisherName — electron-updater compares the
+      #   installer's certificate subject against that string and REFUSES an update that
+      #   doesn't match, so changing the cert's CN without changing publisherName (or vice
+      #   versa) silently breaks auto-update for everyone already installed.
       - name: Build NSIS installer
         run: npm run dist
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CSC_LINK: ${{ secrets.WINDOWS_CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.WINDOWS_CSC_KEY_PASSWORD }}
+
+      # An unsigned build would still publish happily and then trip exactly the warnings
+      # this signing exists to remove, so fail loudly instead of shipping one.
+      - name: Verify the installer is signed
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem dist/*.exe | Select-Object -First 1
+          $sig = Get-AuthenticodeSignature $exe.FullName
+          "Installer : $($exe.Name)"
+          "Status    : $($sig.Status)"
+          "Signer    : $($sig.SignerCertificate.Subject)"
+          if ($sig.Status -eq 'NotSigned') {
+            Write-Error "Installer is NOT signed - check the WINDOWS_CSC_* repo secrets."
+            exit 1
+          }
+          if ($sig.SignerCertificate.Subject -notmatch 'CN=Fuzzywumpets') {
+            Write-Error "Signed by an unexpected certificate: $($sig.SignerCertificate.Subject)"
+            exit 1
+          }
+          "OK - signed by the expected certificate."
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
