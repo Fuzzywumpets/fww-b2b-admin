@@ -14,6 +14,7 @@ name: Desktop Shell — Build & Release
 #   latest.yml pointing at an .exe that isn't on the same release — a broken update feed.
 #   This repo has no other tags and no tag-driven server release, so `v*` is uncontended;
 #   if the server ever gains tags, prefix them rather than re-prefixing this.
+#   The "Verify tag matches" step below ENFORCES this — it is not merely documentation.
 
 on:
   push:
@@ -39,6 +40,24 @@ jobs:
           node-version: '22'
           cache: 'npm'
           cache-dependency-path: desktop/package-lock.json
+
+      # Enforces the invariant the CHANGE-GUARD above describes. Fails BEFORE the build
+      # so a mistag costs 20 seconds instead of publishing a half-broken release that
+      # then has to be deleted (and deleting a release that clients may already have
+      # polled is exactly the mess this avoids).
+      - name: Verify tag matches desktop/package.json version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          pkg=$(node -p "require('./package.json').version")
+          if [ "$GITHUB_REF_NAME" != "v$pkg" ]; then
+            echo "::error::Tag '$GITHUB_REF_NAME' does not match desktop/package.json version '$pkg' (expected 'v$pkg')."
+            echo "electron-builder publishes under v\$version regardless of the git tag name, so a"
+            echo "mismatch scatters the .exe/.blockmap/latest.yml across two releases and leaves"
+            echo "latest.yml pointing at an installer that is not on the same release."
+            exit 1
+          fi
+          echo "Tag '$GITHUB_REF_NAME' matches desktop version '$pkg'."
 
       - name: Install dependencies
         run: npm ci
