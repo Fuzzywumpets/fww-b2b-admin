@@ -1310,12 +1310,15 @@ await test('REGRESSION: discount does NOT commit on blur, and a correction is NO
 
   // NB: no eval() — the page's CSP is script-src 'self' 'unsafe-inline' (no 'unsafe-eval'),
   // so a stringified predicate throws. Inline the filter.
+  // 2026-08-05: an order discount is a per-line discount ALLOCATION, not a line item, so this reads
+  // the line-state `discount` summary instead of filtering lines on an "Order discount: " title.
+  // Still returns an array so the surrounding "exactly 1" assertions keep their meaning: 0 entries =
+  // nothing applied, 1 entry = exactly one distinct order discount on the order.
   const readDisc = () => page.evaluate(async () => {
     const r = await fetch('/api/orders/1008/line-state', { credentials: 'same-origin' });
     const s = await r.json();
-    return (s.lines || [])
-      .filter(l => (l.title || '').startsWith('Order discount: ') && (l.currentQuantity || 0) > 0)
-      .map(l => ({ title: l.title, amt: Math.abs(l.unitPrice * l.currentQuantity) }));
+    const d = s.discount || { amount: 0 };
+    return d.amount > 0 ? [{ title: d.reason, amt: d.amount }] : [];
   });
 
   // Type a WRONG percentage and tab away — the old build committed right here.

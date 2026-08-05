@@ -231,7 +231,13 @@ function transformLineItems(orderShopifyId, lineItemsEdges) {
       variant_title: n.variantTitle || null,
       quantity: n.quantity || 0,
       price: parseFloat(n.originalUnitPriceSet?.presentmentMoney?.amount || 0),
-      total_discount: parseFloat(n.totalDiscountSet?.presentmentMoney?.amount || 0),
+      // SYNC: same rule as scripts/backfill-orders-per-customer.mjs — prefer Σ discountAllocations.
+      // totalDiscountSet is UNRELIABLE (verified live on #38611: 0.00 against a real 37.99
+      // allocation), and `price` above is PRE-discount, so a 0 over-states cached product revenue.
+      // DEPENDS: db.mjs getReportsFromCache subtracts this column from SUM(price*quantity).
+      total_discount: (n.discountAllocations || []).length
+        ? (n.discountAllocations || []).reduce((s, a) => s + (parseFloat(a?.allocatedAmountSet?.presentmentMoney?.amount || 0) || 0), 0)
+        : parseFloat(n.totalDiscountSet?.presentmentMoney?.amount || 0),
       taxable: n.taxable ? 1 : 0,
       vendor,
       is_fww_vendor: vendor === FWW_VENDOR ? 1 : 0,
@@ -269,6 +275,7 @@ async function backfillOrders() {
                 product{id}
                 originalUnitPriceSet{presentmentMoney{amount}}
                 totalDiscountSet{presentmentMoney{amount}}
+                discountAllocations{allocatedAmountSet{presentmentMoney{amount}}}
               }}}
             }}
             pageInfo{hasNextPage endCursor}
