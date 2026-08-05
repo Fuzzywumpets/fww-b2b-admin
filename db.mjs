@@ -538,6 +538,12 @@ export function upsertPortalLead(row) {
     // -- which both spammed writes and reordered getLeads()'s ORDER BY updated_at DESC list on
     // every page view.
     if (existing.portal_lead_id != null && existing.portal_lead_id !== row.id) {
+      // Still allow a narrow FEIN backfill from a later duplicate that has it when the FIRST
+      // linked portal row didn't -- COALESCE only ever fills a currently-NULL fein, so this stays
+      // a true no-op once backfilled. Deliberately does NOT touch portal_lead_id or updated_at:
+      // that's what keeps this a no-op for the render-churn regression the guard above exists to
+      // fix.
+      db.prepare(`UPDATE leads SET fein = COALESCE(fein, ?) WHERE id = ?`).run(row.fein || null, existing.id);
       return { action: 'duplicate_portal_row', id: existing.id };
     }
     db.prepare(`UPDATE leads SET portal_lead_id = ?, application_data_json = ?,
