@@ -528,8 +528,24 @@ export function upsertPortalLead(row) {
     submittedAt: row.submitted_at || null,
   });
 
-  const existing = db.prepare('SELECT id FROM leads WHERE email = ?').get(row.email);
+  const existing = db.prepare('SELECT id, portal_lead_id FROM leads WHERE email = ?').get(row.email);
   if (existing) {
+    // The portal has no UNIQUE constraint on email, so more than one portal row can share an
+    // address (see INVARIANT above). Only the first portal row to link wins; once
+    // existing.portal_lead_id is set to a DIFFERENT id, every later duplicate must be a pure
+    // no-op. Without this guard, every /leads render re-ran this UPDATE for every duplicate
+    // row, continuously rewriting portal_lead_id/application_data_json and bumping updated_at
+    // -- which both spammed writes and reordered getLeads()'s ORDER BY updated_at DESC list on
+    // every page view.
+    if (existing.portal_lead_id != null && existing.portal_lead_id !== row.id) {
+      // Still allow a narrow FEIN backfill from a later duplicate that has it when the FIRST
+      // linked portal row didn't -- COALESCE only ever fills a currently-NULL fein, so this stays
+      // a true no-op once backfilled. Deliberately does NOT touch portal_lead_id or updated_at:
+      // that's what keeps this a no-op for the render-churn regression the guard above exists to
+      // fix.
+      db.prepare(`UPDATE leads SET fein = COALESCE(fein, ?) WHERE id = ?`).run(row.fein || null, existing.id);
+      return { action: 'duplicate_portal_row', id: existing.id };
+    }
     db.prepare(`UPDATE leads SET portal_lead_id = ?, application_data_json = ?,
                   fein = COALESCE(fein, ?), updated_at = ? WHERE id = ?`)
       .run(row.id, applicationJson, row.fein || null, now, existing.id);

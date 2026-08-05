@@ -119,5 +119,74 @@ await test('duplicate applications from the portal collapse onto one lead', asyn
   assertEqual(getLeads({ limit: 500 }).length, before + 1, 'two applications, one lead row');
 });
 
+// Regression: /leads calls this sync on EVERY render. Before this fix, a second (or later)
+// duplicate portal row for the same email re-ran the UPDATE every single time it was
+// re-ingested, rewriting portal_lead_id/application_data_json and bumping updated_at forever --
+// which both spammed writes and reordered the ORDER BY updated_at DESC lead list on every page
+// view. A duplicate must be a true no-op after the first link, however many times it is re-seen.
+await test('re-ingesting a duplicate portal row NEVER rewrites the linked lead', async () => {
+  // Date.now() is ms-resolution, so two calls in the same test can land on the same millisecond
+  // and make a plain equality check on updated_at pass even if the code DID rewrite it (a
+  // false-negative regression test, flagged by Qodo on this PR). Stub it so "unchanged" is
+  // actually meaningful: 1000 for the first ingest, 2000+ for everything after.
+  const realNow = Date.now;
+  let fakeNow = 1000;
+  Date.now = () => fakeNow;
+  try {
+    const first = upsertPortalLead(portalRow({ id: 910, email: 'dupe2@example.com' }));
+    assertEqual(first.action, 'inserted', 'first portal row for this email inserts');
+    const linkedBefore = getLead(first.id);
+    assertEqual(linkedBefore.updated_at, 1000, 'sanity: the stub is actually driving updated_at');
+
+    fakeNow = 2000;
+    const dupe = upsertPortalLead(portalRow({ id: 911, email: 'dupe2@example.com', business_name: 'Should Not Win' }));
+    assertEqual(dupe.action, 'duplicate_portal_row', 'a second portal row for the same email must be a no-op, not a re-link');
+    assertEqual(dupe.id, first.id, 'the no-op must still report the lead it collided with');
+
+    const linkedAfter = getLead(first.id);
+    assertEqual(linkedAfter.portal_lead_id, 910, 'portal_lead_id must stay pinned to the FIRST portal row that linked');
+    assertEqual(linkedAfter.updated_at, linkedBefore.updated_at, 'a duplicate must not bump updated_at (or it reorders the leads list on every render)');
+    assertEqual(linkedAfter.business_name, linkedBefore.business_name, 'a duplicate must not overwrite fields from the first application');
+
+    // Re-ingesting the SAME duplicate row again (simulating a second /leads render) must be
+    // identical -- this is the "every render" repro, not just a single extra call.
+    fakeNow = 3000;
+    const dupeAgain = upsertPortalLead(portalRow({ id: 911, email: 'dupe2@example.com' }));
+    assertEqual(dupeAgain.action, 'duplicate_portal_row', 'repeated re-ingestion of the same duplicate stays a no-op');
+    assertEqual(getLead(first.id).updated_at, linkedBefore.updated_at, 'still no updated_at churn after a second render');
+  } finally {
+    Date.now = realNow;
+  }
+});
+
+// A later duplicate can be MORE complete than the first-linked row (e.g. the applicant retried
+// and this time entered their FEIN). The no-op guard above must not permanently lock the lead out
+// of that data just because it arrived on a portal row that lost the "who links" race.
+await test('a duplicate portal row can still backfill a missing FEIN, without relinking or touching updated_at', async () => {
+  const realNow = Date.now;
+  let fakeNow = 5000;
+  Date.now = () => fakeNow;
+  try {
+    const first = upsertPortalLead(portalRow({ id: 920, email: 'dupe3@example.com', fein: null }));
+    assertEqual(getLead(first.id).fein, null, 'sanity: first row really had no FEIN');
+
+    fakeNow = 6000;
+    const dupe = upsertPortalLead(portalRow({ id: 921, email: 'dupe3@example.com', fein: '12-3456789' }));
+    assertEqual(dupe.action, 'duplicate_portal_row', 'still a no-op action, not a re-link');
+
+    const after = getLead(first.id);
+    assertEqual(after.fein, '12-3456789', 'the missing FEIN must be backfilled from the duplicate');
+    assertEqual(after.portal_lead_id, 920, 'backfill must not steal portal_lead_id from the first row');
+    assertEqual(after.updated_at, 5000, 'FEIN backfill must not bump updated_at (still no render-churn)');
+
+    // Once backfilled, a THIRD duplicate must not stomp a different FEIN back over it.
+    fakeNow = 7000;
+    upsertPortalLead(portalRow({ id: 922, email: 'dupe3@example.com', fein: '99-9999999' }));
+    assertEqual(getLead(first.id).fein, '12-3456789', 'FEIN backfill is fill-once (COALESCE), not last-write-wins');
+  } finally {
+    Date.now = realNow;
+  }
+});
+
 console.log(`\n  ${passed} passed, ${failed} failed`);
 process.exit(failed === 0 ? 0 : 1);
