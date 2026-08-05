@@ -852,6 +852,47 @@ const MOCK_ORDERS = [
     fulfillments: [],
     transactions: [{ id: 'tx9', status: 'PENDING', kind: 'AUTHORIZATION', gateway: 'manual', createdAt: '2026-05-28T10:00:00Z', amountSet: { presentmentMoney: { amount: '80.00', currencyCode: 'USD' } } }],
   },
+  // INVOICE-MONEY test fixture (#1010). Every other fixture hardcodes totalTaxSet '0.00', which made
+  // two whole classes of money bug structurally untestable. This one carries:
+  //   • non-zero TAX (8.00) and SHIPPING (10.00) — so an invoice that bills either of them twice is
+  //     visible in the stored totals, which it was not before.
+  //   • a COMPED line (li1009b): 100% line-level EXPLICIT discount. Shopify reports
+  //     discountedUnitPriceSet/discountedTotalSet of "0.00" and charges the customer nothing. A
+  //     truthiness-based fallback reads that legitimate 0.00 as "field absent" and substitutes the
+  //     45.99 list price. Nothing in the old fixtures had a zero here, so nothing could catch it.
+  // Correct arithmetic: 4 x 25.00 = 100.00 subtotal (the comped line contributes 0.00),
+  // + 10.00 shipping + 8.00 tax = 118.00 total.
+  {
+    id: 'gid://shopify/Order/1010', name: '#1010', processedAt: '2026-05-29T10:00:00Z',
+    customer: { id: 'gid://shopify/Customer/101', displayName: 'Acme Pet Supply', email: 'buyer@acme.com' },
+    displayFinancialStatus: 'PENDING', displayFulfillmentStatus: 'UNFULFILLED',
+    totalPriceSet:    { presentmentMoney: { amount: '118.00', currencyCode: 'USD' } },
+    subtotalPriceSet: { presentmentMoney: { amount: '100.00', currencyCode: 'USD' } },
+    currentTotalPriceSet:    { presentmentMoney: { amount: '118.00', currencyCode: 'USD' } },
+    currentSubtotalPriceSet: { presentmentMoney: { amount: '100.00', currencyCode: 'USD' } },
+    sourceName: 'web', tags: ['b2b-portal'], note: '',
+    lineItems: { edges: [
+      { node: { id: 'li1010a', title: 'Billed Collar', quantity: 4, currentQuantity: 4, variant: { id: 'v601', sku: 'BC-001', price: '25.00', inventoryQuantity: 10 },
+          discountedUnitPriceSet: { presentmentMoney: { amount: '25.00', currencyCode: 'USD' } },
+          originalUnitPriceSet:   { presentmentMoney: { amount: '25.00', currencyCode: 'USD' } },
+          discountedTotalSet:     { presentmentMoney: { amount: '100.00', currencyCode: 'USD' } } } },
+      // Comped replacement: charged 0.00, allocation is EXPLICIT (line-level), NOT 'ALL'.
+      { node: { id: 'li1010b', title: 'Comped Replacement Collar', quantity: 2, currentQuantity: 2, variant: { id: 'v602', sku: 'CR-002', price: '45.99', inventoryQuantity: 5 },
+          discountedUnitPriceSet: { presentmentMoney: { amount: '0.00', currencyCode: 'USD' } },
+          originalUnitPriceSet:   { presentmentMoney: { amount: '45.99', currencyCode: 'USD' } },
+          discountedTotalSet:     { presentmentMoney: { amount: '0.00', currencyCode: 'USD' } },
+          discountAllocations: [{ allocatedAmountSet: { presentmentMoney: { amount: '91.98', currencyCode: 'USD' } },
+                                  discountApplication: { targetSelection: 'EXPLICIT' } }] } },
+    ]},
+    totalShippingPriceSet: { presentmentMoney: { amount: '10.00', currencyCode: 'USD' } },
+    totalTaxSet:           { presentmentMoney: { amount: '8.00', currencyCode: 'USD' } },
+    totalOutstandingSet:   { presentmentMoney: { amount: '118.00', currencyCode: 'USD' } },
+    totalReceivedSet:      { presentmentMoney: { amount: '0.00', currencyCode: 'USD' } },
+    shippingAddress: { firstName: 'Jane', lastName: 'Smith', address1: '456 Park Ave', address2: '', city: 'Seattle', province: 'WA', zip: '98101', country: 'US' },
+    billingAddress:  { firstName: 'Jane', lastName: 'Smith', address1: '456 Park Ave', address2: '', city: 'Seattle', province: 'WA', zip: '98101', country: 'US' },
+    fulfillments: [{ status: 'SUCCESS', trackingInfo: [{ number: 'TRACK1009', url: null, company: 'UPS' }], createdAt: '2026-05-30T12:00:00Z' }],
+    transactions: [],
+  },
 ];
 
 // In-memory overrides for mock mutations (mark paid, note changes)
@@ -3653,29 +3694,28 @@ function renderOrderDetail(session, order, flash, flashMsg) {
           <div style="background:#fff;border-radius:8px;padding:24px;min-width:380px;max-width:500px">
             <h3 style="margin:0 0 16px">Generate Invoice</h3>
             <form method="POST" action="/orders/${h(numId)}/partial-invoice">
-              <div style="margin-bottom:14px">
-                <div style="font-size:13px;font-weight:500;margin-bottom:8px">Invoice scope</div>
-                ${(order.fulfillments || []).length > 0
-                  ? `<label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-bottom:6px">
-                      <input type="radio" name="type" value="fulfilled_only" checked>
-                      Fulfilled items only (partial invoice)
-                    </label>`
-                  : ''}
-                <label style="display:flex;align-items:center;gap:8px;font-size:13px">
-                  <input type="radio" name="type" value="full" ${(order.fulfillments || []).length === 0 ? 'checked' : ''}>
-                  Entire order
-                </label>
-              </div>
+              ${/* The "Fulfilled items only (partial invoice)" radio was REMOVED (2026-08-05): both
+                    branches of the server-side ternary it drove were identical, so it billed the
+                    ENTIRE order while badging the result "partial". It pre-selected itself whenever
+                    the order had any fulfillment, so the default action told staff they had issued a
+                    partial invoice when they had issued a duplicate full one. The server now rejects
+                    that value outright — see POST /orders/:id/partial-invoice.
+                    SYNC: re-adding a scope control here requires real per-line fulfillment detail in
+                    getOrderDetail AND lifting the server-side rejection; do not re-add just the UI. */''}
+              <input type="hidden" name="type" value="full">
               <div style="margin-bottom:16px">
                 <div style="font-size:13px;font-weight:500;margin-bottom:6px">Shipping charge</div>
                 <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-bottom:4px">
                   <input type="radio" name="shipping_handling" value="first" checked>
-                  Include all shipping on this invoice (common for wholesale)
+                  Include shipping on this invoice (common for wholesale)
                 </label>
                 <label style="display:flex;align-items:center;gap:8px;font-size:13px">
                   <input type="radio" name="shipping_handling" value="none">
-                  No shipping on this invoice (prorate later)
+                  No shipping on this invoice
                 </label>
+                <div style="font-size:11px;color:var(--muted);margin-top:6px">
+                  Shipping and tax are billed once per order, on the first invoice only.
+                </div>
               </div>
               <div style="display:flex;gap:8px">
                 <button type="submit" class="btn btn-primary">Generate PDF</button>
@@ -3794,7 +3834,15 @@ function renderOrderDetail(session, order, flash, flashMsg) {
               <div class="kv-row" style="align-items:flex-start">
                 <span>
                   <strong>#${h(String(order.name||numId))}-${h(inv.invoice_letter)}</strong>
-                  <span class="badge badge-muted" style="margin-left:4px">${inv.invoice_type === 'fulfilled_only' ? 'partial' : 'full'}</span>
+                  ${/* Every invoice this app has ever produced billed ALL line items — the old
+                       `fulfilled_only` path was a no-op (see POST /orders/:id/partial-invoice). So a
+                       stored type of 'fulfilled_only' does NOT mean the row was partial, and badging
+                       it "partial" misrepresented historical invoices as well as new ones. Label by
+                       what was actually billed, and flag the legacy rows rather than hiding them. */''}
+                  <span class="badge badge-muted" style="margin-left:4px">all items</span>
+                  ${inv.invoice_type === 'fulfilled_only'
+                    ? `<span class="badge badge-orange" style="margin-left:4px" title="Issued before 2026-08-05, when the &quot;fulfilled items only&quot; option billed the entire order despite its label. This invoice charged for every line.">was mislabelled partial</span>`
+                    : ''}
                 </span>
                 <div style="text-align:right">
                   <div class="mono">${fmtMoney(inv.total)}</div>
@@ -5941,20 +5989,44 @@ app.post('/orders/:id/partial-invoice', requireAuth, async (req, res) => {
   const allLineItems = (order.lineItems?.edges || []).map(e => e.node);
   const orderGid     = `gid://shopify/Order/${numId}`;
 
-  // For fulfilled_only: use all line items (fulfillment line detail not tracked in mock/query)
-  const lineItems = type === 'fulfilled_only' && (order.fulfillments || []).length > 0
-    ? allLineItems  // simplified: treat all items as fulfilled for billing
-    : allLineItems;
+  // WHAT: rejects the old `fulfilled_only` scope outright.
+  // WHY: it never worked. Both arms of the ternary that used to live here were `allLineItems`, so a
+  //   "partial" invoice billed the ENTIRE order — while the modal pre-selected that option whenever
+  //   the order had any fulfillment and the stored row was badged "partial" next to the full total.
+  //   Staff were told they had issued a partial invoice when they had issued a duplicate full one.
+  //   Real fulfilled-line billing needs per-line fulfillment detail this query does not fetch;
+  //   until that exists, refusing is the only honest behaviour.
+  // CHANGE-GUARD: this server-side rejection is load-bearing even though the radio is gone from the
+  //   modal — the Electron shell has been observed serving HTML cached on DISK across app restarts
+  //   (see the Cache-Control note near the top of this file), so a stale page can still POST it.
+  if (type === 'fulfilled_only') {
+    return res.status(422).json({
+      error: 'Partial invoicing by fulfilled items is not available — this order can only be invoiced in full.',
+    });
+  }
+  const lineItems = allLineItems;
+
+  // WHAT: shipping and tax are charged ONCE per order, on the first invoice only, and the decision is
+  //   made HERE rather than trusted from the request body.
+  // WHY: `shipping_handling` arrived from the client with the modal defaulting it to 'first', and tax
+  //   had no gate at all. Generating two invoices without touching the radio therefore billed the full
+  //   shipping twice and the full tax twice: a $100 + $10 ship + $8 tax order invoiced $118 then $108.
+  // INVARIANT(S): an operator may still suppress shipping explicitly ('none'); they cannot cause it to
+  //   be charged a second time. Tax follows the same once-per-order rule.
+  const priorInvoices = getPartialInvoices(orderGid);
+  const isFirstInvoice = priorInvoices.length === 0;
 
   // ORDER-LEVEL discount fix: the partial-invoice subtotal + the stored per-line snapshot must be net of
   // ALL discounts (incl order/cart-level). Sum the shared lineItemTrueTotal (post-ALL-discounts, current
   // qty) and snapshot the post-discount unit + current qty so the re-download path (which reconstructs
   // from the flat {unitPrice,quantity} shape, without discountedTotalSet/allocations) renders identically.
   const subtotal = lineItems.reduce((sum, item) => sum + lineItemTrueTotal(item), 0);
-  const shippingAmt = shipping_handling === 'first'
+  const shippingAmt = (isFirstInvoice && shipping_handling !== 'none')
     ? parseFloat(order.totalShippingPriceSet?.presentmentMoney?.amount || 0)
     : 0;
-  const taxAmt  = parseFloat(order.totalTaxSet?.presentmentMoney?.amount || 0);
+  const taxAmt  = isFirstInvoice
+    ? parseFloat(order.totalTaxSet?.presentmentMoney?.amount || 0)
+    : 0;
   const total   = subtotal + shippingAmt + taxAmt;
 
   const letter = getNextInvoiceLetter(orderGid);
