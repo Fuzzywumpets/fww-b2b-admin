@@ -1208,9 +1208,18 @@ export function getReportsDataFromCache() {
     revenue: r.revenue || 0, orders: r.orders || 0, aov: Math.round(r.aov || 0),
   }));
 
+  // DISCOUNT-AWARE (2026-08-05): revenue MUST subtract li.total_discount. li.price is the line's
+  // PRE-discount unit price, so `SUM(price*quantity)` alone over-states every discounted order.
+  // It only ever netted out because an order discount used to arrive as its own cached row at a
+  // NEGATIVE price; order discounts are now per-line discount allocations, which the webhook caches
+  // into total_discount instead. Rows written under the old representation are unaffected (their
+  // total_discount is 0, so the subtraction is a no-op) — this stays correct across both.
+  // DEPENDS: scripts/backfill-orders-per-customer.mjs and scripts/backfill-shopify.mjs must keep
+  // populating total_discount from the per-line discountAllocations, or backfilled history silently
+  // reverts to the over-stated figure here.
   const productRows = db.prepare(`
     SELECT li.title AS title, li.sku AS sku,
-           ROUND(SUM(li.price * li.quantity), 2) AS revenue,
+           ROUND(SUM(li.price * li.quantity - COALESCE(li.total_discount, 0)), 2) AS revenue,
            SUM(li.quantity) AS units
     FROM order_line_items_cache li
     JOIN orders_cache o ON o.shopify_id = li.order_shopify_id

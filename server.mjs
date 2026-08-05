@@ -488,27 +488,33 @@ async function createXeroInvoice(order, accountMap) {
     .map(e => e.node)
     .filter(li => (li.currentQuantity != null ? li.currentQuantity : (li.quantity || 0)) > 0)
     .map(li => {
-      const price  = parseFloat(li.originalUnitPriceSet?.presentmentMoney?.amount || li.discountedUnitPriceSet?.presentmentMoney?.amount || '0');
-      const qty    = li.currentQuantity != null ? li.currentQuantity : (li.quantity || 1);
+      // DISCOUNT-AWARE (2026-08-05): bill the price the customer actually owes, via the SAME shared
+      // helpers the invoice PDF and CSV use (lineItemTrueUnit/lineItemTrueTotal in pdf.mjs), so Xero,
+      // the PDF and the CSV can never disagree about one order's money.
+      // CHANGE-GUARD: this used to prefer originalUnitPriceSet — the PRE-discount price — and netted
+      // out only because an order discount was then a separate NEGATIVE line item that got emitted as
+      // its own negative Xero line. Order discounts are now per-line discount ALLOCATIONS, so the old
+      // code would have invoiced FULL RETAIL, over-billing by the entire discount on real accounting.
+      // (Latent until XERO_WRITES_ENABLED is turned back on — it would have broken on that day, not
+      // on deploy, which is exactly why it is fixed here rather than left for later.)
+      const qty    = lineItemCurrentQty(li);
+      const price  = Math.round(lineItemTrueUnit(li) * 100) / 100;
       return {
         Description:    `${li.title}${li.variantTitle ? ' — ' + li.variantTitle : ''}`,
         Quantity:        qty,
         UnitAmount:      price,
         AccountCode:     accountMap.sales_revenue,
         TaxType:         'NONE',
-        LineAmount:      Math.round(price * qty * 100) / 100,
+        LineAmount:      Math.round(lineItemTrueTotal(li) * 100) / 100,
       };
     });
 
-  // Add order-level discounts if present (as negative line)
-  if (order.discountApplications?.edges?.length) {
-    for (const da of order.discountApplications.edges) {
-      const app = da.node;
-      if (app.value?.__typename === 'MoneyV2') {
-        lineItems.push({ Description: `Discount: ${app.title || 'Order discount'}`, Quantity: 1, UnitAmount: -parseFloat(app.value.amount || '0'), AccountCode: accountMap.discounts, TaxType: 'NONE' });
-      }
-    }
-  }
+  // NOTE (2026-08-05): a separate negative "Discount:" line USED to be appended here from
+  // order.discountApplications. It was already dead code — getOrderDetail, the only feeder of this
+  // function, never selected discountApplications — and it is now actively DANGEROUS: UnitAmount
+  // above is already net of every discount, so emitting a discount line as well would credit the
+  // customer twice. Deliberately removed rather than left dormant for someone to "fix" by adding
+  // discountApplications to the query.
 
   const orderDate  = toXeroDate(order.processedAt || order.createdAt);
   const dueDate    = addDays(orderDate, accountMap.payment_terms_days);
@@ -2051,7 +2057,7 @@ async function getOrderDetail(numericId) {
           discountedUnitPriceSet{presentmentMoney{amount currencyCode}}
           originalUnitPriceSet{presentmentMoney{amount currencyCode}}
           discountedTotalSet{presentmentMoney{amount currencyCode}}
-          discountAllocations{allocatedAmountSet{presentmentMoney{amount currencyCode}} discountApplication{targetSelection}}
+          discountAllocations{allocatedAmountSet{presentmentMoney{amount currencyCode}} discountApplication{targetSelection ... on ManualDiscountApplication{description}}}
         }}}
         fulfillments{status trackingInfo{number url company} createdAt}
         transactions(first:10){id status kind gateway createdAt
@@ -2271,6 +2277,19 @@ function renderOrderDetail(session, order, flash, flashMsg) {
   const sub   = fmtMoney(curTotals.subtotal);
   const ship  = fmtMoney(order.totalShippingPriceSet?.presentmentMoney?.amount);
   const total = fmtMoney(curTotals.total);
+  // DISCOUNT-VISIBILITY (2026-08-05): an order discount used to render as its own (negative) line-item
+  // ROW in the table above — the ONLY place staff could see one existed or clear it. It is now a
+  // per-line discount allocation, so it has no row: surface it in the totals block instead, and pair
+  // it with the "Remove discount" control in the edit bar (POST /orders/:id/discount/order/remove).
+  // DEPENDS: getOrderDetail must select discountAllocations{...discountApplication{... on
+  // ManualDiscountApplication{description}}} or `reason` is blank and the row never renders.
+  const orderDiscount = summarizeOrderDiscount((order.lineItems?.edges || []).map(e => ({
+    currentQuantity: lineItemCurrentQty(e.node),
+    discounts: normalizeAllocations(e.node.discountAllocations),
+  })));
+  const discountRowHtml = orderDiscount.amount > 0
+    ? `<div class="totals-row" id="order-discount-row"><span>Discount${orderDiscount.reason ? ` — ${h(orderDiscount.reason)}` : ''}</span><span>-${fmtMoney(orderDiscount.amount)}</span></div>`
+    : '';
 
   // Fulfillments
   const fulfillmentsHtml = (order.fulfillments || []).length > 0
@@ -2696,6 +2715,7 @@ function renderOrderDetail(session, order, flash, flashMsg) {
           </table>
           <div class="totals-block">
             <div class="totals-row"><span>Subtotal</span><span>${sub}</span></div>
+            ${discountRowHtml}
             <div class="totals-row"><span>Shipping</span><span>${ship}</span></div>
             <div class="totals-row totals-total"><span>Total</span><span>${total}</span></div>
           </div>
@@ -2725,6 +2745,7 @@ function renderOrderDetail(session, order, flash, flashMsg) {
               </label>
               <input type="text" name="discountReason" placeholder="Reason (required for discount)" class="filter-input" style="width:220px">
               <button type="button" id="discount-apply-btn" class="btn btn-primary btn-sm" title="Apply this discount to the order">Apply discount</button>
+              <button type="button" id="discount-remove-btn" class="btn btn-ghost btn-sm" title="Clear the order discount entirely" style="display:${orderDiscount.amount > 0 ? '' : 'none'}">Remove discount</button>
               <span id="discount-chip" class="row-save-chip" data-state="idle" style="font-size:11px;vertical-align:middle"></span>
             </div>
           </div>
@@ -3023,6 +3044,31 @@ function renderOrderDetail(session, order, flash, flashMsg) {
                   if (rows[0]) rows[0].lastElementChild.textContent = money(order.subtotal);
                   var totRow = document.querySelector('.totals-block .totals-total');
                   if (totRow) totRow.lastElementChild.textContent = money(order.total);
+                  if (order.discount !== undefined) discountRow(order.discount);
+                }
+                // Keep the totals-block Discount row in sync. An order discount is a per-line
+                // allocation, so there is no line ROW to repaint — without this the applied discount
+                // stays invisible until a full page reload.
+                function discountRow(d){
+                  function money(n){ return '$' + (Number(n)||0).toFixed(2); }
+                  var row = document.getElementById('order-discount-row');
+                  var amt = d && Number(d.amount) || 0;
+                  if (amt <= 0){ if (row) row.remove(); toggleRemoveDiscBtn(false); return; }
+                  if (!row){
+                    row = document.createElement('div');
+                    row.className = 'totals-row'; row.id = 'order-discount-row';
+                    row.appendChild(document.createElement('span'));
+                    row.appendChild(document.createElement('span'));
+                    var first = document.querySelector('.totals-block .totals-row');
+                    if (first && first.parentNode) first.parentNode.insertBefore(row, first.nextSibling);
+                  }
+                  row.firstElementChild.textContent = 'Discount' + (d.reason ? ' — ' + d.reason : '');
+                  row.lastElementChild.textContent = '-' + money(amt);
+                  toggleRemoveDiscBtn(true);
+                }
+                function toggleRemoveDiscBtn(on){
+                  var b = document.getElementById('discount-remove-btn');
+                  if (b) b.style.display = on ? '' : 'none';
                 }
                 function reconcile(){
                   fetch('/api/orders/' + ORDER_ID + '/line-state', { credentials:'same-origin' })
@@ -3344,6 +3390,7 @@ function renderOrderDetail(session, order, flash, flashMsg) {
                       if (btn){ btn.disabled = false; btn.textContent = 'Apply discount'; }
                       if (res.ok && res.json && res.json.ok){
                         totals(res.json.order);
+                        discountRow(res.json.discount);   // no discount LINE row to repaint — see discountRow()
                         setDiscChip('saved', (res.json.warnings && res.json.warnings.length) ? res.json.warnings.join(' ') : '');
                       } else if (res.json && res.json.code === 'IDEM_PAYLOAD_MISMATCH'){
                         // Stale key vs new values — rekey and let the operator re-apply.
@@ -3361,6 +3408,31 @@ function renderOrderDetail(session, order, flash, flashMsg) {
                     });
                   }
                   if (btn) btn.addEventListener('click', apply);
+                  // Clear the discount entirely. Replaces the ✕ that used to sit on the negative
+                  // discount LINE row — an allocation has no row, so without this there is no way
+                  // to undo an order discount from the admin at all.
+                  var removeBtn = document.getElementById('discount-remove-btn');
+                  if (removeBtn) removeBtn.addEventListener('click', function(){
+                    if (applying) return;
+                    applying = true;
+                    removeBtn.disabled = true;
+                    setDiscChip('saving'); inflight++; setPill();
+                    post('/orders/' + ORDER_ID + '/discount/order/remove', { idemKey: uuid() }).then(function(res){
+                      inflight--; applying = false; removeBtn.disabled = false;
+                      if (res.ok && res.json && res.json.ok){
+                        lastTuple = null; lastKey = null;
+                        if (pctEl) pctEl.value = ''; if (fixedEl) fixedEl.value = ''; if (reasonEl) reasonEl.value = '';
+                        totals(res.json.order);
+                        discountRow(res.json.discount);
+                        setDiscChip('idle');
+                      } else {
+                        anyFailed = true;
+                        setDiscChip('failed', (res.json && res.json.errors) ? res.json.errors.join('; ') : 'Remove failed');
+                        reconcile();
+                      }
+                      setPill();
+                    });
+                  });
                   [pctEl, fixedEl, reasonEl].forEach(function(el){
                     if (!el) return;
                     el.addEventListener('keydown', function(e){ if (e.key === 'Enter'){ e.preventDefault(); apply(); } });
@@ -6030,6 +6102,88 @@ function withOrderLock(orderId, fn) {
   return result;
 }
 
+// ── Order-level discount: representation, identity, and shared staging ────────
+//
+// WHAT: an "order discount" is a per-line Shopify MANUAL DISCOUNT APPLICATION (percentValue)
+// carrying the description `Order discount: <reason>`, applied at the SAME percentage to every
+// eligible line. It is NOT a line item.
+//
+// WHY NOT the old negative-priced custom line (2026-08-05 — THE bug this replaces): Shopify
+// rejects negative custom items outright — `orderEditAddCustomItem(price:{amount:"-136.95"})`
+// returns userErrors [{field:["price","amount"], message:"must be greater than or equal to 0"}],
+// which became OrderEditError -> 422 on EVERY apply (reproduced live on #38616). The schema's own
+// arg doc says "This value can't be negative". There is no flag or ordering that makes it work.
+// Shopify also has NO order/cart-level discount mutation in the orderEdit* suite at all
+// ("Order level discounts can't be added, removed or updated"), so an order discount MUST be
+// synthesized as an equal percentage across the lines.
+//
+// CHANGE-GUARD: the DESCRIPTION prefix is now the only identity of an order discount (it used to be
+// a line TITLE prefix). If you change it, existing orders' discounts become invisible to the replace
+// logic and the next apply DOUBLE-DISCOUNTS. The prefix must stay byte-identical everywhere it is
+// written and read.
+// INVARIANT(S): percentValue (never fixedValue) — fixedValue is PER UNIT and silently CLAMPS to the
+// line total with NO userErrors, so a $136.95 fixedValue on a qty-12 $12.50 line allocates $150.00
+// and reports success. A fixed-$ order discount is therefore converted to its equivalent percentage
+// of the goods basis before staging. Shopify permits at most ONE manual discount per line (a second
+// add REPLACES the first, verified live) — see stageOrderDiscount's foreign-discount refusal.
+// DEPENDS: pdf.mjs lineItemTrueTotal/lineItemTrueUnit subtract only targetSelection 'ALL'
+// allocations because EXPLICIT (line-level) ones are already baked into
+// discountedUnitPriceSet/discountedTotalSet. Our discounts are EXPLICIT (verified live), so the
+// invoice PDF, the invoice CSV and the partial-invoice math stay correct with NO change. Do NOT
+// "fix" pdf.mjs to also subtract EXPLICIT allocations — that would double-subtract every line.
+const ORDER_DISCOUNT_PREFIX = 'Order discount: ';
+const isOrderDiscountDescription = (d) => String(d || '').startsWith(ORDER_DISCOUNT_PREFIX);
+const orderDiscountDescription = (reason) => `${ORDER_DISCOUNT_PREFIX}${reason}`;
+
+// Flatten a committed line's discountAllocations into { amount, targetSelection, description, isOurs }.
+function normalizeAllocations(allocations) {
+  return (allocations || []).map(a => ({
+    amount: parseFloat(a?.allocatedAmountSet?.presentmentMoney?.amount ?? 0) || 0,
+    targetSelection: a?.discountApplication?.targetSelection || null,
+    description: a?.discountApplication?.description || '',
+    isOurs: isOrderDiscountDescription(a?.discountApplication?.description),
+  }));
+}
+
+// Σ of the order-discount allocations on a committed line (0 when the line carries none).
+function lineOrderDiscountAmount(line) {
+  return (line.discounts || []).filter(d => d.isOurs).reduce((s, d) => s + d.amount, 0);
+}
+
+// WHAT: the order's currently-applied order discount, derived from committed line state.
+// Returns { amount, reason, lineCount } — amount 0 / reason null when there is none.
+// INVARIANT(S): amount is Σ allocatedAmountSet across ALL active lines (the authoritative surface —
+// lineItem.totalDiscountSet is UNRELIABLE and reads 0.00 despite a real allocation, verified live).
+function summarizeOrderDiscount(lines) {
+  let amount = 0, reason = null, n = 0;
+  for (const l of (lines || [])) {
+    if ((l.currentQuantity || 0) <= 0) continue;
+    const ours = (l.discounts || []).filter(d => d.isOurs);
+    if (!ours.length) continue;
+    n++;
+    for (const d of ours) {
+      amount += d.amount;
+      if (reason == null) reason = d.description.slice(ORDER_DISCOUNT_PREFIX.length);
+    }
+  }
+  return { amount: Math.round(amount * 100) / 100, reason, lineCount: n };
+}
+
+// SYNC: CALC_LINE_FIELDS — the CalculatedLineItem selection shared by orderEditBegin and by the
+// orderEditRemoveDiscount payload in stageOrderDiscount. Both must return the SAME shape or the
+// post-removal basis read silently falls back to stale pre-removal prices. `description` and `id`
+// are on the CalculatedDiscountApplication INTERFACE (verified against live 2024-10), so no inline
+// fragment is needed on this side — unlike the committed-order read in readCommittedLineState.
+const CALC_LINE_FIELDS = `
+  id title quantity variant{id}
+  discountedUnitPriceSet{presentmentMoney{amount}}
+  originalUnitPriceSet{presentmentMoney{amount}}
+  calculatedDiscountAllocations{
+    allocatedAmountSet{presentmentMoney{amount}}
+    discountApplication{ id targetType targetSelection description }
+  }
+`;
+
 // Read authoritative line state straight off the live order (NOT a calculatedOrder).
 // Returns currentQuantity (Shopify retains removed/zeroed lines — UI must key off this, not quantity).
 // CHANGE-GUARD (total-not-updating bug, 2026-06-29): use current*PriceSet, NOT subtotal/totalPriceSet.
@@ -6038,6 +6192,12 @@ function withOrderLock(orderId, fn) {
 // currentSubtotalPriceSet / currentTotalPriceSet ARE the post-edit truth. We also recompute the
 // subtotal from the surviving lines (currentQuantity * unitPrice) as a belt-and-braces fallback in
 // case the current* fields lag immediately after a rapid edit.
+// DISCOUNT-VISIBILITY (2026-08-05): the query now also selects discountAllocations. An order
+// discount is a per-line MANUAL discount application (see ORDER_DISCOUNT_PREFIX below), which is NOT
+// a line — without these fields the discount is completely unobservable to the server and
+// verifyFn cannot check anything. `description` lives on ManualDiscountApplication, NOT on the
+// DiscountApplication interface, so the inline fragment is REQUIRED here (verified against live
+// 2024-10; contrast the CALCULATED side, where description IS on the interface).
 async function readCommittedLineState(orderId) {
   const r = await shopifyFetch(`query($id:ID!){order(id:$id){
     subtotalPriceSet{presentmentMoney{amount}}
@@ -6049,6 +6209,10 @@ async function readCommittedLineState(orderId) {
       variant{id}
       discountedUnitPriceSet{presentmentMoney{amount}}
       originalUnitPriceSet{presentmentMoney{amount}}
+      discountAllocations{
+        allocatedAmountSet{presentmentMoney{amount}}
+        discountApplication{ targetSelection ... on ManualDiscountApplication { description } }
+      }
     }}}
   }}`, { id: orderId });
   const o = r.data?.order || {};
@@ -6059,6 +6223,7 @@ async function readCommittedLineState(orderId) {
     sku: n.sku || n.variant?.sku || '',
     currentQuantity: n.currentQuantity != null ? n.currentQuantity : n.quantity,
     unitPrice: parseFloat(n.discountedUnitPriceSet?.presentmentMoney?.amount ?? n.originalUnitPriceSet?.presentmentMoney?.amount ?? 0),
+    discounts: normalizeAllocations(n.discountAllocations),
   }));
   // Subtotal/total + active line count use the SHARED helper so this stays in lockstep with the
   // first-paint totals in renderOrderDetail (deriveCurrentOrderTotals). Both honor the same
@@ -6073,6 +6238,137 @@ async function readCommittedLineState(orderId) {
 function lineHasStackedOrderDiscount(calcItem) {
   return (calcItem?.calculatedDiscountAllocations || []).some(a =>
     a?.discountApplication?.targetSelection === 'ALL');
+}
+
+// WHAT: removes EVERY previously-applied order discount from the open edit session and returns the
+// refreshed calculated lines. This is the REPLACE half of the order-discount contract.
+// WHY it works: a committed manual discount application is exposed again (with a stable id) on
+// calculatedOrder.lineItems[].calculatedDiscountAllocations[].discountApplication after a fresh
+// orderEditBegin, and orderEditRemoveDiscount accepts it. The committed Order does NOT expose the
+// application id at all, so removal is ONLY ever possible inside an edit session.
+// CHANGE-GUARD: do NOT add `stagedChanges` to this mutation's selection — Shopify throws an internal
+// error when stagedChanges is selected in the same response as a discount removal.
+// INVARIANT(S): ids are de-duplicated (one application spans many lines, so the same id appears on
+// every discounted line and removing it twice would error); the returned line list REPLACES
+// ctx.calcItems for the caller so the discount basis is read post-removal, never pre-removal.
+async function removePriorOrderDiscounts(calcId, calcItems) {
+  const priorIds = [...new Set((calcItems || []).flatMap(i =>
+    (i.calculatedDiscountAllocations || [])
+      .map(a => a?.discountApplication)
+      .filter(da => da?.id && isOrderDiscountDescription(da.description))
+      .map(da => da.id)))];
+  let lines = calcItems || [];
+  for (const did of priorIds) {
+    const remRes = await shopifyFetch(`mutation rem($id:ID!,$did:ID!){
+      orderEditRemoveDiscount(id:$id,discountApplicationId:$did){
+        calculatedOrder{ id lineItems(first:100){edges{node{ ${CALC_LINE_FIELDS} }}} }
+        userErrors{field message}}}`, { id: calcId, did });
+    const remErrs = remRes.data?.orderEditRemoveDiscount?.userErrors || [];
+    if (remErrs.length) throw new OrderEditError(remErrs.map(e => e.message));
+    const fresh = remRes.data?.orderEditRemoveDiscount?.calculatedOrder?.lineItems?.edges?.map(e => e.node);
+    if (fresh?.length) lines = fresh;
+  }
+  return { removed: priorIds.length, lines };
+}
+
+// Re-read an OPEN calculatedOrder's lines mid-session (there is no root `calculatedOrder` query
+// field in 2024-10 — `node` is the only way in). Needed by the batch /edit handler, whose cached
+// calcItems are stale by the time the discount is staged (qty + price mutations ran first).
+async function readCalcLines(calcId) {
+  const r = await shopifyFetch(`query($id:ID!){node(id:$id){ ... on CalculatedOrder {
+    id lineItems(first:100){edges{node{ ${CALC_LINE_FIELDS} }}} } }}`, { id: calcId });
+  return r.data?.node?.lineItems?.edges?.map(e => e.node) || [];
+}
+
+// WHAT: stages an order-level discount onto an OPEN calculatedOrder — replace-then-apply, all inside
+// the caller's single orderEditBegin/commit. Returns the expectation object verifyOrderDiscount checks.
+// CHANGE-GUARD: percentValue ONLY. fixedValue is per-UNIT and silently clamps to the line total with
+// zero userErrors, so it cannot be used to express an order-level amount (that is the live defect in
+// the legacy modal route). A fixed-$ request is converted to the equivalent percentage of the basis.
+// INVARIANT(S):
+//  - The basis is read from the calculated order AFTER prior order discounts are removed, so a
+//    corrected % is NEVER computed on an already-discounted subtotal. (The old code achieved this by
+//    excluding discount-titled LINES from the basis; there are no discount lines any more, and
+//    discountedUnitPriceSet on the calculated order DOES bake in a live line discount, so removing
+//    first and re-reading is what keeps the guarantee.)
+//  - Shopify permits at most ONE manual discount per line — a second add REPLACES the first. So a
+//    line already carrying a foreign manual discount ("B2B price adj" / "B2B wholesale") CANNOT also
+//    carry an order discount. We REFUSE rather than silently overwrite it, because overwriting would
+//    raise that line back toward retail and OVERCHARGE the customer.
+//  - expectedAmt is derived from the ROUNDED percentage actually sent, not from the requested amount,
+//    so verify compares like with like.
+async function stageOrderDiscount(calcId, ctx, { pct, fixed, reason }) {
+  const description = orderDiscountDescription(reason);
+
+  const { removed, lines } = await removePriorOrderDiscounts(calcId, ctx.calcItems);
+  if (removed) ctx.warnings.push(`replaced ${removed} existing order discount${removed === 1 ? '' : 's'}`);
+
+  const eligible = [];
+  const blocked = [];
+  for (const it of lines) {
+    const qty = it.quantity || 0;
+    if (qty <= 0) continue;
+    if (lineHasStackedOrderDiscount(it)) {
+      throw new OrderEditError('This order carries an order-level discount applied at checkout, and Shopify refuses to add a line discount on top of it. Remove that discount in Shopify first.');
+    }
+    const foreign = (it.calculatedDiscountAllocations || [])
+      .map(a => a?.discountApplication)
+      .find(da => da && !isOrderDiscountDescription(da.description));
+    if (foreign) { blocked.push(`"${it.title}" (${foreign.description || 'manual discount'})`); continue; }
+    const unit = parseFloat(it.discountedUnitPriceSet?.presentmentMoney?.amount ?? it.originalUnitPriceSet?.presentmentMoney?.amount ?? 0) || 0;
+    if (unit <= 0) continue;
+    eligible.push({ id: it.id, title: it.title, unit, qty, lineTotal: unit * qty });
+  }
+  if (blocked.length) {
+    throw new OrderEditError(`Shopify allows only ONE discount per line, and ${blocked.length} line(s) already carry a manual price adjustment: ${blocked.join('; ')}. Clear those line prices first, or apply the reduction as a per-line price instead.`);
+  }
+  if (!eligible.length) throw new OrderEditError('this order has no discountable lines');
+
+  const basis = eligible.reduce((s, l) => s + l.lineTotal, 0);
+  const requested = pct > 0 ? basis * pct / 100 : fixed;
+  if (!(requested > 0)) throw new OrderEditError('computed discount is zero — nothing to apply');
+  if (requested > basis + 0.005) throw new OrderEditError(`discount ${fmtMoney(requested)} exceeds the order subtotal ${fmtMoney(basis)}`);
+  const effPct = parseFloat(Math.min(100, (requested / basis) * 100).toFixed(4));
+  // What Shopify will actually allocate: the rounded % against each line, rounded to cents.
+  const expectedAmt = Math.round(eligible.reduce((s, l) => s + Math.round(l.lineTotal * effPct) / 100, 0) * 100) / 100;
+  if (fixed > 0 && Math.abs(expectedAmt - fixed) > 0.01) {
+    ctx.warnings.push(`a fixed $ discount is applied as ${effPct}% across ${eligible.length} lines, landing at ${fmtMoney(expectedAmt)}`);
+  }
+
+  for (const l of eligible) {
+    const r = await shopifyFetch(`mutation addDisc($id:ID!,$li:ID!,$d:OrderEditAppliedDiscountInput!){
+      orderEditAddLineItemDiscount(id:$id,lineItemId:$li,discount:$d){ calculatedOrder{id} userErrors{field message}}}`,
+      { id: calcId, li: l.id, d: { percentValue: effPct, description } });
+    const errs = r.data?.orderEditAddLineItemDiscount?.userErrors || [];
+    if (errs.length) throw new OrderEditError(errs.map(e => `"${l.title}": ${e.message}`));
+  }
+  return { expectedAmt, effPct, basis, description, lineCount: eligible.length };
+}
+
+// WHAT: VERIFY-OR-FAIL for an order discount, run against committed line state before the action is
+// recorded `committed`. Replaces the old "exactly 1 discount line" assertion, which is unimplementable
+// against an allocation (and, left in place, would have failed EVERY successful apply — a false-RED
+// after the money already moved).
+// INVARIANT(S): Σ allocatedAmountSet is the authoritative applied amount; exactly one distinct
+// description must survive (two = a failed replace = the customer is double-discounted).
+function verifyOrderDiscount(lineState, expected) {
+  const active = (lineState.lines || []).filter(l => (l.currentQuantity || 0) > 0);
+  const bearing = active.filter(l => (l.discounts || []).some(d => d.isOurs));
+  if (!bearing.length) {
+    throw new OrderEditError('the discount did not persist — no discounted line found on the order after commit (please retry)');
+  }
+  const descs = [...new Set(bearing.flatMap(l => l.discounts.filter(d => d.isOurs).map(d => d.description)))];
+  if (descs.length !== 1) {
+    throw new OrderEditError(`the order carries ${descs.length} different order discounts (${descs.join(', ')}) — it may be double-discounted; review it in Shopify`);
+  }
+  const applied = Math.round(bearing.reduce((s, l) => s + lineOrderDiscountAmount(l), 0) * 100) / 100;
+  const tol = 0.01 * bearing.length + 0.01;   // per-line cent rounding on the synthesized percentage
+  if (Math.abs(applied - expected.expectedAmt) > tol) {
+    throw new OrderEditError(`discount landed at ${fmtMoney(applied)} but ${fmtMoney(expected.expectedAmt)} was intended — please re-check the order`);
+  }
+  if (bearing.length !== expected.lineCount) {
+    return `discount applied to ${bearing.length} of ${expected.lineCount} intended lines`;
+  }
 }
 
 // THE chokepoint. idempotent + atomic + serialized + userError-honest.
@@ -6107,13 +6403,7 @@ async function runOrderEdit(orderId, idemKey, editedBy, action, payload, stageFn
     try {
       const beginResult = await shopifyFetch(`
         mutation begin($id:ID!){orderEditBegin(id:$id){
-          calculatedOrder{
-            id
-            lineItems(first:100){edges{node{
-              id title quantity variant{id}
-              calculatedDiscountAllocations{ discountApplication{id targetType targetSelection} }
-            }}}
-          }
+          calculatedOrder{ id lineItems(first:100){edges{node{ ${CALC_LINE_FIELDS} }}} }
           userErrors{field message}
         }}
       `, { id: orderId });
@@ -6213,6 +6503,9 @@ function mockIncrementalEdit({ numId, idemKey, action, payload, editFn, editedBy
     liId: e.node.id, title: e.node.title, sku: e.node.variant?.sku || '',
     currentQuantity: e.node.currentQuantity != null ? e.node.currentQuantity : e.node.quantity,
     unitPrice: parseFloat(e.node.discountedUnitPriceSet?.presentmentMoney?.amount || 0),
+    // SYNC: must mirror readCommittedLineState's `discounts` shape — the order-discount verify and
+    // the line-state API read this field, so a mock that omits it hides discounts from the tests.
+    discounts: normalizeAllocations(e.node.discountAllocations),
   }));
   const lineCount = lines.filter(l => (l.currentQuantity || 0) > 0).length;
   const result = { ok: true, idemKey, warnings, order: { subtotal, total: subtotal + ship, lineCount }, lineState: { lines, subtotal, total: subtotal + ship, lineCount } };
@@ -6423,16 +6716,25 @@ app.post('/orders/:id/edit', requireAuth, async (req, res) => {
       if (addErrs.length) console.error('[order-edit] add discount failed:', JSON.stringify(addErrs));
       else console.log('[order-edit] price updated:', origLiId, currentPrice, '->', newPrice, `(${newPct.toFixed(2)}%)`);
     }
-    // Apply order-level discount as a custom item
+    // Collected non-fatal warnings surfaced to staff via ?msg= on the redirect. Declared HERE (not at
+    // the Phase 16F block below) because the order-discount staging that follows also pushes into it.
+    const batchWarnings = [];
+    // Apply the order-level discount — SAME code path as POST /orders/:id/discount/order.
+    // CHANGE-GUARD (2026-08-05): this block used to be an independent SECOND copy of the
+    // negative-priced orderEditAddCustomItem bug, and it did not even read its userErrors — so it
+    // failed SILENTLY mid-batch on every save. It also computed the basis from subtotalPriceSet,
+    // which both lags and is already net of any existing discount (a % re-apply then compounded).
+    // Both defects are gone by delegating to the shared helper; do not re-inline this.
+    // DEPENDS: the calculated order is RE-READ here because the qty/remove/price mutations above
+    // have already mutated it — the `calcItems` captured at begin are stale, and staging a discount
+    // off stale prices would compute the wrong basis.
     if ((discountPct || discountFixed) && discountReason) {
-      // Fetch current order total to compute discount amount
-      const totResult = await shopifyFetch(`query($id:ID!){order(id:$id){subtotalPriceSet{presentmentMoney{amount}}}}`, { id: orderId });
-      const subTotal = parseFloat(totResult.data?.order?.subtotalPriceSet?.presentmentMoney?.amount || 0);
-      const discAmt = discountPct ? subTotal * parseFloat(discountPct) / 100 : parseFloat(discountFixed || 0);
-      await shopifyFetch(`mutation addItem($id:ID!,$title:String!,$price:MoneyInput!,$qty:Int!){
-        orderEditAddCustomItem(id:$id,title:$title,price:$price,quantity:$qty,taxable:false,requiresShipping:false){
-          calculatedOrder{id} userErrors{field message}}}`,
-        { id: calcId, title: `Order discount: ${discountReason}`, price: { amount: `-${discAmt.toFixed(2)}`, currencyCode: "USD" }, qty: 1 });
+      const discCtx = { calcItems: await readCalcLines(calcId), warnings: batchWarnings };
+      await stageOrderDiscount(calcId, discCtx, {
+        pct: parseFloat(discountPct) || 0,
+        fixed: parseFloat(discountFixed) || 0,
+        reason: String(discountReason).slice(0, 200),
+      });
     }
     // Phase 16A: add new custom items before commit
     for (const line of newCustomLines) {
@@ -6455,7 +6757,6 @@ app.post('/orders/:id/edit', requireAuth, async (req, res) => {
     // orderEditAddLineItemDiscount throws "The order has a discount which prevents applying
     // additional discounts to this line item" — so the line is added at LIST price and a
     // warning is collected and surfaced (NOT a silent continue, NOT a swallowed userError).
-    const batchWarnings = [];
     for (const line of newVariantLines) {
       const variantGid = line.variantId.startsWith('gid://') ? line.variantId : `gid://shopify/ProductVariant/${line.variantId}`;
       const addRes = await shopifyFetch(`mutation addVar($id:ID!,$v:ID!,$q:Int!){
@@ -6798,7 +7099,20 @@ app.post('/orders/:id/line/price', requireAuth, async (req, res) => {
   if (MOCK) {
     const out = mockIncrementalEdit({ numId, idemKey, action: 'line/price', payload, editedBy: session.email, editFn: (edges) => {
       const e = edges.find(x => x.node.id === payload.liId);
-      if (e) e.node.discountedUnitPriceSet = { presentmentMoney: { amount: pr.toFixed(2), currencyCode: 'USD' } };
+      if (!e) return [];
+      // MOCK FIDELITY: production sets a unit price by REMOVING the line's explicit discount and
+      // adding a `percentValue` one described "B2B price adj" — so the price change always leaves a
+      // discount ALLOCATION behind. Modelling only the price (and no allocation) hid the fact that a
+      // per-line adjustment and an order discount cannot coexist on one line.
+      const qty = (e.node.currentQuantity != null ? e.node.currentQuantity : e.node.quantity) || 0;
+      const retail = parseFloat(e.node.originalUnitPriceSet?.presentmentMoney?.amount || 0) || 0;
+      e.node.discountedUnitPriceSet = { presentmentMoney: { amount: pr.toFixed(2), currencyCode: 'USD' } };
+      const keep = (e.node.discountAllocations || []).filter(a => a?.discountApplication?.targetSelection !== 'EXPLICIT');
+      const adj = Math.round((retail - pr) * qty * 100) / 100;
+      e.node.discountAllocations = adj > 0
+        ? [...keep, { allocatedAmountSet: { presentmentMoney: { amount: adj.toFixed(2), currencyCode: 'USD' } },
+                      discountApplication: { targetSelection: 'EXPLICIT', description: 'B2B price adj' } }]
+        : keep;
       return [];
     }});
     if (!out) return res.status(404).json({ ok: false, errors: ['order not found'] });
@@ -6819,6 +7133,14 @@ app.post('/orders/:id/line/price', requireAuth, async (req, res) => {
         .map(a => a.discountApplication).find(da => da?.targetSelection === 'EXPLICIT');
       if (lineHasStackedOrderDiscount(calcItem) && !explicitDisc) {
         throw new OrderEditError('The order has a discount which prevents applying additional discounts to this line item.');
+      }
+      // DEPENDS: since 2026-08-05 an ORDER discount is itself an EXPLICIT per-line manual discount
+      // (see stageOrderDiscount), so it can be the allocation we are about to remove. Shopify permits
+      // only ONE manual discount per line, so setting an explicit price here NECESSARILY drops the
+      // order discount from this line — that is unavoidable, but it must never be silent: warn, or
+      // staff would see the order total move for no visible reason.
+      if (isOrderDiscountDescription(explicitDisc?.description)) {
+        ctx.warnings.push('this line’s share of the order discount was replaced by the manual price — re-apply the order discount if it should still cover this line');
       }
       if (explicitDisc?.id) {
         const remRes = await shopifyFetch(`mutation rem($id:ID!,$did:ID!){
@@ -6899,20 +7221,89 @@ app.post('/orders/:id/line/remove', requireAuth, async (req, res) => {
   }
 });
 
-// WHAT: title prefix that marks a line item as the app's order-level discount. This app does NOT
-// use a real Shopify discount — an "order discount" is a NEGATIVE-priced custom line item. That is
-// why it can be replaced/removed at all (a true orderEditAddDiscount CANNOT be removed once
-// committed), and why re-posting without removing the old one would STACK a second discount.
-// CHANGE-GUARD: the prefix is the ONLY way a discount line is identified. If you change it, existing
-// orders' discount lines become invisible to the replace logic and the next apply will DOUBLE-DISCOUNT.
-// INVARIANT(S): a staff-authored custom line literally titled "Order discount: …" would be treated
-// as one and replaced — acceptable, but do not advertise that title elsewhere in the UI.
-const ORDER_DISCOUNT_PREFIX = 'Order discount: ';
-const isOrderDiscountLine = (title) => String(title || '').startsWith(ORDER_DISCOUNT_PREFIX);
+// ── MOCK model of an order discount ──────────────────────────────────────────
+// WHAT: applies/removes the order discount on mock line edges the SAME WAY Shopify does — as a
+// per-line manual discount ALLOCATION that lowers discountedUnitPriceSet, leaving
+// originalUnitPriceSet at retail.
+// CHANGE-GUARD (2026-08-05, the reason this exists): the previous mock fabricated a NEGATIVE-priced
+// custom line item. Production rejects negative custom items outright ("must be greater than or
+// equal to 0"), so the suite was green against behaviour Shopify 422s on every single call. A mock
+// that models a representation the API refuses is worse than no mock — keep this in lockstep with
+// stageOrderDiscount/removePriorOrderDiscounts, and never model a discount as a line again.
+// SYNC: mockApplyOrderDiscount ↔ stageOrderDiscount — the basis, the effective-percent rounding and
+// the per-line cent rounding must match, or the mock's amounts drift from production's.
+function mockStripOrderDiscount(edges) {
+  let removed = 0;
+  for (const e of edges) {
+    const allocs = e.node.discountAllocations || [];
+    const ours = allocs.filter(a => isOrderDiscountDescription(a?.discountApplication?.description));
+    if (!ours.length) continue;
+    removed++;
+    const qty = (e.node.currentQuantity != null ? e.node.currentQuantity : e.node.quantity) || 0;
+    const back = ours.reduce((s, a) => s + (parseFloat(a?.allocatedAmountSet?.presentmentMoney?.amount ?? 0) || 0), 0);
+    const net = parseFloat(e.node.discountedUnitPriceSet?.presentmentMoney?.amount || 0) * qty;
+    e.node.discountAllocations = allocs.filter(a => !isOrderDiscountDescription(a?.discountApplication?.description));
+    if (qty > 0) e.node.discountedUnitPriceSet = { presentmentMoney: { amount: ((net + back) / qty).toFixed(2), currencyCode: 'USD' } };
+  }
+  return removed;
+}
 
-// POST /orders/:id/discount/order — incremental order-level discount (negative custom item).
-// REPLACE semantics (2026-07-21): removes any existing discount line, then adds the new one, ALL
-// inside one orderEditBegin/commit. Re-applying a corrected % must never stack a second discount.
+function mockApplyOrderDiscount(edges, { pct, fixed, reason }) {
+  const description = orderDiscountDescription(reason);
+  const warnings = [];
+  const removed = mockStripOrderDiscount(edges);
+  if (removed) warnings.push(`replaced ${removed} existing order discount${removed === 1 ? '' : 's'}`);
+
+  const eligible = [], blocked = [];
+  for (const e of edges) {
+    const qty = (e.node.currentQuantity != null ? e.node.currentQuantity : e.node.quantity) || 0;
+    if (qty <= 0) continue;
+    // Mirror the live guard: Shopify refuses a line discount when a cart-level ('ALL') discount
+    // exists ("The order has a discount which prevents applying additional discounts to this line
+    // item."), e.g. mock order #1009.
+    if ((e.node.discountAllocations || []).some(a => a?.discountApplication?.targetSelection === 'ALL')) {
+      throw new OrderEditError('This order carries an order-level discount applied at checkout, and Shopify refuses to add a line discount on top of it. Remove that discount in Shopify first.');
+    }
+    const foreign = (e.node.discountAllocations || [])
+      .map(a => a?.discountApplication)
+      .find(da => da && !isOrderDiscountDescription(da.description));
+    if (foreign) { blocked.push(`"${e.node.title}" (${foreign.description || 'manual discount'})`); continue; }
+    const unit = parseFloat(e.node.discountedUnitPriceSet?.presentmentMoney?.amount ?? e.node.originalUnitPriceSet?.presentmentMoney?.amount ?? 0) || 0;
+    if (unit <= 0) continue;
+    eligible.push({ e, qty, lineTotal: unit * qty });
+  }
+  if (blocked.length) throw new OrderEditError(`Shopify allows only ONE discount per line, and ${blocked.length} line(s) already carry a manual price adjustment: ${blocked.join('; ')}. Clear those line prices first, or apply the reduction as a per-line price instead.`);
+  if (!eligible.length) throw new OrderEditError('this order has no discountable lines');
+
+  const basis = eligible.reduce((s, l) => s + l.lineTotal, 0);
+  const requested = pct > 0 ? basis * pct / 100 : fixed;
+  if (!(requested > 0)) throw new OrderEditError('computed discount is zero — nothing to apply');
+  if (requested > basis + 0.005) throw new OrderEditError(`discount ${fmtMoney(requested)} exceeds the order subtotal ${fmtMoney(basis)}`);
+  const effPct = parseFloat(Math.min(100, (requested / basis) * 100).toFixed(4));
+
+  for (const l of eligible) {
+    const alloc = Math.round(l.lineTotal * effPct) / 100;
+    l.e.node.discountedUnitPriceSet = { presentmentMoney: { amount: ((l.lineTotal - alloc) / l.qty).toFixed(2), currencyCode: 'USD' } };
+    l.e.node.discountAllocations = [
+      ...(l.e.node.discountAllocations || []),
+      { allocatedAmountSet: { presentmentMoney: { amount: alloc.toFixed(2), currencyCode: 'USD' } },
+        discountApplication: { targetSelection: 'EXPLICIT', description } },
+    ];
+  }
+  return warnings;
+}
+
+// POST /orders/:id/discount/order — incremental order-level discount.
+// WHAT: applies an order discount as an equal-percentage MANUAL LINE-ITEM DISCOUNT on every eligible
+// line (orderEditAddLineItemDiscount), replacing any discount already applied — all inside ONE
+// orderEditBegin/commit, verified against committed allocations before it is recorded committed.
+// CHANGE-GUARD (2026-08-05): this route used to add a NEGATIVE-priced custom line item, which
+// Shopify rejects unconditionally — the route 422'd on every call in production while the mock made
+// the tests pass. Do not reintroduce orderEditAddCustomItem with a negative price; the regression
+// test "an order discount is an ALLOCATION, never a negative-priced line item" guards this.
+// INVARIANT(S): re-applying REPLACES (never stacks); the % basis is read AFTER the prior discount is
+// removed so it can never be computed on an already-discounted subtotal; a line already carrying a
+// foreign manual discount makes the whole apply FAIL rather than silently overwrite it.
 app.post('/orders/:id/discount/order', requireAuth, async (req, res) => {
   const numId = req.params.id;
   const session = req.adminSession;
@@ -6931,89 +7322,92 @@ app.post('/orders/:id/discount/order', requireAuth, async (req, res) => {
   }
 
   if (MOCK) {
-    const out = mockIncrementalEdit({ numId, idemKey, action: 'discount/order', payload, editedBy: session.email, editFn: (edges) => {
-      // Mirror the live REPLACE semantics: zero prior discount lines, and compute the basis with
-      // them EXCLUDED. If the mock stacked while prod replaced, the tests would validate fiction.
-      for (const e of edges) {
-        if (isOrderDiscountLine(e.node.title)) { e.node.currentQuantity = 0; e.node.quantity = 0; }
-      }
-      let sub = 0;
-      for (const e of edges) {
-        if (isOrderDiscountLine(e.node.title)) continue;
-        const cq = e.node.currentQuantity != null ? e.node.currentQuantity : e.node.quantity;
-        sub += parseFloat(e.node.discountedUnitPriceSet?.presentmentMoney?.amount || 0) * (cq || 0);
-      }
-      const amt = pct > 0 ? sub * pct / 100 : fixed;
-      edges.push({ node: {
-        id: `gid://shopify/LineItem/idem-${idemKey}`, title: `${ORDER_DISCOUNT_PREFIX}${payload.discountReason}`, quantity: 1, currentQuantity: 1, variant: null,
-        discountedUnitPriceSet: { presentmentMoney: { amount: (-amt).toFixed(2), currencyCode: 'USD' } },
-        originalUnitPriceSet:   { presentmentMoney: { amount: (-amt).toFixed(2), currencyCode: 'USD' } },
-      } });
-      return [];
-    }});
-    if (!out) return res.status(404).json({ ok: false, errors: ['order not found'] });
-    logOrderEdit(orderId, session.email, null, { action: 'discount/order', payload });
-    return res.json({ ok: true, idemKey: out.idemKey, replayed: !!out.replayed, warnings: out.warnings, order: out.order });
+    try {
+      const out = mockIncrementalEdit({ numId, idemKey, action: 'discount/order', payload, editedBy: session.email,
+        editFn: (edges) => mockApplyOrderDiscount(edges, { pct, fixed, reason: payload.discountReason }) });
+      if (!out) return res.status(404).json({ ok: false, errors: ['order not found'] });
+      logOrderEdit(orderId, session.email, null, { action: 'discount/order', payload });
+      return res.json({ ok: true, idemKey: out.idemKey, replayed: !!out.replayed, warnings: out.warnings, order: out.order, discount: summarizeOrderDiscount(out.lineState?.lines) });
+    } catch (err) {
+      return editErrorResponse(res, idemKey, err, 'discount/order');
+    }
   }
 
   try {
-    let expectedAmt = 0;
-    const result = await runOrderEdit(orderId, idemKey, session.email, 'discount/order', payload, async (calcId, ctx) => {
-      // 1) Zero any EXISTING discount line(s) first — otherwise a corrected % stacks a second
-      //    negative line and the customer is double-discounted.
-      const priorCalcIds = (ctx.calcItems || []).filter(i => isOrderDiscountLine(i.title)).map(i => i.id);
-      for (const li of priorCalcIds) {
-        const rmRes = await shopifyFetch(`mutation setQty($id:ID!,$li:ID!,$qty:Int!,$r:Boolean!){
-          orderEditSetQuantity(id:$id,lineItemId:$li,quantity:$qty,restock:$r){ calculatedOrder{id} userErrors{field message}}}`,
-          { id: calcId, li, qty: 0, r: false });
-        const rmErrs = rmRes.data?.orderEditSetQuantity?.userErrors || [];
-        if (rmErrs.length) throw new OrderEditError(rmErrs.map(e => e.message));
-      }
-      if (priorCalcIds.length) ctx.warnings.push(`replaced ${priorCalcIds.length} existing discount line${priorCalcIds.length === 1 ? '' : 's'}`);
-
-      // 2) Compute the basis from AUTHORITATIVE per-line state, EXCLUDING discount lines.
-      //    order.subtotalPriceSet was wrong twice over: it lags after rapid edits (eventually
-      //    consistent) AND it already nets out any existing discount line, so a % re-apply
-      //    computed against an ALREADY-DISCOUNTED subtotal.
-      const st = await readCommittedLineState(orderId);
-      const basis = (st.lines || [])
-        .filter(l => !isOrderDiscountLine(l.title) && (l.currentQuantity || 0) > 0)
-        .reduce((sum, l) => sum + (l.unitPrice * l.currentQuantity), 0);
-      const discAmt = pct > 0 ? basis * pct / 100 : fixed;
-      if (!(discAmt > 0)) throw new OrderEditError('computed discount is zero — nothing to apply');
-      if (discAmt > basis) throw new OrderEditError(`discount ${fmtMoney(discAmt)} exceeds the order subtotal ${fmtMoney(basis)}`);
-      expectedAmt = discAmt;
-
-      const addRes = await shopifyFetch(`mutation addItem($id:ID!,$title:String!,$price:MoneyInput!,$qty:Int!){
-        orderEditAddCustomItem(id:$id,title:$title,price:$price,quantity:$qty,taxable:false,requiresShipping:false){
-          calculatedOrder{id} userErrors{field message}}}`,
-        { id: calcId, title: `${ORDER_DISCOUNT_PREFIX}${payload.discountReason}`, price: { amount: `-${discAmt.toFixed(2)}`, currencyCode: 'USD' }, qty: 1 });
-      const addErrs = addRes.data?.orderEditAddCustomItem?.userErrors || [];
-      if (addErrs.length) throw new OrderEditError(addErrs.map(e => e.message));
-    }, (lineState) => {
-      // VERIFY-OR-FAIL: exactly ONE active discount line, at the amount we intended. Catches both a
-      // failed replace (two discounts = double-discount) and a silently no-op'd add.
-      const active = (lineState.lines || []).filter(l => isOrderDiscountLine(l.title) && (l.currentQuantity || 0) > 0);
-      if (active.length !== 1) {
-        throw new OrderEditError(`expected exactly 1 discount line after apply, found ${active.length} — the order may be double-discounted; review it in Shopify`);
-      }
-      const applied = Math.abs(active[0].unitPrice * active[0].currentQuantity);
-      if (Math.abs(applied - expectedAmt) > 0.01) {
-        throw new OrderEditError(`discount landed at ${fmtMoney(applied)} but ${fmtMoney(expectedAmt)} was intended — please re-check the order`);
-      }
-    });
+    let expected = null;
+    const result = await runOrderEdit(orderId, idemKey, session.email, 'discount/order', payload,
+      async (calcId, ctx) => { expected = await stageOrderDiscount(calcId, ctx, { pct, fixed, reason: payload.discountReason }); },
+      (lineState) => verifyOrderDiscount(lineState, expected));
     logOrderEdit(orderId, session.email, null, { action: 'discount/order', payload });
     auditLog(session.email, 'order_edit_discount', orderId, null, payload);
-    return res.json({ ok: true, idemKey, replayed: !!result.replayed, warnings: result.warnings || [], order: result.order });
+    return res.json({ ok: true, idemKey, replayed: !!result.replayed, warnings: result.warnings || [], order: result.order, discount: summarizeOrderDiscount(result.lineState?.lines) });
   } catch (err) {
     return editErrorResponse(res, idemKey, err, 'discount/order');
   }
 });
 
+// POST /orders/:id/discount/order/remove — clear the order discount entirely.
+// WHAT: replaces the affordance lost when the discount stopped being a line item. Previously staff
+// cleared a discount by hitting the ✕ (setQuantity 0) on the negative discount ROW in the line table;
+// an allocation has no row, so without this route there is NO way to undo an order discount from the
+// admin at all.
+// INVARIANT(S): idempotent — removing when there is no discount is a successful no-op (runOrderEdit
+// already treats Shopify's "at least one change" commit userError as success).
+app.post('/orders/:id/discount/order/remove', requireAuth, async (req, res) => {
+  const numId = req.params.id;
+  const session = req.adminSession;
+  const orderId = `gid://shopify/Order/${numId}`;
+  const { idemKey } = req.body || {};
+  if (!idemKey) return res.status(400).json({ ok: false, errors: ['idemKey required'] });
+  const payload = {};
+  const dup = getEditAction(idemKey);
+  if (dup && dup.status === 'committed') {
+    try { assertReplayPayloadMatches(dup, 'discount/order/remove', payload); }
+    catch (err) { return editErrorResponse(res, idemKey, err, 'discount/order/remove'); }
+  }
+
+  if (MOCK) {
+    try {
+      const out = mockIncrementalEdit({ numId, idemKey, action: 'discount/order/remove', payload, editedBy: session.email,
+        editFn: (edges) => { const n = mockStripOrderDiscount(edges); return n ? [`removed the order discount from ${n} line${n === 1 ? '' : 's'}`] : []; } });
+      if (!out) return res.status(404).json({ ok: false, errors: ['order not found'] });
+      logOrderEdit(orderId, session.email, null, { action: 'discount/order/remove', payload });
+      return res.json({ ok: true, idemKey: out.idemKey, replayed: !!out.replayed, warnings: out.warnings, order: out.order, discount: summarizeOrderDiscount(out.lineState?.lines) });
+    } catch (err) {
+      return editErrorResponse(res, idemKey, err, 'discount/order/remove');
+    }
+  }
+
+  try {
+    const result = await runOrderEdit(orderId, idemKey, session.email, 'discount/order/remove', payload, async (calcId, ctx) => {
+      const { removed } = await removePriorOrderDiscounts(calcId, ctx.calcItems);
+      if (!removed) ctx.warnings.push('this order had no order discount to remove');
+      else ctx.warnings.push(`removed ${removed} order discount${removed === 1 ? '' : 's'}`);
+    }, (lineState) => {
+      // VERIFY-OR-FAIL: no order-discount allocation may survive on any active line.
+      const left = (lineState.lines || []).filter(l => (l.currentQuantity || 0) > 0 && (l.discounts || []).some(d => d.isOurs));
+      if (left.length) throw new OrderEditError(`the order discount is still on ${left.length} line(s) after commit — please retry`);
+    });
+    logOrderEdit(orderId, session.email, null, { action: 'discount/order/remove', payload });
+    auditLog(session.email, 'order_edit_discount_remove', orderId, null, payload);
+    return res.json({ ok: true, idemKey, replayed: !!result.replayed, warnings: result.warnings || [], order: result.order, discount: summarizeOrderDiscount(result.lineState?.lines) });
+  } catch (err) {
+    return editErrorResponse(res, idemKey, err, 'discount/order/remove');
+  }
+});
+
 // GET /api/orders/:id/line-state — authoritative line state for the client to re-sync/reconcile.
+// DISCOUNT-VISIBILITY (2026-08-05): every line now carries `discounts` (its discount allocations) and
+// `orderDiscount` (the per-line share of the app's order discount), and the response carries an
+// order-level `discount` summary. An order discount is no longer a LINE, so without these fields it
+// is invisible to the client and to the regression tests — which is exactly how the 422 hid.
 app.get('/api/orders/:id/line-state', requireAuth, async (req, res) => {
   const numId = req.params.id;
   const orderId = `gid://shopify/Order/${numId}`;
+  const shape = (l) => ({
+    liId: l.liId, title: l.title || '', currentQuantity: l.currentQuantity, unitPrice: l.unitPrice,
+    discounts: l.discounts || [], orderDiscount: lineOrderDiscountAmount(l),
+  });
   if (MOCK) {
     const order = getMockOrder(numId);
     if (!order) return res.status(404).json({ ok: false, error: 'order not found' });
@@ -7023,74 +7417,71 @@ app.get('/api/orders/:id/line-state', requireAuth, async (req, res) => {
       const cq = e.node.currentQuantity != null ? e.node.currentQuantity : e.node.quantity;
       const up = parseFloat(e.node.discountedUnitPriceSet?.presentmentMoney?.amount || 0);
       subtotal += up * (cq || 0);
-      return { liId: e.node.id, title: e.node.title || '', currentQuantity: cq, unitPrice: up };
+      return { liId: e.node.id, title: e.node.title || '', currentQuantity: cq, unitPrice: up, discounts: normalizeAllocations(e.node.discountAllocations) };
     });
     const ship = parseFloat(order.totalShippingPriceSet?.presentmentMoney?.amount || 0);
-    return res.json({ ok: true, lines, subtotal, total: subtotal + ship, lineCount: lines.filter(l => (l.currentQuantity || 0) > 0).length });
+    return res.json({ ok: true, lines: lines.map(shape), subtotal, total: subtotal + ship, lineCount: lines.filter(l => (l.currentQuantity || 0) > 0).length, discount: summarizeOrderDiscount(lines) });
   }
   try {
     const st = await readCommittedLineState(orderId);
-    return res.json({ ok: true, lines: st.lines.map(l => ({ liId: l.liId, title: l.title || '', currentQuantity: l.currentQuantity, unitPrice: l.unitPrice })), subtotal: st.subtotal, total: st.total, lineCount: st.lineCount });
+    return res.json({ ok: true, lines: st.lines.map(shape), subtotal: st.subtotal, total: st.total, lineCount: st.lineCount, discount: summarizeOrderDiscount(st.lines) });
   } catch (err) {
     console.error('[line-state] failed:', err.message);
     return res.status(502).json({ ok: false, error: err.message });
   }
 });
 
-// 16B: Order-level discount (standalone; can also be triggered via /edit)
-// WHAT: 16B — applies a standalone order-level discount; body {type:'pct'|fixed, value, reason}. MOCK adjusts mockOrderOverrides; real mode uses orderEditBegin->orderEditAddLineItemDiscount(fixedValue on first calc line)->commit.
-// CHANGE-GUARD: discount is attached to calcOrder.lineItems[0] because Shopify rejects negative-priced custom items — if the order has zero line items it throws 'no line items for discount target'; re-test after API-version bumps.
-// INVARIANT(S): commit uses notifyCustomer:false; pct math is value/100 of subtotalPriceSet; failures redirect with ?error=discount_failed rather than surfacing userErrors to the client.
+// 16B: Order-level discount (the legacy MODAL path; form POST + redirect, no idemKey).
+// WHAT: applies a standalone order-level discount; body {type:'pct'|'fixed', value, reason}. Now a thin
+// wrapper over the SAME runOrderEdit + stageOrderDiscount + verifyOrderDiscount path as
+// POST /orders/:id/discount/order — only the transport (form POST -> 302) differs.
+// CHANGE-GUARD (2026-08-05): this route used to hand the WHOLE order-level amount to
+// orderEditAddLineItemDiscount as `fixedValue` on calcOrder.lineItems[0]. fixedValue is PER UNIT and
+// silently CLAMPS to the line total with EMPTY userErrors — verified live: fixedValue 136.95 on a
+// qty-12 @ $12.50 line allocated $150.00 and zeroed the unit price, returning success. It also had no
+// replace step (every submit STACKED another discount, computed on the already-discounted
+// subtotalPriceSet) and never inspected orderEditCommit.userErrors. All four defects are gone.
+// INVARIANT(S): the redirect now carries the REAL failure reason in ?msg= instead of a bare
+// ?error=discount_failed; a synthetic idemKey is minted per submission because this transport has no
+// client-side key — that means a double-submit is NOT deduped here, which is precisely why the
+// inline edit-bar route (which does carry an idemKey) is the preferred path.
 app.post('/orders/:id/discount', requireAuth, async (req, res) => {
   const numId  = req.params.id;
+  const session = req.adminSession;
+  const orderId = `gid://shopify/Order/${numId}`;
   const { type, value, reason } = req.body;
   if (!value || !reason) return res.redirect(`/orders/${numId}?error=discount_missing_fields`);
   const changes = { discountType: type, discountValue: value, reason };
+  const pct   = type === 'pct' ? parseFloat(value) || 0 : 0;
+  const fixed = type === 'pct' ? 0 : parseFloat(value) || 0;
+  const cleanReason = String(reason).slice(0, 200);
+  const idemKey = `modal-${numId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const payload = { discountPct: pct || null, discountFixed: fixed || null, discountReason: cleanReason };
+
   if (MOCK) {
-    const order = getMockOrder(numId);
-    if (!order) return res.status(404).json({ error: 'not found' });
-    const overrides = mockOrderOverrides.get(numId) || {};
-    const sub = parseFloat(order.subtotalPriceSet?.presentmentMoney?.amount || 0);
-    const discAmt = type === 'pct' ? sub * parseFloat(value) / 100 : parseFloat(value);
-    const newSub = Math.max(0, sub - discAmt);
-    overrides.subtotalPriceSet = { presentmentMoney: { amount: newSub.toFixed(2), currencyCode: 'USD' } };
-    overrides.totalPriceSet    = { presentmentMoney: { amount: (newSub + parseFloat(order.totalShippingPriceSet?.presentmentMoney?.amount || 0)).toFixed(2), currencyCode: 'USD' } };
-    overrides._discountLine    = { type, value, reason, amount: discAmt.toFixed(2) };
-    mockOrderOverrides.set(numId, overrides);
-    auditLog(req.adminSession.email, 'order_discount', `gid://shopify/Order/${numId}`, null, changes);
-    return res.redirect(`/orders/${numId}?success=discount_applied`);
+    try {
+      const out = mockIncrementalEdit({ numId, idemKey, action: 'discount/order', payload, editedBy: session.email,
+        editFn: (edges) => mockApplyOrderDiscount(edges, { pct, fixed, reason: cleanReason }) });
+      if (!out) return res.status(404).json({ error: 'not found' });
+      auditLog(session.email, 'order_discount', orderId, null, changes);
+      return res.redirect(`/orders/${numId}?success=discount_applied`);
+    } catch (err) {
+      return res.redirect(`/orders/${numId}?error=discount_failed&msg=${encodeURIComponent(String(err.message || '').slice(0, 300))}`);
+    }
   }
-  // Real mode: delegate to /orders/:id/edit with discount fields only
+
   try {
-    const orderId = `gid://shopify/Order/${numId}`;
-    // Pull calcLineItems[0].id along with calcId to use as the discount target
-    const beginResult = await shopifyFetch(`mutation begin($id:ID!){orderEditBegin(id:$id){
-      calculatedOrder{id lineItems(first:5){edges{node{id title}}}}
-      userErrors{field message}
-    }}`, { id: orderId });
-    const calcOrder = beginResult.data?.orderEditBegin?.calculatedOrder;
-    const calcId = calcOrder?.id;
-    if (!calcId) throw new Error('begin failed');
-    const firstCalcLi = calcOrder.lineItems?.edges?.[0]?.node;
-    if (!firstCalcLi) throw new Error('order has no line items for discount target');
-    const totResult = await shopifyFetch(`query($id:ID!){order(id:$id){subtotalPriceSet{presentmentMoney{amount}}}}`, { id: orderId });
-    const subTotal = parseFloat(totResult.data?.order?.subtotalPriceSet?.presentmentMoney?.amount || 0);
-    const discAmt  = type === 'pct' ? subTotal * parseFloat(value) / 100 : parseFloat(value);
-    // Apply discount as a line-item discount on the first calc line item (Shopify
-    // refuses negative-priced custom items; addLineItemDiscount needs the CalculatedLineItem ID).
-    const discRes = await shopifyFetch(`mutation discount($id:ID!,$li:ID!,$d:OrderEditAppliedDiscountInput!){
-      orderEditAddLineItemDiscount(id:$id,lineItemId:$li,discount:$d){
-        calculatedOrder{id} userErrors{field message}}}`,
-      { id: calcId, li: firstCalcLi.id, d: { description: `Order discount: ${reason}`, fixedValue: { amount: discAmt.toFixed(2), currencyCode: "USD" } } });
-    const dErrs = discRes.data?.orderEditAddLineItemDiscount?.userErrors || [];
-    if (dErrs.length) throw new Error(dErrs.map(e => e.message).join(', '));
-    await shopifyFetch(`mutation commit($id:ID!,$notify:Boolean!){orderEditCommit(id:$id,notifyCustomer:$notify){order{id}userErrors{field message}}}`,
-      { id: calcId, notify: false });
-    auditLog(req.adminSession.email, 'order_discount', orderId, null, changes);
+    let expected = null;
+    await runOrderEdit(orderId, idemKey, session.email, 'discount/order', payload,
+      async (calcId, ctx) => { expected = await stageOrderDiscount(calcId, ctx, { pct, fixed, reason: cleanReason }); },
+      (lineState) => verifyOrderDiscount(lineState, expected));
+    logOrderEdit(orderId, session.email, null, { action: 'discount/order', payload });
+    auditLog(session.email, 'order_discount', orderId, null, changes);
     res.redirect(`/orders/${numId}?success=discount_applied`);
   } catch (err) {
-    console.error('discount error:', err.message);
-    res.redirect(`/orders/${numId}?error=discount_failed`);
+    const msg = err instanceof OrderEditError ? err.userMessages.join('; ') : String(err.message || '');
+    console.error('discount error:', msg);
+    res.redirect(`/orders/${numId}?error=discount_failed&msg=${encodeURIComponent(msg.slice(0, 300))}`);
   }
 });
 
@@ -11030,7 +11421,18 @@ app.post('/webhooks/shopify', (req, res) => {
             product_shopify_id: li.product_id ? String(li.product_id) : null,
             sku: li.sku, title: li.title, variant_title: li.variant_title,
             quantity: li.quantity, price: parseFloat(li.price) || 0,
-            total_discount: parseFloat(li.total_discount) || 0,
+            // DISCOUNT-AWARE (2026-08-05): prefer Σ discount_allocations over total_discount.
+            // VERIFIED on live order #38611: REST reports total_discount "0.00" while
+            // discount_allocations carries the real 37.99 (pre_tax_price 3.00 = 40.99 − 37.99).
+            // `price` is the PRE-discount unit price, so caching a 0 discount here makes
+            // getReportsFromCache over-state B2B product revenue by the full discount on every
+            // discounted order — which order discounts now are, since they stopped being their own
+            // negative-priced cached row.
+            // SYNC: same rule as scripts/backfill-shopify.mjs + scripts/backfill-orders-per-customer.mjs.
+            // DEPENDS: db.mjs getReportsFromCache subtracts this column from SUM(price*quantity).
+            total_discount: (li.discount_allocations || []).length
+              ? (li.discount_allocations || []).reduce((s, a) => s + (parseFloat(a?.amount ?? a?.amount_set?.shop_money?.amount ?? 0) || 0), 0)
+              : parseFloat(li.total_discount) || 0,
             taxable: li.taxable ? 1 : 0, vendor: li.vendor || null,
           })));
         }

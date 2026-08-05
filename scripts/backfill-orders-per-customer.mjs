@@ -42,6 +42,7 @@ async function fetchOrdersForCustomer(customerGid) {
               vendor
               originalUnitPriceSet{shopMoney{amount}}
               totalDiscountSet{shopMoney{amount}}
+              discountAllocations{allocatedAmountSet{shopMoney{amount}}}
               variant{id product{id}}
               taxable
             }}}
@@ -115,7 +116,15 @@ async function fetchOrdersForCustomer(customerGid) {
           variant_title: n.variantTitle || null,
           quantity: n.quantity || 0,
           price: parseFloat(n.originalUnitPriceSet?.shopMoney?.amount || 0),
-          total_discount: parseFloat(n.totalDiscountSet?.shopMoney?.amount || 0),
+          // DISCOUNT-AWARE (2026-08-05): prefer Σ discountAllocations over totalDiscountSet.
+          // totalDiscountSet is UNRELIABLE — verified live on order #38611, where it reads 0.00 while
+          // the line carries a real 37.99 allocation. Since `price` above is the PRE-discount unit
+          // price, a 0 here makes getReportsFromCache over-state that product's revenue by the whole
+          // discount. Falls back to totalDiscountSet when there are no allocations.
+          // DEPENDS: db.mjs getReportsFromCache subtracts this column from SUM(price*quantity).
+          total_discount: (n.discountAllocations || []).length
+            ? (n.discountAllocations || []).reduce((s, a) => s + (parseFloat(a?.allocatedAmountSet?.shopMoney?.amount || 0) || 0), 0)
+            : parseFloat(n.totalDiscountSet?.shopMoney?.amount || 0),
           taxable: n.taxable ? 1 : 0,
           vendor: n.vendor || null,
           is_fww_vendor: (n.vendor === 'Fuzzywumpets') ? 1 : 0,

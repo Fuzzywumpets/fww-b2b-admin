@@ -670,47 +670,187 @@ await test('REGRESSION companion: reused idemKey + IDENTICAL payload still repla
   assert.equal(r2.json.replayed, true, 'identical retry is a replay');
 });
 
-// REGRESSION (order-discount latch, 2026-07-21): an "order discount" in this app is a NEGATIVE
-// custom LINE ITEM, not a Shopify discount. So re-applying a corrected % must REPLACE the prior
-// discount line — never stack a second one on top (that would double-discount the customer).
-await test('REGRESSION: re-applying a corrected discount REPLACES, never stacks a second discount line', async () => {
+// ── Order-discount regressions ───────────────────────────────────────────────
+// An "order discount" is a per-line MANUAL DISCOUNT ALLOCATION (percentValue) carrying the
+// description "Order discount: <reason>", applied at the same % to every eligible line. It used to
+// be a NEGATIVE-priced custom line item — a representation Shopify rejects outright, so the route
+// 422'd on every call in production while these tests passed against a mock that faked it.
+// Helpers read the allocation surface, never a line title.
+const readState = async (cookie, id = 1001) =>
+  (await (await fetch(`${BASE}/api/orders/${id}/line-state`, { headers: { Cookie: cookie } })).json());
+const goodsBasis = (st) => (st.lines || [])
+  .filter(l => (l.currentQuantity || 0) > 0)
+  .reduce((s, l) => s + l.unitPrice * l.currentQuantity + (l.orderDiscount || 0), 0);
+
+// REGRESSION (THE 422, 2026-08-05): Shopify refuses negative-priced custom items
+// ("must be greater than or equal to 0"), so an order discount must NEVER be a line item. This test
+// fails against the old implementation on every assertion: it produced a line titled
+// "Order discount: …" at a negative unit price and produced no discount allocations at all.
+await test('REGRESSION: an order discount is an ALLOCATION, never a negative-priced line item', async () => {
   const cookie = await seedSession();
-  const isDisc = l => (l.title || '').startsWith('Order discount: ');
+  const r = await postJson('/orders/1002/discount/order', cookie, { idemKey: uuid(), discountPct: 10, discountFixed: '', discountReason: 'no negative lines' });
+  assert.equal(r.status, 200, `apply must succeed, got ${r.status} ${JSON.stringify(r.json)}`);
+
+  const st = await readState(cookie, 1002);
+  // (a) no negative-priced line may exist — that is the shape Shopify rejects.
+  const negative = (st.lines || []).filter(l => l.unitPrice < 0);
+  assert.equal(negative.length, 0, `negative-priced line item(s) present: ${JSON.stringify(negative)}`);
+  // (b) no line may be titled like a discount — the discount is not a line at all.
+  const titled = (st.lines || []).filter(l => (l.title || '').startsWith('Order discount: '));
+  assert.equal(titled.length, 0, `order discount is still modelled as a LINE: ${JSON.stringify(titled)}`);
+  // (c) it must be visible as real per-line allocations carrying our description.
+  const bearing = (st.lines || []).filter(l => (l.discounts || []).some(d => d.isOurs));
+  assert.ok(bearing.length > 0, 'no discount allocation found — the discount is unobservable');
+  assert.ok(bearing.every(d => d.discounts.every(a => a.targetSelection !== 'ALL')),
+    'our discounts must be EXPLICIT (line-level); an ALL target would be double-subtracted by pdf.mjs');
+  assert.ok(st.discount.amount > 0 && /no negative lines/.test(st.discount.reason), `summary wrong: ${JSON.stringify(st.discount)}`);
+});
+
+// REGRESSION (order-discount latch, 2026-07-21): re-applying a corrected % must REPLACE the prior
+// discount — never stack a second one (that would double-discount the customer).
+await test('REGRESSION: re-applying a corrected discount REPLACES, never stacks a second discount', async () => {
+  const cookie = await seedSession();
 
   const r1 = await postJson('/orders/1001/discount/order', cookie, { idemKey: uuid(), discountPct: 10, discountFixed: '', discountReason: 'first pass' });
   assert.equal(r1.status, 200, 'first discount should apply');
-  const s1 = await (await fetch(`${BASE}/api/orders/1001/line-state`, { headers: { Cookie: cookie } })).json();
-  const d1 = (s1.lines || []).filter(l => isDisc(l) && (l.currentQuantity || 0) > 0);
-  assert.equal(d1.length, 1, `expected 1 discount line after first apply, got ${d1.length}`);
+  const s1 = await readState(cookie);
+  assert.ok(s1.discount.amount > 0, 'expected a discount after first apply');
+  assert.equal(s1.discount.reason, 'first pass');
 
   // Operator realises 10% was wrong and re-applies at 20%.
   const r2 = await postJson('/orders/1001/discount/order', cookie, { idemKey: uuid(), discountPct: 20, discountFixed: '', discountReason: 'corrected' });
   assert.equal(r2.status, 200, 'corrected discount must be accepted, not silently discarded');
-  const s2 = await (await fetch(`${BASE}/api/orders/1001/line-state`, { headers: { Cookie: cookie } })).json();
-  const d2 = (s2.lines || []).filter(l => isDisc(l) && (l.currentQuantity || 0) > 0);
-  assert.equal(d2.length, 1, `DOUBLE-DISCOUNT: expected exactly 1 active discount line, got ${d2.length}`);
-  assert.ok(/corrected/.test(d2[0].title), `surviving discount should be the corrected one, got "${d2[0].title}"`);
+  const s2 = await readState(cookie);
+  // Exactly ONE distinct discount description may survive across every line.
+  const descs = [...new Set((s2.lines || []).flatMap(l => (l.discounts || []).filter(d => d.isOurs).map(d => d.description)))];
+  assert.equal(descs.length, 1, `DOUBLE-DISCOUNT: expected exactly 1 active order discount, got ${descs.length}: ${descs}`);
+  assert.ok(/corrected/.test(descs[0]), `surviving discount should be the corrected one, got "${descs[0]}"`);
+  assert.ok(s2.discount.amount > s1.discount.amount, `20% must exceed 10%: ${s1.discount.amount} -> ${s2.discount.amount}`);
 });
 
-await test('REGRESSION: the % basis EXCLUDES an existing discount line (no discount-on-discounted)', async () => {
+await test('REGRESSION: the % basis EXCLUDES the existing discount (no discount-on-discounted)', async () => {
   const cookie = await seedSession();
-  const isDisc = l => (l.title || '').startsWith('Order discount: ');
   // NOTE: uses 1001, never 1007 — a UI test asserts 1007 is pristine, and the mock order state is
   // shared across the whole run, so touching 1007 here fails a test in a different file.
-  const base = await (await fetch(`${BASE}/api/orders/1001/line-state`, { headers: { Cookie: cookie } })).json();
-  const goods = (base.lines || []).filter(l => !isDisc(l) && (l.currentQuantity || 0) > 0)
-    .reduce((s, l) => s + l.unitPrice * l.currentQuantity, 0);
+  // The basis is goods NET of any other discount but GROSS of ours — reconstructed by adding each
+  // line's own order-discount allocation back onto its discounted unit price.
+  const goods = goodsBasis(await readState(cookie));
 
   await postJson('/orders/1001/discount/order', cookie, { idemKey: uuid(), discountPct: 10, discountFixed: '', discountReason: 'r1' });
   await postJson('/orders/1001/discount/order', cookie, { idemKey: uuid(), discountPct: 10, discountFixed: '', discountReason: 'r2' });
 
-  const st = await (await fetch(`${BASE}/api/orders/1001/line-state`, { headers: { Cookie: cookie } })).json();
-  const disc = (st.lines || []).filter(l => isDisc(l) && (l.currentQuantity || 0) > 0);
-  assert.equal(disc.length, 1, `expected 1 discount line, got ${disc.length}`);
-  const applied = Math.abs(disc[0].unitPrice * disc[0].currentQuantity);
+  const st = await readState(cookie);
   const expected = goods * 0.10;
-  assert.ok(Math.abs(applied - expected) < 0.02,
-    `second 10% must be computed on the GOODS subtotal (${expected.toFixed(2)}), not the already-discounted total — got ${applied.toFixed(2)}`);
+  assert.ok(Math.abs(st.discount.amount - expected) < 0.02,
+    `second 10% must be computed on the GOODS subtotal (${expected.toFixed(2)}), not the already-discounted total — got ${st.discount.amount.toFixed(2)}`);
+  // And the subtotal must have moved by exactly the discount, i.e. the allocations really landed.
+  assert.ok(Math.abs((goods - st.discount.amount) - st.subtotal) < 0.02,
+    `subtotal ${st.subtotal} should be goods ${goods.toFixed(2)} less discount ${st.discount.amount}`);
+});
+
+await test('a FIXED-$ order discount lands at the requested amount (fixedValue is per-UNIT — must be synthesized as a %)', async () => {
+  const cookie = await seedSession();
+  // Live-verified hazard: passing the whole order amount as OrderEditAppliedDiscountInput.fixedValue
+  // applies it PER UNIT and silently CLAMPS to the line total with EMPTY userErrors, so a $25
+  // discount on a qty-10 line takes $250 off and reports success.
+  const before = goodsBasis(await readState(cookie, 1004));
+  const r = await postJson('/orders/1004/discount/order', cookie, { idemKey: uuid(), discountPct: '', discountFixed: 25, discountReason: 'fixed dollars' });
+  assert.equal(r.status, 200, `fixed discount should apply, got ${JSON.stringify(r.json)}`);
+  const st = await readState(cookie, 1004);
+  assert.ok(Math.abs(st.discount.amount - 25) <= 0.02, `expected ~$25.00 off, got ${st.discount.amount}`);
+  assert.ok(Math.abs(st.subtotal - (before - 25)) <= 0.02, `subtotal should drop by 25: ${before} -> ${st.subtotal}`);
+});
+
+await test('POST /orders/:id/discount/order/remove clears the discount (the affordance the discount LINE used to provide)', async () => {
+  const cookie = await seedSession();
+  await postJson('/orders/1005/discount/order', cookie, { idemKey: uuid(), discountPct: 15, discountFixed: '', discountReason: 'to be removed' });
+  const applied = await readState(cookie, 1005);
+  assert.ok(applied.discount.amount > 0, 'discount should be applied first');
+
+  const r = await postJson('/orders/1005/discount/order/remove', cookie, { idemKey: uuid() });
+  assert.equal(r.status, 200, `remove should succeed, got ${JSON.stringify(r.json)}`);
+  const after = await readState(cookie, 1005);
+  assert.equal(after.discount.amount, 0, `discount should be gone, got ${JSON.stringify(after.discount)}`);
+  assert.equal((after.lines || []).filter(l => (l.discounts || []).some(d => d.isOurs)).length, 0, 'no allocation may survive');
+  assert.ok(Math.abs(after.subtotal - goodsBasis(applied)) < 0.02, 'removing must restore the pre-discount subtotal');
+});
+
+await test('order detail SHOWS an applied order discount (the visibility the discount LINE row used to give)', async () => {
+  const cookie = await seedSession();
+  // Self-cleaning: applies then removes, so #1006 is left pristine for the refusal test below.
+  const rowOf = (html) => (html.match(/<div class="totals-row" id="order-discount-row">.*?<\/div>/) || [])[0];
+  const page = async () => (await (await fetch(`${BASE}/orders/1006`, { headers: { Cookie: cookie } })).text());
+
+  assert.ok(!rowOf(await page()), 'no discount row before one is applied');
+
+  await postJson('/orders/1006/discount/order', cookie, { idemKey: uuid(), discountPct: 10, discountFixed: '', discountReason: 'Bulk deal' });
+  const html = await page();
+  const row = rowOf(html);
+  assert.ok(row, 'order detail must render a Discount row in the totals block — otherwise an applied discount is INVISIBLE to staff');
+  assert.ok(/Bulk deal/.test(row), `discount row should name the reason: ${row}`);
+  assert.ok(/-\$/.test(row), `discount row should show a negative amount: ${row}`);
+  // …and the control that clears it must be revealed (it is hidden until a discount exists).
+  assert.ok(/id="discount-remove-btn"[^>]*style="display:"/.test(html), 'Remove discount button must be visible once a discount exists');
+
+  await postJson('/orders/1006/discount/order/remove', cookie, { idemKey: uuid() });
+  assert.ok(!rowOf(await page()), 'the Discount row must disappear once the discount is removed');
+});
+
+// The invoice is a CUSTOMER-FACING money document. An order discount used to appear as its own
+// negative CSV/PDF row, which is why Σ rows equalled the printed subtotal. It is now absorbed into
+// each line's discounted unit price instead, so the rows must STILL sum to the discounted subtotal —
+// if they silently reverted to list prices the customer would be billed the full amount.
+await test('an order discount flows into the invoice CSV: rows are discounted and Σ Line Total == subtotal', async () => {
+  const cookie = await seedSession();
+  // Unit prices BEFORE the discount — the invoice must bill below these afterwards.
+  const beforeUnits = new Map((await readState(cookie, 1005)).lines.filter(l => l.currentQuantity > 0).map(l => [l.title, l.unitPrice]));
+  await postJson('/orders/1005/discount/order', cookie, { idemKey: uuid(), discountPct: 10, discountFixed: '', discountReason: 'invoice check' });
+  const st = await readState(cookie, 1005);
+  assert.ok(st.discount.amount > 0, 'discount should be applied');
+
+  const text = await (await fetch(`${BASE}/orders/1005/invoice.csv`, { headers: { Cookie: cookie } })).text();
+  const rows = parseCsvBody(text);
+  const header = rows[0], data = rows.slice(1);
+  const totalIdx = header.indexOf('Line Total');
+  const whIdx    = header.indexOf('Wholesale Price');
+  const titleIdx = header.indexOf('Product');
+  assert.ok(totalIdx >= 0 && whIdx >= 0 && titleIdx >= 0, `missing columns ${JSON.stringify(header)}`);
+  // No negative row may appear — the discount is not a line any more.
+  assert.ok(data.every(r => parseFloat(r[totalIdx]) >= 0), `negative invoice row present: ${JSON.stringify(data)}`);
+  // Every billed unit price must be strictly BELOW its pre-discount price, i.e. the discount really
+  // reached the customer-facing document rather than the rows quietly reverting to list.
+  for (const r of data) {
+    const was = beforeUnits.get(r[titleIdx]);
+    assert.ok(was != null, `unexpected invoice row ${r[titleIdx]}`);
+    assert.ok(parseFloat(r[whIdx]) < was, `"${r[titleIdx]}" billed at ${r[whIdx]}, not below its pre-discount ${was} — invoice ignored the discount`);
+  }
+  const sum = data.reduce((s, r) => s + parseFloat(r[totalIdx]), 0);
+  assert.ok(Math.abs(sum - st.subtotal) < 0.02,
+    `Σ Line Total (${sum.toFixed(2)}) must equal the discounted subtotal (${st.subtotal.toFixed(2)}) — the invoice would under/over-bill`);
+
+  const pdf = await fetch(`${BASE}/orders/1005/invoice.pdf`, { headers: { Cookie: cookie } });
+  assert.equal(pdf.status, 200, 'invoice.pdf must still render for a discounted order');
+
+  await postJson('/orders/1005/discount/order/remove', cookie, { idemKey: uuid() });
+});
+
+await test('an order discount REFUSES to overwrite a foreign per-line manual discount (would overcharge)', async () => {
+  const cookie = await seedSession();
+  // Shopify permits only ONE manual discount per line — a second add REPLACES the first. Overwriting
+  // a "B2B price adj" with an order discount would raise that line back toward retail, so the whole
+  // apply must fail loudly rather than silently re-pricing the customer's goods upward.
+  const st = await readState(cookie, 1006);
+  const line = (st.lines || []).find(l => (l.currentQuantity || 0) > 0);
+  assert.ok(line, 'fixture 1006 needs at least one active line');
+  // A manual unit-price override is exactly how a "B2B price adj" discount gets onto a line.
+  const pr = await postJson('/orders/1006/line/price', cookie, { idemKey: uuid(), liId: line.liId, price: line.unitPrice - 5 });
+  assert.equal(pr.status, 200, `price override should apply, got ${JSON.stringify(pr.json)}`);
+
+  const r = await postJson('/orders/1006/discount/order', cookie, { idemKey: uuid(), discountPct: 10, discountFixed: '', discountReason: 'should refuse' });
+  assert.equal(r.status, 422, `expected refusal, got ${r.status} ${JSON.stringify(r.json)}`);
+  assert.ok(/only ONE discount per line/i.test((r.json.errors || []).join(' ')), `wrong error: ${JSON.stringify(r.json.errors)}`);
+  const after = await readState(cookie, 1006);
+  assert.equal(after.discount.amount, 0, 'a refused apply must leave no partial discount behind');
 });
 
 await test('REGRESSION: line/qty reused key + different qty also 409s (guard covers every action route)', async () => {
