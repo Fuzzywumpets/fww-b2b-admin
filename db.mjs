@@ -342,6 +342,20 @@ db.exec(`
   if (!cols.has('current_subtotal')) db.exec(`ALTER TABLE orders_cache ADD COLUMN current_subtotal REAL`);
 }
 
+// MIGRATION (2026-08-04): wholesale applications submitted on fuzzywumpets.com land in the PORTAL's
+// wholesale_leads table; this app ingests them into `leads` so staff see them in the tool they
+// actually use. Two columns support that:
+//   portal_lead_id — the originating portal row. Load-bearing beyond bookkeeping: the portal's
+//     /__internal__/leads/:id/invite endpoint is keyed on the PORTAL id, not this table's id, so
+//     without this column an ingested lead cannot be turned into an invite at all.
+//   fein — the FEDERAL employer id, distinct from the existing sales_tax_id (state resale number).
+// Idempotent, same PRAGMA-then-ALTER shape as above.
+{
+  const cols = new Set(db.prepare(`PRAGMA table_info(leads)`).all().map(c => c.name));
+  if (!cols.has('portal_lead_id')) db.exec(`ALTER TABLE leads ADD COLUMN portal_lead_id INTEGER`);
+  if (!cols.has('fein'))           db.exec(`ALTER TABLE leads ADD COLUMN fein TEXT`);
+}
+
 export default db;
 
 export function createSession(sid, email, displayName, picture) {
@@ -486,6 +500,56 @@ export function createLead(fields) {
     fields.next_followup_due || null, now, now
   );
   return r.lastInsertRowid;
+}
+
+// WHAT: ingests ONE portal wholesale_leads row into this app's `leads` table, idempotently.
+// CHANGE-GUARD: this runs repeatedly (on every /leads view), so it must never overwrite work staff
+//   have done. Three cases, deliberately: already-ingested → untouched; an existing lead with the
+//   same email → LINKED only (portal id + application payload attached, CRM state left alone,
+//   because `status`, `assigned_to`, `next_followup_due` and `rejected_reason` are staff-owned);
+//   otherwise → inserted as 'new'. Do NOT add a general "refresh the descriptive fields" branch —
+//   that is what would silently revert a staff edit on the next page load.
+// INVARIANT(S): `leads.email` is UNIQUE, so a duplicate application (the portal has no unique
+//   constraint on email) collapses onto one row here rather than erroring; created_at preserves the
+//   applicant's original submission time, not the ingest time.
+export function upsertPortalLead(row) {
+  const now = Date.now();
+  const already = db.prepare('SELECT id FROM leads WHERE portal_lead_id = ?').get(row.id);
+  if (already) return { action: 'skipped', id: already.id };
+
+  // Everything the portal collected that has no first-class column here, kept verbatim so the lead
+  // detail page can render the full application rather than a lossy subset.
+  const applicationJson = JSON.stringify({
+    portalLeadId: row.id,
+    address: row.address || null,
+    products: row.products || null,
+    notes: row.notes || null,
+    hasTaxExemptDoc: !!row.tax_exempt_doc_path,
+    submittedAt: row.submitted_at || null,
+  });
+
+  const existing = db.prepare('SELECT id FROM leads WHERE email = ?').get(row.email);
+  if (existing) {
+    db.prepare(`UPDATE leads SET portal_lead_id = ?, application_data_json = ?,
+                  fein = COALESCE(fein, ?), updated_at = ? WHERE id = ?`)
+      .run(row.id, applicationJson, row.fein || null, now, existing.id);
+    return { action: 'linked', id: existing.id };
+  }
+
+  const info = db.prepare(`
+    INSERT INTO leads (email, business_name, contact_name, phone, website,
+      sales_tax_state, sales_tax_id, fein, source, source_detail,
+      application_data_json, portal_lead_id, status, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'wholesale_form', 'fuzzywumpets.com/pages/wholesale-1',
+      ?, ?, 'new', ?, ?)
+  `).run(
+    row.email, row.business_name || null, row.contact_name || null,
+    row.phone || null, row.website || null,
+    row.state || null, row.tax_id || null, row.fein || null,
+    applicationJson, row.id,
+    row.submitted_at || now, now
+  );
+  return { action: 'inserted', id: info.lastInsertRowid };
 }
 
 export function getLeads({ status, search, limit = 100, offset = 0 } = {}) {

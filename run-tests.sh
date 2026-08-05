@@ -30,6 +30,7 @@ fi
 
 API_FAIL=0
 UI_FAIL=0
+UNIT_FAIL=0
 
 if [ -f test/api.test.mjs ]; then
   echo ""
@@ -41,15 +42,24 @@ if [ -f test/ui.test.mjs ]; then
   TEST_BASE="http://127.0.0.1:$PORT" node test/ui.test.mjs || UI_FAIL=$?
 fi
 
+# Standalone unit suites — run WITHOUT the mock HTTP server on purpose, because the code they cover
+# is short-circuited under MOCK (getPortalDb returns null) and the API suite would otherwise report
+# a false green over an untested ingest.
+if [ -f test/leads-ingest.test.mjs ]; then
+  echo ""
+  B2B_ADMIN_MOCK=1 node test/leads-ingest.test.mjs || UNIT_FAIL=$?
+fi
+
 echo ""
 echo "======================================================"
-if [ $API_FAIL -eq 0 ] && [ $UI_FAIL -eq 0 ]; then
+if [ $API_FAIL -eq 0 ] && [ $UI_FAIL -eq 0 ] && [ $UNIT_FAIL -eq 0 ]; then
   echo "  ALL TESTS PASSED"
   echo "======================================================"
   exit 0
 else
-  [ $API_FAIL -ne 0 ] && echo "  API tests: FAILED"
-  [ $UI_FAIL  -ne 0 ] && echo "  UI tests:  FAILED"
+  [ $API_FAIL  -ne 0 ] && echo "  API tests:  FAILED"
+  [ $UI_FAIL   -ne 0 ] && echo "  UI tests:   FAILED"
+  [ $UNIT_FAIL -ne 0 ] && echo "  Unit tests: FAILED"
   echo "======================================================"
   exit 1
 fi
