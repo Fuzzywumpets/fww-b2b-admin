@@ -2569,7 +2569,11 @@ await test('POST /orders/1001/partial-invoice with type=full → returns PDF', a
   assert.equal(res.headers.get('content-type'), 'application/pdf', 'Should return PDF');
 });
 
-await test('POST /orders/1001/partial-invoice with type=fulfilled_only → returns PDF', async () => {
+// REGRESSION: this test previously asserted that type=fulfilled_only returned a PDF — which it did,
+// while billing the ENTIRE order. Both arms of the ternary behind it were `allLineItems`, so the
+// "partial invoice" the modal pre-selected was a full one wearing a "partial" badge. The scope is
+// now refused server-side; the old assertion was locking in the bug.
+await test('REGRESSION: type=fulfilled_only is REFUSED, not silently billed in full', async () => {
   const cookie = await seedSession();
   const body = new URLSearchParams({ type: 'fulfilled_only', shipping_handling: 'none' });
   const res = await fetch(`${BASE}/orders/1001/partial-invoice`, {
@@ -2577,8 +2581,56 @@ await test('POST /orders/1001/partial-invoice with type=fulfilled_only → retur
     headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
     body: body.toString(),
   });
-  assert.equal(res.status, 200, `Expected 200, got ${res.status}`);
-  assert.equal(res.headers.get('content-type'), 'application/pdf', 'Should return PDF');
+  assert.equal(res.status, 422, `fulfilled_only must be refused, got ${res.status}`);
+  const j = await res.json();
+  assert.ok(/full/i.test(j.error || ''), `error should explain the order can only be invoiced in full, got: ${j.error}`);
+});
+
+// REGRESSION: shipping and tax were billed IN FULL on every invoice — shipping because
+// shipping_handling came from the client (modal default 'first') with no server-side check against
+// existing invoices, tax because it had no gate at all. Two invoices on a $100+$10 ship+$8 tax order
+// billed $118 then $108 = $226 for a $118 order. Both figures were persisted.
+await test('REGRESSION: shipping and tax are billed ONCE per order, not on every invoice', async () => {
+  const cookie = await seedSession();
+  const post = () => fetch(`${BASE}/orders/1010/partial-invoice`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ type: 'full', shipping_handling: 'first' }).toString(),
+  });
+  assert.equal((await post()).status, 200, 'first invoice should succeed');
+  assert.equal((await post()).status, 200, 'second invoice should succeed');
+
+  const list = await (await fetch(`${BASE}/api/admin/orders/1010/partial-invoices`, { headers: { Cookie: cookie } })).json();
+  const invs = list.invoices || list;
+  assert.ok(invs.length >= 2, `expected at least 2 invoices, got ${invs.length}`);
+  const [a, b] = invs.slice(0, 2).sort((x, y) => String(x.invoice_letter).localeCompare(String(y.invoice_letter)));
+
+  assert.equal(Number(a.shipping), 10, 'the FIRST invoice carries the shipping');
+  assert.equal(Number(a.tax), 8, 'the FIRST invoice carries the tax');
+  assert.equal(Number(b.shipping), 0, 'the SECOND invoice must NOT re-bill shipping');
+  assert.equal(Number(b.tax), 0, 'the SECOND invoice must NOT re-bill tax');
+  // The order is $118 all-in; the extras must appear exactly once across all invoices.
+  const totalShipping = invs.reduce((s, i) => s + Number(i.shipping || 0), 0);
+  const totalTax      = invs.reduce((s, i) => s + Number(i.tax || 0), 0);
+  assert.equal(totalShipping, 10, `shipping billed ${totalShipping} across invoices, expected 10`);
+  assert.equal(totalTax, 8, `tax billed ${totalTax} across invoices, expected 8`);
+});
+
+// REGRESSION: a 100%-comped line was invoiced at FULL LIST price. liNum() ends in `|| 0`, so a
+// legitimate "0.00" is falsy and `liNum(discounted) || liNum(original)` treated the genuine zero as
+// "field absent" and substituted 45.99. The printed rows then did not sum to the printed subtotal on
+// a customer-facing document, and the overstated figure was persisted into the invoice snapshot.
+await test('REGRESSION: a 100%-comped line is invoiced at 0.00, not at list price', async () => {
+  const cookie = await seedSession();
+  const csv = await (await fetch(`${BASE}/orders/1010/invoice.csv`, { headers: { Cookie: cookie } })).text();
+  assert.ok(/Comped Replacement Collar/.test(csv), 'the comped line should appear on the invoice');
+  const compedRow = csv.split(/\r?\n/).find(l => /Comped Replacement Collar/.test(l));
+  assert.ok(!/45\.99/.test(compedRow), `comped line must NOT be priced at list: ${compedRow}`);
+  assert.ok(/\b0(\.00)?\b/.test(compedRow), `comped line total should be zero: ${compedRow}`);
+
+  // The stated invariant: the line totals must sum to the order's current subtotal (100.00).
+  const billedRow = csv.split(/\r?\n/).find(l => /Billed Collar/.test(l));
+  assert.ok(/100(\.00)?/.test(billedRow), `the billed line should total 100.00: ${billedRow}`);
 });
 
 await test('POST /orders/1001/partial-invoice twice → second gets letter B', async () => {

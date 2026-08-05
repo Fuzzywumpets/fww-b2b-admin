@@ -39,6 +39,16 @@ const LOGO_PATH = join(ASSETS, 'logo.png');
 //   money only. Keep this the single source of truth shared by buildInvoiceCsv (CSV) and the PDF row
 //   loop so the two documents never disagree.
 function liNum(s) { return parseFloat(s?.presentmentMoney?.amount ?? 0) || 0; }
+// WHAT: true when a money field is actually PRESENT, regardless of its value.
+// WHY: liNum ends in `|| 0`, so a legitimate "0.00" parses to 0 — falsy. Using `liNum(x) || liNum(y)`
+//   to mean "x, falling back to y when x is absent" therefore treats a genuine ZERO as "absent" and
+//   substitutes the undiscounted price. A 100%-comped line (Shopify returns discountedUnitPriceSet
+//   "0.00" and charges the customer nothing) was invoiced at full list on the PDF, the CSV, and the
+//   persisted partial-invoice snapshot. Presence must be tested on the amount STRING, not on the
+//   parsed number.
+// DEPENDS: lineItemTrueTotal below — the only reason this exists; do not "simplify" those guards
+//   back to `||`.
+function liHas(s) { return s?.presentmentMoney?.amount != null; }
 export function lineItemCurrentQty(item) {
   return item.currentQuantity != null ? item.currentQuantity : (item.quantity || 0);
 }
@@ -51,8 +61,10 @@ export function lineItemTrueTotal(item) {
   const cq = lineItemCurrentQty(item);
   if (cq <= 0) return 0;
   const q  = item.quantity || cq || 1;
-  const du = liNum(item.discountedUnitPriceSet) || liNum(item.originalUnitPriceSet);
-  const dt = liNum(item.discountedTotalSet) || (du * q);   // fallback when discountedTotalSet absent
+  // Presence-checked, NOT truthiness-checked — a comped line legitimately reports 0.00 and must
+  // stay 0.00 rather than falling back to the list price. See liHas above.
+  const du = liHas(item.discountedUnitPriceSet) ? liNum(item.discountedUnitPriceSet) : liNum(item.originalUnitPriceSet);
+  const dt = liHas(item.discountedTotalSet) ? liNum(item.discountedTotalSet) : (du * q);   // fallback when discountedTotalSet absent
   const cartAlloc = lineItemCartDiscount(item);
   return (dt - cartAlloc) * (cq / q);
 }
