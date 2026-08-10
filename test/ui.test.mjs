@@ -1165,6 +1165,83 @@ await test('Customer detail: B2B Customer Settings card has outstanding section'
   assert.ok(html.includes('B2B Customer Settings'), 'Customer detail should have B2B Customer Settings card');
 });
 
+// ── ui-truthfulness: list footers + failed-action feedback ───────────────────
+// The truncation BANNER itself can only be reached on the cache path (`if (!MOCK)`), so it is
+// covered by test/list-truncation.test.mjs at the db + copy level. What these browser tests pin
+// down is the half that IS reachable here: the untruncated footer must still read as a plain
+// count (the copy change must not regress the normal case), and a failed tax-exempt action must
+// produce a visible banner instead of a silent same-page reload.
+
+await test('orders list: untruncated footer is a plain count and shows no truncation banner', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+
+  await page.goto(`${BASE}/orders`);
+  await page.waitForSelector('.pagination');
+  const footer = (await page.textContent('.pagination .text-muted')).trim();
+  assert.ok(/^\d+ orders?$/.test(footer), `Expected a plain count footer, got "${footer}"`);
+  assert.equal(await page.locator('[data-truncation-notice]').count(), 0,
+    'a complete list must not claim it was truncated');
+
+  // Real keystrokes into the search box — a scripted .value assignment would bypass focus/submit.
+  const search = page.locator('input[name="q"]');
+  await search.click();
+  await search.type('#1001', { delay: 20 });
+  await page.keyboard.press('Enter');
+  await page.waitForSelector('.pagination');
+  const filtered = (await page.textContent('.pagination .text-muted')).trim();
+  assert.ok(/^\d+ orders?$/.test(filtered), `Expected a plain count on the filtered view, got "${filtered}"`);
+  assert.equal(await page.locator('[data-truncation-notice]').count(), 0);
+});
+
+await test('customers list: untruncated footer is a plain count and shows no truncation banner', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+
+  await page.goto(`${BASE}/customers`);
+  await page.waitForSelector('.pagination');
+  const footer = (await page.textContent('.pagination .text-muted')).trim();
+  assert.ok(/^\d+ customers?$/.test(footer), `Expected a plain count footer, got "${footer}"`);
+  assert.equal(await page.locator('[data-truncation-notice]').count(), 0);
+});
+
+await test('tax-exempt: a FAILED approve/reject renders a visible error banner', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+
+  // Clean page: no flash at all.
+  await page.goto(`${BASE}/tax-exempt`);
+  await page.waitForSelector('.data-table');
+  assert.equal(await page.locator('.alert').count(), 0, 'no flash expected on a clean load');
+
+  // This is exactly where POST /tax-exempt/:id/approve lands when callPortalInternal fails
+  // (portal unreachable, or PORTAL_INTERNAL_TOKEN unset -> error:'no_internal_token').
+  await page.goto(`${BASE}/tax-exempt?success=error&msg=no_internal_token`);
+  const banner = page.locator('[data-taxexempt-error]');
+  await banner.waitFor({ timeout: 4000 });
+  const text = await banner.textContent();
+  assert.ok(/failed/i.test(text), `SILENT FAILURE: expected a failure message, got "${text}"`);
+  assert.ok(text.includes('PORTAL_INTERNAL_TOKEN'), 'banner should point at the likely misconfiguration');
+  assert.ok(text.includes('no_internal_token'), 'the portal-side error code should be surfaced');
+
+  // The success flashes must still work.
+  await page.goto(`${BASE}/tax-exempt?success=approved`);
+  assert.ok((await page.textContent('.alert-success')).includes('approved'));
+  await page.goto(`${BASE}/tax-exempt?success=rejected`);
+  assert.ok((await page.textContent('.alert-success')).includes('rejected'));
+});
+
+await test('tax-exempt: the error msg param is escaped, not injected', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+
+  const payload = encodeURIComponent('<img src=x onerror=window.__xss=1>');
+  await page.goto(`${BASE}/tax-exempt?success=error&msg=${payload}`);
+  await page.locator('[data-taxexempt-error]').waitFor({ timeout: 4000 });
+  assert.equal(await page.evaluate(() => window.__xss), undefined, 'msg must not execute');
+  assert.equal(await page.locator('[data-taxexempt-error] img').count(), 0, 'msg must not inject markup');
+});
+
 // ── REGRESSION: $80-shipping custom-line loss (2026-07-21) ───────────────────
 // Reproduces Alex's exact keystroke sequence: type a partial title, PAUSE past the old 600ms
 // debounce, finish the title, enter the price, commit. On the pre-fix build the pause committed

@@ -50,6 +50,13 @@ if [ -f test/leads-ingest.test.mjs ]; then
   B2B_ADMIN_MOCK=1 node test/leads-ingest.test.mjs || UNIT_FAIL=$?
 fi
 
+# List truncation lives here for the same reason: the cache path is gated on `if (!MOCK)`, so the
+# HTTP suite can never reach the capped query that truncates /orders and /customers.
+if [ -f test/list-truncation.test.mjs ]; then
+  echo ""
+  B2B_ADMIN_MOCK=1 node test/list-truncation.test.mjs || UNIT_FAIL=$?
+fi
+
 echo ""
 echo "======================================================"
 if [ $API_FAIL -eq 0 ] && [ $UI_FAIL -eq 0 ] && [ $UNIT_FAIL -eq 0 ]; then

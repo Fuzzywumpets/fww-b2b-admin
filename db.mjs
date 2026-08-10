@@ -3,6 +3,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { reportEvent } from './fww-logsink.mjs';
+// SYNC: page-size constants live in lib/list-truncation.mjs so the SQL LIMIT here and the number
+// printed in the /orders + /customers footers (server.mjs) cannot drift apart.
+import { ORDERS_LIST_LIMIT, CUSTOMERS_LIST_LIMIT } from './lib/list-truncation.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const MOCK = process.env.B2B_ADMIN_MOCK === '1';
@@ -855,6 +858,25 @@ export function getOrderHistory(orderGid) {
 
 // ── Phase 24: Cache helpers ────────────────────────────────────────────────────
 
+// WHAT: coerce a caller-supplied list limit to a sane positive integer, falling back to the default.
+// INVARIANT(S): never returns 0/NaN/negative (that would make LIMIT limit+1 return a single row and
+// report every list as truncated); hard ceiling keeps a hostile ?limit= from scanning the cache.
+const LIST_LIMIT_MAX = 5000;
+function normalizeListLimit(value, fallback) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 1) return fallback;
+  return Math.min(Math.floor(n), LIST_LIMIT_MAX);
+}
+
+// WHAT: attach the truncation signal to a returned row array without changing its shape.
+// DEPENDS: server.mjs getOrdersData/getCustomersData read `.truncated` off these arrays to decide
+// whether the list page prints "showing the first N" plus a warning banner.
+// INVARIANT(S): non-enumerable on purpose — map/filter/JSON.stringify consumers stay unaffected.
+function withTruncatedFlag(rows, truncated) {
+  Object.defineProperty(rows, 'truncated', { value: !!truncated, enumerable: false });
+  return rows;
+}
+
 export function upsertCustomerCache(c) {
   const tags = Array.isArray(c.tags) ? c.tags.join(',') : (c.tags || '');
   db.prepare(`
@@ -878,6 +900,15 @@ export function getCustomerFromCache(shopifyId) {
   return db.prepare('SELECT * FROM customers_cache WHERE shopify_id = ?').get(shopifyId) || null;
 }
 
+// WHAT: cache-backed customer list feeding /customers (and the dashboard Xero review queue).
+// CHANGE-GUARD: the page size now comes from filters.limit (default CUSTOMERS_LIST_LIMIT) and the
+// query fetches limit+1 so the caller can tell "exactly a full page" from "there is more". The
+// returned array carries a non-enumerable `truncated` boolean — server.mjs reads it to render the
+// "showing the first N" footer instead of printing the row count as a complete total.
+// NOTE: filters.limit used to be accepted-and-ignored (getCustomersPendingXeroReview passes 999),
+// so that caller silently saw only 100 B2B customers; it now gets what it asked for.
+// INVARIANT(S): return value is still a plain Array of the same row shape — `truncated` is extra,
+// non-enumerable, and invisible to JSON.stringify/map/filter consumers.
 export function listCustomersFromCache(filters = {}) {
   const where = [];
   const params = [];
@@ -896,10 +927,14 @@ export function listCustomersFromCache(filters = {}) {
   let orderBy = 'amount_spent_total DESC';
   if (filters.sort === 'name_asc') orderBy = 'display_name ASC';
   else if (filters.sort === 'orders_desc') orderBy = 'orders_count DESC';
-  const sql = `SELECT * FROM customers_cache ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY ${orderBy} LIMIT 100`;
-  const rows = db.prepare(sql).all(...params);
+  const limit = normalizeListLimit(filters.limit, CUSTOMERS_LIST_LIMIT);
+  // fetch limit+1: the extra row is never returned, it only proves more rows exist
+  const sql = `SELECT * FROM customers_cache ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY ${orderBy} LIMIT ${limit + 1}`;
+  const all = db.prepare(sql).all(...params);
+  const truncated = all.length > limit;
+  const rows = truncated ? all.slice(0, limit) : all;
   // Map to the shape getCustomersData returns (matching live Shopify GraphQL response)
-  return rows.map(r => ({
+  return withTruncatedFlag(rows.map(r => ({
     id: r.gid,
     displayName: (r.company && r.company.trim()) ? r.company.trim() : r.display_name,
     personalName: r.display_name,
@@ -913,11 +948,15 @@ export function listCustomersFromCache(filters = {}) {
     metafields: { edges: [] },
     _fromCache: true,
     _syncedAt: r.synced_at,
-  }));
+  })), truncated);
 }
 
 // WHAT: B2B-only order list (joins customers_cache where is_b2b=1) with q/status/date filters, feeding the /orders page and CSV.
-// CHANGE-GUARD: LIMIT 200 is hardcoded with no offset/cursor — beyond 200 matching orders are silently dropped and getOrdersData reports hasNextPage:false (see bugs[]); re-test filter SQL after any status-enum change.
+// CHANGE-GUARD: there is still no offset/cursor on the cache path — the page size is ORDERS_LIST_LIMIT
+// (overridable via filters.limit) and the query fetches limit+1 so overflow is DETECTED: the returned
+// array carries a non-enumerable `truncated` flag that server.mjs turns into a "showing the first N"
+// footer + warning banner. Dropped rows are now visible to the user, not silent; re-test filter SQL
+// after any status-enum change.
 // INVARIANT(S): the is_b2b=1 join is the B2B scoping guarantee — never widen it without an explicit segment flag; status buckets must mirror FINANCIAL_STATUS_FILTER in server.mjs; q is parameterized (no injection) but the LIKE has no escaping of %/_ .
 export function listOrdersFromCache(filters = {}) {
   // Phase 24D: B2B-only — joins customers_cache where is_b2b=1
@@ -947,13 +986,17 @@ export function listOrdersFromCache(filters = {}) {
       params.push(cutoff);
     }
   }
+  const limit = normalizeListLimit(filters.limit, ORDERS_LIST_LIMIT);
+  // fetch limit+1: the extra row is never returned, it only proves more rows exist
   const sql = `SELECT o.*, c.display_name AS customer_display_name, c.email AS customer_email_cached, c.company AS customer_company
                FROM orders_cache o
                JOIN customers_cache c ON o.customer_shopify_id = c.shopify_id
                WHERE ${where.join(' AND ')}
-               ORDER BY o.created_at DESC LIMIT 200`;
-  const rows = db.prepare(sql).all(...params);
-  return rows.map(r => ({
+               ORDER BY o.created_at DESC LIMIT ${limit + 1}`;
+  const all = db.prepare(sql).all(...params);
+  const truncated = all.length > limit;
+  const rows = truncated ? all.slice(0, limit) : all;
+  return withTruncatedFlag(rows.map(r => ({
     id: r.gid,
     name: r.name,
     processedAt: new Date(r.processed_at || r.created_at).toISOString(),
@@ -979,7 +1022,7 @@ export function listOrdersFromCache(filters = {}) {
     tags: (r.tags || '').split(',').filter(Boolean),
     lineItems: { edges: [] },
     _fromCache: true,
-  }));
+  })), truncated);
 }
 
 export function getOrdersCacheStats() {
