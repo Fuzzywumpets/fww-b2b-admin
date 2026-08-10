@@ -1125,6 +1125,65 @@ await test('/customers/101 shows activity card that loads on click', async (page
   assert.ok(bodyText && bodyText.length > 5, 'Activity body appears empty after load');
 });
 
+// Regression (H19): the activity filter form used to carry a preset <select name="from"> AND a date
+// <input name="from">. A real submit therefore produced from=<preset>&from=<date>; Express's qs
+// parser turned req.query.from into an array, the date comparison matched nothing, and staff saw
+// "No activity in this range" for a customer whose events existed. Drive the real controls (typed
+// keystrokes, real <select> change) and assert the URL that actually reaches the server.
+await test('/customers/101/activity filter submit sends ONE from + ONE to', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/customers/101/activity`);
+
+  // Only one control may own each date name.
+  assert.equal(await page.locator('form [name="from"]').count(), 1,
+    'more than one control named "from" — every submit will send an array param');
+  assert.equal(await page.locator('form [name="to"]').count(), 1, 'expected one control named "to"');
+
+  // Real keystrokes into the date inputs (scripted .value assignment is a false pass).
+  // Click near the left edge so the caret lands on the FIRST (month) segment, then type MMDDYYYY.
+  const fromInput = page.locator('form input[type="date"][name="from"]');
+  await fromInput.click({ position: { x: 6, y: 10 } });
+  await fromInput.pressSequentially('01012026', { delay: 30 });
+  const toInput = page.locator('form input[type="date"][name="to"]');
+  await toInput.click({ position: { x: 6, y: 10 } });
+  await toInput.pressSequentially('02012026', { delay: 30 });
+  assert.equal(await fromInput.inputValue(), '2026-01-01', 'typed from-date did not land in the field');
+  assert.equal(await toInput.inputValue(), '2026-02-01', 'typed to-date did not land in the field');
+
+  await Promise.all([
+    page.waitForNavigation({ waitUntil: 'domcontentloaded' }),
+    page.click('form button[type="submit"]'),
+  ]);
+
+  const params = new URL(page.url()).searchParams;
+  assert.deepEqual(params.getAll('from'), ['2026-01-01'],
+    `expected a single from param, got ${JSON.stringify(params.getAll('from'))}`);
+  assert.deepEqual(params.getAll('to'), ['2026-02-01'],
+    `expected a single to param, got ${JSON.stringify(params.getAll('to'))}`);
+  // The page must still render its table rather than an error.
+  assert.ok((await page.content()).includes('Activity log'), 'filtered page failed to render');
+});
+
+await test('/customers/101/activity date preset sets BOTH from and to, once each', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/customers/101/activity`);
+
+  await Promise.all([
+    page.waitForNavigation({ waitUntil: 'domcontentloaded' }),
+    page.selectOption('#date-preset', { label: 'Last 30d' }),
+  ]);
+
+  const params = new URL(page.url()).searchParams;
+  assert.equal(params.getAll('from').length, 1, 'preset must not add a second from param');
+  assert.equal(params.getAll('to').length, 1, 'preset must set exactly one to param');
+  const from = new Date(params.get('from'));
+  const to = new Date(params.get('to'));
+  const spanDays = Math.round((to - from) / 86400000);
+  assert.equal(spanDays, 30, `Last 30d preset should span 30 days, got ${spanDays}`);
+});
+
 
 // ── Task 45: Backorder queue page ────────────────────────────────────────────
 console.log('\nUI tests — Task 45 (Backorder queue):');
