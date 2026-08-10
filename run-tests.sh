@@ -50,6 +50,14 @@ if [ -f test/leads-ingest.test.mjs ]; then
   B2B_ADMIN_MOCK=1 node test/leads-ingest.test.mjs || UNIT_FAIL=$?
 fi
 
+# Order/line-item cache integrity (H14 line-item duplication, H15 status casing). Standalone for the
+# same reason as above: getOrdersData() short-circuits to the MOCK fixture array and never reads
+# orders_cache, so these writes are invisible to the API suite.
+if [ -f test/order-cache-integrity.test.mjs ]; then
+  echo ""
+  B2B_ADMIN_MOCK=1 node test/order-cache-integrity.test.mjs || UNIT_FAIL=$?
+fi
+
 echo ""
 echo "======================================================"
 if [ $API_FAIL -eq 0 ] && [ $UI_FAIL -eq 0 ] && [ $UNIT_FAIL -eq 0 ]; then
