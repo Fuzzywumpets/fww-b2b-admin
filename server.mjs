@@ -45,6 +45,7 @@ import {
 import { generateInvoicePdf, lineItemTrueTotal, lineItemTrueUnit, lineItemCurrentQty } from './pdf.mjs';
 import { renderLabelSheet, expandItems, TEMPLATES as LABEL_TEMPLATES, DEFAULT_FIELDS } from './labels.mjs';
 import { isInsider, resolveXeroContact, syncCustomerToXero, getXeroSyncStatus } from './lib/xero-customer-sync.mjs';
+import { assertNoUserErrors } from './lib/shopify-user-errors.mjs';
 // fww-error-sink monitoring (injected 2026-06-30): error-logging shim only. To disable, remove this import, the installGlobalHandlers() call, and the expressErrorMiddleware() app.use. See fww-error-sink RUNBOOK.
 import { installGlobalHandlers, expressErrorMiddleware, reportEvent } from './fww-logsink.mjs';
 installGlobalHandlers();
@@ -6588,7 +6589,7 @@ function mockIncrementalEdit({ numId, idemKey, action, payload, editFn, editedBy
 // 16A: Edit order line items (qty changes, remove, add, price override)
 // WHAT: applies qty changes, removals, per-line B2B price re-discounting, order-level discount, and custom line additions via the Shopify orderEdit* mutation suite (begin->setQuantity/removeDiscount/addLineItemDiscount/addCustomItem->commit).
 // CHANGE-GUARD: this is the most fragile handler — re-test the original-li-id -> calculated-li-id mapping (matched by variant id + title) after any Shopify API-version bump; price re-discount does remove+add (NOT updateDiscount) because discounts stack on commit.
-// INVARIANT(S): NON-ATOMIC across many round-trips — a mid-sequence failure leaves the calculatedOrder partially edited yet still commits; orderEditSetQuantity/remove userErrors are logged but not surfaced; commit uses notifyCustomer:false; restock:true only on full removes.
+// INVARIANT(S): NON-ATOMIC across many round-trips — a mid-sequence failure leaves the calculatedOrder partially edited, but it is then ABANDONED, not committed: orderEditSetQuantity userErrors (qty changes AND removes) throw via assertNoUserErrors before orderEditCommit, so the customer is never billed for a line a failed remove left behind; commit uses notifyCustomer:false; restock:true only on full removes.
 app.post('/orders/:id/edit', requireAuth, async (req, res) => {
   const numId   = req.params.id;
   const session = req.adminSession;
@@ -6739,19 +6740,25 @@ app.post('/orders/:id/edit', requireAuth, async (req, res) => {
       if (!calcLiId) { console.warn('[order-edit] no calc map for', origLiId); continue; }
       if (calcQtyById.get(calcLiId) === newQty) { qtySkipped++; continue; }  // unchanged — skip the round-trip
       qtyWrites++;
-      await shopifyFetch(`mutation setQty($id:ID!,$li:ID!,$qty:Int!,$r:Boolean!){
+      const qRes = await shopifyFetch(`mutation setQty($id:ID!,$li:ID!,$qty:Int!,$r:Boolean!){
         orderEditSetQuantity(id:$id,lineItemId:$li,quantity:$qty,restock:$r){
           calculatedOrder{id} userErrors{field message}}}`,
         { id: calcId, li: calcLiId, qty: newQty, r: false });
+      // Throw BEFORE commit: a rejected qty change must abandon the whole edit session, not commit
+      // the rest of the batch and report success.
+      assertNoUserErrors(qRes, 'orderEditSetQuantity', origLiId);
     }
     if (qtySkipped) console.log(`[order-edit] BATCH /edit order=${numId} qty: ${qtyWrites} changed, ${qtySkipped} unchanged (skipped)`);
     for (const origLiId of removeSet) {
       const calcLiId = idMap[origLiId];
       if (!calcLiId) { console.warn('[order-edit] no calc map for remove', origLiId); continue; }
-      await shopifyFetch(`mutation setQty($id:ID!,$li:ID!,$qty:Int!,$r:Boolean!){
+      const rmRes = await shopifyFetch(`mutation setQty($id:ID!,$li:ID!,$qty:Int!,$r:Boolean!){
         orderEditSetQuantity(id:$id,lineItemId:$li,quantity:$qty,restock:$r){
           calculatedOrder{id} userErrors{field message}}}`,
         { id: calcId, li: calcLiId, qty: 0, r: true });
+      // A silently-failed remove leaves the line ON the order — the post-commit check only catches a
+      // line count LOWER than expected, so an over-bill would sail through as success=order_edited.
+      assertNoUserErrors(rmRes, 'orderEditSetQuantity', `remove ${origLiId}`);
     }
     // Apply per-line price changes: remove existing B2B discount + add new one at new %
     // Note: orderEditUpdateDiscount stacks on commit — must remove+add instead.

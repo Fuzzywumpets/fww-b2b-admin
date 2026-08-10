@@ -50,6 +50,13 @@ if [ -f test/leads-ingest.test.mjs ]; then
   B2B_ADMIN_MOCK=1 node test/leads-ingest.test.mjs || UNIT_FAIL=$?
 fi
 
+# Order-edit userErrors: the batch /edit handler returns from its MOCK branch before any Shopify
+# mutation, so this path can ONLY be covered standalone.
+if [ -f test/order-edit-user-errors.test.mjs ]; then
+  echo ""
+  node test/order-edit-user-errors.test.mjs || UNIT_FAIL=$?
+fi
+
 echo ""
 echo "======================================================"
 if [ $API_FAIL -eq 0 ] && [ $UI_FAIL -eq 0 ] && [ $UNIT_FAIL -eq 0 ]; then
