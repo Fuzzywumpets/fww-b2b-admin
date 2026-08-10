@@ -5476,16 +5476,38 @@ app.get('/manifest.json', (_req, res) => {
 
 // Mock: seed session
 // WHAT: TEST-ONLY backdoor that mints a real authenticated session for an arbitrary email and sets the session cookie.
-// CHANGE-GUARD: this BYPASSES the entire Google-OAuth allowlist — it is gated by MOCK || B2B_ADMIN_ALLOW_TEST_SESSION==='1'. NEVER let that env var be set in production; re-verify the 404 guard before any deploy.
-// INVARIANT(S): in real (non-MOCK) prod with the env unset it must return 404 'not found' — otherwise anyone can become any allowed admin.
+// CHANGE-GUARD: this BYPASSES the Google-OAuth flow — it is gated by MOCK || B2B_ADMIN_ALLOW_TEST_SESSION==='1'. NEVER let that env var be set in production; re-verify the 404 guard before any deploy.
+// INVARIANT(S): in real (non-MOCK) prod with the env unset it must return 404 'not found'.
+//
+// DEFENCE IN DEPTH (2026-08-09): the env flag is one stray staging variable away from being an
+// unauthenticated "become any admin" endpoint, so the non-MOCK branch no longer trusts the flag
+// alone. When the route is reached in a real (non-MOCK) process it additionally:
+//   1. refuses (403) any email that is not in currentAllowedEmails() — same allowlist the real
+//      OAuth callback enforces at :5543, so the flag can at worst impersonate an existing admin,
+//      never mint a brand-new one;
+//   2. writes an auditLog row (real logins audit at :5547; this one did not, so a leaked flag was
+//      also invisible);
+//   3. omits `sid` from the JSON body — the Set-Cookie header is enough for any test driver, and
+//      an echoed session id is a credential in a response body / proxy log.
+// MOCK mode is deliberately untouched: under MOCK the allowlist is hardcoded elsewhere and the
+// in-repo test suites read `sid` out of the JSON body (test/api.test.mjs seedSession()).
+// DEPENDS: test/api.test.mjs + test/ui.test.mjs seedSession() read json.sid — that field only
+// survives on the MOCK branch. Do not drop it there without updating both suites.
 app.get('/__test__/session', (req, res) => {
-  if (!MOCK && process.env.B2B_ADMIN_ALLOW_TEST_SESSION !== '1') return res.status(404).json({ error: 'not found' });
+  const flagEnabled = !MOCK && process.env.B2B_ADMIN_ALLOW_TEST_SESSION === '1';
+  if (!MOCK && !flagEnabled) return res.status(404).json({ error: 'not found' });
   const email = req.query.email || 'alex@fuzzywumpets.com';
   const displayName = req.query.name || 'Alex (Test)';
+  if (flagEnabled) {
+    const emailLower = String(email).toLowerCase();
+    if (!currentAllowedEmails().some(e => e.toLowerCase() === emailLower))
+      return res.status(403).json({ error: 'not allowed' });
+  }
   const sid = crypto.randomBytes(32).toString('hex');
   createSession(sid, email, displayName, '');
+  if (flagEnabled) auditLog(email, 'login:test_session', null, null, { ip: req.ip });
   res.setHeader('Set-Cookie', sessionCookie(sid));
-  res.json({ ok: true, sid, email });
+  res.json(flagEnabled ? { ok: true, email } : { ok: true, sid, email });
 });
 
 // Auth
