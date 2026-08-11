@@ -57,6 +57,35 @@ if [ -f test/order-money.test.mjs ]; then
   node test/order-money.test.mjs || UNIT_FAIL=$?
 fi
 
+# Order-edit userErrors: the batch /edit handler returns from its MOCK branch before any Shopify
+# mutation, so this path can ONLY be covered standalone.
+if [ -f test/order-edit-user-errors.test.mjs ]; then
+  echo ""
+  node test/order-edit-user-errors.test.mjs || UNIT_FAIL=$?
+fi
+
+# List truncation lives here for the same reason: the cache path is gated on `if (!MOCK)`, so the
+# HTTP suite can never reach the capped query that truncates /orders and /customers.
+if [ -f test/list-truncation.test.mjs ]; then
+  echo ""
+  B2B_ADMIN_MOCK=1 node test/list-truncation.test.mjs || UNIT_FAIL=$?
+fi
+
+# The leads list cap + phone search are DB-level (a REPLACE() chain in SQL, and one shared WHERE
+# builder feeding both getLeads and countLeads). Same reasoning as the block above — the HTTP suite
+# cannot reach either, so they get their own in-memory unit run.
+if [ -f test/leads-list.test.mjs ]; then
+  echo ""
+  B2B_ADMIN_MOCK=1 node test/leads-list.test.mjs || UNIT_FAIL=$?
+fi
+
+# The allowlist gate is pure logic over env, and it guards the WHOLE dashboard. It gets its own run
+# because the HTTP suite short-circuits Google OAuth entirely in MOCK and never exercises it.
+if [ -f test/admin-allowlist.test.mjs ]; then
+  echo ""
+  node test/admin-allowlist.test.mjs || UNIT_FAIL=$?
+fi
+
 echo ""
 echo "======================================================"
 if [ $API_FAIL -eq 0 ] && [ $UI_FAIL -eq 0 ] && [ $UNIT_FAIL -eq 0 ]; then

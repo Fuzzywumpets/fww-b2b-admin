@@ -1125,6 +1125,65 @@ await test('/customers/101 shows activity card that loads on click', async (page
   assert.ok(bodyText && bodyText.length > 5, 'Activity body appears empty after load');
 });
 
+// Regression (H19): the activity filter form used to carry a preset <select name="from"> AND a date
+// <input name="from">. A real submit therefore produced from=<preset>&from=<date>; Express's qs
+// parser turned req.query.from into an array, the date comparison matched nothing, and staff saw
+// "No activity in this range" for a customer whose events existed. Drive the real controls (typed
+// keystrokes, real <select> change) and assert the URL that actually reaches the server.
+await test('/customers/101/activity filter submit sends ONE from + ONE to', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/customers/101/activity`);
+
+  // Only one control may own each date name.
+  assert.equal(await page.locator('form [name="from"]').count(), 1,
+    'more than one control named "from" — every submit will send an array param');
+  assert.equal(await page.locator('form [name="to"]').count(), 1, 'expected one control named "to"');
+
+  // Real keystrokes into the date inputs (scripted .value assignment is a false pass).
+  // Click near the left edge so the caret lands on the FIRST (month) segment, then type MMDDYYYY.
+  const fromInput = page.locator('form input[type="date"][name="from"]');
+  await fromInput.click({ position: { x: 6, y: 10 } });
+  await fromInput.pressSequentially('01012026', { delay: 30 });
+  const toInput = page.locator('form input[type="date"][name="to"]');
+  await toInput.click({ position: { x: 6, y: 10 } });
+  await toInput.pressSequentially('02012026', { delay: 30 });
+  assert.equal(await fromInput.inputValue(), '2026-01-01', 'typed from-date did not land in the field');
+  assert.equal(await toInput.inputValue(), '2026-02-01', 'typed to-date did not land in the field');
+
+  await Promise.all([
+    page.waitForNavigation({ waitUntil: 'domcontentloaded' }),
+    page.click('form button[type="submit"]'),
+  ]);
+
+  const params = new URL(page.url()).searchParams;
+  assert.deepEqual(params.getAll('from'), ['2026-01-01'],
+    `expected a single from param, got ${JSON.stringify(params.getAll('from'))}`);
+  assert.deepEqual(params.getAll('to'), ['2026-02-01'],
+    `expected a single to param, got ${JSON.stringify(params.getAll('to'))}`);
+  // The page must still render its table rather than an error.
+  assert.ok((await page.content()).includes('Activity log'), 'filtered page failed to render');
+});
+
+await test('/customers/101/activity date preset sets BOTH from and to, once each', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/customers/101/activity`);
+
+  await Promise.all([
+    page.waitForNavigation({ waitUntil: 'domcontentloaded' }),
+    page.selectOption('#date-preset', { label: 'Last 30d' }),
+  ]);
+
+  const params = new URL(page.url()).searchParams;
+  assert.equal(params.getAll('from').length, 1, 'preset must not add a second from param');
+  assert.equal(params.getAll('to').length, 1, 'preset must set exactly one to param');
+  const from = new Date(params.get('from'));
+  const to = new Date(params.get('to'));
+  const spanDays = Math.round((to - from) / 86400000);
+  assert.equal(spanDays, 30, `Last 30d preset should span 30 days, got ${spanDays}`);
+});
+
 
 // ── Task 45: Backorder queue page ────────────────────────────────────────────
 console.log('\nUI tests — Task 45 (Backorder queue):');
@@ -1163,6 +1222,83 @@ await test('Customer detail: B2B Customer Settings card has outstanding section'
   await page.waitForSelector('.card-header', { timeout: 8000 });
   const html = await page.content();
   assert.ok(html.includes('B2B Customer Settings'), 'Customer detail should have B2B Customer Settings card');
+});
+
+// ── ui-truthfulness: list footers + failed-action feedback ───────────────────
+// The truncation BANNER itself can only be reached on the cache path (`if (!MOCK)`), so it is
+// covered by test/list-truncation.test.mjs at the db + copy level. What these browser tests pin
+// down is the half that IS reachable here: the untruncated footer must still read as a plain
+// count (the copy change must not regress the normal case), and a failed tax-exempt action must
+// produce a visible banner instead of a silent same-page reload.
+
+await test('orders list: untruncated footer is a plain count and shows no truncation banner', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+
+  await page.goto(`${BASE}/orders`);
+  await page.waitForSelector('.pagination');
+  const footer = (await page.textContent('.pagination .text-muted')).trim();
+  assert.ok(/^\d+ orders?$/.test(footer), `Expected a plain count footer, got "${footer}"`);
+  assert.equal(await page.locator('[data-truncation-notice]').count(), 0,
+    'a complete list must not claim it was truncated');
+
+  // Real keystrokes into the search box — a scripted .value assignment would bypass focus/submit.
+  const search = page.locator('input[name="q"]');
+  await search.click();
+  await search.type('#1001', { delay: 20 });
+  await page.keyboard.press('Enter');
+  await page.waitForSelector('.pagination');
+  const filtered = (await page.textContent('.pagination .text-muted')).trim();
+  assert.ok(/^\d+ orders?$/.test(filtered), `Expected a plain count on the filtered view, got "${filtered}"`);
+  assert.equal(await page.locator('[data-truncation-notice]').count(), 0);
+});
+
+await test('customers list: untruncated footer is a plain count and shows no truncation banner', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+
+  await page.goto(`${BASE}/customers`);
+  await page.waitForSelector('.pagination');
+  const footer = (await page.textContent('.pagination .text-muted')).trim();
+  assert.ok(/^\d+ customers?$/.test(footer), `Expected a plain count footer, got "${footer}"`);
+  assert.equal(await page.locator('[data-truncation-notice]').count(), 0);
+});
+
+await test('tax-exempt: a FAILED approve/reject renders a visible error banner', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+
+  // Clean page: no flash at all.
+  await page.goto(`${BASE}/tax-exempt`);
+  await page.waitForSelector('.data-table');
+  assert.equal(await page.locator('.alert').count(), 0, 'no flash expected on a clean load');
+
+  // This is exactly where POST /tax-exempt/:id/approve lands when callPortalInternal fails
+  // (portal unreachable, or PORTAL_INTERNAL_TOKEN unset -> error:'no_internal_token').
+  await page.goto(`${BASE}/tax-exempt?success=error&msg=no_internal_token`);
+  const banner = page.locator('[data-taxexempt-error]');
+  await banner.waitFor({ timeout: 4000 });
+  const text = await banner.textContent();
+  assert.ok(/failed/i.test(text), `SILENT FAILURE: expected a failure message, got "${text}"`);
+  assert.ok(text.includes('PORTAL_INTERNAL_TOKEN'), 'banner should point at the likely misconfiguration');
+  assert.ok(text.includes('no_internal_token'), 'the portal-side error code should be surfaced');
+
+  // The success flashes must still work.
+  await page.goto(`${BASE}/tax-exempt?success=approved`);
+  assert.ok((await page.textContent('.alert-success')).includes('approved'));
+  await page.goto(`${BASE}/tax-exempt?success=rejected`);
+  assert.ok((await page.textContent('.alert-success')).includes('rejected'));
+});
+
+await test('tax-exempt: the error msg param is escaped, not injected', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+
+  const payload = encodeURIComponent('<img src=x onerror=window.__xss=1>');
+  await page.goto(`${BASE}/tax-exempt?success=error&msg=${payload}`);
+  await page.locator('[data-taxexempt-error]').waitFor({ timeout: 4000 });
+  assert.equal(await page.evaluate(() => window.__xss), undefined, 'msg must not execute');
+  assert.equal(await page.locator('[data-taxexempt-error] img').count(), 0, 'msg must not inject markup');
 });
 
 // ── REGRESSION: $80-shipping custom-line loss (2026-07-21) ───────────────────

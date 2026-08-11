@@ -20,7 +20,7 @@ import {
   getCustomerNotes, setCustomerNotes, getDropshipCache, setDropshipCache,
   getSetting, setSetting, getGlobalSettings, getAuditLog, getAuditLogCount,
   logLabelBatch, logExportBatch,
-  createLead, getLeads, getLeadCounts, getLead, updateLead, upsertPortalLead,
+  createLead, getLeads, countLeads, getLeadCounts, getLead, updateLead, upsertPortalLead,
   addLeadNote, getLeadNotes, addLeadStatusHistory, getLeadStatusHistory,
   upsertBackorder, getBackordersForOrder, getOpenBackorders, fulfillBackorder, logOrderEdit,
   getEditAction, putEditAction,
@@ -46,6 +46,10 @@ import { generateInvoicePdf, lineItemTrueTotal, lineItemTrueUnit, lineItemCurren
 import { renderLabelSheet, expandItems, TEMPLATES as LABEL_TEMPLATES, DEFAULT_FIELDS } from './labels.mjs';
 import { isInsider, resolveXeroContact, syncCustomerToXero, getXeroSyncStatus } from './lib/xero-customer-sync.mjs';
 import { parseLinePrices, applyLinePriceChanges, bulkMarkOrdersPaid } from './lib/order-money.mjs';
+import { assertNoUserErrors } from './lib/shopify-user-errors.mjs';
+// SYNC: same module db.mjs uses for the SQL LIMIT — the banner/footer copy and the query page size
+// must agree, otherwise the list lies about how much it is showing.
+import { ORDERS_LIST_LIMIT, CUSTOMERS_LIST_LIMIT, LEADS_LIST_LIMIT, listCountLabel, truncationNoticeHtml } from './lib/list-truncation.mjs';
 // fww-error-sink monitoring (injected 2026-06-30): error-logging shim only. To disable, remove this import, the installGlobalHandlers() call, and the expressErrorMiddleware() app.use. See fww-error-sink RUNBOOK.
 import { installGlobalHandlers, expressErrorMiddleware, reportEvent } from './fww-logsink.mjs';
 installGlobalHandlers();
@@ -1271,6 +1275,36 @@ function currentAllowedEmails() {
   return (process.env.B2B_ADMIN_ALLOWED_EMAILS || '').split(',').map(s => s.trim()).filter(Boolean);
 }
 
+// WHAT: does this Google-verified email get in? An allowlist entry is EITHER a whole address
+//   ("erin.m.karson@gmail.com") OR a bare domain written with a leading @ ("@fuzzywumpets.com"),
+//   which admits every mailbox on that domain.
+// WHY: owner decision 2026-08-11 — "just open up all @fuzzywumpets.com and Erin to the full-access.
+//   Easier until we grow and I need to manage a larger team." Before this, every new hire needed a
+//   Doppler edit and a service restart before they could log in at all.
+// CHANGE-GUARD: this is THE gate on the whole dashboard. Two things must not be weakened:
+//   (1) the caller must still require user.email_verified — a domain rule is only as good as
+//       Google's proof that the person owns the mailbox;
+//   (2) the domain comparison is on the substring after the LAST '@', compared for EQUALITY.
+//       Never use a bare endsWith/includes against the raw address: "a@fuzzywumpets.com.evil.tld"
+//       and "x@notfuzzywumpets.com" must both fail, and a substring test lets the wrong one
+//       through depending on how it is written.
+// INVARIANT(S): case-insensitive both sides; an entry that is exactly "@" or has no domain is
+//   ignored rather than matching everything; an address with no '@' never matches a domain rule.
+function isAllowedAdminEmail(email) {
+  const lower = String(email || '').trim().toLowerCase();
+  const at = lower.lastIndexOf('@');
+  if (at < 1 || at === lower.length - 1) return false;
+  const domain = lower.slice(at + 1);
+  return currentAllowedEmails().some((entry) => {
+    const e = entry.toLowerCase();
+    if (e.startsWith('@')) {
+      const allowedDomain = e.slice(1);
+      return allowedDomain.length > 0 && domain === allowedDomain;
+    }
+    return e === lower;
+  });
+}
+
 function fmtMoney(amount, currency = 'USD') {
   return new Intl.NumberFormat('en-US', { style: 'currency', currency }).format(Number(amount) || 0);
 }
@@ -1278,6 +1312,91 @@ function fmtMoney(amount, currency = 'USD') {
 function fmtDate(iso) {
   if (!iso) return '—';
   return new Date(iso).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+}
+
+// WHAT: today's date as YYYY-MM-DD in the SERVER's LOCAL timezone (2026-08-11, phone/overdue
+//   audit). `next_followup_due` comes from an <input type="date">, which is always the user's
+//   LOCAL date -- comparing it against `new Date().toISOString().split('T')[0]` compares it
+//   against UTC instead. Chicago is UTC-5/-6, so from ~7pm local onward UTC has already rolled
+//   to tomorrow and a follow-up due TODAY renders as overdue. Use this everywhere a
+//   next_followup_due (or any other local-date input) is compared against "today".
+// INVARIANT(S): pure; matches the YYYY-MM-DD lexicographic-compare format used throughout.
+function localDateStr(d = new Date()) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+// WHAT: formats a stored phone value as "(xxx) xxx-xxxx" ONLY when it confidently parses as a
+//   NANP number (10 digits, or 11 digits starting with '1') -- 2026-08-11 phone audit, requested
+//   by Alex after lead #3 rendered as the illegible "8282160282". Anything else (an international
+//   number, garbage input) renders VERBATIM, unmangled. Same fail-safe principle as the
+//   country-code validator above: never coerce a value you cannot confidently classify -- this
+//   business already shipped one order to Auckland NZ from exactly that kind of over-eager
+//   normalization elsewhere.
+// INVARIANT(S): pure; never throws; the caller still h()-escapes the result.
+function fmtPhone(raw) {
+  const s = String(raw == null ? '' : raw).trim();
+  if (!s) return '';
+  // A leading '+' is the caller EXPLICITLY stating a country code -- trust that signal rather
+  // than reinterpreting the raw digit count. Without this check, a New Zealand number like
+  // "+64 9 123 4567" (10 digits once punctuation is stripped) would be silently misread as a
+  // bare NANP number and mangled into "(649) 123-4567" -- precisely the failure mode this
+  // function exists to avoid. Only format when the explicit country code is +1.
+  if (s.startsWith('+')) {
+    const digits = s.replace(/\D/g, '');
+    if (digits.length === 11 && digits[0] === '1') {
+      const ten = digits.slice(1);
+      return `(${ten.slice(0, 3)}) ${ten.slice(3, 6)}-${ten.slice(6)}`;
+    }
+    return s;
+  }
+  const digits = s.replace(/\D/g, '');
+  let ten = null;
+  if (digits.length === 10) ten = digits;
+  else if (digits.length === 11 && digits[0] === '1') ten = digits.slice(1);
+  if (!ten) return s;
+  return `(${ten.slice(0, 3)}) ${ten.slice(3, 6)}-${ten.slice(6)}`;
+}
+
+// WHAT: builds a `tel:` href from a stored phone value for click-to-call. A leading '+' is taken
+//   as an already-international number and passed through verbatim (digits only); a confident
+//   NANP number (see fmtPhone) gets a `+1` prefix; anything else falls back to bare digits with
+//   NO assumed country code -- we must never guess a country the way toCountryCode() in the
+//   portal wrongly defaults to 'US' (see VALID_LEAD_COUNTRY_CODES comment above).
+// INVARIANT(S): pure; returns '' for empty/unparseable input so callers can skip the <a> entirely.
+function telHref(raw) {
+  const s = String(raw == null ? '' : raw).trim();
+  if (!s) return '';
+  if (s.startsWith('+')) return `tel:${s.replace(/[^\d+]/g, '')}`;
+  const digits = s.replace(/\D/g, '');
+  if (!digits) return '';
+  if (digits.length === 10) return `tel:+1${digits}`;
+  if (digits.length === 11 && digits[0] === '1') return `tel:+${digits}`;
+  return `tel:${digits}`;
+}
+
+// WHAT: normalizes a phone number for STORAGE (2026-08-11 phone audit) -- E.164 (+1XXXXXXXXXX)
+//   when it confidently parses as NANP, otherwise stored VERBATIM. Display formatting (fmtPhone)
+//   is applied at render time, never baked into storage, so the stored value stays the source of
+//   truth and re-formatting logic changes don't require a data migration.
+// INVARIANT(S): pure; returns null for empty input (matches the `|| null` convention used for
+//   every other optional lead field in createLead/updateLead).
+function normalizePhone(raw) {
+  const s = String(raw == null ? '' : raw).trim();
+  if (!s) return null;
+  // Same leading-'+' guard as fmtPhone: an explicit country code must be trusted, never
+  // reinterpreted by raw digit count (see fmtPhone's comment for the NZ-number failure case).
+  if (s.startsWith('+')) {
+    const digits = s.replace(/\D/g, '');
+    return (digits.length === 11 && digits[0] === '1') ? `+1${digits.slice(1)}` : s;
+  }
+  const digits = s.replace(/\D/g, '');
+  let ten = null;
+  if (digits.length === 10) ten = digits;
+  else if (digits.length === 11 && digits[0] === '1') ten = digits.slice(1);
+  return ten ? `+1${ten}` : s;
 }
 
 // ── Second build (Build D): order-history timeline helpers ─────────────────────
@@ -1846,7 +1965,7 @@ const FINANCIAL_STATUS_FILTER = {
 };
 
 // WHAT: orders-list data source — prefers the local orders_cache (B2B-only, joined on customers_cache.is_b2b) and falls back to live Shopify; also handles the MOCK fixture path.
-// CHANGE-GUARD: the cache branch returns hasNextPage:false and the FULL filtered set with no real pagination, while the live branch pages 50 at a time via after-cursor — these two paths have DIFFERENT pagination semantics, so UI 'Next 50' only works on the live path. Re-test list parity cache-vs-live after filter changes.
+// CHANGE-GUARD: the cache branch returns hasNextPage:false with at most ORDERS_LIST_LIMIT rows and no real pagination, while the live branch pages 50 at a time via after-cursor — these two paths have DIFFERENT pagination semantics, so UI 'Next 50' only works on the live path. The cache branch instead sets truncated:true when the cap is hit, which renderOrdersList turns into a banner + honest footer. Re-test list parity cache-vs-live after filter changes.
 // INVARIANT(S): cache is authoritative only when getOrdersCacheStats().total>0; live query string is assembled from qParts and user q is passed THROUGH to Shopify's query DSL (Shopify-side escaping, not SQL) — keep filters server-derived where possible; financial_status filter expands via FINANCIAL_STATUS_FILTER.
 async function getOrdersData(filters) {
   // Phase 24D: try cache first (B2B-only by definition — joined to customers_cache where is_b2b=1)
@@ -1855,7 +1974,11 @@ async function getOrdersData(filters) {
       const stats = getOrdersCacheStats();
       if (stats && stats.total > 0) {
         const cached = listOrdersFromCache(filters);
-        return { orders: cached, hasNextPage: false, endCursor: null, total: cached.length, _fromCache: true, _syncedAt: stats.latest };
+        // TRUNCATION (ui-truth): the cache path has no cursor, so when the row cap is hit we must
+        // say so — otherwise the footer prints the cap as if it were the complete total.
+        return { orders: cached, hasNextPage: false, endCursor: null, total: cached.length,
+                 truncated: cached.truncated === true, listLimit: ORDERS_LIST_LIMIT,
+                 _fromCache: true, _syncedAt: stats.latest };
       }
     } catch (e) {
       console.error('orders cache read failed, falling back to live Shopify:', e.message);
@@ -1954,7 +2077,8 @@ function listRowTotalAmount(o) {
 // CHANGE-GUARD: the bulk form POSTs /orders/bulk with checked `ids`; the inline select-all/upd() script wires the bulk bar — keep input name="ids" stable. 'Sync now' button only shows when data._fromCache. Re-test bulk mark-paid after table column changes.
 // INVARIANT(S): all order/customer fields h()-escaped; pagination 'Next 50' uses endCursor copied into the after param and only renders when hasNextPage (live path only); colspan on the empty row (10) must match the header column count.
 function renderOrdersList(session, data, filters) {
-  const { orders, hasNextPage, endCursor, error } = data;
+  const { orders, hasNextPage, endCursor, error, truncated } = data;
+  const truncationBanner = truncationNoticeHtml({ truncated, limit: data.listLimit || ORDERS_LIST_LIMIT, noun: 'order' });
 
   const rows = orders.map(o => {
     const numId  = shopifyNumericId(o.id);
@@ -2015,6 +2139,7 @@ function renderOrdersList(session, data, filters) {
     </div>
     ${flash}
     ${error ? `<div class="alert alert-warning">Shopify unavailable: ${h(error)}</div>` : ''}
+    ${truncationBanner}
     <div class="filter-chips">${sourceChips}</div>
     <form class="filter-bar" method="GET" action="/orders">
       ${filters.source ? `<input type="hidden" name="source" value="${h(filters.source)}">` : ''}
@@ -2053,7 +2178,7 @@ function renderOrdersList(session, data, filters) {
       </div>
     </form>
     <div class="pagination">
-      <span class="text-muted">${orders.length} order${orders.length !== 1 ? 's' : ''}</span>
+      <span class="text-muted">${h(listCountLabel({ count: orders.length, noun: 'order', truncated }))}</span>
       ${hasNextPage ? `<a href="/orders?${nextParams}" class="btn btn-ghost">Next 50 →</a>` : ''}
     </div>
     <script>
@@ -3797,7 +3922,7 @@ function renderOrderDetail(session, order, flash, flashMsg) {
           <div class="card-header"><h2>Customer</h2></div>
           <p><a href="/customers/${shopifyNumericId(order.customer.id)}" class="link-strong">${h(order.customer.displayName)}</a></p>
           <p class="text-muted">${h(order.customer.email)}</p>
-          ${order.customer.phone ? `<p class="text-muted">${h(order.customer.phone)}</p>` : ''}
+          ${order.customer.phone ? `<p class="text-muted"><a href="${h(telHref(order.customer.phone))}" class="link">${h(fmtPhone(order.customer.phone))}</a></p>` : ''}
         </div>` : ''}
         <div class="card">
           <div class="card-header"><h2>Shipping Address</h2></div>
@@ -3892,7 +4017,10 @@ async function getCustomersData(filters) {
       if (stats && stats.total > 0) {
         const cached = listCustomersFromCache(filters);
         if (cached.length > 0) {
-          return { customers: cached, hasNextPage: false, total: cached.length, _fromCache: true, _syncedAt: stats.latest };
+          // TRUNCATION (ui-truth): see getOrdersData — cache path has no pager, so surface the cap.
+          return { customers: cached, hasNextPage: false, total: cached.length,
+                   truncated: cached.truncated === true, listLimit: CUSTOMERS_LIST_LIMIT,
+                   _fromCache: true, _syncedAt: stats.latest };
         }
       }
     } catch (e) {
@@ -3981,7 +4109,8 @@ function tagChip(t, { linked = false } = {}) {
 // CHANGE-GUARD: the ★ top-customer badge is index-based (idx < TOP_CUSTOMER_THRESHOLD) and ONLY valid when sort is lifetime_spend_desc — if you change the default sort or page size, the star logic silently mislabels. Re-test that 'Next 50' preserves q/segment/tag/sort params plus after cursor.
 // INVARIANT(S): colspan=7 on the empty row must match the 7 <th> columns; pagination uses endCursor (opaque Shopify cursor), never an offset.
 function renderCustomersList(session, data, filters) {
-  const { customers, hasNextPage, endCursor, error } = data;
+  const { customers, hasNextPage, endCursor, error, truncated } = data;
+  const truncationBanner = truncationNoticeHtml({ truncated, limit: data.listLimit || CUSTOMERS_LIST_LIMIT, noun: 'customer' });
 
   // top-10 by spend get a star badge (Phase 20) — rank = index in list when sorted by spend
   const TOP_CUSTOMER_THRESHOLD = 10;
@@ -4045,6 +4174,7 @@ function renderCustomersList(session, data, filters) {
       ${data._fromCache ? '<button type="button" class="btn btn-ghost btn-sm" onclick="syncCacheNow(this)" title="Refresh cache from Shopify">\u{1F504} Sync now</button>' : ''}
     </div>
     ${error ? `<div class="alert alert-warning">Shopify unavailable: ${h(error)}</div>` : ''}
+    ${truncationBanner}
     <div class="filter-chips">${segmentChips}</div>
     <form class="filter-bar" method="GET" action="/customers">
       ${filters.segment ? `<input type="hidden" name="segment" value="${h(filters.segment)}">` : ''}
@@ -4072,7 +4202,7 @@ function renderCustomersList(session, data, filters) {
       </table>
     </div>
     <div class="pagination">
-      <span class="text-muted">${customers.length} customer${customers.length !== 1 ? 's' : ''}</span>
+      <span class="text-muted">${h(listCountLabel({ count: customers.length, noun: 'customer', truncated }))}</span>
       ${hasNextPage ? `<a href="/customers?${nextParams}" class="btn btn-ghost">Next 50 →</a>` : ''}
     </div>
   ` });
@@ -4373,7 +4503,7 @@ function renderCustomerDetail(session, customer, recentOrders, notes, _dropshipC
     <div class="detail-header">
       <div class="detail-header-left">
         <h1>${h(customer.displayName)}</h1>
-        <p class="text-muted">${h(customer.email)}${customer.phone ? ' · ' + h(customer.phone) : ''}</p>
+        <p class="text-muted">${h(customer.email)}${customer.phone ? ' · <a href="' + h(telHref(customer.phone)) + '" class="link">' + h(fmtPhone(customer.phone)) + '</a>' : ''}</p>
       </div>
       <div class="detail-header-actions">
         <a href="/customers/${h(numId)}/activity" class="btn btn-ghost btn-sm" title="View portal activity log">Activity log</a>
@@ -5365,7 +5495,7 @@ async function submitNewOrder(req, session) {
 
 // WHAT: Dashboard manual-review queue — B2B customers (from local cache) that are NOT yet mapped to a Xero contact and are NOT insiders.
 // CHANGE-GUARD: insider ids are HARDCODED here (4742401425601, 5163530813633) AND duplicated in isInsider elsewhere — keep them in sync or a customer shows in the review queue while their orders skip Xero. Reads data/shopify_to_xero_mapping.json (by_shopify_id keys); a missing/corrupt file degrades to 'everyone unmapped' rather than throwing.
-// INVARIANT(S): listCustomersFromCache({segment:'b2b', limit:999}) — the 999 cap silently truncates if >999 B2B customers exist; ids are normalized by stripping the gid://shopify/Customer/ prefix before the mapped/insider Set lookups.
+// INVARIANT(S): listCustomersFromCache({segment:'b2b', limit:999}) — limit is now actually honored (it used to be ignored, silently capping this queue at 100); >999 B2B customers still truncates; ids are normalized by stripping the gid://shopify/Customer/ prefix before the mapped/insider Set lookups.
 function getCustomersPendingXeroReview() {
   // B2B customers not yet mapped to a Xero contact (and not insiders).
   // Helps surface manual-review queue on the dashboard.
@@ -5544,8 +5674,9 @@ app.get('/auth/google/callback', async (req, res) => {
     const tokMs = tUser - tTok, userMs = Date.now() - tUser;
     if (tokMs + userMs > 1000) console.log(`[auth-timing] token-exchange=${tokMs}ms userinfo=${userMs}ms`);
     if (!user.email_verified) return res.redirect('/login?error=Google+email+not+verified');
-    const emailLower = (user.email || '').toLowerCase();
-    if (!currentAllowedEmails().some(e => e.toLowerCase() === emailLower))
+    // SYNC: isAllowedAdminEmail handles BOTH whole-address entries and "@domain" entries — see its
+    //   CHANGE-GUARD. Do not reintroduce an inline equality test here; that is what this replaced.
+    if (!isAllowedAdminEmail(user.email))
       return res.status(403).send(renderUnauthorized(user.email));
     const sid = crypto.randomBytes(32).toString('hex');
     createSession(sid, user.email, user.name || user.email, user.picture || '');
@@ -6609,7 +6740,7 @@ function mockIncrementalEdit({ numId, idemKey, action, payload, editFn, editedBy
 // 16A: Edit order line items (qty changes, remove, add, price override)
 // WHAT: applies qty changes, removals, per-line B2B price re-discounting, order-level discount, and custom line additions via the Shopify orderEdit* mutation suite (begin->setQuantity/removeDiscount/addLineItemDiscount/addCustomItem->commit).
 // CHANGE-GUARD: this is the most fragile handler — re-test the original-li-id -> calculated-li-id mapping (matched by variant id + title) after any Shopify API-version bump; price re-discount does remove+add (NOT updateDiscount) because discounts stack on commit.
-// INVARIANT(S): NON-ATOMIC across many round-trips — a mid-sequence failure leaves the calculatedOrder partially edited yet still commits; orderEditSetQuantity/remove userErrors are logged but not surfaced; commit uses notifyCustomer:false; restock:true only on full removes.
+// INVARIANT(S): NON-ATOMIC across many round-trips — a mid-sequence failure leaves the calculatedOrder partially edited, but it is then ABANDONED, not committed: orderEditSetQuantity userErrors (qty changes AND removes) throw via assertNoUserErrors before orderEditCommit, so the customer is never billed for a line a failed remove left behind; commit uses notifyCustomer:false; restock:true only on full removes.
 app.post('/orders/:id/edit', requireAuth, async (req, res) => {
   const numId   = req.params.id;
   const session = req.adminSession;
@@ -6768,19 +6899,25 @@ app.post('/orders/:id/edit', requireAuth, async (req, res) => {
       if (!calcLiId) { console.warn('[order-edit] no calc map for', origLiId); continue; }
       if (calcQtyById.get(calcLiId) === newQty) { qtySkipped++; continue; }  // unchanged — skip the round-trip
       qtyWrites++;
-      await shopifyFetch(`mutation setQty($id:ID!,$li:ID!,$qty:Int!,$r:Boolean!){
+      const qRes = await shopifyFetch(`mutation setQty($id:ID!,$li:ID!,$qty:Int!,$r:Boolean!){
         orderEditSetQuantity(id:$id,lineItemId:$li,quantity:$qty,restock:$r){
           calculatedOrder{id} userErrors{field message}}}`,
         { id: calcId, li: calcLiId, qty: newQty, r: false });
+      // Throw BEFORE commit: a rejected qty change must abandon the whole edit session, not commit
+      // the rest of the batch and report success.
+      assertNoUserErrors(qRes, 'orderEditSetQuantity', origLiId);
     }
     if (qtySkipped) console.log(`[order-edit] BATCH /edit order=${numId} qty: ${qtyWrites} changed, ${qtySkipped} unchanged (skipped)`);
     for (const origLiId of removeSet) {
       const calcLiId = idMap[origLiId];
       if (!calcLiId) { console.warn('[order-edit] no calc map for remove', origLiId); continue; }
-      await shopifyFetch(`mutation setQty($id:ID!,$li:ID!,$qty:Int!,$r:Boolean!){
+      const rmRes = await shopifyFetch(`mutation setQty($id:ID!,$li:ID!,$qty:Int!,$r:Boolean!){
         orderEditSetQuantity(id:$id,lineItemId:$li,quantity:$qty,restock:$r){
           calculatedOrder{id} userErrors{field message}}}`,
         { id: calcId, li: calcLiId, qty: 0, r: true });
+      // A silently-failed remove leaves the line ON the order — the post-commit check only catches a
+      // line count LOWER than expected, so an over-bill would sail through as success=order_edited.
+      assertNoUserErrors(rmRes, 'orderEditSetQuantity', `remove ${origLiId}`);
     }
     // Apply per-line price changes: remove existing B2B discount + add new one at new %
     // Note: orderEditUpdateDiscount stacks on commit — must remove+add instead.
@@ -8074,10 +8211,17 @@ app.get('/api/orders/:id/conversations/:slug/messages', requireAuth, async (req,
 // INVARIANT(S): MOCK shows no certs; customerId is split on '/' to recover the numeric id; all dynamic fields are h()-escaped.
 app.get('/tax-exempt', requireAuth, (req, res) => {
   const pendingCerts = MOCK ? [] : getPendingTaxCertsFromPortal();
+  // UI-TRUTH: approve/reject redirect here with success=error when callPortalInternal fails (portal
+  // down, or PORTAL_INTERNAL_TOKEN unset -> {ok:false,error:'no_internal_token'}, in which case an
+  // approval can NEVER succeed). Without this branch the staff member saw the cert still listed and
+  // no message at all — indistinguishable from a slow refresh, so a misconfigured token stayed
+  // invisible indefinitely. `msg` is the portal-side error code, h()-escaped.
   const flashHtml = req.query.success === 'approved'
     ? `<div class="alert alert-success">Certificate approved — customer is now tax-exempt.</div>`
     : req.query.success === 'rejected'
     ? `<div class="alert alert-success">Certificate rejected.</div>`
+    : req.query.success === 'error'
+    ? `<div class="alert alert-warning" data-taxexempt-error>Action failed — the portal did not accept the change, so nothing was updated. Check that the portal is reachable and PORTAL_INTERNAL_TOKEN is set.${req.query.msg ? ` (${h(String(req.query.msg).slice(0, 200))})` : ''}</div>`
     : '';
   const rows = pendingCerts.map(c => `
     <tr>
@@ -8115,7 +8259,9 @@ app.post('/tax-exempt/:id/approve', requireAuth, async (req, res) => {
     reviewedBy: req.adminSession.email,
   });
   auditLog(req.adminSession.email, 'tax-cert-approve', `cert:${req.params.id}`, null, { reviewedBy: req.adminSession.email });
-  res.redirect(`/tax-exempt?success=${result.ok ? 'approved' : 'error'}`);
+  // DEPENDS: the GET /tax-exempt flash renderer handles success=error and the optional msg param.
+  if (!result.ok) return res.redirect(`/tax-exempt?success=error&msg=${encodeURIComponent(String(result.error || 'failed').slice(0, 200))}`);
+  res.redirect('/tax-exempt?success=approved');
 });
 
 // WHAT: rejects a tax-exempt cert with a reason (capped 500 chars) via the portal-internal reject endpoint.
@@ -8128,7 +8274,9 @@ app.post('/tax-exempt/:id/reject', requireAuth, async (req, res) => {
     reviewedBy: req.adminSession.email, reason,
   });
   auditLog(req.adminSession.email, 'tax-cert-reject', `cert:${req.params.id}`, null, { reason });
-  res.redirect(`/tax-exempt?success=${result.ok ? 'rejected' : 'error'}`);
+  // DEPENDS: the GET /tax-exempt flash renderer handles success=error and the optional msg param.
+  if (!result.ok) return res.redirect(`/tax-exempt?success=error&msg=${encodeURIComponent(String(result.error || 'failed').slice(0, 200))}`);
+  res.redirect('/tax-exempt?success=rejected');
 });
 
 // Phase 4: Customers CSV export
@@ -9957,7 +10105,7 @@ app.post('/labels/print',   requireAuth, (req, res) => handleLabelsPdf(req, res,
 // ── Phase 6: Exports ──────────────────────────────────────────────────────────
 
 // WHAT: loads full product+variant detail (images, inventory, timestamps) for CSV/image exports via Shopify nodes(ids:) or MOCK_PRODUCTS.
-// CHANGE-GUARD: images first:30 and variants first:50 — exports silently drop overflow beyond those caps; the gid mapping `gid://shopify/Product/<id>` must match what getAllB2bProductIds returns (numeric ids).
+// CHANGE-GUARD: images first:30 and variants first:50 — exports silently drop overflow beyond those caps; the gid mapping `gid://shopify/Product/<id>` must match what getAllB2bProductIds returns (numeric ids). Shopify's nodes(ids:) rejects >250 ids, so gids are fetched in sequential batches of 250 and concatenated.
 // INVARIANT(S): null nodes filtered out; b2b_price in the CSV is later derived as price*0.5 (hardcoded 50%, NOT the per-customer/global discount) — see /exports/csv.
 async function getProductsForExport(ids) {
   if (MOCK) {
@@ -9965,18 +10113,22 @@ async function getProductsForExport(ids) {
     return MOCK_PRODUCTS;
   }
   const gids = ids.map(id => `gid://shopify/Product/${id}`);
-  const result = await shopifyFetch(`
-    query($ids:[ID!]!){nodes(ids:$ids){... on Product{
-      id handle title vendor productType tags
-      featuredImage{url altText}
-      images(first:30){edges{node{url altText}}}
-      variants(first:50){edges{node{
-        id title sku barcode price compareAtPrice inventoryQuantity inventoryPolicy
+  const out = [];
+  for (let i = 0; i < gids.length; i += 250) {
+    const result = await shopifyFetch(`
+      query($ids:[ID!]!){nodes(ids:$ids){... on Product{
+        id handle title vendor productType tags
+        featuredImage{url altText}
+        images(first:30){edges{node{url altText}}}
+        variants(first:50){edges{node{
+          id title sku barcode price compareAtPrice inventoryQuantity inventoryPolicy
+          createdAt updatedAt
+        }}}
         createdAt updatedAt
-      }}}
-      createdAt updatedAt
-    }}}`, { ids: gids });
-  return (result.data?.nodes || []).filter(Boolean);
+      }}}`, { ids: gids.slice(i, i + 250) });
+    out.push(...(result.data?.nodes || []).filter(Boolean));
+  }
+  return out;
 }
 
 // WHAT: paginates all product ids in the B2B publication (publication_id:<B2B_PUB_ID tail>) for select-all on the export pages.
@@ -10333,7 +10485,7 @@ const LEAD_TRANSITIONS = {
 // WHAT: renders the leads index — a search box, per-status filter chips with live counts, and a table; overdue follow-ups render in text-danger.
 // CHANGE-GUARD: chip links carry both status and (encoded) q so filtering+search compose; the 'all' count is summed from counts across every status — if a status is missing from counts it contributes 0.
 // INVARIANT(S): business_name/email/contact_name are h()-escaped; overdue is computed as next_followup_due < today (ISO date compare, lexicographic but safe for YYYY-MM-DD).
-function renderLeadsList(session, { leads, counts, flash, q, status }) {
+function renderLeadsList(session, { leads, counts, flash, q, status, total, truncated }) {
   const allCount = Object.values(counts).reduce((s, n) => s + n, 0);
   const chipList = [
     { value: 'all', label: `All (${allCount})` },
@@ -10346,7 +10498,7 @@ function renderLeadsList(session, { leads, counts, flash, q, status }) {
   const rows = leads.map(l => {
     const st = LEAD_STATUSES[l.status] || { label: l.status, color: 'muted' };
     const followUp = l.next_followup_due
-      ? `<span class="${l.next_followup_due < new Date().toISOString().split('T')[0] ? 'text-danger' : 'text-muted'}">${h(l.next_followup_due)}</span>`
+      ? `<span class="${l.next_followup_due < localDateStr() ? 'text-danger' : 'text-muted'}">${h(l.next_followup_due)}</span>`
       : '<span class="text-muted">—</span>';
     return `<tr>
       <td><a href="/leads/${l.id}" class="link-strong">${h(l.business_name || '—')}</a><br><small class="text-muted">${h(l.email)}</small></td>
@@ -10375,12 +10527,16 @@ function renderLeadsList(session, { leads, counts, flash, q, status }) {
       </form>
     </div>
     <div class="filter-chips-row" style="margin-bottom:1rem;display:flex;flex-wrap:wrap;gap:0.35rem">${chipBar}</div>
+    ${truncationNoticeHtml({ truncated, limit: LEADS_LIST_LIMIT, noun: 'lead' })}
     ${leads.length === 0
       ? `<div class="empty-state card" style="padding:2rem;text-align:center"><p class="text-muted">No leads found.</p><a href="/leads/new" class="btn btn-primary" style="margin-top:0.75rem">Create first lead</a></div>`
       : `<div class="table-wrap"><table class="data-table">
           <thead><tr><th>Business</th><th>Contact</th><th>Status</th><th>Last Activity</th><th>Follow-up</th><th></th></tr></thead>
           <tbody>${rows}</tbody>
-        </table></div>`
+        </table></div>
+        <div class="list-footer" style="margin-top:0.6rem">
+          <span class="text-muted">${h(listCountLabel({ count: leads.length, noun: 'lead', truncated, total }))}</span>
+        </div>`
     }
   ` });
 }
@@ -10388,6 +10544,77 @@ function renderLeadsList(session, { leads, counts, flash, q, status }) {
 // WHAT: renders the New Lead form; `prefill` repopulates fields after a validation error (e.g. duplicate email).
 // CHANGE-GUARD: the business_type and source <option> lists are hardcoded here — keep them in sync with any DB constraints or downstream reporting that buckets on these values.
 // INVARIANT(S): email is the only required field (marked *); all prefill values pass through h() including the numeric estimated_monthly_volume_usd (String()-coerced).
+// WHAT: closed set of valid ISO-3166-1 alpha-2 country codes for the lead address `country_code`
+//   <select>. Deliberately NOT the same helper as fww-b2b-portal's `toCountryCode()` -- that
+//   function DEFAULTS an unrecognized/blank value to 'US' (see its own comment: "US-only B2B
+//   store"), which is precisely the bug that shipped order #38656 to Auckland NZ marked "United
+//   States" (HANDOFF-2026-08-11). This map has no default: a code not in it is rejected outright.
+// SYNC: keys here must stay in sync with the <option value=...> list rendered by countryOptions()
+//   below and with PROVINCE_REQUIRED_COUNTRY_CODES/validateLeadInput's zip check.
+const VALID_LEAD_COUNTRY_CODES = new Map(Object.entries({
+  US: 'United States', CA: 'Canada', MX: 'Mexico', GB: 'United Kingdom', IE: 'Ireland',
+  AU: 'Australia', NZ: 'New Zealand', DE: 'Germany', FR: 'France', ES: 'Spain', IT: 'Italy',
+  NL: 'Netherlands', BE: 'Belgium', LU: 'Luxembourg', CH: 'Switzerland', AT: 'Austria',
+  PT: 'Portugal', DK: 'Denmark', SE: 'Sweden', NO: 'Norway', FI: 'Finland', IS: 'Iceland',
+  PL: 'Poland', CZ: 'Czechia', SK: 'Slovakia', HU: 'Hungary', RO: 'Romania', BG: 'Bulgaria',
+  GR: 'Greece', HR: 'Croatia', SI: 'Slovenia', EE: 'Estonia', LV: 'Latvia', LT: 'Lithuania',
+  JP: 'Japan', KR: 'South Korea', CN: 'China', HK: 'Hong Kong', TW: 'Taiwan', SG: 'Singapore',
+  MY: 'Malaysia', TH: 'Thailand', PH: 'Philippines', ID: 'Indonesia', VN: 'Vietnam', IN: 'India',
+  IL: 'Israel', AE: 'United Arab Emirates', SA: 'Saudi Arabia', ZA: 'South Africa',
+  BR: 'Brazil', AR: 'Argentina', CL: 'Chile', CO: 'Colombia', PE: 'Peru', UY: 'Uruguay',
+  CR: 'Costa Rica', PA: 'Panama', DO: 'Dominican Republic', JM: 'Jamaica', PR: 'Puerto Rico',
+}));
+
+// WHAT: countries where a resale-style state/province is a meaningful, expected part of the
+//   address (used to gate a required-field error in validateLeadInput). Not exhaustive of every
+//   country that HAS provinces -- deliberately scoped to where Fuzzywumpets actually ships/sells.
+const PROVINCE_REQUIRED_COUNTRY_CODES = new Set(['US', 'CA', 'AU', 'MX']);
+
+function countryOptions(selected) {
+  const sel = String(selected || '').toUpperCase();
+  const rows = [...VALID_LEAD_COUNTRY_CODES.entries()].sort((a, b) => a[1].localeCompare(b[1]));
+  return `<option value="">— select —</option>` + rows.map(([code, name]) =>
+    `<option value="${code}"${sel === code ? ' selected' : ''}>${h(name)}</option>`
+  ).join('');
+}
+
+// WHAT: shared validator for lead contact + address fields, used by both POST /leads/new and
+//   POST /leads/:id/edit (D5, HANDOFF-2026-08-11) so the two entry points can never drift.
+// CHANGE-GUARD: returns the FIRST problem found, as a specific human-readable message naming the
+//   field, or null when the input is acceptable. Address requiredness rules ONLY engage once
+//   country_code is non-blank -- a lead with a street address and nothing else (Hydref K-9, lead
+//   #3) is honestly incomplete, not invalid, and must remain storable. NEVER default a blank or
+//   unrecognized country to 'US' -- see VALID_LEAD_COUNTRY_CODES comment above.
+// INVARIANT(S): pure function, no I/O; does not mutate req.body.
+function validateLeadInput(body) {
+  const email = String(body.email || '').trim();
+  if (!email) return 'Email is required.';
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return 'Enter a valid email address.';
+
+  const country = String(body.country_code || '').trim().toUpperCase();
+  if (country) {
+    if (!VALID_LEAD_COUNTRY_CODES.has(country)) return 'Unrecognized country. Choose one from the list.';
+    if (PROVINCE_REQUIRED_COUNTRY_CODES.has(country) && !String(body.state || '').trim()) {
+      return `State/province is required for ${VALID_LEAD_COUNTRY_CODES.get(country)}.`;
+    }
+    const postal = String(body.postal_code || '').trim();
+    if (!postal) return 'Postal code is required when a country is set.';
+    if (country === 'US' && !/^\d{5}(-\d{4})?$/.test(postal)) {
+      return 'Enter a valid 5-digit US ZIP code (12345 or 12345-6789).';
+    }
+  }
+  return null;
+}
+
+// SYNC: business_type option list -- renderLeadNew and renderLeadEdit must render the SAME
+//   set. /leads/new already enforces this vocabulary via a <select> (it only LOOKED like free
+//   text on lead #3 because that lead was hand-inserted via createLead(), bypassing the form --
+//   corrected 2026-08-11, HANDOFF-2026-08-11 D6 correction). If the edit page used a different
+//   list, or a free-text input, it would silently undo the constraint the create page enforces.
+//   Nothing enforces this vocabulary at the DB/ingest layer (createLead/upsertPortalLead accept
+//   anything) -- these two <select>s are the only actual enforcement.
+const LEAD_BUSINESS_TYPES = ['boutique', 'trainer', 'kennel', 'show-vendor', 'groomer', 'other'];
+
 function renderLeadNew(session, { flash, prefill = {} }) {
   const flashHtml = flash ? `<div class="alert alert-danger">${h(flash)}</div>` : '';
   return layout({ title: 'New Lead', session, activePath: '/leads', content: `
@@ -10410,7 +10637,7 @@ function renderLeadNew(session, { flash, prefill = {} }) {
           <label>Business type</label>
           <select name="business_type" class="input">
             <option value="">— select —</option>
-            ${['boutique','trainer','kennel','show-vendor','groomer','other'].map(t =>
+            ${LEAD_BUSINESS_TYPES.map(t =>
               `<option value="${t}"${prefill.business_type===t?' selected':''}>${h(t)}</option>`
             ).join('')}
           </select>
@@ -10480,6 +10707,22 @@ function renderLeadDetail(session, { lead, notes, history, flash }) {
     ? `<a href="/leads/${lead.id}/convert" class="btn btn-primary">Convert to Customer</a>`
     : '';
 
+  // WHAT: address completeness display (B2B-1/B2B-2, HANDOFF-2026-08-11). "Complete" here means
+  //   enough to actually ship to: a street line, a city, and a postal code, PLUS a country (never
+  //   assumed — see validateLeadInput). Anything short of that reads as "Address incomplete" so
+  //   staff can see at a glance that a lead like Hydref K-9 (street only) still needs follow-up.
+  const hasAnyAddressField = [lead.address1, lead.address2, lead.city, lead.state, lead.postal_code, lead.country_code].some(Boolean);
+  const addressComplete = !!(lead.address1 && lead.city && lead.postal_code && lead.country_code);
+  const countryName = lead.country_code ? (VALID_LEAD_COUNTRY_CODES.get(lead.country_code) || lead.country_code) : '';
+  const addressLines = [lead.address1, lead.address2].filter(Boolean).map(l => h(l)).join('<br>');
+  const cityStateZip = [lead.city, lead.state].filter(Boolean).join(', ') + (lead.postal_code ? ' ' + lead.postal_code : '');
+  const addressHtml = !hasAnyAddressField
+    ? `<div class="kv-row"><span>Address</span><strong class="text-muted">Not on file</strong></div>`
+    : `<div class="kv-row" style="align-items:flex-start"><span>Address</span><strong>
+        ${addressLines ? addressLines + '<br>' : ''}${h(cityStateZip.trim())}${cityStateZip.trim() ? '<br>' : ''}${h(countryName)}
+        ${!addressComplete ? '<br><span class="badge badge-orange badge-xs" style="margin-top:0.25rem;display:inline-block">⚠ Address incomplete</span>' : ''}
+      </strong></div>`;
+
   // WHAT: renders the wholesale application as the applicant submitted it.
   // WHY: everything the portal collects that has no first-class column here lives in
   //   application_data_json — a column that, before this, was written by nothing and rendered by
@@ -10532,6 +10775,7 @@ function renderLeadDetail(session, { lead, notes, history, flash }) {
         <p class="text-muted">${h(lead.contact_name || '')}${lead.contact_name && lead.email ? ' · ' : ''}${h(lead.email)} <span class="badge badge-${st.color}" style="margin-left:0.5rem">${h(st.label)}</span></p>
       </div>
       <div class="detail-header-actions">
+        <a href="/leads/${lead.id}/edit" class="btn btn-secondary">Edit</a>
         ${convertBtn}
       </div>
     </div>
@@ -10579,17 +10823,23 @@ function renderLeadDetail(session, { lead, notes, history, flash }) {
       <div class="detail-side">
         <div class="card">
           <div class="card-header"><h2>Profile</h2></div>
-          <form method="POST" action="/leads/${lead.id}/profile">
+          <!-- FINDING (2026-08-11 phone/overdue audit): this panel used to be wrapped in a POST
+               form pointing at a /leads/(id)/profile route that does not exist anywhere in this
+               file -- it never submitted (no submit button) so it never 404'd, but it was a dead
+               stub of the edit feature. Removed in favor of the real GET/POST /leads/:id/edit
+               (the Edit button above); this panel is read-only display now. -->
             <div class="kv-list">
               <div class="kv-row"><span>Email</span><strong><a href="mailto:${h(lead.email)}" class="link">${h(lead.email)}</a></strong></div>
-              ${lead.phone ? `<div class="kv-row"><span>Phone</span><strong>${h(lead.phone)}</strong></div>` : ''}
+              ${lead.phone ? `<div class="kv-row"><span>Phone</span><strong><a href="${h(telHref(lead.phone))}" class="link">${h(fmtPhone(lead.phone))}</a></strong></div>` : ''}
               ${lead.website ? `<div class="kv-row"><span>Website</span><strong><a href="${h(safeUrl(lead.website))}" target="_blank" rel="noopener noreferrer" class="link">${h(lead.website)}</a></strong></div>` : ''}
               ${lead.business_type ? `<div class="kv-row"><span>Type</span><strong>${h(lead.business_type)}</strong></div>` : ''}
               ${lead.source ? `<div class="kv-row"><span>Source</span><strong>${h(lead.source)}${lead.source_detail ? ' — ' + h(lead.source_detail) : ''}</strong></div>` : ''}
               ${lead.estimated_monthly_volume_usd ? `<div class="kv-row"><span>Est. volume</span><strong>${fmtMoney(lead.estimated_monthly_volume_usd)}/mo</strong></div>` : ''}
+              ${addressHtml}
+              ${lead.sales_tax_id ? `<div class="kv-row"><span>Resale tax ID</span><strong>${h(lead.sales_tax_id)}${lead.sales_tax_state ? ` (${h(lead.sales_tax_state)})` : ''}</strong></div>` : ''}
+              ${lead.fein ? `<div class="kv-row"><span>FEIN</span><strong>${h(lead.fein)}</strong></div>` : ''}
               <div class="kv-row"><span>Created</span><strong class="text-muted">${fmtDate(new Date(lead.created_at).toISOString())}</strong></div>
             </div>
-          </form>
         </div>
         <div class="card">
           <div class="card-header"><h2>Follow-up</h2></div>
@@ -10597,13 +10847,91 @@ function renderLeadDetail(session, { lead, notes, history, flash }) {
             <input type="date" name="next_followup_due" value="${h(lead.next_followup_due||'')}" class="input input-sm" style="flex:1">
             <button type="submit" class="btn btn-secondary btn-sm">Save</button>
           </form>
-          ${lead.next_followup_due && lead.next_followup_due < new Date().toISOString().split('T')[0]
+          ${lead.next_followup_due && lead.next_followup_due < localDateStr()
             ? `<p class="text-danger small-text" style="margin-top:0.35rem">⚠ Overdue</p>` : ''}
         </div>
         ${lead.shopify_customer_id ? `<div class="card"><div class="card-header"><h2>Customer</h2></div>
           <p><a href="/customers/${lead.shopify_customer_id.split('/').pop()}" class="link">View customer →</a></p>
         </div>` : ''}
       </div>
+    </div>
+  ` });
+}
+
+// WHAT: renders GET/POST /leads/:id/edit — contact + address + tax field editor (B2B-1/B2B-2,
+//   HANDOFF-2026-08-11). `lead` is the source of truth on GET; on a validation/UNIQUE failure the
+//   POST handler passes { ...lead, ...req.body } so the form re-shows what the user just typed
+//   rather than snapping back to the stored values.
+// CHANGE-GUARD: field names here are consumed verbatim by POST /leads/:id/edit — renaming a field
+//   here without updating the handler silently drops that field from every save. country_code
+//   is a <select> populated from VALID_LEAD_COUNTRY_CODES, never a free-text input (see that
+//   const's comment — order #38656 shipped to NZ marked "United States" from a free-text/defaulted
+//   country field in a different app).
+// INVARIANT(S): every dynamic value is h()-escaped; email is required, everything else optional.
+function renderLeadEdit(session, { lead, flash }) {
+  const flashHtml = flash ? `<div class="alert alert-danger">${h(flash)}</div>` : '';
+  return layout({ title: 'Edit Lead', session, activePath: '/leads', content: `
+    <div class="breadcrumb-row"><a href="/leads/${lead.id}" class="breadcrumb">← ${h(lead.business_name || lead.email)}</a></div>
+    <div class="page-header-row"><h1>Edit Lead</h1></div>
+    ${flashHtml}
+    <div class="card" style="max-width:640px">
+      <form method="POST" action="/leads/${lead.id}/edit">
+        <div class="settings-grid">
+          <label>Email *</label>
+          <input type="email" name="email" value="${h(lead.email||'')}" required class="input">
+          <label>Business name</label>
+          <input type="text" name="business_name" value="${h(lead.business_name||'')}" class="input">
+          <label>Contact name</label>
+          <input type="text" name="contact_name" value="${h(lead.contact_name||'')}" class="input">
+          <label>Phone</label>
+          <input type="tel" name="phone" value="${h(lead.phone||'')}" class="input">
+          <label>Website</label>
+          <input type="url" name="website" value="${h(lead.website||'')}" class="input" placeholder="https://…">
+          <label>Business type</label>
+          <select name="business_type" class="input">
+            <option value="">— select —</option>
+            ${LEAD_BUSINESS_TYPES.map(t =>
+              `<option value="${t}"${lead.business_type===t?' selected':''}>${h(t)}</option>`
+            ).join('')}
+            ${lead.business_type && !LEAD_BUSINESS_TYPES.includes(lead.business_type)
+              ? `<option value="${h(lead.business_type)}" selected>${h(lead.business_type)} (existing, not in list)</option>`
+              : ''}
+          </select>
+        </div>
+
+        <h2 style="margin-top:1.5rem;font-size:0.95rem">Address</h2>
+        <p class="text-muted small-text" style="margin:0 0 0.5rem">A street address with no city/state/zip yet is fine — it will show as incomplete until filled in.</p>
+        <div class="settings-grid">
+          <label>Address line 1</label>
+          <input type="text" name="address1" value="${h(lead.address1||'')}" class="input">
+          <label>Address line 2</label>
+          <input type="text" name="address2" value="${h(lead.address2||'')}" class="input">
+          <label>City</label>
+          <input type="text" name="city" value="${h(lead.city||'')}" class="input">
+          <label>State / province</label>
+          <input type="text" name="state" value="${h(lead.state||'')}" class="input" placeholder="TX">
+          <label>Postal code</label>
+          <input type="text" name="postal_code" value="${h(lead.postal_code||'')}" class="input">
+          <label>Country</label>
+          <select name="country_code" class="input">${countryOptions(lead.country_code)}</select>
+        </div>
+
+        <h2 style="margin-top:1.5rem;font-size:0.95rem">Tax</h2>
+        <p class="text-muted small-text" style="margin:0 0 0.5rem">Two different IDs — the state resale number and the federal EIN. Some applications label the FEIN as a "Resale Tax ID" by mistake; check the number's shape before filing it.</p>
+        <div class="settings-grid">
+          <label>Resale tax ID</label>
+          <input type="text" name="sales_tax_id" value="${h(lead.sales_tax_id||'')}" class="input">
+          <label>Tax-registration state</label>
+          <input type="text" name="sales_tax_state" value="${h(lead.sales_tax_state||'')}" class="input" placeholder="TX">
+          <label>FEIN</label>
+          <input type="text" name="fein" value="${h(lead.fein||'')}" class="input" placeholder="12-3456789">
+        </div>
+
+        <div style="margin-top:1.25rem;display:flex;gap:0.75rem">
+          <button type="submit" class="btn btn-primary">Save Changes</button>
+          <a href="/leads/${lead.id}" class="btn btn-ghost">Cancel</a>
+        </div>
+      </form>
     </div>
   ` });
 }
@@ -10656,8 +10984,15 @@ app.get('/leads', requireAuth, (req, res) => {
   const q      = String(req.query.q || '').trim();
   const leads  = getLeads({ status, search: q || undefined });
   const counts = getLeadCounts();
+  // DEPENDS: countLeads shares buildLeadsWhere with getLeads, so `total` always counts the same
+  //   rows the table is drawn from. Without this the page could not distinguish "exactly 100 leads"
+  //   from "the first 100 of 342" and rendered both the same way.
+  const total  = countLeads({ status, search: q || undefined });
   const flash  = req.query.flash === 'created' ? 'Lead created.' : req.query.flash === 'saved' ? 'Lead updated.' : null;
-  res.send(renderLeadsList(req.adminSession, { leads, counts, flash, q, status: req.query.status || 'all' }));
+  res.send(renderLeadsList(req.adminSession, {
+    leads, counts, flash, q, status: req.query.status || 'all',
+    total, truncated: total > leads.length,
+  }));
 });
 
 // WHAT: GET /leads/new — renders the empty New Lead form.
@@ -10669,14 +11004,28 @@ app.get('/leads/new', requireAuth, (req, res) => {
 
 // WHAT: POST /leads/new — creates a lead from the whole req.body, seeds status history as null->'new', and redirects to the detail page.
 // CHANGE-GUARD: createLead(req.body) trusts the entire body object — it must whitelist columns internally; the catch maps a UNIQUE-constraint error to a friendly 'email already exists' message, so changing the email unique index changes this UX.
-// INVARIANT(S): email is required (early return); a created lead always gets exactly one initial status-history row and an auditLog lead:create.
+// INVARIANT(S): validated by the shared validateLeadInput() (D5, HANDOFF-2026-08-11) before any
+//   write — same rules as POST /leads/:id/edit; a created lead always gets exactly one initial
+//   status-history row and an auditLog lead:create.
 app.post('/leads/new', requireAuth, (req, res) => {
-  const email = String(req.body.email || '').trim();
-  if (!email) return res.send(renderLeadNew(req.adminSession, { flash: 'Email is required.', prefill: req.body }));
+  const err = validateLeadInput(req.body);
+  if (err) return res.send(renderLeadNew(req.adminSession, { flash: err, prefill: req.body }));
   try {
-    const id = createLead(req.body);
+    // DEPENDS: phone is normalized to E.164 (or left verbatim if not confidently NANP) before
+    //   storage -- fmtPhone/telHref at every render site assume this shape. See normalizePhone.
+    // BUGFIX (Qodo, 2026-08-11): validateLeadInput() validates a TRIMMED copy of email but never
+    //   mutated req.body, so createLead(req.body) previously stored the email with any
+    //   leading/trailing whitespace intact -- breaking UNIQUE-collision expectations and exact
+    //   lookups, and leaving auditLog's email out of sync with the stored row. Trim here too,
+    //   matching what POST /leads/:id/edit already does.
+    const id = createLead({
+      ...req.body,
+      email: String(req.body.email || '').trim(),
+      phone: normalizePhone(req.body.phone),
+      country_code: String(req.body.country_code || '').trim().toUpperCase() || null,
+    });
     addLeadStatusHistory(id, null, 'new', 'Lead created', req.adminSession.email);
-    auditLog(req.adminSession.email, 'lead:create', String(id), null, { email });
+    auditLog(req.adminSession.email, 'lead:create', String(id), null, { email: String(req.body.email || '').trim() });
     res.redirect('/leads/' + id + '?flash=created');
   } catch (err) {
     const msg = err.message.includes('UNIQUE') ? 'A lead with that email already exists.' : err.message;
@@ -10695,6 +11044,58 @@ app.get('/leads/:id', requireAuth, (req, res) => {
   const history = getLeadStatusHistory(lead.id);
   const flash   = req.query.flash === 'created' ? 'Lead created.' : req.query.flash === 'saved' ? 'Saved.' : req.query.flash === 'status_changed' ? 'Status updated.' : null;
   res.send(renderLeadDetail(req.adminSession, { lead, notes, history, flash }));
+});
+
+// WHAT: GET /leads/:id/edit — renders the contact/address/tax editor, pre-filled from the lead.
+// CHANGE-GUARD: pure render; the matching POST does the validation and write.
+// INVARIANT(S): 404s (redirect to /leads) when the lead is unknown.
+app.get('/leads/:id/edit', requireAuth, (req, res) => {
+  const lead = getLead(req.params.id);
+  if (!lead) return res.redirect('/leads');
+  res.send(renderLeadEdit(req.adminSession, { lead, flash: null }));
+});
+
+// WHAT: POST /leads/:id/edit — validates via the shared validateLeadInput() (same rules as
+//   POST /leads/new, D5 HANDOFF-2026-08-11), then writes through updateLead()'s allow-list.
+// CHANGE-GUARD: `email` is UNIQUE on `leads` — changing it to one that collides with another lead
+//   must show a clean flash message here, never a 500 (mirrors the /leads/new duplicate-email UX).
+//   Every field written here must be present in updateLead()'s `allowed` array (db.mjs) or it
+//   silently no-ops — this exact trap is why sales_tax_id/sales_tax_state/fein were unwritable
+//   before this branch (see HANDOFF-2026-08-11 "Verified starting facts" #3).
+// INVARIANT(S): on any rejection (validation or UNIQUE collision) the form re-renders with the
+//   submitted values (not the stale stored ones) so nothing the user typed is lost.
+app.post('/leads/:id/edit', requireAuth, (req, res) => {
+  const lead = getLead(req.params.id);
+  if (!lead) return res.redirect('/leads');
+
+  const err = validateLeadInput(req.body);
+  if (err) return res.send(renderLeadEdit(req.adminSession, { lead: { ...lead, ...req.body }, flash: err }));
+
+  const fields = {
+    email: String(req.body.email || '').trim(),
+    business_name: req.body.business_name || null,
+    contact_name: req.body.contact_name || null,
+    phone: normalizePhone(req.body.phone),
+    website: req.body.website || null,
+    business_type: req.body.business_type || null,
+    address1: req.body.address1 || null,
+    address2: req.body.address2 || null,
+    city: req.body.city || null,
+    state: req.body.state || null,
+    postal_code: req.body.postal_code || null,
+    country_code: String(req.body.country_code || '').trim().toUpperCase() || null,
+    sales_tax_id: req.body.sales_tax_id || null,
+    sales_tax_state: req.body.sales_tax_state || null,
+    fein: req.body.fein || null,
+  };
+  try {
+    updateLead(lead.id, fields);
+    auditLog(req.adminSession.email, 'lead:edit', String(lead.id), null, fields);
+    res.redirect('/leads/' + lead.id + '?flash=saved');
+  } catch (writeErr) {
+    const msg = writeErr.message.includes('UNIQUE') ? 'A lead with that email already exists.' : writeErr.message;
+    res.send(renderLeadEdit(req.adminSession, { lead: { ...lead, ...req.body }, flash: msg }));
+  }
 });
 
 // WHAT: GET /leads/:id/tax-doc — streams the applicant's optional sales-tax-exemption PDF by
@@ -11224,7 +11625,7 @@ app.get('/api/admin/customers/:id/active-cart', requireAuth, (req, res) => {
 });
 
 // WHAT: GET /customers/:id/activity — full HTML activity-log page with date presets, type filter, free-text path search, expandable per-row detail (IP hash, UA, session, impersonation admin), and a 'did they order on date?' quick-lookup widget.
-// CHANGE-GUARD: defaults to a 7-day window; pagination is 50/page (totalPages from data.total) and pagination links re-encode from/to/type/q — add any new filter to BOTH the form and the pagination/canned-view query strings or it drops on page change; the inline script fetches the /activity/lookup endpoint by interpolated numId.
+// CHANGE-GUARD: defaults to a 7-day window; the date-preset picker is id-only (`#date-preset`) and must never be given a `name` — the form already has one control per query key and a duplicate name makes qs hand the route an array; pagination is 50/page (totalPages from data.total) and pagination links re-encode from/to/type/q — add any new filter to BOTH the form and the pagination/canned-view query strings or it drops on page change; the inline script fetches the /activity/lookup endpoint by interpolated numId.
 // INVARIANT(S): customer displayName is best-effort (falls back to 'Customer <id>' on Shopify error, swallowed); row detail JSON is h()-escaped into a data-detail attribute and re-parsed client-side; this page is read-only.
 app.get('/customers/:id/activity', requireAuth, async (req, res) => {
   const numId = req.params.id;
@@ -11330,9 +11731,14 @@ app.get('/customers/:id/activity', requireAuth, async (req, res) => {
     <!-- Filters -->
     <div class="filter-bar" style="margin-bottom:1rem">
       <form method="GET" style="display:flex;gap:0.5rem;flex-wrap:wrap;align-items:center">
-        <select name="from" class="input input-sm" title="From date" onchange="this.form.submit()">
-          ${datePresets.map(p => `<option value="${h(p.from)}"${p.from === fromParam && p.to === toParam ? ' selected' : ''}>${h(p.label)}</option>`).join('')}
-          <option value="${h(fromParam)}"${!datePresets.some(p => p.from === fromParam) ? ' selected' : ''}>Custom</option>
+        <!-- DEPENDS: this preset picker must NOT carry the from name — the date input below already owns it,
+             and two controls sharing it made every manual submit send from=[preset]&from=[date],
+             which Express's qs parser turns into an array and the date filter then matches nothing.
+             It is id-only: it writes into the from/to date inputs and submits, so exactly one from
+             and one to ever reach the server. -->
+        <select id="date-preset" class="input input-sm" title="Date preset" onchange="var v=this.value;if(v){var f=this.form,d=v.split('|');f.elements.from.value=d[0];f.elements.to.value=d[1];f.submit();}">
+          ${datePresets.map(p => `<option value="${h(p.from)}|${h(p.to)}"${p.from === fromParam && p.to === toParam ? ' selected' : ''}>${h(p.label)}</option>`).join('')}
+          <option value=""${!datePresets.some(p => p.from === fromParam && p.to === toParam) ? ' selected' : ''}>Custom</option>
         </select>
         <input type="date" name="from" class="input input-sm" value="${h(fromParam)}" style="width:130px">
         <span style="font-size:0.85rem;color:#666">to</span>
