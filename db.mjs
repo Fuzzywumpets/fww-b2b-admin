@@ -14,7 +14,13 @@ let db;
 if (MOCK) {
   db = new Database(':memory:');
 } else {
-  const DATA_DIR = path.join(__dirname, 'data');
+  // B2B_ADMIN_DATA_DIR overrides the on-disk location of admin.db. Unset (the prod default) this is
+  // byte-for-byte the previous behaviour: <repo>/data/admin.db. It exists so a non-MOCK regression
+  // test can boot a real (MOCK=false) server against a scratch sqlite file instead of the live DB —
+  // test/test-session-guard.test.mjs must exercise the non-MOCK auth branch, and without this it
+  // would open and write sessions/audit rows into the production admin.db if ever run on the VPS.
+  // DEPENDS: test/test-session-guard.test.mjs sets this; do not remove without updating that suite.
+  const DATA_DIR = process.env.B2B_ADMIN_DATA_DIR || path.join(__dirname, 'data');
   fs.mkdirSync(DATA_DIR, { recursive: true });
   db = new Database(path.join(DATA_DIR, 'admin.db'));
 }
