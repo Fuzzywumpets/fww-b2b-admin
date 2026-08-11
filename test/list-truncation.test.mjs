@@ -154,6 +154,29 @@ await test('footer: a truncated list never presents the cap as a total', async (
   assert(label !== `${ORDERS_LIST_LIMIT} orders`, 'footer must not read as a complete total');
 });
 
+// B2B-16 regression. /leads can supply a true total (countLeads), so listCountLabel grew an optional
+// `total`. The bug this guards: renderLeadsList originally appended " of 342 matching" AFTER the
+// label, but the truncated branch already returns a COMPLETE sentence, producing
+// "showing the first 100 leads — more match, refine the filters of 342 matching".
+// Qodo caught it; the HTTP assertion did not, because it only substring-matched "showing the first".
+await test('footer: with a true total, the truncated label is ONE well-formed sentence', async () => {
+  const label = listCountLabel({ count: 100, noun: 'lead', truncated: true, total: 342 });
+  assertEqual(label, 'showing the first 100 of 342 leads — refine the filters');
+  assert(!/filters .*of \d+ matching/.test(label), 'label must not be two sentences glued together');
+  assert(label.includes('342'), 'the whole point of passing total is to name the real number');
+});
+
+await test('footer: omitting total preserves the exact wording /orders and /customers ship', async () => {
+  // These two read from a cache path with no true total. PR #13's copy must not change under them.
+  assertEqual(listCountLabel({ count: 200, noun: 'order', truncated: true }),
+    'showing the first 200 orders — more match, refine the filters');
+  // A nonsense/unusable total must fall back rather than render "of NaN" or "of 5" under a 100-row page.
+  assertEqual(listCountLabel({ count: 100, noun: 'lead', truncated: true, total: NaN }),
+    'showing the first 100 leads — more match, refine the filters');
+  assertEqual(listCountLabel({ count: 100, noun: 'lead', truncated: true, total: 100 }),
+    'showing the first 100 leads — more match, refine the filters');
+});
+
 await test('banner: only renders when something was actually cut off', async () => {
   assertEqual(truncationNoticeHtml({ truncated: false, limit: 200, noun: 'order' }), '');
   const html = truncationNoticeHtml({ truncated: true, limit: 200, noun: 'order' });

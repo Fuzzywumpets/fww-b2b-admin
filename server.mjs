@@ -10482,9 +10482,7 @@ function renderLeadsList(session, { leads, counts, flash, q, status, total, trun
           <tbody>${rows}</tbody>
         </table></div>
         <div class="list-footer" style="margin-top:0.6rem">
-          <span class="text-muted">${h(listCountLabel({ count: leads.length, noun: 'lead', truncated }))}${
-            truncated && Number.isFinite(total) ? h(` of ${total} matching`) : ''
-          }</span>
+          <span class="text-muted">${h(listCountLabel({ count: leads.length, noun: 'lead', truncated, total }))}</span>
         </div>`
     }
   ` });

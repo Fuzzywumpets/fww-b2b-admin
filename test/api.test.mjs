@@ -2121,11 +2121,18 @@ await test('GET /leads → footer states the count honestly (route→render wiri
   const cookie = await seedSession();
   const res  = await fetch(`${BASE}/leads`, { headers: { Cookie: cookie } });
   const html = await res.text();
-  assert.ok(/\d+ leads?</.test(html) || html.includes('showing the first'),
+  // Not truncated at this volume, so the footer must be the plain "N leads" form...
+  assert.ok(/\d+ leads?</.test(html),
     'leads list must print a count footer — listCountLabel is not wired to the route');
-  // Not truncated at this volume, so the cap banner must NOT appear.
+  // ...and the cap banner must NOT appear.
   assert.ok(!html.includes('data-truncation-notice'),
     'truncation banner shown on a list that was never truncated');
+  // Guard the malformed-copy bug Qodo caught: the truncated branch of listCountLabel returns a
+  // COMPLETE sentence, so nothing may be concatenated onto it. An earlier version rendered
+  // "...refine the filters of 342 matching". A substring check for 'showing the first' passed on
+  // that broken string, which is exactly why this asserts on the glued shape instead.
+  assert.ok(!/refine the filters\s*of\s*\d+/.test(html),
+    'footer copy is two sentences glued together — see listCountLabel CHANGE-GUARD');
 });
 
 await test('GET /leads/:id → lead detail renders', async () => {
