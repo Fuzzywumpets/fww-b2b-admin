@@ -50,6 +50,13 @@ if [ -f test/leads-ingest.test.mjs ]; then
   B2B_ADMIN_MOCK=1 node test/leads-ingest.test.mjs || UNIT_FAIL=$?
 fi
 
+# Order-edit userErrors: the batch /edit handler returns from its MOCK branch before any Shopify
+# mutation, so this path can ONLY be covered standalone.
+if [ -f test/order-edit-user-errors.test.mjs ]; then
+  echo ""
+  node test/order-edit-user-errors.test.mjs || UNIT_FAIL=$?
+fi
+
 # List truncation lives here for the same reason: the cache path is gated on `if (!MOCK)`, so the
 # HTTP suite can never reach the capped query that truncates /orders and /customers.
 if [ -f test/list-truncation.test.mjs ]; then
