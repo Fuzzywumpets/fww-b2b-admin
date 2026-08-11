@@ -2356,6 +2356,96 @@ async function getLead(cookie, id) {
   return res.text();
 }
 
+// ── B2B-1/B2B-2 follow-up: phone formatting, dead-form removal, overdue-date fix ──
+// (2026-08-11 audit findings, folded into this branch rather than left for a follow-up.)
+console.log('\nAPI tests — B2B-1/B2B-2 follow-up: phone/overdue/dead-form:');
+
+await test('lead detail: a NANP phone (10 digits) renders formatted as a tel: link', async () => {
+  const cookie = await seedSession();
+  const { id } = await createTestLead(cookie);
+  await fetch(`${BASE}/leads/${id}/edit`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ email: `phone-nanp-${Date.now()}@example.com`, phone: '8282160282' }).toString(),
+  });
+  const html = await getLead(cookie, id);
+  assert.ok(html.includes('(828) 216-0282'), 'phone was not formatted as (xxx) xxx-xxxx');
+  assert.ok(html.includes('href="tel:+18282160282"'), 'missing/wrong tel: link');
+});
+
+await test('lead detail: an 11-digit NANP phone (leading 1) also formats', async () => {
+  const cookie = await seedSession();
+  const { id } = await createTestLead(cookie);
+  await fetch(`${BASE}/leads/${id}/edit`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ email: `phone-11digit-${Date.now()}@example.com`, phone: '18282160282' }).toString(),
+  });
+  const html = await getLead(cookie, id);
+  assert.ok(html.includes('(828) 216-0282'), '11-digit leading-1 NANP number was not formatted');
+});
+
+await test('lead detail: a non-NANP (international) phone renders VERBATIM, never mangled', async () => {
+  const cookie = await seedSession();
+  const { id } = await createTestLead(cookie);
+  const intlPhone = '+64 9 123 4567'; // NZ landline shape -- the exact kind of number the country-code rule protects
+  await fetch(`${BASE}/leads/${id}/edit`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ email: `phone-intl-${Date.now()}@example.com`, phone: intlPhone }).toString(),
+  });
+  const html = await getLead(cookie, id);
+  assert.ok(html.includes(intlPhone), 'a non-NANP number must render exactly as entered, not reformatted/mangled');
+  assert.ok(html.includes('href="tel:+6491234567"'), 'a leading-+ number should still get a usable tel: link');
+});
+
+await test('lead detail: Profile panel is no longer wrapped in the dead /leads/:id/profile form', async () => {
+  const cookie = await seedSession();
+  const { id } = await createTestLead(cookie);
+  const html = await getLead(cookie, id);
+  assert.ok(!html.includes(`action="/leads/${id}/profile"`), 'dead form wrapper should be removed, not left pointing at a nonexistent route');
+  // Confirm the route really doesn't exist (belt-and-suspenders, matches the finding).
+  const res = await fetch(`${BASE}/leads/${id}/profile`, { method: 'POST', headers: { Cookie: cookie } });
+  assert.equal(res.status, 404, '/leads/:id/profile must not silently exist as a route');
+});
+
+await test('lead detail: a follow-up due TODAY (local date) is never flagged Overdue', async () => {
+  const cookie = await seedSession();
+  const { id } = await createTestLead(cookie);
+  const today = new Date();
+  const localToday = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
+  await fetch(`${BASE}/leads/${id}/followup`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ next_followup_due: localToday }).toString(),
+  });
+  const html = await getLead(cookie, id);
+  assert.ok(!html.includes('⚠ Overdue'), 'a follow-up due today (local date) must never render as overdue');
+});
+
+await test('lead detail: a follow-up due in the past IS flagged Overdue', async () => {
+  const cookie = await seedSession();
+  const { id } = await createTestLead(cookie);
+  await fetch(`${BASE}/leads/${id}/followup`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ next_followup_due: '2020-01-01' }).toString(),
+  });
+  const html = await getLead(cookie, id);
+  assert.ok(html.includes('⚠ Overdue'), 'a genuinely past-due follow-up must still be flagged overdue');
+});
+
+await test('/leads/new and /leads/:id/edit render the SAME business_type option set (D6 correction)', async () => {
+  const cookie = await seedSession();
+  const { id } = await createTestLead(cookie);
+  const newHtml = await (await fetch(`${BASE}/leads/new`, { headers: { Cookie: cookie } })).text();
+  const editHtml = await (await fetch(`${BASE}/leads/${id}/edit`, { headers: { Cookie: cookie } })).text();
+  for (const t of ['boutique', 'trainer', 'kennel', 'show-vendor', 'groomer', 'other']) {
+    assert.ok(newHtml.includes(`>${t}<`), `New Lead form missing option: ${t}`);
+    assert.ok(editHtml.includes(`>${t}<`), `Edit Lead form missing option: ${t}`);
+  }
+});
+
 // ── Phase 19B: Universal hyperlinks ──────────────────────────────────────────
 console.log('\nAPI tests — Phase 19B: Universal hyperlinks:');
 

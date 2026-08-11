@@ -126,11 +126,19 @@ So at least two intake paths exist and only one reaches the database.
 → **In scope:** apply the same validation to `/leads/new` as to `/leads/:id/edit`. One shared
 validator, not two copies. Mark it `// SYNC:` if it ends up duplicated.
 
-### D6. `business_type` is being used as free text
-Its name implies a category/enum, but it currently holds prose (Hydref K-9's reads "dog grooming and
-supply shop, dog show vendor booth").
-→ Leave as free text for now. Raise in the PR whether Alex wants a controlled vocabulary — that
-would be a new feature, not this task.
+### D6. `business_type` is being used as free text — **CORRECTED 2026-08-11, this was wrong**
+Originally reported as free text because lead #3 held prose ("dog grooming and supply shop, dog
+show vendor booth"). That was a false read: `renderLeadNew` already renders `business_type` as a
+constrained `<select>` (`boutique`/`trainer`/`kennel`/`show-vendor`/`groomer`/`other`) — lead #3
+only looked like free text because it was entered by hand via `createLead()`, bypassing the form
+entirely. Nothing enforces the vocabulary at the DB/ingest layer, so `createLead`/`upsertPortalLead`
+can still write anything; the two `<select>`s are the only actual enforcement. Lead #3 has since
+been corrected in the live DB to `business_type='groomer'` with `custom_tags='show-vendor,retail'`.
+→ The edit page (`/leads/:id/edit`) uses the SAME option list as `/leads/new`, factored into the
+shared `LEAD_BUSINESS_TYPES` constant (marked `// SYNC:`) so the two forms can't drift.
+→ Real product question, not a bug: the vocabulary is single-select, but a real business can be
+several at once (this one is a groomer *and* a show vendor *and* a retail shop). `custom_tags` is
+the current escape hatch. Left as a question for Alex, not redesigned here.
 
 ### D7. No merge/delete path for leads
 `leads.email` is UNIQUE while portal `wholesale_leads.email` is NOT, so duplicate applications

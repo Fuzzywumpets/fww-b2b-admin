@@ -1279,6 +1279,91 @@ function fmtDate(iso) {
   return new Date(iso).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
 }
 
+// WHAT: today's date as YYYY-MM-DD in the SERVER's LOCAL timezone (2026-08-11, phone/overdue
+//   audit). `next_followup_due` comes from an <input type="date">, which is always the user's
+//   LOCAL date -- comparing it against `new Date().toISOString().split('T')[0]` compares it
+//   against UTC instead. Chicago is UTC-5/-6, so from ~7pm local onward UTC has already rolled
+//   to tomorrow and a follow-up due TODAY renders as overdue. Use this everywhere a
+//   next_followup_due (or any other local-date input) is compared against "today".
+// INVARIANT(S): pure; matches the YYYY-MM-DD lexicographic-compare format used throughout.
+function localDateStr(d = new Date()) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+// WHAT: formats a stored phone value as "(xxx) xxx-xxxx" ONLY when it confidently parses as a
+//   NANP number (10 digits, or 11 digits starting with '1') -- 2026-08-11 phone audit, requested
+//   by Alex after lead #3 rendered as the illegible "8282160282". Anything else (an international
+//   number, garbage input) renders VERBATIM, unmangled. Same fail-safe principle as the
+//   country-code validator above: never coerce a value you cannot confidently classify -- this
+//   business already shipped one order to Auckland NZ from exactly that kind of over-eager
+//   normalization elsewhere.
+// INVARIANT(S): pure; never throws; the caller still h()-escapes the result.
+function fmtPhone(raw) {
+  const s = String(raw == null ? '' : raw).trim();
+  if (!s) return '';
+  // A leading '+' is the caller EXPLICITLY stating a country code -- trust that signal rather
+  // than reinterpreting the raw digit count. Without this check, a New Zealand number like
+  // "+64 9 123 4567" (10 digits once punctuation is stripped) would be silently misread as a
+  // bare NANP number and mangled into "(649) 123-4567" -- precisely the failure mode this
+  // function exists to avoid. Only format when the explicit country code is +1.
+  if (s.startsWith('+')) {
+    const digits = s.replace(/\D/g, '');
+    if (digits.length === 11 && digits[0] === '1') {
+      const ten = digits.slice(1);
+      return `(${ten.slice(0, 3)}) ${ten.slice(3, 6)}-${ten.slice(6)}`;
+    }
+    return s;
+  }
+  const digits = s.replace(/\D/g, '');
+  let ten = null;
+  if (digits.length === 10) ten = digits;
+  else if (digits.length === 11 && digits[0] === '1') ten = digits.slice(1);
+  if (!ten) return s;
+  return `(${ten.slice(0, 3)}) ${ten.slice(3, 6)}-${ten.slice(6)}`;
+}
+
+// WHAT: builds a `tel:` href from a stored phone value for click-to-call. A leading '+' is taken
+//   as an already-international number and passed through verbatim (digits only); a confident
+//   NANP number (see fmtPhone) gets a `+1` prefix; anything else falls back to bare digits with
+//   NO assumed country code -- we must never guess a country the way toCountryCode() in the
+//   portal wrongly defaults to 'US' (see VALID_LEAD_COUNTRY_CODES comment above).
+// INVARIANT(S): pure; returns '' for empty/unparseable input so callers can skip the <a> entirely.
+function telHref(raw) {
+  const s = String(raw == null ? '' : raw).trim();
+  if (!s) return '';
+  if (s.startsWith('+')) return `tel:${s.replace(/[^\d+]/g, '')}`;
+  const digits = s.replace(/\D/g, '');
+  if (!digits) return '';
+  if (digits.length === 10) return `tel:+1${digits}`;
+  if (digits.length === 11 && digits[0] === '1') return `tel:+${digits}`;
+  return `tel:${digits}`;
+}
+
+// WHAT: normalizes a phone number for STORAGE (2026-08-11 phone audit) -- E.164 (+1XXXXXXXXXX)
+//   when it confidently parses as NANP, otherwise stored VERBATIM. Display formatting (fmtPhone)
+//   is applied at render time, never baked into storage, so the stored value stays the source of
+//   truth and re-formatting logic changes don't require a data migration.
+// INVARIANT(S): pure; returns null for empty input (matches the `|| null` convention used for
+//   every other optional lead field in createLead/updateLead).
+function normalizePhone(raw) {
+  const s = String(raw == null ? '' : raw).trim();
+  if (!s) return null;
+  // Same leading-'+' guard as fmtPhone: an explicit country code must be trusted, never
+  // reinterpreted by raw digit count (see fmtPhone's comment for the NZ-number failure case).
+  if (s.startsWith('+')) {
+    const digits = s.replace(/\D/g, '');
+    return (digits.length === 11 && digits[0] === '1') ? `+1${digits.slice(1)}` : s;
+  }
+  const digits = s.replace(/\D/g, '');
+  let ten = null;
+  if (digits.length === 10) ten = digits;
+  else if (digits.length === 11 && digits[0] === '1') ten = digits.slice(1);
+  return ten ? `+1${ten}` : s;
+}
+
 // ── Second build (Build D): order-history timeline helpers ─────────────────────
 // All pure functions. They take RAW stored strings (from getOrderHistory) and return
 // plain text — every value is escaped via h() at the render site, never here.
@@ -3792,7 +3877,7 @@ function renderOrderDetail(session, order, flash, flashMsg) {
           <div class="card-header"><h2>Customer</h2></div>
           <p><a href="/customers/${shopifyNumericId(order.customer.id)}" class="link-strong">${h(order.customer.displayName)}</a></p>
           <p class="text-muted">${h(order.customer.email)}</p>
-          ${order.customer.phone ? `<p class="text-muted">${h(order.customer.phone)}</p>` : ''}
+          ${order.customer.phone ? `<p class="text-muted"><a href="${h(telHref(order.customer.phone))}" class="link">${h(fmtPhone(order.customer.phone))}</a></p>` : ''}
         </div>` : ''}
         <div class="card">
           <div class="card-header"><h2>Shipping Address</h2></div>
@@ -4368,7 +4453,7 @@ function renderCustomerDetail(session, customer, recentOrders, notes, _dropshipC
     <div class="detail-header">
       <div class="detail-header-left">
         <h1>${h(customer.displayName)}</h1>
-        <p class="text-muted">${h(customer.email)}${customer.phone ? ' · ' + h(customer.phone) : ''}</p>
+        <p class="text-muted">${h(customer.email)}${customer.phone ? ' · <a href="' + h(telHref(customer.phone)) + '" class="link">' + h(fmtPhone(customer.phone)) + '</a>' : ''}</p>
       </div>
       <div class="detail-header-actions">
         <a href="/customers/${h(numId)}/activity" class="btn btn-ghost btn-sm" title="View portal activity log">Activity log</a>
@@ -10335,7 +10420,7 @@ function renderLeadsList(session, { leads, counts, flash, q, status }) {
   const rows = leads.map(l => {
     const st = LEAD_STATUSES[l.status] || { label: l.status, color: 'muted' };
     const followUp = l.next_followup_due
-      ? `<span class="${l.next_followup_due < new Date().toISOString().split('T')[0] ? 'text-danger' : 'text-muted'}">${h(l.next_followup_due)}</span>`
+      ? `<span class="${l.next_followup_due < localDateStr() ? 'text-danger' : 'text-muted'}">${h(l.next_followup_due)}</span>`
       : '<span class="text-muted">—</span>';
     return `<tr>
       <td><a href="/leads/${l.id}" class="link-strong">${h(l.business_name || '—')}</a><br><small class="text-muted">${h(l.email)}</small></td>
@@ -10439,6 +10524,15 @@ function validateLeadInput(body) {
   return null;
 }
 
+// SYNC: business_type option list -- renderLeadNew and renderLeadEdit must render the SAME
+//   set. /leads/new already enforces this vocabulary via a <select> (it only LOOKED like free
+//   text on lead #3 because that lead was hand-inserted via createLead(), bypassing the form --
+//   corrected 2026-08-11, HANDOFF-2026-08-11 D6 correction). If the edit page used a different
+//   list, or a free-text input, it would silently undo the constraint the create page enforces.
+//   Nothing enforces this vocabulary at the DB/ingest layer (createLead/upsertPortalLead accept
+//   anything) -- these two <select>s are the only actual enforcement.
+const LEAD_BUSINESS_TYPES = ['boutique', 'trainer', 'kennel', 'show-vendor', 'groomer', 'other'];
+
 function renderLeadNew(session, { flash, prefill = {} }) {
   const flashHtml = flash ? `<div class="alert alert-danger">${h(flash)}</div>` : '';
   return layout({ title: 'New Lead', session, activePath: '/leads', content: `
@@ -10461,7 +10555,7 @@ function renderLeadNew(session, { flash, prefill = {} }) {
           <label>Business type</label>
           <select name="business_type" class="input">
             <option value="">— select —</option>
-            ${['boutique','trainer','kennel','show-vendor','groomer','other'].map(t =>
+            ${LEAD_BUSINESS_TYPES.map(t =>
               `<option value="${t}"${prefill.business_type===t?' selected':''}>${h(t)}</option>`
             ).join('')}
           </select>
@@ -10647,10 +10741,14 @@ function renderLeadDetail(session, { lead, notes, history, flash }) {
       <div class="detail-side">
         <div class="card">
           <div class="card-header"><h2>Profile</h2></div>
-          <form method="POST" action="/leads/${lead.id}/profile">
+          <!-- FINDING (2026-08-11 phone/overdue audit): this panel used to be wrapped in a POST
+               form pointing at a /leads/(id)/profile route that does not exist anywhere in this
+               file -- it never submitted (no submit button) so it never 404'd, but it was a dead
+               stub of the edit feature. Removed in favor of the real GET/POST /leads/:id/edit
+               (the Edit button above); this panel is read-only display now. -->
             <div class="kv-list">
               <div class="kv-row"><span>Email</span><strong><a href="mailto:${h(lead.email)}" class="link">${h(lead.email)}</a></strong></div>
-              ${lead.phone ? `<div class="kv-row"><span>Phone</span><strong>${h(lead.phone)}</strong></div>` : ''}
+              ${lead.phone ? `<div class="kv-row"><span>Phone</span><strong><a href="${h(telHref(lead.phone))}" class="link">${h(fmtPhone(lead.phone))}</a></strong></div>` : ''}
               ${lead.website ? `<div class="kv-row"><span>Website</span><strong><a href="${h(safeUrl(lead.website))}" target="_blank" rel="noopener noreferrer" class="link">${h(lead.website)}</a></strong></div>` : ''}
               ${lead.business_type ? `<div class="kv-row"><span>Type</span><strong>${h(lead.business_type)}</strong></div>` : ''}
               ${lead.source ? `<div class="kv-row"><span>Source</span><strong>${h(lead.source)}${lead.source_detail ? ' — ' + h(lead.source_detail) : ''}</strong></div>` : ''}
@@ -10660,7 +10758,6 @@ function renderLeadDetail(session, { lead, notes, history, flash }) {
               ${lead.fein ? `<div class="kv-row"><span>FEIN</span><strong>${h(lead.fein)}</strong></div>` : ''}
               <div class="kv-row"><span>Created</span><strong class="text-muted">${fmtDate(new Date(lead.created_at).toISOString())}</strong></div>
             </div>
-          </form>
         </div>
         <div class="card">
           <div class="card-header"><h2>Follow-up</h2></div>
@@ -10668,7 +10765,7 @@ function renderLeadDetail(session, { lead, notes, history, flash }) {
             <input type="date" name="next_followup_due" value="${h(lead.next_followup_due||'')}" class="input input-sm" style="flex:1">
             <button type="submit" class="btn btn-secondary btn-sm">Save</button>
           </form>
-          ${lead.next_followup_due && lead.next_followup_due < new Date().toISOString().split('T')[0]
+          ${lead.next_followup_due && lead.next_followup_due < localDateStr()
             ? `<p class="text-danger small-text" style="margin-top:0.35rem">⚠ Overdue</p>` : ''}
         </div>
         ${lead.shopify_customer_id ? `<div class="card"><div class="card-header"><h2>Customer</h2></div>
@@ -10711,7 +10808,7 @@ function renderLeadEdit(session, { lead, flash }) {
           <label>Business type</label>
           <select name="business_type" class="input">
             <option value="">— select —</option>
-            ${['boutique','trainer','kennel','show-vendor','groomer','other'].map(t =>
+            ${LEAD_BUSINESS_TYPES.map(t =>
               `<option value="${t}"${lead.business_type===t?' selected':''}>${h(t)}</option>`
             ).join('')}
           </select>
@@ -10822,7 +10919,9 @@ app.post('/leads/new', requireAuth, (req, res) => {
   const err = validateLeadInput(req.body);
   if (err) return res.send(renderLeadNew(req.adminSession, { flash: err, prefill: req.body }));
   try {
-    const id = createLead(req.body);
+    // DEPENDS: phone is normalized to E.164 (or left verbatim if not confidently NANP) before
+    //   storage -- fmtPhone/telHref at every render site assume this shape. See normalizePhone.
+    const id = createLead({ ...req.body, phone: normalizePhone(req.body.phone) });
     addLeadStatusHistory(id, null, 'new', 'Lead created', req.adminSession.email);
     auditLog(req.adminSession.email, 'lead:create', String(id), null, { email: String(req.body.email || '').trim() });
     res.redirect('/leads/' + id + '?flash=created');
@@ -10874,7 +10973,7 @@ app.post('/leads/:id/edit', requireAuth, (req, res) => {
     email: String(req.body.email || '').trim(),
     business_name: req.body.business_name || null,
     contact_name: req.body.contact_name || null,
-    phone: req.body.phone || null,
+    phone: normalizePhone(req.body.phone),
     website: req.body.website || null,
     business_type: req.body.business_type || null,
     address1: req.body.address1 || null,
