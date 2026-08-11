@@ -2,7 +2,6 @@
 
 **Repo:** `fww-b2b-admin` (the standalone INTERNAL staff tool — *not* a duplicate of the customer
 portal; treat it as the system of record for staff lead work).
-**Worktree:** `C:/Users/AlexLass/projects/_worktrees/b2b-lead-fields`
 **Branch:** `feat/lead-address-and-edit` (off `main` @ `aae9343`)
 **Ship as:** one PR to `Fuzzywumpets/fww-b2b-admin`.
 

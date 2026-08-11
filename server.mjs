@@ -10811,6 +10811,9 @@ function renderLeadEdit(session, { lead, flash }) {
             ${LEAD_BUSINESS_TYPES.map(t =>
               `<option value="${t}"${lead.business_type===t?' selected':''}>${h(t)}</option>`
             ).join('')}
+            ${lead.business_type && !LEAD_BUSINESS_TYPES.includes(lead.business_type)
+              ? `<option value="${h(lead.business_type)}" selected>${h(lead.business_type)} (existing, not in list)</option>`
+              : ''}
           </select>
         </div>
 
@@ -10921,7 +10924,17 @@ app.post('/leads/new', requireAuth, (req, res) => {
   try {
     // DEPENDS: phone is normalized to E.164 (or left verbatim if not confidently NANP) before
     //   storage -- fmtPhone/telHref at every render site assume this shape. See normalizePhone.
-    const id = createLead({ ...req.body, phone: normalizePhone(req.body.phone) });
+    // BUGFIX (Qodo, 2026-08-11): validateLeadInput() validates a TRIMMED copy of email but never
+    //   mutated req.body, so createLead(req.body) previously stored the email with any
+    //   leading/trailing whitespace intact -- breaking UNIQUE-collision expectations and exact
+    //   lookups, and leaving auditLog's email out of sync with the stored row. Trim here too,
+    //   matching what POST /leads/:id/edit already does.
+    const id = createLead({
+      ...req.body,
+      email: String(req.body.email || '').trim(),
+      phone: normalizePhone(req.body.phone),
+      country_code: String(req.body.country_code || '').trim().toUpperCase() || null,
+    });
     addLeadStatusHistory(id, null, 'new', 'Lead created', req.adminSession.email);
     auditLog(req.adminSession.email, 'lead:create', String(id), null, { email: String(req.body.email || '').trim() });
     res.redirect('/leads/' + id + '?flash=created');

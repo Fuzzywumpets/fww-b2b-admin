@@ -2203,6 +2203,53 @@ async function createTestLead(cookie, overrides = {}) {
   return { id, email };
 }
 
+// ── Qodo findings (2026-08-11 review of this PR) ──────────────────────────────
+console.log('\nAPI tests — Qodo findings: business_type preservation + email trim:');
+
+await test('POST /leads/new → email is trimmed before storage, not stored with whitespace', async () => {
+  const cookie = await seedSession();
+  const rawEmail = `  trim-test-${Date.now()}@example.com  `;
+  const res = await fetch(`${BASE}/leads/new`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ email: rawEmail }).toString(),
+    redirect: 'manual',
+  });
+  assert.equal(res.status, 302);
+  const html = await (await fetch(`${BASE}${res.headers.get('location')}`, { headers: { Cookie: cookie } })).text();
+  assert.ok(html.includes(`mailto:${rawEmail.trim()}"`), 'trimmed email should appear as the mailto: href');
+  assert.ok(!html.includes(`mailto:${rawEmail}"`), 'the untrimmed (padded) email must not have been stored');
+});
+
+await test('POST /leads/:id/edit → an existing free-text business_type survives an unrelated edit (was silently nulled)', async () => {
+  const cookie = await seedSession();
+  const freeTextType = 'dog grooming and supply shop, dog show vendor booth';
+  const email = `legacy-biztype-${Date.now()}@example.com`;
+  // Created directly via POST /leads/new with a value outside the <select> enum -- exactly how a
+  // hand-inserted or portal-ingested lead (Hydref K-9's real shape) can carry free text today,
+  // since nothing enforces the vocabulary below the UI layer.
+  const createRes = await fetch(`${BASE}/leads/new`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ email, business_type: freeTextType }).toString(),
+    redirect: 'manual',
+  });
+  const id = createRes.headers.get('location').split('/leads/')[1]?.replace('?flash=created', '');
+
+  const editFormHtml = await (await fetch(`${BASE}/leads/${id}/edit`, { headers: { Cookie: cookie } })).text();
+  assert.ok(editFormHtml.includes(freeTextType), 'the edit form must show the existing free-text value, not silently blank it');
+
+  // Save the form WITHOUT touching business_type (simulating a real user editing something else,
+  // e.g. adding a phone number, while the free-text value sits unselected in a closed <select>).
+  await fetch(`${BASE}/leads/${id}/edit`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ email, business_type: freeTextType, phone: '8282160282' }).toString(),
+  });
+  const after = await getLead(cookie, id);
+  assert.ok(after.includes(freeTextType), 'business_type must survive an edit, not be silently nulled to the empty <select> value');
+});
+
 await test('GET /leads/:id/edit → form renders with Edit button reachable from detail page', async () => {
   const cookie = await seedSession();
   const { id } = await createTestLead(cookie);
