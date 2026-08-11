@@ -1279,6 +1279,91 @@ function fmtDate(iso) {
   return new Date(iso).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
 }
 
+// WHAT: today's date as YYYY-MM-DD in the SERVER's LOCAL timezone (2026-08-11, phone/overdue
+//   audit). `next_followup_due` comes from an <input type="date">, which is always the user's
+//   LOCAL date -- comparing it against `new Date().toISOString().split('T')[0]` compares it
+//   against UTC instead. Chicago is UTC-5/-6, so from ~7pm local onward UTC has already rolled
+//   to tomorrow and a follow-up due TODAY renders as overdue. Use this everywhere a
+//   next_followup_due (or any other local-date input) is compared against "today".
+// INVARIANT(S): pure; matches the YYYY-MM-DD lexicographic-compare format used throughout.
+function localDateStr(d = new Date()) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+// WHAT: formats a stored phone value as "(xxx) xxx-xxxx" ONLY when it confidently parses as a
+//   NANP number (10 digits, or 11 digits starting with '1') -- 2026-08-11 phone audit, requested
+//   by Alex after lead #3 rendered as the illegible "8282160282". Anything else (an international
+//   number, garbage input) renders VERBATIM, unmangled. Same fail-safe principle as the
+//   country-code validator above: never coerce a value you cannot confidently classify -- this
+//   business already shipped one order to Auckland NZ from exactly that kind of over-eager
+//   normalization elsewhere.
+// INVARIANT(S): pure; never throws; the caller still h()-escapes the result.
+function fmtPhone(raw) {
+  const s = String(raw == null ? '' : raw).trim();
+  if (!s) return '';
+  // A leading '+' is the caller EXPLICITLY stating a country code -- trust that signal rather
+  // than reinterpreting the raw digit count. Without this check, a New Zealand number like
+  // "+64 9 123 4567" (10 digits once punctuation is stripped) would be silently misread as a
+  // bare NANP number and mangled into "(649) 123-4567" -- precisely the failure mode this
+  // function exists to avoid. Only format when the explicit country code is +1.
+  if (s.startsWith('+')) {
+    const digits = s.replace(/\D/g, '');
+    if (digits.length === 11 && digits[0] === '1') {
+      const ten = digits.slice(1);
+      return `(${ten.slice(0, 3)}) ${ten.slice(3, 6)}-${ten.slice(6)}`;
+    }
+    return s;
+  }
+  const digits = s.replace(/\D/g, '');
+  let ten = null;
+  if (digits.length === 10) ten = digits;
+  else if (digits.length === 11 && digits[0] === '1') ten = digits.slice(1);
+  if (!ten) return s;
+  return `(${ten.slice(0, 3)}) ${ten.slice(3, 6)}-${ten.slice(6)}`;
+}
+
+// WHAT: builds a `tel:` href from a stored phone value for click-to-call. A leading '+' is taken
+//   as an already-international number and passed through verbatim (digits only); a confident
+//   NANP number (see fmtPhone) gets a `+1` prefix; anything else falls back to bare digits with
+//   NO assumed country code -- we must never guess a country the way toCountryCode() in the
+//   portal wrongly defaults to 'US' (see VALID_LEAD_COUNTRY_CODES comment above).
+// INVARIANT(S): pure; returns '' for empty/unparseable input so callers can skip the <a> entirely.
+function telHref(raw) {
+  const s = String(raw == null ? '' : raw).trim();
+  if (!s) return '';
+  if (s.startsWith('+')) return `tel:${s.replace(/[^\d+]/g, '')}`;
+  const digits = s.replace(/\D/g, '');
+  if (!digits) return '';
+  if (digits.length === 10) return `tel:+1${digits}`;
+  if (digits.length === 11 && digits[0] === '1') return `tel:+${digits}`;
+  return `tel:${digits}`;
+}
+
+// WHAT: normalizes a phone number for STORAGE (2026-08-11 phone audit) -- E.164 (+1XXXXXXXXXX)
+//   when it confidently parses as NANP, otherwise stored VERBATIM. Display formatting (fmtPhone)
+//   is applied at render time, never baked into storage, so the stored value stays the source of
+//   truth and re-formatting logic changes don't require a data migration.
+// INVARIANT(S): pure; returns null for empty input (matches the `|| null` convention used for
+//   every other optional lead field in createLead/updateLead).
+function normalizePhone(raw) {
+  const s = String(raw == null ? '' : raw).trim();
+  if (!s) return null;
+  // Same leading-'+' guard as fmtPhone: an explicit country code must be trusted, never
+  // reinterpreted by raw digit count (see fmtPhone's comment for the NZ-number failure case).
+  if (s.startsWith('+')) {
+    const digits = s.replace(/\D/g, '');
+    return (digits.length === 11 && digits[0] === '1') ? `+1${digits.slice(1)}` : s;
+  }
+  const digits = s.replace(/\D/g, '');
+  let ten = null;
+  if (digits.length === 10) ten = digits;
+  else if (digits.length === 11 && digits[0] === '1') ten = digits.slice(1);
+  return ten ? `+1${ten}` : s;
+}
+
 // ── Second build (Build D): order-history timeline helpers ─────────────────────
 // All pure functions. They take RAW stored strings (from getOrderHistory) and return
 // plain text — every value is escaped via h() at the render site, never here.
@@ -3792,7 +3877,7 @@ function renderOrderDetail(session, order, flash, flashMsg) {
           <div class="card-header"><h2>Customer</h2></div>
           <p><a href="/customers/${shopifyNumericId(order.customer.id)}" class="link-strong">${h(order.customer.displayName)}</a></p>
           <p class="text-muted">${h(order.customer.email)}</p>
-          ${order.customer.phone ? `<p class="text-muted">${h(order.customer.phone)}</p>` : ''}
+          ${order.customer.phone ? `<p class="text-muted"><a href="${h(telHref(order.customer.phone))}" class="link">${h(fmtPhone(order.customer.phone))}</a></p>` : ''}
         </div>` : ''}
         <div class="card">
           <div class="card-header"><h2>Shipping Address</h2></div>
@@ -4368,7 +4453,7 @@ function renderCustomerDetail(session, customer, recentOrders, notes, _dropshipC
     <div class="detail-header">
       <div class="detail-header-left">
         <h1>${h(customer.displayName)}</h1>
-        <p class="text-muted">${h(customer.email)}${customer.phone ? ' · ' + h(customer.phone) : ''}</p>
+        <p class="text-muted">${h(customer.email)}${customer.phone ? ' · <a href="' + h(telHref(customer.phone)) + '" class="link">' + h(fmtPhone(customer.phone)) + '</a>' : ''}</p>
       </div>
       <div class="detail-header-actions">
         <a href="/customers/${h(numId)}/activity" class="btn btn-ghost btn-sm" title="View portal activity log">Activity log</a>
@@ -10335,7 +10420,7 @@ function renderLeadsList(session, { leads, counts, flash, q, status }) {
   const rows = leads.map(l => {
     const st = LEAD_STATUSES[l.status] || { label: l.status, color: 'muted' };
     const followUp = l.next_followup_due
-      ? `<span class="${l.next_followup_due < new Date().toISOString().split('T')[0] ? 'text-danger' : 'text-muted'}">${h(l.next_followup_due)}</span>`
+      ? `<span class="${l.next_followup_due < localDateStr() ? 'text-danger' : 'text-muted'}">${h(l.next_followup_due)}</span>`
       : '<span class="text-muted">—</span>';
     return `<tr>
       <td><a href="/leads/${l.id}" class="link-strong">${h(l.business_name || '—')}</a><br><small class="text-muted">${h(l.email)}</small></td>
@@ -10377,6 +10462,77 @@ function renderLeadsList(session, { leads, counts, flash, q, status }) {
 // WHAT: renders the New Lead form; `prefill` repopulates fields after a validation error (e.g. duplicate email).
 // CHANGE-GUARD: the business_type and source <option> lists are hardcoded here — keep them in sync with any DB constraints or downstream reporting that buckets on these values.
 // INVARIANT(S): email is the only required field (marked *); all prefill values pass through h() including the numeric estimated_monthly_volume_usd (String()-coerced).
+// WHAT: closed set of valid ISO-3166-1 alpha-2 country codes for the lead address `country_code`
+//   <select>. Deliberately NOT the same helper as fww-b2b-portal's `toCountryCode()` -- that
+//   function DEFAULTS an unrecognized/blank value to 'US' (see its own comment: "US-only B2B
+//   store"), which is precisely the bug that shipped order #38656 to Auckland NZ marked "United
+//   States" (HANDOFF-2026-08-11). This map has no default: a code not in it is rejected outright.
+// SYNC: keys here must stay in sync with the <option value=...> list rendered by countryOptions()
+//   below and with PROVINCE_REQUIRED_COUNTRY_CODES/validateLeadInput's zip check.
+const VALID_LEAD_COUNTRY_CODES = new Map(Object.entries({
+  US: 'United States', CA: 'Canada', MX: 'Mexico', GB: 'United Kingdom', IE: 'Ireland',
+  AU: 'Australia', NZ: 'New Zealand', DE: 'Germany', FR: 'France', ES: 'Spain', IT: 'Italy',
+  NL: 'Netherlands', BE: 'Belgium', LU: 'Luxembourg', CH: 'Switzerland', AT: 'Austria',
+  PT: 'Portugal', DK: 'Denmark', SE: 'Sweden', NO: 'Norway', FI: 'Finland', IS: 'Iceland',
+  PL: 'Poland', CZ: 'Czechia', SK: 'Slovakia', HU: 'Hungary', RO: 'Romania', BG: 'Bulgaria',
+  GR: 'Greece', HR: 'Croatia', SI: 'Slovenia', EE: 'Estonia', LV: 'Latvia', LT: 'Lithuania',
+  JP: 'Japan', KR: 'South Korea', CN: 'China', HK: 'Hong Kong', TW: 'Taiwan', SG: 'Singapore',
+  MY: 'Malaysia', TH: 'Thailand', PH: 'Philippines', ID: 'Indonesia', VN: 'Vietnam', IN: 'India',
+  IL: 'Israel', AE: 'United Arab Emirates', SA: 'Saudi Arabia', ZA: 'South Africa',
+  BR: 'Brazil', AR: 'Argentina', CL: 'Chile', CO: 'Colombia', PE: 'Peru', UY: 'Uruguay',
+  CR: 'Costa Rica', PA: 'Panama', DO: 'Dominican Republic', JM: 'Jamaica', PR: 'Puerto Rico',
+}));
+
+// WHAT: countries where a resale-style state/province is a meaningful, expected part of the
+//   address (used to gate a required-field error in validateLeadInput). Not exhaustive of every
+//   country that HAS provinces -- deliberately scoped to where Fuzzywumpets actually ships/sells.
+const PROVINCE_REQUIRED_COUNTRY_CODES = new Set(['US', 'CA', 'AU', 'MX']);
+
+function countryOptions(selected) {
+  const sel = String(selected || '').toUpperCase();
+  const rows = [...VALID_LEAD_COUNTRY_CODES.entries()].sort((a, b) => a[1].localeCompare(b[1]));
+  return `<option value="">— select —</option>` + rows.map(([code, name]) =>
+    `<option value="${code}"${sel === code ? ' selected' : ''}>${h(name)}</option>`
+  ).join('');
+}
+
+// WHAT: shared validator for lead contact + address fields, used by both POST /leads/new and
+//   POST /leads/:id/edit (D5, HANDOFF-2026-08-11) so the two entry points can never drift.
+// CHANGE-GUARD: returns the FIRST problem found, as a specific human-readable message naming the
+//   field, or null when the input is acceptable. Address requiredness rules ONLY engage once
+//   country_code is non-blank -- a lead with a street address and nothing else (Hydref K-9, lead
+//   #3) is honestly incomplete, not invalid, and must remain storable. NEVER default a blank or
+//   unrecognized country to 'US' -- see VALID_LEAD_COUNTRY_CODES comment above.
+// INVARIANT(S): pure function, no I/O; does not mutate req.body.
+function validateLeadInput(body) {
+  const email = String(body.email || '').trim();
+  if (!email) return 'Email is required.';
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return 'Enter a valid email address.';
+
+  const country = String(body.country_code || '').trim().toUpperCase();
+  if (country) {
+    if (!VALID_LEAD_COUNTRY_CODES.has(country)) return 'Unrecognized country. Choose one from the list.';
+    if (PROVINCE_REQUIRED_COUNTRY_CODES.has(country) && !String(body.state || '').trim()) {
+      return `State/province is required for ${VALID_LEAD_COUNTRY_CODES.get(country)}.`;
+    }
+    const postal = String(body.postal_code || '').trim();
+    if (!postal) return 'Postal code is required when a country is set.';
+    if (country === 'US' && !/^\d{5}(-\d{4})?$/.test(postal)) {
+      return 'Enter a valid 5-digit US ZIP code (12345 or 12345-6789).';
+    }
+  }
+  return null;
+}
+
+// SYNC: business_type option list -- renderLeadNew and renderLeadEdit must render the SAME
+//   set. /leads/new already enforces this vocabulary via a <select> (it only LOOKED like free
+//   text on lead #3 because that lead was hand-inserted via createLead(), bypassing the form --
+//   corrected 2026-08-11, HANDOFF-2026-08-11 D6 correction). If the edit page used a different
+//   list, or a free-text input, it would silently undo the constraint the create page enforces.
+//   Nothing enforces this vocabulary at the DB/ingest layer (createLead/upsertPortalLead accept
+//   anything) -- these two <select>s are the only actual enforcement.
+const LEAD_BUSINESS_TYPES = ['boutique', 'trainer', 'kennel', 'show-vendor', 'groomer', 'other'];
+
 function renderLeadNew(session, { flash, prefill = {} }) {
   const flashHtml = flash ? `<div class="alert alert-danger">${h(flash)}</div>` : '';
   return layout({ title: 'New Lead', session, activePath: '/leads', content: `
@@ -10399,7 +10555,7 @@ function renderLeadNew(session, { flash, prefill = {} }) {
           <label>Business type</label>
           <select name="business_type" class="input">
             <option value="">— select —</option>
-            ${['boutique','trainer','kennel','show-vendor','groomer','other'].map(t =>
+            ${LEAD_BUSINESS_TYPES.map(t =>
               `<option value="${t}"${prefill.business_type===t?' selected':''}>${h(t)}</option>`
             ).join('')}
           </select>
@@ -10469,6 +10625,22 @@ function renderLeadDetail(session, { lead, notes, history, flash }) {
     ? `<a href="/leads/${lead.id}/convert" class="btn btn-primary">Convert to Customer</a>`
     : '';
 
+  // WHAT: address completeness display (B2B-1/B2B-2, HANDOFF-2026-08-11). "Complete" here means
+  //   enough to actually ship to: a street line, a city, and a postal code, PLUS a country (never
+  //   assumed — see validateLeadInput). Anything short of that reads as "Address incomplete" so
+  //   staff can see at a glance that a lead like Hydref K-9 (street only) still needs follow-up.
+  const hasAnyAddressField = [lead.address1, lead.address2, lead.city, lead.state, lead.postal_code, lead.country_code].some(Boolean);
+  const addressComplete = !!(lead.address1 && lead.city && lead.postal_code && lead.country_code);
+  const countryName = lead.country_code ? (VALID_LEAD_COUNTRY_CODES.get(lead.country_code) || lead.country_code) : '';
+  const addressLines = [lead.address1, lead.address2].filter(Boolean).map(l => h(l)).join('<br>');
+  const cityStateZip = [lead.city, lead.state].filter(Boolean).join(', ') + (lead.postal_code ? ' ' + lead.postal_code : '');
+  const addressHtml = !hasAnyAddressField
+    ? `<div class="kv-row"><span>Address</span><strong class="text-muted">Not on file</strong></div>`
+    : `<div class="kv-row" style="align-items:flex-start"><span>Address</span><strong>
+        ${addressLines ? addressLines + '<br>' : ''}${h(cityStateZip.trim())}${cityStateZip.trim() ? '<br>' : ''}${h(countryName)}
+        ${!addressComplete ? '<br><span class="badge badge-orange badge-xs" style="margin-top:0.25rem;display:inline-block">⚠ Address incomplete</span>' : ''}
+      </strong></div>`;
+
   // WHAT: renders the wholesale application as the applicant submitted it.
   // WHY: everything the portal collects that has no first-class column here lives in
   //   application_data_json — a column that, before this, was written by nothing and rendered by
@@ -10521,6 +10693,7 @@ function renderLeadDetail(session, { lead, notes, history, flash }) {
         <p class="text-muted">${h(lead.contact_name || '')}${lead.contact_name && lead.email ? ' · ' : ''}${h(lead.email)} <span class="badge badge-${st.color}" style="margin-left:0.5rem">${h(st.label)}</span></p>
       </div>
       <div class="detail-header-actions">
+        <a href="/leads/${lead.id}/edit" class="btn btn-secondary">Edit</a>
         ${convertBtn}
       </div>
     </div>
@@ -10568,17 +10741,23 @@ function renderLeadDetail(session, { lead, notes, history, flash }) {
       <div class="detail-side">
         <div class="card">
           <div class="card-header"><h2>Profile</h2></div>
-          <form method="POST" action="/leads/${lead.id}/profile">
+          <!-- FINDING (2026-08-11 phone/overdue audit): this panel used to be wrapped in a POST
+               form pointing at a /leads/(id)/profile route that does not exist anywhere in this
+               file -- it never submitted (no submit button) so it never 404'd, but it was a dead
+               stub of the edit feature. Removed in favor of the real GET/POST /leads/:id/edit
+               (the Edit button above); this panel is read-only display now. -->
             <div class="kv-list">
               <div class="kv-row"><span>Email</span><strong><a href="mailto:${h(lead.email)}" class="link">${h(lead.email)}</a></strong></div>
-              ${lead.phone ? `<div class="kv-row"><span>Phone</span><strong>${h(lead.phone)}</strong></div>` : ''}
+              ${lead.phone ? `<div class="kv-row"><span>Phone</span><strong><a href="${h(telHref(lead.phone))}" class="link">${h(fmtPhone(lead.phone))}</a></strong></div>` : ''}
               ${lead.website ? `<div class="kv-row"><span>Website</span><strong><a href="${h(safeUrl(lead.website))}" target="_blank" rel="noopener noreferrer" class="link">${h(lead.website)}</a></strong></div>` : ''}
               ${lead.business_type ? `<div class="kv-row"><span>Type</span><strong>${h(lead.business_type)}</strong></div>` : ''}
               ${lead.source ? `<div class="kv-row"><span>Source</span><strong>${h(lead.source)}${lead.source_detail ? ' — ' + h(lead.source_detail) : ''}</strong></div>` : ''}
               ${lead.estimated_monthly_volume_usd ? `<div class="kv-row"><span>Est. volume</span><strong>${fmtMoney(lead.estimated_monthly_volume_usd)}/mo</strong></div>` : ''}
+              ${addressHtml}
+              ${lead.sales_tax_id ? `<div class="kv-row"><span>Resale tax ID</span><strong>${h(lead.sales_tax_id)}${lead.sales_tax_state ? ` (${h(lead.sales_tax_state)})` : ''}</strong></div>` : ''}
+              ${lead.fein ? `<div class="kv-row"><span>FEIN</span><strong>${h(lead.fein)}</strong></div>` : ''}
               <div class="kv-row"><span>Created</span><strong class="text-muted">${fmtDate(new Date(lead.created_at).toISOString())}</strong></div>
             </div>
-          </form>
         </div>
         <div class="card">
           <div class="card-header"><h2>Follow-up</h2></div>
@@ -10586,13 +10765,91 @@ function renderLeadDetail(session, { lead, notes, history, flash }) {
             <input type="date" name="next_followup_due" value="${h(lead.next_followup_due||'')}" class="input input-sm" style="flex:1">
             <button type="submit" class="btn btn-secondary btn-sm">Save</button>
           </form>
-          ${lead.next_followup_due && lead.next_followup_due < new Date().toISOString().split('T')[0]
+          ${lead.next_followup_due && lead.next_followup_due < localDateStr()
             ? `<p class="text-danger small-text" style="margin-top:0.35rem">⚠ Overdue</p>` : ''}
         </div>
         ${lead.shopify_customer_id ? `<div class="card"><div class="card-header"><h2>Customer</h2></div>
           <p><a href="/customers/${lead.shopify_customer_id.split('/').pop()}" class="link">View customer →</a></p>
         </div>` : ''}
       </div>
+    </div>
+  ` });
+}
+
+// WHAT: renders GET/POST /leads/:id/edit — contact + address + tax field editor (B2B-1/B2B-2,
+//   HANDOFF-2026-08-11). `lead` is the source of truth on GET; on a validation/UNIQUE failure the
+//   POST handler passes { ...lead, ...req.body } so the form re-shows what the user just typed
+//   rather than snapping back to the stored values.
+// CHANGE-GUARD: field names here are consumed verbatim by POST /leads/:id/edit — renaming a field
+//   here without updating the handler silently drops that field from every save. country_code
+//   is a <select> populated from VALID_LEAD_COUNTRY_CODES, never a free-text input (see that
+//   const's comment — order #38656 shipped to NZ marked "United States" from a free-text/defaulted
+//   country field in a different app).
+// INVARIANT(S): every dynamic value is h()-escaped; email is required, everything else optional.
+function renderLeadEdit(session, { lead, flash }) {
+  const flashHtml = flash ? `<div class="alert alert-danger">${h(flash)}</div>` : '';
+  return layout({ title: 'Edit Lead', session, activePath: '/leads', content: `
+    <div class="breadcrumb-row"><a href="/leads/${lead.id}" class="breadcrumb">← ${h(lead.business_name || lead.email)}</a></div>
+    <div class="page-header-row"><h1>Edit Lead</h1></div>
+    ${flashHtml}
+    <div class="card" style="max-width:640px">
+      <form method="POST" action="/leads/${lead.id}/edit">
+        <div class="settings-grid">
+          <label>Email *</label>
+          <input type="email" name="email" value="${h(lead.email||'')}" required class="input">
+          <label>Business name</label>
+          <input type="text" name="business_name" value="${h(lead.business_name||'')}" class="input">
+          <label>Contact name</label>
+          <input type="text" name="contact_name" value="${h(lead.contact_name||'')}" class="input">
+          <label>Phone</label>
+          <input type="tel" name="phone" value="${h(lead.phone||'')}" class="input">
+          <label>Website</label>
+          <input type="url" name="website" value="${h(lead.website||'')}" class="input" placeholder="https://…">
+          <label>Business type</label>
+          <select name="business_type" class="input">
+            <option value="">— select —</option>
+            ${LEAD_BUSINESS_TYPES.map(t =>
+              `<option value="${t}"${lead.business_type===t?' selected':''}>${h(t)}</option>`
+            ).join('')}
+            ${lead.business_type && !LEAD_BUSINESS_TYPES.includes(lead.business_type)
+              ? `<option value="${h(lead.business_type)}" selected>${h(lead.business_type)} (existing, not in list)</option>`
+              : ''}
+          </select>
+        </div>
+
+        <h2 style="margin-top:1.5rem;font-size:0.95rem">Address</h2>
+        <p class="text-muted small-text" style="margin:0 0 0.5rem">A street address with no city/state/zip yet is fine — it will show as incomplete until filled in.</p>
+        <div class="settings-grid">
+          <label>Address line 1</label>
+          <input type="text" name="address1" value="${h(lead.address1||'')}" class="input">
+          <label>Address line 2</label>
+          <input type="text" name="address2" value="${h(lead.address2||'')}" class="input">
+          <label>City</label>
+          <input type="text" name="city" value="${h(lead.city||'')}" class="input">
+          <label>State / province</label>
+          <input type="text" name="state" value="${h(lead.state||'')}" class="input" placeholder="TX">
+          <label>Postal code</label>
+          <input type="text" name="postal_code" value="${h(lead.postal_code||'')}" class="input">
+          <label>Country</label>
+          <select name="country_code" class="input">${countryOptions(lead.country_code)}</select>
+        </div>
+
+        <h2 style="margin-top:1.5rem;font-size:0.95rem">Tax</h2>
+        <p class="text-muted small-text" style="margin:0 0 0.5rem">Two different IDs — the state resale number and the federal EIN. Some applications label the FEIN as a "Resale Tax ID" by mistake; check the number's shape before filing it.</p>
+        <div class="settings-grid">
+          <label>Resale tax ID</label>
+          <input type="text" name="sales_tax_id" value="${h(lead.sales_tax_id||'')}" class="input">
+          <label>Tax-registration state</label>
+          <input type="text" name="sales_tax_state" value="${h(lead.sales_tax_state||'')}" class="input" placeholder="TX">
+          <label>FEIN</label>
+          <input type="text" name="fein" value="${h(lead.fein||'')}" class="input" placeholder="12-3456789">
+        </div>
+
+        <div style="margin-top:1.25rem;display:flex;gap:0.75rem">
+          <button type="submit" class="btn btn-primary">Save Changes</button>
+          <a href="/leads/${lead.id}" class="btn btn-ghost">Cancel</a>
+        </div>
+      </form>
     </div>
   ` });
 }
@@ -10658,14 +10915,28 @@ app.get('/leads/new', requireAuth, (req, res) => {
 
 // WHAT: POST /leads/new — creates a lead from the whole req.body, seeds status history as null->'new', and redirects to the detail page.
 // CHANGE-GUARD: createLead(req.body) trusts the entire body object — it must whitelist columns internally; the catch maps a UNIQUE-constraint error to a friendly 'email already exists' message, so changing the email unique index changes this UX.
-// INVARIANT(S): email is required (early return); a created lead always gets exactly one initial status-history row and an auditLog lead:create.
+// INVARIANT(S): validated by the shared validateLeadInput() (D5, HANDOFF-2026-08-11) before any
+//   write — same rules as POST /leads/:id/edit; a created lead always gets exactly one initial
+//   status-history row and an auditLog lead:create.
 app.post('/leads/new', requireAuth, (req, res) => {
-  const email = String(req.body.email || '').trim();
-  if (!email) return res.send(renderLeadNew(req.adminSession, { flash: 'Email is required.', prefill: req.body }));
+  const err = validateLeadInput(req.body);
+  if (err) return res.send(renderLeadNew(req.adminSession, { flash: err, prefill: req.body }));
   try {
-    const id = createLead(req.body);
+    // DEPENDS: phone is normalized to E.164 (or left verbatim if not confidently NANP) before
+    //   storage -- fmtPhone/telHref at every render site assume this shape. See normalizePhone.
+    // BUGFIX (Qodo, 2026-08-11): validateLeadInput() validates a TRIMMED copy of email but never
+    //   mutated req.body, so createLead(req.body) previously stored the email with any
+    //   leading/trailing whitespace intact -- breaking UNIQUE-collision expectations and exact
+    //   lookups, and leaving auditLog's email out of sync with the stored row. Trim here too,
+    //   matching what POST /leads/:id/edit already does.
+    const id = createLead({
+      ...req.body,
+      email: String(req.body.email || '').trim(),
+      phone: normalizePhone(req.body.phone),
+      country_code: String(req.body.country_code || '').trim().toUpperCase() || null,
+    });
     addLeadStatusHistory(id, null, 'new', 'Lead created', req.adminSession.email);
-    auditLog(req.adminSession.email, 'lead:create', String(id), null, { email });
+    auditLog(req.adminSession.email, 'lead:create', String(id), null, { email: String(req.body.email || '').trim() });
     res.redirect('/leads/' + id + '?flash=created');
   } catch (err) {
     const msg = err.message.includes('UNIQUE') ? 'A lead with that email already exists.' : err.message;
@@ -10684,6 +10955,58 @@ app.get('/leads/:id', requireAuth, (req, res) => {
   const history = getLeadStatusHistory(lead.id);
   const flash   = req.query.flash === 'created' ? 'Lead created.' : req.query.flash === 'saved' ? 'Saved.' : req.query.flash === 'status_changed' ? 'Status updated.' : null;
   res.send(renderLeadDetail(req.adminSession, { lead, notes, history, flash }));
+});
+
+// WHAT: GET /leads/:id/edit — renders the contact/address/tax editor, pre-filled from the lead.
+// CHANGE-GUARD: pure render; the matching POST does the validation and write.
+// INVARIANT(S): 404s (redirect to /leads) when the lead is unknown.
+app.get('/leads/:id/edit', requireAuth, (req, res) => {
+  const lead = getLead(req.params.id);
+  if (!lead) return res.redirect('/leads');
+  res.send(renderLeadEdit(req.adminSession, { lead, flash: null }));
+});
+
+// WHAT: POST /leads/:id/edit — validates via the shared validateLeadInput() (same rules as
+//   POST /leads/new, D5 HANDOFF-2026-08-11), then writes through updateLead()'s allow-list.
+// CHANGE-GUARD: `email` is UNIQUE on `leads` — changing it to one that collides with another lead
+//   must show a clean flash message here, never a 500 (mirrors the /leads/new duplicate-email UX).
+//   Every field written here must be present in updateLead()'s `allowed` array (db.mjs) or it
+//   silently no-ops — this exact trap is why sales_tax_id/sales_tax_state/fein were unwritable
+//   before this branch (see HANDOFF-2026-08-11 "Verified starting facts" #3).
+// INVARIANT(S): on any rejection (validation or UNIQUE collision) the form re-renders with the
+//   submitted values (not the stale stored ones) so nothing the user typed is lost.
+app.post('/leads/:id/edit', requireAuth, (req, res) => {
+  const lead = getLead(req.params.id);
+  if (!lead) return res.redirect('/leads');
+
+  const err = validateLeadInput(req.body);
+  if (err) return res.send(renderLeadEdit(req.adminSession, { lead: { ...lead, ...req.body }, flash: err }));
+
+  const fields = {
+    email: String(req.body.email || '').trim(),
+    business_name: req.body.business_name || null,
+    contact_name: req.body.contact_name || null,
+    phone: normalizePhone(req.body.phone),
+    website: req.body.website || null,
+    business_type: req.body.business_type || null,
+    address1: req.body.address1 || null,
+    address2: req.body.address2 || null,
+    city: req.body.city || null,
+    state: req.body.state || null,
+    postal_code: req.body.postal_code || null,
+    country_code: String(req.body.country_code || '').trim().toUpperCase() || null,
+    sales_tax_id: req.body.sales_tax_id || null,
+    sales_tax_state: req.body.sales_tax_state || null,
+    fein: req.body.fein || null,
+  };
+  try {
+    updateLead(lead.id, fields);
+    auditLog(req.adminSession.email, 'lead:edit', String(lead.id), null, fields);
+    res.redirect('/leads/' + lead.id + '?flash=saved');
+  } catch (writeErr) {
+    const msg = writeErr.message.includes('UNIQUE') ? 'A lead with that email already exists.' : writeErr.message;
+    res.send(renderLeadEdit(req.adminSession, { lead: { ...lead, ...req.body }, flash: msg }));
+  }
 });
 
 // WHAT: GET /leads/:id/tax-doc — streams the applicant's optional sales-tax-exemption PDF by

@@ -356,6 +356,19 @@ db.exec(`
   if (!cols.has('fein'))           db.exec(`ALTER TABLE leads ADD COLUMN fein TEXT`);
 }
 
+// MIGRATION (2026-08-11, B2B-1/B2B-2): `leads` has never had address columns, so a lead like
+// #3 Hydref K-9 (street address only, no city/state/zip yet) has nowhere to store it -- it
+// survived only inside a hand-written note. Adds six nullable TEXT columns: address1, address2,
+// city, state, postal_code, country_code. All nullable so existing rows are unaffected and a
+// partial address (street only) is a valid, storable state, not an error.
+// Idempotent, same PRAGMA-then-ALTER shape as the portal_lead_id/fein migration above.
+{
+  const cols = new Set(db.prepare(`PRAGMA table_info(leads)`).all().map(c => c.name));
+  for (const col of ['address1', 'address2', 'city', 'state', 'postal_code', 'country_code']) {
+    if (!cols.has(col)) db.exec(`ALTER TABLE leads ADD COLUMN ${col} TEXT`);
+  }
+}
+
 export default db;
 
 export function createSession(sid, email, displayName, picture) {
@@ -484,22 +497,65 @@ export function logExportBatch(email, type, productCount, rowOrImageCount, bytes
 
 // ── Wholesale leads ────────────────────────────────────────────────────────────
 
+// WHAT: inserts a new lead. Accepts the six address columns and sales_tax_id/sales_tax_state in
+//   addition to the original field set -- before B2B-1/B2B-2 these existed on the table (or didn't
+//   exist at all, for the address columns) but were never writable here, so a manually-created lead
+//   could never carry a tax ID or an address (the concrete Hydref K-9 bug -- see HANDOFF-2026-08-11).
+// CHANGE-GUARD: the column list here must stay a superset of updateLead()'s `allowed` array below --
+//   both are the write surface for `leads` and both were missing these columns before this change.
 export function createLead(fields) {
   const now = Date.now();
   const r = db.prepare(`
     INSERT INTO leads (email, business_name, contact_name, phone, website, business_type,
       estimated_monthly_volume_usd, source, source_detail, status, custom_tags,
-      assigned_to, next_followup_due, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', ?, ?, ?, ?, ?)
+      assigned_to, next_followup_due, address1, address2, city, state, postal_code,
+      country_code, sales_tax_id, sales_tax_state, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     fields.email, fields.business_name || null, fields.contact_name || null,
     fields.phone || null, fields.website || null, fields.business_type || null,
     fields.estimated_monthly_volume_usd ? parseInt(fields.estimated_monthly_volume_usd, 10) : null,
     fields.source || null, fields.source_detail || null,
     fields.custom_tags || null, fields.assigned_to || null,
-    fields.next_followup_due || null, now, now
+    fields.next_followup_due || null,
+    fields.address1 || null, fields.address2 || null, fields.city || null,
+    fields.state || null, fields.postal_code || null, fields.country_code || null,
+    fields.sales_tax_id || null, fields.sales_tax_state || null,
+    now, now
   );
   return r.lastInsertRowid;
+}
+
+// WHAT: best-effort parse of the portal's free-text `row.address` ("City, ST 12345" or "City, ST")
+//   into the structured location columns (city/state/postal_code). Never guesses country -- see
+//   HANDOFF-2026-08-11 D1/validation: order #38656 shipped to Auckland NZ marked "United States"
+//   from exactly this kind of silent default, so an address with no explicit country stays flagged
+//   incomplete rather than assumed US.
+// CHANGE-GUARD: deliberately CONSERVATIVE -- only fills fields it can match with a real US state
+//   code, and never touches address1 (the portal's `address` column is documented as city/state/zip
+//   only, not a street). A non-matching string parses to all-null; the raw text is never lost
+//   either way because it also survives verbatim in application_data_json below.
+// INVARIANT(S): pure function, no I/O; returns {city, state, postal_code} with null for any field it
+//   isn't confident about.
+const US_STATE_CODES = new Set([
+  'AL','AK','AZ','AR','CA','CO','CT','DE','DC','FL','GA','HI','ID','IL','IN','IA','KS','KY','LA',
+  'ME','MD','MA','MI','MN','MS','MO','MT','NE','NV','NH','NJ','NM','NY','NC','ND','OH','OK','OR',
+  'PA','RI','SC','SD','TN','TX','UT','VT','VA','WA','WV','WI','WY',
+]);
+function parsePortalAddress(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return { city: null, state: null, postal_code: null };
+  // "City, ST 12345" or "City, ST 12345-6789"
+  let m = s.match(/^(.+?),\s*([A-Za-z]{2})\s+(\d{5}(?:-\d{4})?)$/);
+  if (m && US_STATE_CODES.has(m[2].toUpperCase())) {
+    return { city: m[1].trim(), state: m[2].toUpperCase(), postal_code: m[3] };
+  }
+  // "City, ST" with no zip
+  m = s.match(/^(.+?),\s*([A-Za-z]{2})$/);
+  if (m && US_STATE_CODES.has(m[2].toUpperCase())) {
+    return { city: m[1].trim(), state: m[2].toUpperCase(), postal_code: null };
+  }
+  return { city: null, state: null, postal_code: null };
 }
 
 // WHAT: ingests ONE portal wholesale_leads row into this app's `leads` table, idempotently.
@@ -518,7 +574,9 @@ export function upsertPortalLead(row) {
   if (already) return { action: 'skipped', id: already.id };
 
   // Everything the portal collected that has no first-class column here, kept verbatim so the lead
-  // detail page can render the full application rather than a lossy subset.
+  // detail page can render the full application rather than a lossy subset. Kept even for fields
+  // ALSO parsed into columns below (row.address) -- the raw text is the fallback when the parse
+  // below can't confidently extract a city/state/zip.
   const applicationJson = JSON.stringify({
     portalLeadId: row.id,
     address: row.address || null,
@@ -552,16 +610,25 @@ export function upsertPortalLead(row) {
     return { action: 'linked', id: existing.id };
   }
 
+  // D1 (HANDOFF-2026-08-11): city/state/postal_code are the LOCATION address, parsed best-effort
+  // from the portal's free-text row.address. This is deliberately separate from sales_tax_state
+  // below (row.state), which the portal maps to the tax-registration state, not location -- see
+  // D2 in the handoff: those can legitimately differ (a business registered for sales tax in a
+  // different state than it's located in) and this insert does NOT change that existing mapping.
+  const parsedAddr = parsePortalAddress(row.address);
+
   const info = db.prepare(`
     INSERT INTO leads (email, business_name, contact_name, phone, website,
       sales_tax_state, sales_tax_id, fein, source, source_detail,
+      city, state, postal_code,
       application_data_json, portal_lead_id, status, created_at, updated_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'wholesale_form', 'fuzzywumpets.com/pages/wholesale-1',
-      ?, ?, 'new', ?, ?)
+      ?, ?, ?, ?, ?, 'new', ?, ?)
   `).run(
     row.email, row.business_name || null, row.contact_name || null,
     row.phone || null, row.website || null,
     row.state || null, row.tax_id || null, row.fein || null,
+    parsedAddr.city, parsedAddr.state, parsedAddr.postal_code,
     applicationJson, row.id,
     row.submitted_at || now, now
   );
@@ -592,10 +659,16 @@ export function getLead(id) {
   return db.prepare('SELECT * FROM leads WHERE id = ?').get(id) || null;
 }
 
+// DEPENDS: /leads/:id/edit and /leads/new (server.mjs) both write through this allow-list -- any
+//   column added to the `leads` schema that staff should be able to edit must be added HERE or it
+//   silently no-ops (this exact trap is what made sales_tax_id/sales_tax_state/fein unwritable
+//   despite existing as columns -- see HANDOFF-2026-08-11 "Verified starting facts" #3).
 export function updateLead(id, fields) {
   const allowed = ['email','business_name','contact_name','phone','website','business_type',
     'estimated_monthly_volume_usd','source','source_detail','status','custom_tags',
-    'assigned_to','next_followup_due','converted_at','shopify_customer_id','rejected_reason'];
+    'assigned_to','next_followup_due','converted_at','shopify_customer_id','rejected_reason',
+    'address1','address2','city','state','postal_code','country_code',
+    'sales_tax_id','sales_tax_state','fein'];
   const sets = [];
   const vals = [];
   for (const [k, v] of Object.entries(fields)) {

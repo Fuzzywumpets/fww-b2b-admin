@@ -2187,6 +2187,312 @@ await test('GET /leads?status=under_review → filters by status', async () => {
   assert.ok(html.includes('Under Review') || html.includes('filter-chip-active'), 'Status filter not applied');
 });
 
+// ── B2B-1/B2B-2: lead address + tax field editing (HANDOFF-2026-08-11) ───────
+console.log('\nAPI tests — B2B-1/B2B-2: lead address + tax editing:');
+
+async function createTestLead(cookie, overrides = {}) {
+  const email = overrides.email || `edit-lead-${Date.now()}-${Math.random().toString(36).slice(2)}@example.com`;
+  const res = await fetch(`${BASE}/leads/new`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ email, business_name: 'Edit Target Co' }).toString(),
+    redirect: 'manual',
+  });
+  const loc = res.headers.get('location') || '';
+  const id = loc.split('/leads/')[1]?.replace('?flash=created', '');
+  return { id, email };
+}
+
+// ── Qodo findings (2026-08-11 review of this PR) ──────────────────────────────
+console.log('\nAPI tests — Qodo findings: business_type preservation + email trim:');
+
+await test('POST /leads/new → email is trimmed before storage, not stored with whitespace', async () => {
+  const cookie = await seedSession();
+  const rawEmail = `  trim-test-${Date.now()}@example.com  `;
+  const res = await fetch(`${BASE}/leads/new`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ email: rawEmail }).toString(),
+    redirect: 'manual',
+  });
+  assert.equal(res.status, 302);
+  const html = await (await fetch(`${BASE}${res.headers.get('location')}`, { headers: { Cookie: cookie } })).text();
+  assert.ok(html.includes(`mailto:${rawEmail.trim()}"`), 'trimmed email should appear as the mailto: href');
+  assert.ok(!html.includes(`mailto:${rawEmail}"`), 'the untrimmed (padded) email must not have been stored');
+});
+
+await test('POST /leads/:id/edit → an existing free-text business_type survives an unrelated edit (was silently nulled)', async () => {
+  const cookie = await seedSession();
+  const freeTextType = 'dog grooming and supply shop, dog show vendor booth';
+  const email = `legacy-biztype-${Date.now()}@example.com`;
+  // Created directly via POST /leads/new with a value outside the <select> enum -- exactly how a
+  // hand-inserted or portal-ingested lead (Hydref K-9's real shape) can carry free text today,
+  // since nothing enforces the vocabulary below the UI layer.
+  const createRes = await fetch(`${BASE}/leads/new`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ email, business_type: freeTextType }).toString(),
+    redirect: 'manual',
+  });
+  const id = createRes.headers.get('location').split('/leads/')[1]?.replace('?flash=created', '');
+
+  const editFormHtml = await (await fetch(`${BASE}/leads/${id}/edit`, { headers: { Cookie: cookie } })).text();
+  assert.ok(editFormHtml.includes(freeTextType), 'the edit form must show the existing free-text value, not silently blank it');
+
+  // Save the form WITHOUT touching business_type (simulating a real user editing something else,
+  // e.g. adding a phone number, while the free-text value sits unselected in a closed <select>).
+  await fetch(`${BASE}/leads/${id}/edit`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ email, business_type: freeTextType, phone: '8282160282' }).toString(),
+  });
+  const after = await getLead(cookie, id);
+  assert.ok(after.includes(freeTextType), 'business_type must survive an edit, not be silently nulled to the empty <select> value');
+});
+
+await test('GET /leads/:id/edit → form renders with Edit button reachable from detail page', async () => {
+  const cookie = await seedSession();
+  const { id } = await createTestLead(cookie);
+  const detailRes = await fetch(`${BASE}/leads/${id}`, { headers: { Cookie: cookie } });
+  const detailHtml = await detailRes.text();
+  assert.ok(detailHtml.includes(`href="/leads/${id}/edit"`), 'Edit button missing from lead detail page');
+
+  const res = await fetch(`${BASE}/leads/${id}/edit`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  assert.ok(html.includes('name="address1"'), 'address1 field missing');
+  assert.ok(html.includes('name="country_code"'), 'country_code field missing');
+  assert.ok(html.includes('<select name="country_code"'), 'country must be a select, not free text');
+  assert.ok(html.includes('name="sales_tax_id"'), 'sales_tax_id field missing');
+  assert.ok(html.includes('name="fein"'), 'fein field missing');
+});
+
+await test('POST /leads/:id/edit → the allow-list trap: address + tax fields actually persist', async () => {
+  const cookie = await seedSession();
+  const { id } = await createTestLead(cookie);
+  const res = await fetch(`${BASE}/leads/${id}/edit`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      email: `edit-persist-${Date.now()}@example.com`,
+      business_name: 'Hydref K-9',
+      address1: '604 Vengeance Creek Road',
+      sales_tax_id: '87-3951696',
+    }).toString(),
+    redirect: 'manual',
+  });
+  assert.equal(res.status, 302, 'Should redirect after a valid save');
+  const detailRes = await fetch(`${BASE}${res.headers.get('location')}`, { headers: { Cookie: cookie } });
+  const html = await detailRes.text();
+  assert.ok(html.includes('604 Vengeance Creek Road'), 'address1 did not persist (allow-list trap)');
+  assert.ok(html.includes('87-3951696'), 'sales_tax_id did not persist (allow-list trap)');
+  assert.ok(html.includes('Address incomplete'), 'a street-only address should be flagged incomplete');
+});
+
+await test('POST /leads/:id/edit → FEIN persists through updateLead (was missing from the allow-list)', async () => {
+  const cookie = await seedSession();
+  const { id } = await createTestLead(cookie);
+  const res = await fetch(`${BASE}/leads/${id}/edit`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ email: `fein-persist-${Date.now()}@example.com`, fein: '12-3456789' }).toString(),
+    redirect: 'manual',
+  });
+  assert.equal(res.status, 302);
+  const detailRes = await fetch(`${BASE}${res.headers.get('location')}`, { headers: { Cookie: cookie } });
+  const html = await detailRes.text();
+  assert.ok(html.includes('12-3456789'), 'FEIN did not persist');
+});
+
+await test('POST /leads/:id/edit → a complete US address renders with no "incomplete" flag', async () => {
+  const cookie = await seedSession();
+  const { id } = await createTestLead(cookie);
+  const res = await fetch(`${BASE}/leads/${id}/edit`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      email: `complete-addr-${Date.now()}@example.com`,
+      address1: '123 Main St', city: 'Austin', state: 'TX', postal_code: '78701', country_code: 'US',
+    }).toString(),
+    redirect: 'manual',
+  });
+  assert.equal(res.status, 302, 'A complete, valid address must be accepted');
+  const html = await (await fetch(`${BASE}${res.headers.get('location')}`, { headers: { Cookie: cookie } })).text();
+  assert.ok(html.includes('123 Main St'), 'address did not persist');
+  assert.ok(!html.includes('Address incomplete'), 'a complete address must not be flagged incomplete');
+});
+
+await test('POST /leads/:id/edit → an unrecognized country code is rejected, never defaulted to US', async () => {
+  const cookie = await seedSession();
+  const { id } = await createTestLead(cookie);
+  const res = await fetch(`${BASE}/leads/${id}/edit`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      email: `bad-country-${Date.now()}@example.com`, address1: '1 Fake St', country_code: 'ZZ',
+    }).toString(),
+  });
+  assert.equal(res.status, 200, 'Invalid country must re-render the form, not redirect');
+  const html = await res.text();
+  assert.ok(html.includes('Unrecognized country'), 'Missing the specific rejection message');
+  const after = await getLead(cookie, id);
+  assert.ok(!after.includes('ZZ'), 'the invalid country must not have been written');
+});
+
+await test('POST /leads/:id/edit → US country with no state is rejected with a specific message', async () => {
+  const cookie = await seedSession();
+  const { id } = await createTestLead(cookie);
+  const res = await fetch(`${BASE}/leads/${id}/edit`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      email: `no-state-${Date.now()}@example.com`, address1: '1 Fake St', postal_code: '78701', country_code: 'US',
+    }).toString(),
+  });
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  assert.ok(html.includes('State/province is required'), 'Missing the state-required message');
+});
+
+await test('POST /leads/:id/edit → a malformed US ZIP is rejected', async () => {
+  const cookie = await seedSession();
+  const { id } = await createTestLead(cookie);
+  const res = await fetch(`${BASE}/leads/${id}/edit`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      email: `bad-zip-${Date.now()}@example.com`, address1: '1 Fake St', city: 'Austin', state: 'TX',
+      postal_code: 'not-a-zip', country_code: 'US',
+    }).toString(),
+  });
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  assert.ok(html.includes('valid 5-digit US ZIP'), 'Missing the ZIP-format message');
+});
+
+await test('POST /leads/:id/edit → a street-only address with no country is accepted (honestly incomplete, not invalid)', async () => {
+  const cookie = await seedSession();
+  const { id } = await createTestLead(cookie);
+  const res = await fetch(`${BASE}/leads/${id}/edit`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      email: `street-only-${Date.now()}@example.com`, address1: '604 Vengeance Creek Road',
+    }).toString(),
+    redirect: 'manual',
+  });
+  assert.equal(res.status, 302, 'An honestly incomplete address (Hydref K-9 case) must be storable');
+});
+
+await test('POST /leads/:id/edit → changing email to one already in use fails cleanly, not a 500', async () => {
+  const cookie = await seedSession();
+  const existing = await createTestLead(cookie);
+  const { id: otherId } = await createTestLead(cookie);
+  const res = await fetch(`${BASE}/leads/${otherId}/edit`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ email: existing.email }).toString(),
+  });
+  assert.equal(res.status, 200, 'A UNIQUE collision must render a clean error, not crash');
+  const html = await res.text();
+  assert.ok(html.includes('already exists'), 'Missing the duplicate-email message');
+});
+
+async function getLead(cookie, id) {
+  const res = await fetch(`${BASE}/leads/${id}`, { headers: { Cookie: cookie } });
+  return res.text();
+}
+
+// ── B2B-1/B2B-2 follow-up: phone formatting, dead-form removal, overdue-date fix ──
+// (2026-08-11 audit findings, folded into this branch rather than left for a follow-up.)
+console.log('\nAPI tests — B2B-1/B2B-2 follow-up: phone/overdue/dead-form:');
+
+await test('lead detail: a NANP phone (10 digits) renders formatted as a tel: link', async () => {
+  const cookie = await seedSession();
+  const { id } = await createTestLead(cookie);
+  await fetch(`${BASE}/leads/${id}/edit`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ email: `phone-nanp-${Date.now()}@example.com`, phone: '8282160282' }).toString(),
+  });
+  const html = await getLead(cookie, id);
+  assert.ok(html.includes('(828) 216-0282'), 'phone was not formatted as (xxx) xxx-xxxx');
+  assert.ok(html.includes('href="tel:+18282160282"'), 'missing/wrong tel: link');
+});
+
+await test('lead detail: an 11-digit NANP phone (leading 1) also formats', async () => {
+  const cookie = await seedSession();
+  const { id } = await createTestLead(cookie);
+  await fetch(`${BASE}/leads/${id}/edit`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ email: `phone-11digit-${Date.now()}@example.com`, phone: '18282160282' }).toString(),
+  });
+  const html = await getLead(cookie, id);
+  assert.ok(html.includes('(828) 216-0282'), '11-digit leading-1 NANP number was not formatted');
+});
+
+await test('lead detail: a non-NANP (international) phone renders VERBATIM, never mangled', async () => {
+  const cookie = await seedSession();
+  const { id } = await createTestLead(cookie);
+  const intlPhone = '+64 9 123 4567'; // NZ landline shape -- the exact kind of number the country-code rule protects
+  await fetch(`${BASE}/leads/${id}/edit`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ email: `phone-intl-${Date.now()}@example.com`, phone: intlPhone }).toString(),
+  });
+  const html = await getLead(cookie, id);
+  assert.ok(html.includes(intlPhone), 'a non-NANP number must render exactly as entered, not reformatted/mangled');
+  assert.ok(html.includes('href="tel:+6491234567"'), 'a leading-+ number should still get a usable tel: link');
+});
+
+await test('lead detail: Profile panel is no longer wrapped in the dead /leads/:id/profile form', async () => {
+  const cookie = await seedSession();
+  const { id } = await createTestLead(cookie);
+  const html = await getLead(cookie, id);
+  assert.ok(!html.includes(`action="/leads/${id}/profile"`), 'dead form wrapper should be removed, not left pointing at a nonexistent route');
+  // Confirm the route really doesn't exist (belt-and-suspenders, matches the finding).
+  const res = await fetch(`${BASE}/leads/${id}/profile`, { method: 'POST', headers: { Cookie: cookie } });
+  assert.equal(res.status, 404, '/leads/:id/profile must not silently exist as a route');
+});
+
+await test('lead detail: a follow-up due TODAY (local date) is never flagged Overdue', async () => {
+  const cookie = await seedSession();
+  const { id } = await createTestLead(cookie);
+  const today = new Date();
+  const localToday = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
+  await fetch(`${BASE}/leads/${id}/followup`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ next_followup_due: localToday }).toString(),
+  });
+  const html = await getLead(cookie, id);
+  assert.ok(!html.includes('⚠ Overdue'), 'a follow-up due today (local date) must never render as overdue');
+});
+
+await test('lead detail: a follow-up due in the past IS flagged Overdue', async () => {
+  const cookie = await seedSession();
+  const { id } = await createTestLead(cookie);
+  await fetch(`${BASE}/leads/${id}/followup`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ next_followup_due: '2020-01-01' }).toString(),
+  });
+  const html = await getLead(cookie, id);
+  assert.ok(html.includes('⚠ Overdue'), 'a genuinely past-due follow-up must still be flagged overdue');
+});
+
+await test('/leads/new and /leads/:id/edit render the SAME business_type option set (D6 correction)', async () => {
+  const cookie = await seedSession();
+  const { id } = await createTestLead(cookie);
+  const newHtml = await (await fetch(`${BASE}/leads/new`, { headers: { Cookie: cookie } })).text();
+  const editHtml = await (await fetch(`${BASE}/leads/${id}/edit`, { headers: { Cookie: cookie } })).text();
+  for (const t of ['boutique', 'trainer', 'kennel', 'show-vendor', 'groomer', 'other']) {
+    assert.ok(newHtml.includes(`>${t}<`), `New Lead form missing option: ${t}`);
+    assert.ok(editHtml.includes(`>${t}<`), `Edit Lead form missing option: ${t}`);
+  }
+});
+
 // ── Phase 19B: Universal hyperlinks ──────────────────────────────────────────
 console.log('\nAPI tests — Phase 19B: Universal hyperlinks:');
 
