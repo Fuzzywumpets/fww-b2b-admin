@@ -1273,6 +1273,36 @@ function currentAllowedEmails() {
   return (process.env.B2B_ADMIN_ALLOWED_EMAILS || '').split(',').map(s => s.trim()).filter(Boolean);
 }
 
+// WHAT: does this Google-verified email get in? An allowlist entry is EITHER a whole address
+//   ("erin.m.karson@gmail.com") OR a bare domain written with a leading @ ("@fuzzywumpets.com"),
+//   which admits every mailbox on that domain.
+// WHY: owner decision 2026-08-11 — "just open up all @fuzzywumpets.com and Erin to the full-access.
+//   Easier until we grow and I need to manage a larger team." Before this, every new hire needed a
+//   Doppler edit and a service restart before they could log in at all.
+// CHANGE-GUARD: this is THE gate on the whole dashboard. Two things must not be weakened:
+//   (1) the caller must still require user.email_verified — a domain rule is only as good as
+//       Google's proof that the person owns the mailbox;
+//   (2) the domain comparison is on the substring after the LAST '@', compared for EQUALITY.
+//       Never use a bare endsWith/includes against the raw address: "a@fuzzywumpets.com.evil.tld"
+//       and "x@notfuzzywumpets.com" must both fail, and a substring test lets the wrong one
+//       through depending on how it is written.
+// INVARIANT(S): case-insensitive both sides; an entry that is exactly "@" or has no domain is
+//   ignored rather than matching everything; an address with no '@' never matches a domain rule.
+function isAllowedAdminEmail(email) {
+  const lower = String(email || '').trim().toLowerCase();
+  const at = lower.lastIndexOf('@');
+  if (at < 1 || at === lower.length - 1) return false;
+  const domain = lower.slice(at + 1);
+  return currentAllowedEmails().some((entry) => {
+    const e = entry.toLowerCase();
+    if (e.startsWith('@')) {
+      const allowedDomain = e.slice(1);
+      return allowedDomain.length > 0 && domain === allowedDomain;
+    }
+    return e === lower;
+  });
+}
+
 function fmtMoney(amount, currency = 'USD') {
   return new Intl.NumberFormat('en-US', { style: 'currency', currency }).format(Number(amount) || 0);
 }
@@ -5638,8 +5668,9 @@ app.get('/auth/google/callback', async (req, res) => {
     const tokMs = tUser - tTok, userMs = Date.now() - tUser;
     if (tokMs + userMs > 1000) console.log(`[auth-timing] token-exchange=${tokMs}ms userinfo=${userMs}ms`);
     if (!user.email_verified) return res.redirect('/login?error=Google+email+not+verified');
-    const emailLower = (user.email || '').toLowerCase();
-    if (!currentAllowedEmails().some(e => e.toLowerCase() === emailLower))
+    // SYNC: isAllowedAdminEmail handles BOTH whole-address entries and "@domain" entries — see its
+    //   CHANGE-GUARD. Do not reintroduce an inline equality test here; that is what this replaced.
+    if (!isAllowedAdminEmail(user.email))
       return res.status(403).send(renderUnauthorized(user.email));
     const sid = crypto.randomBytes(32).toString('hex');
     createSession(sid, user.email, user.name || user.email, user.picture || '');

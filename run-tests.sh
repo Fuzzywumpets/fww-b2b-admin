@@ -65,6 +65,13 @@ if [ -f test/leads-list.test.mjs ]; then
   B2B_ADMIN_MOCK=1 node test/leads-list.test.mjs || UNIT_FAIL=$?
 fi
 
+# The allowlist gate is pure logic over env, and it guards the WHOLE dashboard. It gets its own run
+# because the HTTP suite short-circuits Google OAuth entirely in MOCK and never exercises it.
+if [ -f test/admin-allowlist.test.mjs ]; then
+  echo ""
+  node test/admin-allowlist.test.mjs || UNIT_FAIL=$?
+fi
+
 echo ""
 echo "======================================================"
 if [ $API_FAIL -eq 0 ] && [ $UI_FAIL -eq 0 ] && [ $UNIT_FAIL -eq 0 ]; then
