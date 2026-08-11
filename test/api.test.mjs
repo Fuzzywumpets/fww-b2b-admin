@@ -2187,6 +2187,175 @@ await test('GET /leads?status=under_review → filters by status', async () => {
   assert.ok(html.includes('Under Review') || html.includes('filter-chip-active'), 'Status filter not applied');
 });
 
+// ── B2B-1/B2B-2: lead address + tax field editing (HANDOFF-2026-08-11) ───────
+console.log('\nAPI tests — B2B-1/B2B-2: lead address + tax editing:');
+
+async function createTestLead(cookie, overrides = {}) {
+  const email = overrides.email || `edit-lead-${Date.now()}-${Math.random().toString(36).slice(2)}@example.com`;
+  const res = await fetch(`${BASE}/leads/new`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ email, business_name: 'Edit Target Co' }).toString(),
+    redirect: 'manual',
+  });
+  const loc = res.headers.get('location') || '';
+  const id = loc.split('/leads/')[1]?.replace('?flash=created', '');
+  return { id, email };
+}
+
+await test('GET /leads/:id/edit → form renders with Edit button reachable from detail page', async () => {
+  const cookie = await seedSession();
+  const { id } = await createTestLead(cookie);
+  const detailRes = await fetch(`${BASE}/leads/${id}`, { headers: { Cookie: cookie } });
+  const detailHtml = await detailRes.text();
+  assert.ok(detailHtml.includes(`href="/leads/${id}/edit"`), 'Edit button missing from lead detail page');
+
+  const res = await fetch(`${BASE}/leads/${id}/edit`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  assert.ok(html.includes('name="address1"'), 'address1 field missing');
+  assert.ok(html.includes('name="country_code"'), 'country_code field missing');
+  assert.ok(html.includes('<select name="country_code"'), 'country must be a select, not free text');
+  assert.ok(html.includes('name="sales_tax_id"'), 'sales_tax_id field missing');
+  assert.ok(html.includes('name="fein"'), 'fein field missing');
+});
+
+await test('POST /leads/:id/edit → the allow-list trap: address + tax fields actually persist', async () => {
+  const cookie = await seedSession();
+  const { id } = await createTestLead(cookie);
+  const res = await fetch(`${BASE}/leads/${id}/edit`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      email: `edit-persist-${Date.now()}@example.com`,
+      business_name: 'Hydref K-9',
+      address1: '604 Vengeance Creek Road',
+      sales_tax_id: '87-3951696',
+    }).toString(),
+    redirect: 'manual',
+  });
+  assert.equal(res.status, 302, 'Should redirect after a valid save');
+  const detailRes = await fetch(`${BASE}${res.headers.get('location')}`, { headers: { Cookie: cookie } });
+  const html = await detailRes.text();
+  assert.ok(html.includes('604 Vengeance Creek Road'), 'address1 did not persist (allow-list trap)');
+  assert.ok(html.includes('87-3951696'), 'sales_tax_id did not persist (allow-list trap)');
+  assert.ok(html.includes('Address incomplete'), 'a street-only address should be flagged incomplete');
+});
+
+await test('POST /leads/:id/edit → FEIN persists through updateLead (was missing from the allow-list)', async () => {
+  const cookie = await seedSession();
+  const { id } = await createTestLead(cookie);
+  const res = await fetch(`${BASE}/leads/${id}/edit`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ email: `fein-persist-${Date.now()}@example.com`, fein: '12-3456789' }).toString(),
+    redirect: 'manual',
+  });
+  assert.equal(res.status, 302);
+  const detailRes = await fetch(`${BASE}${res.headers.get('location')}`, { headers: { Cookie: cookie } });
+  const html = await detailRes.text();
+  assert.ok(html.includes('12-3456789'), 'FEIN did not persist');
+});
+
+await test('POST /leads/:id/edit → a complete US address renders with no "incomplete" flag', async () => {
+  const cookie = await seedSession();
+  const { id } = await createTestLead(cookie);
+  const res = await fetch(`${BASE}/leads/${id}/edit`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      email: `complete-addr-${Date.now()}@example.com`,
+      address1: '123 Main St', city: 'Austin', state: 'TX', postal_code: '78701', country_code: 'US',
+    }).toString(),
+    redirect: 'manual',
+  });
+  assert.equal(res.status, 302, 'A complete, valid address must be accepted');
+  const html = await (await fetch(`${BASE}${res.headers.get('location')}`, { headers: { Cookie: cookie } })).text();
+  assert.ok(html.includes('123 Main St'), 'address did not persist');
+  assert.ok(!html.includes('Address incomplete'), 'a complete address must not be flagged incomplete');
+});
+
+await test('POST /leads/:id/edit → an unrecognized country code is rejected, never defaulted to US', async () => {
+  const cookie = await seedSession();
+  const { id } = await createTestLead(cookie);
+  const res = await fetch(`${BASE}/leads/${id}/edit`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      email: `bad-country-${Date.now()}@example.com`, address1: '1 Fake St', country_code: 'ZZ',
+    }).toString(),
+  });
+  assert.equal(res.status, 200, 'Invalid country must re-render the form, not redirect');
+  const html = await res.text();
+  assert.ok(html.includes('Unrecognized country'), 'Missing the specific rejection message');
+  const after = await getLead(cookie, id);
+  assert.ok(!after.includes('ZZ'), 'the invalid country must not have been written');
+});
+
+await test('POST /leads/:id/edit → US country with no state is rejected with a specific message', async () => {
+  const cookie = await seedSession();
+  const { id } = await createTestLead(cookie);
+  const res = await fetch(`${BASE}/leads/${id}/edit`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      email: `no-state-${Date.now()}@example.com`, address1: '1 Fake St', postal_code: '78701', country_code: 'US',
+    }).toString(),
+  });
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  assert.ok(html.includes('State/province is required'), 'Missing the state-required message');
+});
+
+await test('POST /leads/:id/edit → a malformed US ZIP is rejected', async () => {
+  const cookie = await seedSession();
+  const { id } = await createTestLead(cookie);
+  const res = await fetch(`${BASE}/leads/${id}/edit`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      email: `bad-zip-${Date.now()}@example.com`, address1: '1 Fake St', city: 'Austin', state: 'TX',
+      postal_code: 'not-a-zip', country_code: 'US',
+    }).toString(),
+  });
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  assert.ok(html.includes('valid 5-digit US ZIP'), 'Missing the ZIP-format message');
+});
+
+await test('POST /leads/:id/edit → a street-only address with no country is accepted (honestly incomplete, not invalid)', async () => {
+  const cookie = await seedSession();
+  const { id } = await createTestLead(cookie);
+  const res = await fetch(`${BASE}/leads/${id}/edit`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      email: `street-only-${Date.now()}@example.com`, address1: '604 Vengeance Creek Road',
+    }).toString(),
+    redirect: 'manual',
+  });
+  assert.equal(res.status, 302, 'An honestly incomplete address (Hydref K-9 case) must be storable');
+});
+
+await test('POST /leads/:id/edit → changing email to one already in use fails cleanly, not a 500', async () => {
+  const cookie = await seedSession();
+  const existing = await createTestLead(cookie);
+  const { id: otherId } = await createTestLead(cookie);
+  const res = await fetch(`${BASE}/leads/${otherId}/edit`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ email: existing.email }).toString(),
+  });
+  assert.equal(res.status, 200, 'A UNIQUE collision must render a clean error, not crash');
+  const html = await res.text();
+  assert.ok(html.includes('already exists'), 'Missing the duplicate-email message');
+});
+
+async function getLead(cookie, id) {
+  const res = await fetch(`${BASE}/leads/${id}`, { headers: { Cookie: cookie } });
+  return res.text();
+}
+
 // ── Phase 19B: Universal hyperlinks ──────────────────────────────────────────
 console.log('\nAPI tests — Phase 19B: Universal hyperlinks:');
 

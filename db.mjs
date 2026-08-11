@@ -668,7 +668,7 @@ export function updateLead(id, fields) {
     'estimated_monthly_volume_usd','source','source_detail','status','custom_tags',
     'assigned_to','next_followup_due','converted_at','shopify_customer_id','rejected_reason',
     'address1','address2','city','state','postal_code','country_code',
-    'sales_tax_id','sales_tax_state'];
+    'sales_tax_id','sales_tax_state','fein'];
   const sets = [];
   const vals = [];
   for (const [k, v] of Object.entries(fields)) {
