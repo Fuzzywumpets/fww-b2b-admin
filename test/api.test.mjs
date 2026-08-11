@@ -3343,6 +3343,30 @@ await test('POST /webhooks/shopify customers/updated → 200 ok', async () => {
   assert.ok(json.ok);
 });
 
+// REGRESSION (H21, 2026-08-09): express.json defaults to a 100kb limit, and the webhook HMAC is
+// verified over the rawBody captured by that same parser — so an over-limit payload was rejected
+// with 413 by the body parser BEFORE the handler ran. Shopify retried, then gave up, and the order
+// never reached orders_cache. That silently lost the LARGEST B2B orders (most line items = biggest
+// body). This asserts a ~300kb order webhook is accepted.
+await test('POST /webhooks/shopify with a >100kb order payload → 200, not 413', async () => {
+  const lineItems = Array.from({ length: 1200 }, (_, i) => ({
+    id: 900000 + i, variant_id: 500000 + i, product_id: 400000 + i,
+    sku: `BULK-SKU-${i}`, title: `Bulk Line Item Number ${i} — long title padding for payload size`,
+    variant_title: 'Large / Red / Extra padding to grow the JSON body',
+    quantity: 1, price: '19.99', total_discount: '0.00', vendor: 'Fuzzywumpets',
+  }));
+  const body = JSON.stringify({ id: 998877, name: '#BIG-998877', financial_status: 'paid', line_items: lineItems });
+  assert.ok(Buffer.byteLength(body) > 100 * 1024, `test payload must exceed the old 100kb limit (was ${Buffer.byteLength(body)})`);
+  const res = await fetch(`${BASE}/webhooks/shopify`, {
+    method: 'POST',
+    headers: makeWebhookHeaders(body, 'orders/updated'),
+    body,
+  });
+  assert.equal(res.status, 200, 'a large order webhook must not be rejected by the body-size limit');
+  const json = await res.json();
+  assert.ok(json.ok);
+});
+
 await test('POST /webhooks/shopify products/updated → 200 ok', async () => {
   const body = JSON.stringify({ id: 201, title: 'Test Product', vendor: 'Fuzzywumpets' });
   const res = await fetch(`${BASE}/webhooks/shopify`, {

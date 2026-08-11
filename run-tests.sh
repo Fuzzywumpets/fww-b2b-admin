@@ -51,6 +51,14 @@ if [ -f test/leads-ingest.test.mjs ]; then
   B2B_ADMIN_MOCK=1 node test/leads-ingest.test.mjs || UNIT_FAIL=$?
 fi
 
+# Order/line-item cache integrity (H14 line-item duplication, H15 status casing). Standalone for the
+# same reason as above: getOrdersData() short-circuits to the MOCK fixture array and never reads
+# orders_cache, so these writes are invisible to the API suite.
+if [ -f test/order-cache-integrity.test.mjs ]; then
+  echo ""
+  B2B_ADMIN_MOCK=1 node test/order-cache-integrity.test.mjs || UNIT_FAIL=$?
+fi
+
 # Boots its OWN non-MOCK servers (against throwaway sqlite dirs via B2B_ADMIN_DATA_DIR) because the
 # /__test__/session allowlist+audit guard only exists on the non-MOCK branch. Deliberately NOT given
 # B2B_ADMIN_MOCK.

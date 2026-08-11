@@ -365,6 +365,42 @@ db.exec(`
   if (!cols.has('fein'))           db.exec(`ALTER TABLE leads ADD COLUMN fein TEXT`);
 }
 
+// MIGRATION (2026-08-09, one-off): de-duplicate order_line_items_cache.
+// Until upsertOrderLineItemsCache learned to delete-before-insert (see its CHANGE-GUARD), every
+// re-sync of an order APPENDED a fresh full copy of its lines, so getReportsDataFromCache multiplied
+// product revenue by the number of times each order had been synced. The code fix stops new
+// duplicates; this clears the ones already on disk. Two passes, because they catch different things:
+//   1. keep only the newest sync generation per order — upsertOrderLineItemsCache stamps every row of
+//      one call with the same synced_at, so MAX(synced_at) per order IS the last complete write. This
+//      also drops the orphans left behind when an order was edited down to fewer lines.
+//   2. within that generation, keep MAX(id) per (order, line_id) — covers two syncs landing in the
+//      same millisecond, which pass 1 cannot separate. Scoped to line_id IS NOT NULL on purpose:
+//      SQLite has no natural identity for NULL-line_id rows, and an order legitimately can carry
+//      several of them, so collapsing those would delete real lines. Every current writer sets
+//      line_id (server.mjs:11491, both backfill scripts), so only pre-historic rows are skipped.
+// Guarded by a sync_state marker so it runs once, not on every boot (it is a full table scan).
+{
+  const MARKER = 'migration:lineitems_dedupe_2026_08_09';
+  const done = db.prepare('SELECT 1 FROM sync_state WHERE resource = ?').get(MARKER);
+  if (!done) {
+    db.transaction(() => {
+      db.exec(`
+        DELETE FROM order_line_items_cache
+        WHERE synced_at < (
+          SELECT MAX(x.synced_at) FROM order_line_items_cache x
+          WHERE x.order_shopify_id = order_line_items_cache.order_shopify_id
+        );
+        DELETE FROM order_line_items_cache
+        WHERE line_id IS NOT NULL AND id NOT IN (
+          SELECT MAX(id) FROM order_line_items_cache WHERE line_id IS NOT NULL
+          GROUP BY order_shopify_id, line_id
+        );
+      `);
+      db.prepare('INSERT INTO sync_state (resource, last_synced_at) VALUES (?, ?)').run(MARKER, Date.now());
+    })();
+  }
+}
+
 // MIGRATION (2026-08-11, B2B-1/B2B-2): `leads` has never had address columns, so a lead like
 // #3 Hydref K-9 (street address only, no city/state/zip yet) has nowhere to store it -- it
 // survived only inside a hand-written note. Adds six nullable TEXT columns: address1, address2,
@@ -1174,6 +1210,15 @@ export function getCustomersCountInCache() {
   return db.prepare('SELECT COUNT(*) as n FROM customers_cache').get().n;
 }
 
+// STATUS-CASE (2026-08-09, fixes H15): financial_status/fulfillment_status are normalized to
+// UPPERCASE here, at the single write site, because every reader compares uppercase —
+// listOrdersFromCache's status buckets (~line 968) and getOutstandingBalanceForCustomer's
+// PENDING/PARTIALLY_PAID/UNPAID sum (~line 686). The GraphQL sync paths feed displayFinancialStatus
+// (already uppercase, so this is a no-op for them), but the REST orders/* webhook payload is
+// LOWERCASE ('paid'), so a webhook-updated order used to drop out of every status-filtered view and
+// out of the customer unpaid-balance total until the next full sync overwrote it.
+// DEPENDS: readers that lowercase for display (order badge class in server.mjs) normalize on read
+// and are unaffected. Do not remove without giving the readers case-insensitive comparisons.
 export function upsertOrderCache(o) {
   db.prepare(`
     INSERT OR REPLACE INTO orders_cache
@@ -1188,7 +1233,8 @@ export function upsertOrderCache(o) {
     o.shopify_id, o.gid, o.name || null, o.customer_shopify_id || null,
     o.created_at || null, o.updated_at || null, o.processed_at || null,
     o.cancelled_at || null, o.closed_at || null,
-    o.financial_status || null, o.fulfillment_status || null,
+    o.financial_status ? String(o.financial_status).toUpperCase() : null,
+    o.fulfillment_status ? String(o.fulfillment_status).toUpperCase() : null,
     o.display_financial_status || null, o.display_fulfillment_status || null,
     o.total_price || 0, o.subtotal_price || 0, o.total_tax || 0, o.total_shipping || 0,
     o.total_discounts || 0, o.total_refunded || 0, o.currency || 'USD',
@@ -1208,26 +1254,42 @@ export function upsertOrderCache(o) {
   );
 }
 
-// WHAT: replaces the cached line items for an order (INSERT OR REPLACE per row keyed by autoincrement id).
-// CHANGE-GUARD: there is NO delete-before-insert of stale rows for the order — because the PK is a synthetic autoincrement, editing an order down to fewer lines leaves orphaned old line rows in the cache, inflating product-revenue reports; re-test reports after an order edit.
+// WHAT: REPLACES the cached line items for an order — deletes every existing row for
+// order_shopify_id, then inserts the supplied set, all inside one transaction.
+// CHANGE-GUARD (2026-08-09, fixes H14): this used to be a bare INSERT OR REPLACE. The table's only
+// unique key is the synthetic autoincrement id, which this function never supplies, so REPLACE could
+// never fire — every webhook redelivery / re-sync / backfill re-run APPENDED a second full copy of the
+// order's lines, and getReportsDataFromCache (which SUMs li.price*li.quantity) double- and triple-counted
+// product revenue. The same absence also orphaned rows when an order was edited down to fewer lines.
+// Delete-before-insert fixes both. Do NOT revert to a plain insert without adding a real UNIQUE key —
+// and note line_id is nullable, so a UNIQUE(order_shopify_id, line_id) index would not constrain
+// NULL-line_id rows (SQLite treats NULLs as distinct).
+// DEPENDS: callers must pass the COMPLETE current line set for the order, never a partial batch —
+// anything omitted is now deleted rather than left behind. Current callers (server.mjs webhook +
+// GraphQL sync, scripts/backfill-orders-per-customer.mjs, scripts/backfill-shopify.mjs) all do.
 // INVARIANT(S): is_fww_vendor is derived from vendor === 'Fuzzywumpets' (string-literal coupling shared with the backfill scripts); quantity/price default to 0; taxable normalized to 0/1.
 export function upsertOrderLineItemsCache(orderShopifyId, lineItems) {
+  const del = db.prepare('DELETE FROM order_line_items_cache WHERE order_shopify_id = ?');
   const stmt = db.prepare(`
-    INSERT OR REPLACE INTO order_line_items_cache
+    INSERT INTO order_line_items_cache
     (order_shopify_id, line_id, variant_shopify_id, product_shopify_id, sku, title,
      variant_title, quantity, price, total_discount, taxable, vendor, is_fww_vendor, synced_at)
     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
   `);
   const now = Date.now();
-  for (const li of lineItems) {
-    stmt.run(
-      orderShopifyId, li.line_id || null, li.variant_shopify_id || null,
-      li.product_shopify_id || null, li.sku || null, li.title || null,
-      li.variant_title || null, li.quantity || 0, li.price || 0,
-      li.total_discount || 0, li.taxable ? 1 : 0, li.vendor || null,
-      li.vendor === 'Fuzzywumpets' ? 1 : 0, now
-    );
-  }
+  const run = db.transaction((rows) => {
+    del.run(orderShopifyId);
+    for (const li of rows) {
+      stmt.run(
+        orderShopifyId, li.line_id || null, li.variant_shopify_id || null,
+        li.product_shopify_id || null, li.sku || null, li.title || null,
+        li.variant_title || null, li.quantity || 0, li.price || 0,
+        li.total_discount || 0, li.taxable ? 1 : 0, li.vendor || null,
+        li.vendor === 'Fuzzywumpets' ? 1 : 0, now
+      );
+    }
+  });
+  run(lineItems || []);
 }
 
 export function getOrdersFromCache({ customerId, from, to, limit = 250, offset = 0 } = {}) {

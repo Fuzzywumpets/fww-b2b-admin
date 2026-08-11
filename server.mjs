@@ -114,7 +114,15 @@ const app = express();
 // HMAC over the ORIGINAL payload (not a re-serialization). SECURITY: without this, express.json
 // parses+re-stringifies before the webhook handler runs and the HMAC never matches → all real
 // Shopify webhooks were being rejected.
-app.use(express.json({ verify: (req, _res, buf) => { req.rawBody = buf; } }));
+// LIMIT (2026-08-09, fixes H21): express.json defaults to 100kb. Because the Shopify webhook route
+// verifies its HMAC over the rawBody captured by THIS parser (see the CHANGE-GUARD on
+// POST /webhooks/shopify), a body over the limit is rejected with 413 by the parser BEFORE the
+// handler or the HMAC check ever runs — Shopify retries, then gives up, and the order never lands in
+// orders_cache/order_line_items_cache. That silently loses precisely the biggest B2B orders (many
+// line items = biggest payload). 2mb comfortably covers a large multi-line order payload.
+// DEPENDS: the webhook HMAC path relies on this parser running; raising the limit is strictly more
+// permissive, so no existing consumer changes behaviour.
+app.use(express.json({ limit: '2mb', verify: (req, _res, buf) => { req.rawBody = buf; } }));
 app.use(express.urlencoded({ extended: true }));
 
 // WHAT: slow-request tripwire — any response slower than 1s logs method/path/status/ms, so a
@@ -11906,7 +11914,16 @@ app.post('/webhooks/shopify', (req, res) => {
           updated_at: o.updated_at ? new Date(o.updated_at).getTime() : null,
           processed_at: o.processed_at ? new Date(o.processed_at).getTime() : null,
           cancelled_at: o.cancelled_at ? new Date(o.cancelled_at).getTime() : null,
-          financial_status: o.financial_status, fulfillment_status: o.fulfillment_status,
+          // STATUS-CASE (2026-08-09, fixes H15): the REST webhook payload carries LOWERCASE statuses
+          // ('paid'), while the GraphQL sync writes UPPERCASE ('PAID') into the same columns and every
+          // reader compares uppercase — listOrdersFromCache's status buckets (db.mjs) and
+          // getOutstandingBalanceForCustomer's PENDING/PARTIALLY_PAID/UNPAID sum (db.mjs). Storing the
+          // raw lowercase value made any webhook-updated order vanish from every status-filtered view
+          // and from the customer unpaid-balance total until the next full sync overwrote it.
+          // DEPENDS: readers that lowercase for display (badge class, ~line 11640) still work — they
+          // normalize on read. Keep this uppercase to match the GraphQL sync writer.
+          financial_status: o.financial_status?.toUpperCase() || null,
+          fulfillment_status: o.fulfillment_status?.toUpperCase() || null,
           display_financial_status: o.financial_status?.toUpperCase(),
           display_fulfillment_status: o.fulfillment_status?.toUpperCase(),
           total_price: parseFloat(o.total_price) || 0,
