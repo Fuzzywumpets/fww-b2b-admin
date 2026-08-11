@@ -385,6 +385,57 @@ await test('POST /orders/bulk mark-paid redirects to /orders', async () => {
   assert.ok(res.headers.get('location')?.includes('/orders'));
 });
 
+// REGRESSION: the bulk path used to discard the orderMarkAsPaid response entirely — a refused order
+// was still audit-logged 'mark_paid' and the batch reported success=marked_paid. #1003 is already
+// PAID in the fixtures, so Shopify (and now the mock) refuses it. Only #1003 is submitted here on
+// purpose: it mutates no fixture, so later tests that depend on a PENDING order are unaffected.
+await test('POST /orders/bulk mark-paid reports a refused order instead of a blanket success', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(BASE + '/orders/bulk', {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: 'ids=1003&action=mark-paid',
+    redirect: 'manual',
+  });
+  assert.equal(res.status, 302);
+  const loc = res.headers.get('location') || '';
+  assert.ok(loc.includes('error=mark_paid_partial'), 'expected error=mark_paid_partial, got ' + loc);
+  assert.ok(!loc.includes('success=marked_paid'), 'must NOT claim success: ' + loc);
+  assert.ok(decodeURIComponent(loc).includes('#1003'), 'failed order id must be named: ' + loc);
+});
+
+await test('GET /orders?error=mark_paid_partial renders an ERROR banner, not the success one', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(BASE + '/orders?error=mark_paid_partial&msg=' + encodeURIComponent('1 of 2 order(s) could NOT be marked paid: #1003'), { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  assert.ok(html.includes('alert-error'), 'expected an alert-error banner');
+  assert.ok(!html.includes('Order(s) marked as paid.'), 'must not also show the success banner');
+});
+
+// REGRESSION: a cleared price input used to parse to 0 and comp the line at 100% off. The batch must
+// now be rejected outright (matching POST /orders/:id/line/price, which 400s on the same input).
+// This request early-returns before any mock mutation, so it leaves the shared fixtures untouched.
+await test('POST /orders/:id/edit REJECTS a blank price instead of committing the line at $0.00', async () => {
+  const cookie = await seedSession();
+  const body = new URLSearchParams();
+  body.set('prices[gid://shopify/LineItem/2001]', '');
+  const res = await fetch(BASE + '/orders/1001/edit', {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: body.toString(),
+    redirect: 'manual',
+  });
+  assert.equal(res.status, 302);
+  const loc = decodeURIComponent(res.headers.get('location') || '');
+  assert.ok(loc.includes('error=edit_failed'), 'expected error=edit_failed, got ' + loc);
+  assert.ok(!loc.includes('success=order_edited'), 'must NOT report success: ' + loc);
+  assert.ok(/invalid price/i.test(loc), 'expected an explanatory msg, got ' + loc);
+});
+
+// (The mirror case — an explicitly typed 0 is a legitimate deliberate comp and must still parse —
+// is asserted in test/order-money.test.mjs, which does not mutate the shared mock order fixtures.)
+
 console.log('\nAPI tests — Phase 2: Customers:');
 
 await test('GET /customers requires auth', async () => {

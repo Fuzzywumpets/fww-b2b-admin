@@ -45,6 +45,7 @@ import {
 import { generateInvoicePdf, lineItemTrueTotal, lineItemTrueUnit, lineItemCurrentQty } from './pdf.mjs';
 import { renderLabelSheet, expandItems, TEMPLATES as LABEL_TEMPLATES, DEFAULT_FIELDS } from './labels.mjs';
 import { isInsider, resolveXeroContact, syncCustomerToXero, getXeroSyncStatus } from './lib/xero-customer-sync.mjs';
+import { parseLinePrices, applyLinePriceChanges, bulkMarkOrdersPaid } from './lib/order-money.mjs';
 import { assertNoUserErrors } from './lib/shopify-user-errors.mjs';
 // SYNC: same module db.mjs uses for the SQL LIMIT — the banner/footer copy and the query page size
 // must agree, otherwise the list lies about how much it is showing.
@@ -2119,7 +2120,11 @@ function renderOrdersList(session, data, filters) {
   const nextParams = new URLSearchParams(currentParams);
   if (endCursor) nextParams.set('after', endCursor);
 
-  const flash = filters.success === 'marked_paid' ? `<div class="alert alert-success">Order(s) marked as paid.</div>` : '';
+  // DEPENDS: GET /orders puts `error`/`msg` on `filters`. mark_paid_partial must NEVER render as a
+  // success banner — some of the selected orders are still unpaid.
+  const flash = filters.error === 'mark_paid_partial'
+    ? `<div class="alert alert-error">Some orders could not be marked as paid.${filters.msg ? ` ${h(filters.msg)}` : ''}</div>`
+    : filters.success === 'marked_paid' ? `<div class="alert alert-success">Order(s) marked as paid.</div>` : '';
 
   // Source filter removed — all orders shown are B2B (filtered via customers_cache.is_b2b)
   const sourceChips = '';
@@ -5725,7 +5730,9 @@ app.get('/', requireAuth, async (req, res) => {
 // CHANGE-GUARD: ROUTE ORDER IS LOad-BEARING — /orders/new, /orders/bulk and /orders/export.csv MUST be registered before /orders/:id (see banner) or ':id' captures 'new'/'export.csv'. 'after' is the opaque Shopify cursor for pagination.
 // INVARIANT(S): filters object shape must match getOrdersData + renderOrdersList expectations; all values default to '' (never undefined).
 app.get('/orders', requireAuth, async (req, res) => {
-  const filters = { q: req.query.q || '', source: req.query.source || '', status: req.query.status || '', date: req.query.date || '', after: req.query.after || '', success: req.query.success || '' };
+  // DEPENDS: renderOrdersList reads `error`+`msg` to render the partial mark-paid failure banner
+  // (POST /orders/bulk redirects with ?error=mark_paid_partial&msg=...). All values default to ''.
+  const filters = { q: req.query.q || '', source: req.query.source || '', status: req.query.status || '', date: req.query.date || '', after: req.query.after || '', success: req.query.success || '', error: req.query.error || '', msg: req.query.msg || '' };
   const data = await getOrdersData(filters);
   res.send(renderOrdersList(req.adminSession, data, filters));
 });
@@ -5757,26 +5764,40 @@ app.post('/orders/new', requireAuth, async (req, res) => {
 });
 
 // WHAT: Bulk order action from the list — currently only 'mark-paid'; iterates selected ids and calls orderMarkAsPaid per order (or mocks the status).
-// CHANGE-GUARD: must precede /orders/:id. Per-order Shopify errors are caught+logged but NOT surfaced — a partial failure still redirects to success=marked_paid (no per-order result). If you add actions, branch on `action` and keep the empty-ids early-return.
-// INVARIANT(S): ids may arrive as a single value or array — normalized via Array.isArray(ids) ? ids : [ids]. Unlike the single mark-paid route, this bulk path does NOT trigger Xero payment recording — a known asymmetry.
+// CHANGE-GUARD: must precede /orders/:id. Per-order orderMarkAsPaid userErrors ARE read (via lib/order-money.mjs bulkMarkOrdersPaid) — an order Shopify refused is never audit-logged as paid, and a partial failure redirects to ?error=mark_paid_partial naming the failed ids. If you add actions, branch on `action` and keep the empty-ids early-return.
+// INVARIANT(S): ids may arrive as a single value or array — normalized via Array.isArray(ids) ? ids : [ids]. Unlike the single mark-paid route, this bulk path does NOT trigger Xero payment recording — a known asymmetry, which is exactly why an unread userError here would have no second system to catch it.
 app.post('/orders/bulk', requireAuth, async (req, res) => {
   const { action, ids } = req.body;
   const idList = Array.isArray(ids) ? ids : (ids ? [ids] : []);
   if (!idList.length) return res.redirect('/orders');
 
   if (action === 'mark-paid') {
-    for (const numId of idList) {
-      if (MOCK) {
+    let paid = [], failed = [];
+    if (MOCK) {
+      for (const numId of idList) {
         const prev = mockOrderOverrides.get(numId) || {};
+        // MOCK FIDELITY: mirror the real refusal — Shopify rejects orderMarkAsPaid on an order that
+        // is already PAID/REFUNDED, so the mock must too or the partial-failure path is untested.
+        if (['PAID', 'REFUNDED'].includes(prev.displayFinancialStatus || getMockOrder(numId)?.displayFinancialStatus)) {
+          failed.push({ id: String(numId), message: 'Order cannot be marked as paid.' });
+          continue;
+        }
         mockOrderOverrides.set(numId, { ...prev, displayFinancialStatus: 'PAID' });
-      } else {
-        try {
-          await shopifyFetch(`mutation orderMarkAsPaid($input:OrderMarkAsPaidInput!){
-            orderMarkAsPaid(input:$input){ order{id displayFinancialStatus} userErrors{field message} }
-          }`, { input: { id: shopifyOrderGid(numId) } });
-        } catch (err) { console.error('bulk mark-paid error:', err.message); }
+        paid.push(String(numId));
       }
-      auditLog(req.adminSession.email, 'mark_paid', shopifyOrderGid(numId), null, null);
+    } else {
+      ({ paid, failed } = await bulkMarkOrdersPaid({
+        shopifyFetch, ids: idList, toGid: shopifyOrderGid,
+        log: (...args) => console.error(...args),
+      }));
+    }
+    // DEPENDS: audit rows are the only record that this path ran — only log the orders that really
+    // moved to PAID, or the audit trail asserts payment for orders that stayed unpaid.
+    for (const numId of paid) auditLog(req.adminSession.email, 'mark_paid', shopifyOrderGid(numId), null, null);
+    if (failed.length) {
+      const msg = `${failed.length} of ${idList.length} order(s) could NOT be marked paid: ${failed.map(f => `#${f.id} (${f.message})`).join('; ')}`;
+      console.error('[orders/bulk] mark-paid partial failure:', msg);
+      return res.redirect(`/orders?error=mark_paid_partial&msg=${encodeURIComponent(msg.slice(0, 300))}`);
     }
   }
   res.redirect('/orders?success=marked_paid');
@@ -6757,7 +6778,15 @@ app.post('/orders/:id/edit', requireAuth, async (req, res) => {
     console.warn('[order-edit] addVariantLines parse failed:', e.message);
   }
 
-  const pricesMap = Object.fromEntries(Object.entries(prices || {}).map(([k,v]) => [k, parseFloat(v) || 0]));
+  // DEPENDS: lib/order-money.mjs parseLinePrices — a blank/garbage price must NOT become 0. The
+  // edit-mode UI submits a price input for EVERY line, so a field the operator cleared arrives as
+  // "" and the old `|| 0` comped that line at 100% off behind a success banner. Reject the batch
+  // instead, matching POST /orders/:id/line/price which 400s on the same input.
+  const { prices: pricesMap, invalid: invalidPriceLines } = parseLinePrices(prices);
+  if (invalidPriceLines.length) {
+    console.warn(`[order-edit] BATCH /edit order=${numId} REJECTED — invalid price input on ${invalidPriceLines.length} line(s)`);
+    return res.redirect(`/orders/${numId}?error=edit_failed&msg=${encodeURIComponent(`invalid price on ${invalidPriceLines.length} line(s) — enter a number (0 or more), or leave the original price in place. Nothing was saved.`)}`);
+  }
   const changes = { qtys: qtysMap, removes: [...removeSet], prices: pricesMap, discountPct, discountFixed, discountReason, addCustomLines: newCustomLines, addVariantLines: newVariantLines };
   console.log(`[order-edit] BATCH /edit order=${numId} qtys=${Object.keys(qtysMap).length} removes=${removeSet.size} prices=${Object.keys(pricesMap).length} addCustom=${newCustomLines.length} addVariant=${newVariantLines.length} disc=${discountPct||discountFixed||'none'}`);
 
@@ -6892,42 +6921,24 @@ app.post('/orders/:id/edit', requireAuth, async (req, res) => {
     }
     // Apply per-line price changes: remove existing B2B discount + add new one at new %
     // Note: orderEditUpdateDiscount stacks on commit — must remove+add instead.
-    for (const [origLiId, newPrice] of Object.entries(pricesMap)) {
-      const info = discountIdMap[origLiId];
-      if (!info) continue;  // no B2B discount on this line (custom item or no discount)
-      const calcLiId = idMap[origLiId];
-      if (!calcLiId) continue;
-      const currentPrice = info.wholesalePrice;
-      if (Math.abs(newPrice - currentPrice) < 0.005) continue;  // no change
-      const newPct = ((info.retailPrice - newPrice) / info.retailPrice) * 100;
-      if (newPct < 0 || newPct > 100) { console.warn('[order-edit] price out of range — skipping', origLiId); continue; }
-      // Step 1: remove existing per-line B2B discount
-      const remRes = await shopifyFetch(
-        `mutation rem($id:ID!,$did:ID!){
-          orderEditRemoveDiscount(id:$id,discountApplicationId:$did){
-            calculatedOrder{id} userErrors{field message}
-          }
-        }`,
-        { id: calcId, did: info.discountAppId }
-      );
-      const remErrs = remRes.data?.orderEditRemoveDiscount?.userErrors || [];
-      if (remErrs.length) { console.error('[order-edit] remove discount failed:', JSON.stringify(remErrs)); continue; }
-      // Step 2: add new discount at adjusted percentage
-      const addRes = await shopifyFetch(
-        `mutation add($id:ID!,$li:ID!,$d:OrderEditAppliedDiscountInput!){
-          orderEditAddLineItemDiscount(id:$id,lineItemId:$li,discount:$d){
-            addedDiscountStagedChange{id} calculatedOrder{id} userErrors{field message}
-          }
-        }`,
-        { id: calcId, li: calcLiId, d: { percentValue: parseFloat(newPct.toFixed(4)), description: 'B2B price adj' } }
-      );
-      const addErrs = addRes.data?.orderEditAddLineItemDiscount?.userErrors || [];
-      if (addErrs.length) console.error('[order-edit] add discount failed:', JSON.stringify(addErrs));
-      else console.log('[order-edit] price updated:', origLiId, currentPrice, '->', newPrice, `(${newPct.toFixed(2)}%)`);
-    }
     // Collected non-fatal warnings surfaced to staff via ?msg= on the redirect. Declared HERE (not at
-    // the Phase 16F block below) because the order-discount staging that follows also pushes into it.
+    // the Phase 16F block below) because the price loop and the order-discount staging that follows
+    // both push into it.
     const batchWarnings = [];
+    // DEPENDS: lib/order-money.mjs applyLinePriceChanges THROWS when the re-add fails after the
+    // remove succeeded. That throw must reach the catch below WITHOUT hitting orderEditCommit — an
+    // abandoned calculatedOrder persists nothing, whereas committing the removal alone reverts the
+    // line from wholesale to full retail behind a success banner. Do not wrap this in a try/continue.
+    const priceOutcome = await applyLinePriceChanges({
+      shopifyFetch, calcId, pricesMap, discountIdMap, idMap,
+      log: (...args) => console.log(...args),
+    });
+    for (const s of priceOutcome.skipped) {
+      // 'unchanged' / 'no explicit discount' / 'no calc mapping' are ordinary no-ops; only report the
+      // cases where a price the operator typed was NOT applied.
+      if (s.reason === 'unchanged' || s.reason === 'no calc mapping' || s.reason === 'no explicit discount on line') continue;
+      batchWarnings.push(`price not changed on one line — ${s.reason}.`);
+    }
     // Apply the order-level discount — SAME code path as POST /orders/:id/discount/order.
     // CHANGE-GUARD (2026-08-05): this block used to be an independent SECOND copy of the
     // negative-priced orderEditAddCustomItem bug, and it did not even read its userErrors — so it

@@ -50,6 +50,13 @@ if [ -f test/leads-ingest.test.mjs ]; then
   B2B_ADMIN_MOCK=1 node test/leads-ingest.test.mjs || UNIT_FAIL=$?
 fi
 
+# Money-correctness helpers (lib/order-money.mjs). Standalone because the branches under test are
+# Shopify userError branches — MOCK never calls shopifyFetch, so only an injected fake reaches them.
+if [ -f test/order-money.test.mjs ]; then
+  echo ""
+  node test/order-money.test.mjs || UNIT_FAIL=$?
+fi
+
 # Order-edit userErrors: the batch /edit handler returns from its MOCK branch before any Shopify
 # mutation, so this path can ONLY be covered standalone.
 if [ -f test/order-edit-user-errors.test.mjs ]; then
