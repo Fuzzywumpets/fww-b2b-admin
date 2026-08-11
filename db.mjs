@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { reportEvent } from './fww-logsink.mjs';
 // SYNC: page-size constants live in lib/list-truncation.mjs so the SQL LIMIT here and the number
 // printed in the /orders + /customers footers (server.mjs) cannot drift apart.
-import { ORDERS_LIST_LIMIT, CUSTOMERS_LIST_LIMIT } from './lib/list-truncation.mjs';
+import { ORDERS_LIST_LIMIT, CUSTOMERS_LIST_LIMIT, LEADS_LIST_LIMIT } from './lib/list-truncation.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const MOCK = process.env.B2B_ADMIN_MOCK === '1';
@@ -638,17 +638,66 @@ export function upsertPortalLead(row) {
   return { action: 'inserted', id: info.lastInsertRowid };
 }
 
-export function getLeads({ status, search, limit = 100, offset = 0 } = {}) {
+// WHAT: SQL expression that strips the punctuation humans put in phone numbers, so a stored value
+//   can be compared against a digits-only search term.
+// WHY: phones are NOT stored in one shape. server.mjs normalizePhone() writes E.164 ('+18282160282')
+//   for NANP numbers, but it is only applied by POST /leads/new and /leads/:id/edit — rows created
+//   before it existed (lead #3 is plain '8282160282') and rows ingested from the portal by
+//   upsertPortalLead() keep whatever the applicant typed, e.g. '(828) 216-0282'. Matching the raw
+//   column would find some of those and miss others, which is worse than not searching at all.
+// INVARIANT(S): strips + - ( ) space and . only — it never strips digits, so it cannot make two
+//   different numbers collide.
+const PHONE_DIGITS_SQL =
+  "REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(IFNULL(phone,''),'+',''),'-',''),'(',''),')',''),' ',''),'.','')";
+
+// WHAT: single source of the leads WHERE clause + bound params, shared by getLeads and countLeads.
+// CHANGE-GUARD: both callers MUST use this. If the filter logic is ever duplicated instead, the
+//   count and the rows silently answer different questions and the "showing the first N" banner
+//   starts lying — which is the exact defect class this whole change exists to remove.
+// INVARIANT(S): every user-controlled value is bound with ?, never interpolated. The phone clause is
+//   added ONLY when the search term carries 3+ digits: a term with no digits would reduce to
+//   LIKE '%%', which matches every row that has a phone at all.
+function buildLeadsWhere({ status, search }) {
   let where = '1=1';
   const params = [];
   if (status && status !== 'all') { where += ' AND status = ?'; params.push(status); }
   if (search) {
-    where += ' AND (email LIKE ? OR business_name LIKE ? OR contact_name LIKE ?)';
     const like = `%${search}%`;
-    params.push(like, like, like);
+    const digits = String(search).replace(/\D/g, '');
+    if (digits.length >= 3) {
+      where += ` AND (email LIKE ? OR business_name LIKE ? OR contact_name LIKE ? OR ${PHONE_DIGITS_SQL} LIKE ?)`;
+      params.push(like, like, like, `%${digits}%`);
+    } else {
+      where += ' AND (email LIKE ? OR business_name LIKE ? OR contact_name LIKE ?)';
+      params.push(like, like, like);
+    }
   }
+  return { where, params };
+}
+
+// WHAT: one page of leads, newest activity first.
+// CHANGE-GUARD: `limit` defaults to the SHARED LEADS_LIST_LIMIT constant, not a local literal, so
+//   the SQL cap and the number the UI prints can never drift apart. The GET /leads route pairs this
+//   with countLeads() to decide whether to show the truncation banner — if you change the shape
+//   returned here, update that route and test/leads-list.test.mjs together.
+// INVARIANT(S): still returns a plain ARRAY (six call sites in test/leads-ingest.test.mjs index it
+//   directly) — the truncated flag is deliberately NOT bolted on here; ask countLeads instead.
+export function getLeads({ status, search, limit = LEADS_LIST_LIMIT, offset = 0 } = {}) {
+  const { where, params } = buildLeadsWhere({ status, search });
   return db.prepare(`SELECT * FROM leads WHERE ${where} ORDER BY updated_at DESC LIMIT ? OFFSET ?`)
     .all(...params, limit, offset);
+}
+
+// WHAT: total leads matching the SAME filters as getLeads, ignoring limit/offset.
+// WHY: the list is capped and has no pagination, so without a true total the page cannot tell the
+//   difference between "exactly 100 leads" and "the first 100 of 342" — and it used to render both
+//   identically. The status chips already showed unbounded per-status counts, so a chip reading
+//   "New (150)" sat directly above a 100-row table with nothing explaining the gap.
+// INVARIANT(S): shares buildLeadsWhere with getLeads (see its CHANGE-GUARD) so the count always
+//   answers the same question as the rows.
+export function countLeads({ status, search } = {}) {
+  const { where, params } = buildLeadsWhere({ status, search });
+  return db.prepare(`SELECT COUNT(*) AS n FROM leads WHERE ${where}`).get(...params).n;
 }
 
 export function getLeadCounts() {

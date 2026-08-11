@@ -20,7 +20,7 @@ import {
   getCustomerNotes, setCustomerNotes, getDropshipCache, setDropshipCache,
   getSetting, setSetting, getGlobalSettings, getAuditLog, getAuditLogCount,
   logLabelBatch, logExportBatch,
-  createLead, getLeads, getLeadCounts, getLead, updateLead, upsertPortalLead,
+  createLead, getLeads, countLeads, getLeadCounts, getLead, updateLead, upsertPortalLead,
   addLeadNote, getLeadNotes, addLeadStatusHistory, getLeadStatusHistory,
   upsertBackorder, getBackordersForOrder, getOpenBackorders, fulfillBackorder, logOrderEdit,
   getEditAction, putEditAction,
@@ -47,7 +47,7 @@ import { renderLabelSheet, expandItems, TEMPLATES as LABEL_TEMPLATES, DEFAULT_FI
 import { isInsider, resolveXeroContact, syncCustomerToXero, getXeroSyncStatus } from './lib/xero-customer-sync.mjs';
 // SYNC: same module db.mjs uses for the SQL LIMIT — the banner/footer copy and the query page size
 // must agree, otherwise the list lies about how much it is showing.
-import { ORDERS_LIST_LIMIT, CUSTOMERS_LIST_LIMIT, listCountLabel, truncationNoticeHtml } from './lib/list-truncation.mjs';
+import { ORDERS_LIST_LIMIT, CUSTOMERS_LIST_LIMIT, LEADS_LIST_LIMIT, listCountLabel, truncationNoticeHtml } from './lib/list-truncation.mjs';
 // fww-error-sink monitoring (injected 2026-06-30): error-logging shim only. To disable, remove this import, the installGlobalHandlers() call, and the expressErrorMiddleware() app.use. See fww-error-sink RUNBOOK.
 import { installGlobalHandlers, expressErrorMiddleware, reportEvent } from './fww-logsink.mjs';
 installGlobalHandlers();
@@ -10432,7 +10432,7 @@ const LEAD_TRANSITIONS = {
 // WHAT: renders the leads index — a search box, per-status filter chips with live counts, and a table; overdue follow-ups render in text-danger.
 // CHANGE-GUARD: chip links carry both status and (encoded) q so filtering+search compose; the 'all' count is summed from counts across every status — if a status is missing from counts it contributes 0.
 // INVARIANT(S): business_name/email/contact_name are h()-escaped; overdue is computed as next_followup_due < today (ISO date compare, lexicographic but safe for YYYY-MM-DD).
-function renderLeadsList(session, { leads, counts, flash, q, status }) {
+function renderLeadsList(session, { leads, counts, flash, q, status, total, truncated }) {
   const allCount = Object.values(counts).reduce((s, n) => s + n, 0);
   const chipList = [
     { value: 'all', label: `All (${allCount})` },
@@ -10474,12 +10474,18 @@ function renderLeadsList(session, { leads, counts, flash, q, status }) {
       </form>
     </div>
     <div class="filter-chips-row" style="margin-bottom:1rem;display:flex;flex-wrap:wrap;gap:0.35rem">${chipBar}</div>
+    ${truncationNoticeHtml({ truncated, limit: LEADS_LIST_LIMIT, noun: 'lead' })}
     ${leads.length === 0
       ? `<div class="empty-state card" style="padding:2rem;text-align:center"><p class="text-muted">No leads found.</p><a href="/leads/new" class="btn btn-primary" style="margin-top:0.75rem">Create first lead</a></div>`
       : `<div class="table-wrap"><table class="data-table">
           <thead><tr><th>Business</th><th>Contact</th><th>Status</th><th>Last Activity</th><th>Follow-up</th><th></th></tr></thead>
           <tbody>${rows}</tbody>
-        </table></div>`
+        </table></div>
+        <div class="list-footer" style="margin-top:0.6rem">
+          <span class="text-muted">${h(listCountLabel({ count: leads.length, noun: 'lead', truncated }))}${
+            truncated && Number.isFinite(total) ? h(` of ${total} matching`) : ''
+          }</span>
+        </div>`
     }
   ` });
 }
@@ -10927,8 +10933,15 @@ app.get('/leads', requireAuth, (req, res) => {
   const q      = String(req.query.q || '').trim();
   const leads  = getLeads({ status, search: q || undefined });
   const counts = getLeadCounts();
+  // DEPENDS: countLeads shares buildLeadsWhere with getLeads, so `total` always counts the same
+  //   rows the table is drawn from. Without this the page could not distinguish "exactly 100 leads"
+  //   from "the first 100 of 342" and rendered both the same way.
+  const total  = countLeads({ status, search: q || undefined });
   const flash  = req.query.flash === 'created' ? 'Lead created.' : req.query.flash === 'saved' ? 'Lead updated.' : null;
-  res.send(renderLeadsList(req.adminSession, { leads, counts, flash, q, status: req.query.status || 'all' }));
+  res.send(renderLeadsList(req.adminSession, {
+    leads, counts, flash, q, status: req.query.status || 'all',
+    total, truncated: total > leads.length,
+  }));
 });
 
 // WHAT: GET /leads/new — renders the empty New Lead form.
