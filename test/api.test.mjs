@@ -2113,6 +2113,28 @@ await test('POST /leads/new with duplicate email → shows error', async () => {
   assert.ok(html.includes('already exists') || html.includes('alert'), 'Duplicate error message missing');
 });
 
+// B2B-16: the DB layer is covered by test/leads-list.test.mjs, but nothing asserted that the ROUTE
+// actually hands `total`/`truncated` to the renderer. A typo there would render a page with no
+// count at all and every unit test would still pass. Runs after the POST tests above so at least
+// one lead exists (an empty list renders the empty-state card instead of a footer).
+await test('GET /leads → footer states the count honestly (route→render wiring)', async () => {
+  const cookie = await seedSession();
+  const res  = await fetch(`${BASE}/leads`, { headers: { Cookie: cookie } });
+  const html = await res.text();
+  // Not truncated at this volume, so the footer must be the plain "N leads" form...
+  assert.ok(/\d+ leads?</.test(html),
+    'leads list must print a count footer — listCountLabel is not wired to the route');
+  // ...and the cap banner must NOT appear.
+  assert.ok(!html.includes('data-truncation-notice'),
+    'truncation banner shown on a list that was never truncated');
+  // Guard the malformed-copy bug Qodo caught: the truncated branch of listCountLabel returns a
+  // COMPLETE sentence, so nothing may be concatenated onto it. An earlier version rendered
+  // "...refine the filters of 342 matching". A substring check for 'showing the first' passed on
+  // that broken string, which is exactly why this asserts on the glued shape instead.
+  assert.ok(!/refine the filters\s*of\s*\d+/.test(html),
+    'footer copy is two sentences glued together — see listCountLabel CHANGE-GUARD');
+});
+
 await test('GET /leads/:id → lead detail renders', async () => {
   const cookie = await seedSession();
   // Create a lead first
