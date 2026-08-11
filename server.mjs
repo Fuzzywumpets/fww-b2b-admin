@@ -45,6 +45,9 @@ import {
 import { generateInvoicePdf, lineItemTrueTotal, lineItemTrueUnit, lineItemCurrentQty } from './pdf.mjs';
 import { renderLabelSheet, expandItems, TEMPLATES as LABEL_TEMPLATES, DEFAULT_FIELDS } from './labels.mjs';
 import { isInsider, resolveXeroContact, syncCustomerToXero, getXeroSyncStatus } from './lib/xero-customer-sync.mjs';
+// SYNC: same module db.mjs uses for the SQL LIMIT — the banner/footer copy and the query page size
+// must agree, otherwise the list lies about how much it is showing.
+import { ORDERS_LIST_LIMIT, CUSTOMERS_LIST_LIMIT, listCountLabel, truncationNoticeHtml } from './lib/list-truncation.mjs';
 // fww-error-sink monitoring (injected 2026-06-30): error-logging shim only. To disable, remove this import, the installGlobalHandlers() call, and the expressErrorMiddleware() app.use. See fww-error-sink RUNBOOK.
 import { installGlobalHandlers, expressErrorMiddleware, reportEvent } from './fww-logsink.mjs';
 installGlobalHandlers();
@@ -1930,7 +1933,7 @@ const FINANCIAL_STATUS_FILTER = {
 };
 
 // WHAT: orders-list data source — prefers the local orders_cache (B2B-only, joined on customers_cache.is_b2b) and falls back to live Shopify; also handles the MOCK fixture path.
-// CHANGE-GUARD: the cache branch returns hasNextPage:false and the FULL filtered set with no real pagination, while the live branch pages 50 at a time via after-cursor — these two paths have DIFFERENT pagination semantics, so UI 'Next 50' only works on the live path. Re-test list parity cache-vs-live after filter changes.
+// CHANGE-GUARD: the cache branch returns hasNextPage:false with at most ORDERS_LIST_LIMIT rows and no real pagination, while the live branch pages 50 at a time via after-cursor — these two paths have DIFFERENT pagination semantics, so UI 'Next 50' only works on the live path. The cache branch instead sets truncated:true when the cap is hit, which renderOrdersList turns into a banner + honest footer. Re-test list parity cache-vs-live after filter changes.
 // INVARIANT(S): cache is authoritative only when getOrdersCacheStats().total>0; live query string is assembled from qParts and user q is passed THROUGH to Shopify's query DSL (Shopify-side escaping, not SQL) — keep filters server-derived where possible; financial_status filter expands via FINANCIAL_STATUS_FILTER.
 async function getOrdersData(filters) {
   // Phase 24D: try cache first (B2B-only by definition — joined to customers_cache where is_b2b=1)
@@ -1939,7 +1942,11 @@ async function getOrdersData(filters) {
       const stats = getOrdersCacheStats();
       if (stats && stats.total > 0) {
         const cached = listOrdersFromCache(filters);
-        return { orders: cached, hasNextPage: false, endCursor: null, total: cached.length, _fromCache: true, _syncedAt: stats.latest };
+        // TRUNCATION (ui-truth): the cache path has no cursor, so when the row cap is hit we must
+        // say so — otherwise the footer prints the cap as if it were the complete total.
+        return { orders: cached, hasNextPage: false, endCursor: null, total: cached.length,
+                 truncated: cached.truncated === true, listLimit: ORDERS_LIST_LIMIT,
+                 _fromCache: true, _syncedAt: stats.latest };
       }
     } catch (e) {
       console.error('orders cache read failed, falling back to live Shopify:', e.message);
@@ -2038,7 +2045,8 @@ function listRowTotalAmount(o) {
 // CHANGE-GUARD: the bulk form POSTs /orders/bulk with checked `ids`; the inline select-all/upd() script wires the bulk bar — keep input name="ids" stable. 'Sync now' button only shows when data._fromCache. Re-test bulk mark-paid after table column changes.
 // INVARIANT(S): all order/customer fields h()-escaped; pagination 'Next 50' uses endCursor copied into the after param and only renders when hasNextPage (live path only); colspan on the empty row (10) must match the header column count.
 function renderOrdersList(session, data, filters) {
-  const { orders, hasNextPage, endCursor, error } = data;
+  const { orders, hasNextPage, endCursor, error, truncated } = data;
+  const truncationBanner = truncationNoticeHtml({ truncated, limit: data.listLimit || ORDERS_LIST_LIMIT, noun: 'order' });
 
   const rows = orders.map(o => {
     const numId  = shopifyNumericId(o.id);
@@ -2095,6 +2103,7 @@ function renderOrdersList(session, data, filters) {
     </div>
     ${flash}
     ${error ? `<div class="alert alert-warning">Shopify unavailable: ${h(error)}</div>` : ''}
+    ${truncationBanner}
     <div class="filter-chips">${sourceChips}</div>
     <form class="filter-bar" method="GET" action="/orders">
       ${filters.source ? `<input type="hidden" name="source" value="${h(filters.source)}">` : ''}
@@ -2133,7 +2142,7 @@ function renderOrdersList(session, data, filters) {
       </div>
     </form>
     <div class="pagination">
-      <span class="text-muted">${orders.length} order${orders.length !== 1 ? 's' : ''}</span>
+      <span class="text-muted">${h(listCountLabel({ count: orders.length, noun: 'order', truncated }))}</span>
       ${hasNextPage ? `<a href="/orders?${nextParams}" class="btn btn-ghost">Next 50 →</a>` : ''}
     </div>
     <script>
@@ -3972,7 +3981,10 @@ async function getCustomersData(filters) {
       if (stats && stats.total > 0) {
         const cached = listCustomersFromCache(filters);
         if (cached.length > 0) {
-          return { customers: cached, hasNextPage: false, total: cached.length, _fromCache: true, _syncedAt: stats.latest };
+          // TRUNCATION (ui-truth): see getOrdersData — cache path has no pager, so surface the cap.
+          return { customers: cached, hasNextPage: false, total: cached.length,
+                   truncated: cached.truncated === true, listLimit: CUSTOMERS_LIST_LIMIT,
+                   _fromCache: true, _syncedAt: stats.latest };
         }
       }
     } catch (e) {
@@ -4061,7 +4073,8 @@ function tagChip(t, { linked = false } = {}) {
 // CHANGE-GUARD: the ★ top-customer badge is index-based (idx < TOP_CUSTOMER_THRESHOLD) and ONLY valid when sort is lifetime_spend_desc — if you change the default sort or page size, the star logic silently mislabels. Re-test that 'Next 50' preserves q/segment/tag/sort params plus after cursor.
 // INVARIANT(S): colspan=7 on the empty row must match the 7 <th> columns; pagination uses endCursor (opaque Shopify cursor), never an offset.
 function renderCustomersList(session, data, filters) {
-  const { customers, hasNextPage, endCursor, error } = data;
+  const { customers, hasNextPage, endCursor, error, truncated } = data;
+  const truncationBanner = truncationNoticeHtml({ truncated, limit: data.listLimit || CUSTOMERS_LIST_LIMIT, noun: 'customer' });
 
   // top-10 by spend get a star badge (Phase 20) — rank = index in list when sorted by spend
   const TOP_CUSTOMER_THRESHOLD = 10;
@@ -4125,6 +4138,7 @@ function renderCustomersList(session, data, filters) {
       ${data._fromCache ? '<button type="button" class="btn btn-ghost btn-sm" onclick="syncCacheNow(this)" title="Refresh cache from Shopify">\u{1F504} Sync now</button>' : ''}
     </div>
     ${error ? `<div class="alert alert-warning">Shopify unavailable: ${h(error)}</div>` : ''}
+    ${truncationBanner}
     <div class="filter-chips">${segmentChips}</div>
     <form class="filter-bar" method="GET" action="/customers">
       ${filters.segment ? `<input type="hidden" name="segment" value="${h(filters.segment)}">` : ''}
@@ -4152,7 +4166,7 @@ function renderCustomersList(session, data, filters) {
       </table>
     </div>
     <div class="pagination">
-      <span class="text-muted">${customers.length} customer${customers.length !== 1 ? 's' : ''}</span>
+      <span class="text-muted">${h(listCountLabel({ count: customers.length, noun: 'customer', truncated }))}</span>
       ${hasNextPage ? `<a href="/customers?${nextParams}" class="btn btn-ghost">Next 50 →</a>` : ''}
     </div>
   ` });
@@ -5445,7 +5459,7 @@ async function submitNewOrder(req, session) {
 
 // WHAT: Dashboard manual-review queue — B2B customers (from local cache) that are NOT yet mapped to a Xero contact and are NOT insiders.
 // CHANGE-GUARD: insider ids are HARDCODED here (4742401425601, 5163530813633) AND duplicated in isInsider elsewhere — keep them in sync or a customer shows in the review queue while their orders skip Xero. Reads data/shopify_to_xero_mapping.json (by_shopify_id keys); a missing/corrupt file degrades to 'everyone unmapped' rather than throwing.
-// INVARIANT(S): listCustomersFromCache({segment:'b2b', limit:999}) — the 999 cap silently truncates if >999 B2B customers exist; ids are normalized by stripping the gid://shopify/Customer/ prefix before the mapped/insider Set lookups.
+// INVARIANT(S): listCustomersFromCache({segment:'b2b', limit:999}) — limit is now actually honored (it used to be ignored, silently capping this queue at 100); >999 B2B customers still truncates; ids are normalized by stripping the gid://shopify/Customer/ prefix before the mapped/insider Set lookups.
 function getCustomersPendingXeroReview() {
   // B2B customers not yet mapped to a Xero contact (and not insiders).
   // Helps surface manual-review queue on the dashboard.
@@ -8148,10 +8162,17 @@ app.get('/api/orders/:id/conversations/:slug/messages', requireAuth, async (req,
 // INVARIANT(S): MOCK shows no certs; customerId is split on '/' to recover the numeric id; all dynamic fields are h()-escaped.
 app.get('/tax-exempt', requireAuth, (req, res) => {
   const pendingCerts = MOCK ? [] : getPendingTaxCertsFromPortal();
+  // UI-TRUTH: approve/reject redirect here with success=error when callPortalInternal fails (portal
+  // down, or PORTAL_INTERNAL_TOKEN unset -> {ok:false,error:'no_internal_token'}, in which case an
+  // approval can NEVER succeed). Without this branch the staff member saw the cert still listed and
+  // no message at all — indistinguishable from a slow refresh, so a misconfigured token stayed
+  // invisible indefinitely. `msg` is the portal-side error code, h()-escaped.
   const flashHtml = req.query.success === 'approved'
     ? `<div class="alert alert-success">Certificate approved — customer is now tax-exempt.</div>`
     : req.query.success === 'rejected'
     ? `<div class="alert alert-success">Certificate rejected.</div>`
+    : req.query.success === 'error'
+    ? `<div class="alert alert-warning" data-taxexempt-error>Action failed — the portal did not accept the change, so nothing was updated. Check that the portal is reachable and PORTAL_INTERNAL_TOKEN is set.${req.query.msg ? ` (${h(String(req.query.msg).slice(0, 200))})` : ''}</div>`
     : '';
   const rows = pendingCerts.map(c => `
     <tr>
@@ -8189,7 +8210,9 @@ app.post('/tax-exempt/:id/approve', requireAuth, async (req, res) => {
     reviewedBy: req.adminSession.email,
   });
   auditLog(req.adminSession.email, 'tax-cert-approve', `cert:${req.params.id}`, null, { reviewedBy: req.adminSession.email });
-  res.redirect(`/tax-exempt?success=${result.ok ? 'approved' : 'error'}`);
+  // DEPENDS: the GET /tax-exempt flash renderer handles success=error and the optional msg param.
+  if (!result.ok) return res.redirect(`/tax-exempt?success=error&msg=${encodeURIComponent(String(result.error || 'failed').slice(0, 200))}`);
+  res.redirect('/tax-exempt?success=approved');
 });
 
 // WHAT: rejects a tax-exempt cert with a reason (capped 500 chars) via the portal-internal reject endpoint.
@@ -8202,7 +8225,9 @@ app.post('/tax-exempt/:id/reject', requireAuth, async (req, res) => {
     reviewedBy: req.adminSession.email, reason,
   });
   auditLog(req.adminSession.email, 'tax-cert-reject', `cert:${req.params.id}`, null, { reason });
-  res.redirect(`/tax-exempt?success=${result.ok ? 'rejected' : 'error'}`);
+  // DEPENDS: the GET /tax-exempt flash renderer handles success=error and the optional msg param.
+  if (!result.ok) return res.redirect(`/tax-exempt?success=error&msg=${encodeURIComponent(String(result.error || 'failed').slice(0, 200))}`);
+  res.redirect('/tax-exempt?success=rejected');
 });
 
 // Phase 4: Customers CSV export
