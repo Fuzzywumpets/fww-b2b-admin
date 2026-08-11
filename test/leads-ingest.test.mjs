@@ -10,7 +10,8 @@
 
 process.env.B2B_ADMIN_MOCK = '1';
 
-const { upsertPortalLead, getLead, updateLead, getLeads } = await import('../db.mjs');
+const { upsertPortalLead, getLead, updateLead, getLeads, createLead } = await import('../db.mjs');
+const db = (await import('../db.mjs')).default;
 
 let passed = 0, failed = 0;
 async function test(name, fn) {
@@ -186,6 +187,55 @@ await test('a duplicate portal row can still backfill a missing FEIN, without re
   } finally {
     Date.now = realNow;
   }
+});
+
+// ── B2B-1/B2B-2: migration + allow-list write-through (HANDOFF-2026-08-11) ───
+console.log('\n── Unit: leads address/tax migration + allow-list (B2B-1/B2B-2) ──');
+
+await test('migration is idempotent: address + tax columns exist, and re-running the guard is a no-op', () => {
+  const cols = new Set(db.prepare(`PRAGMA table_info(leads)`).all().map(c => c.name));
+  for (const col of ['address1', 'address2', 'city', 'state', 'postal_code', 'country_code', 'sales_tax_id', 'sales_tax_state', 'fein']) {
+    assert(cols.has(col), `missing column: ${col}`);
+  }
+  // The same PRAGMA-then-ALTER guard db.mjs runs at load time — re-running it here must not throw
+  // (ALTER TABLE ADD COLUMN on an existing column is the failure mode this guards against).
+  for (const col of ['address1', 'address2', 'city', 'state', 'postal_code', 'country_code']) {
+    if (!cols.has(col)) db.exec(`ALTER TABLE leads ADD COLUMN ${col} TEXT`);
+  }
+});
+
+await test('updateLead: address columns actually persist (the allow-list trap)', () => {
+  const id = createLead({ email: `allowlist-addr-${Date.now()}@example.com`, business_name: 'Allow-list Co' });
+  updateLead(id, {
+    address1: '604 Vengeance Creek Road', address2: 'Unit 2', city: 'Springfield',
+    state: 'TX', postal_code: '78701', country_code: 'US',
+  });
+  const after = getLead(id);
+  assertEqual(after.address1, '604 Vengeance Creek Road');
+  assertEqual(after.address2, 'Unit 2');
+  assertEqual(after.city, 'Springfield');
+  assertEqual(after.state, 'TX');
+  assertEqual(after.postal_code, '78701');
+  assertEqual(after.country_code, 'US');
+});
+
+await test('updateLead: sales_tax_id, sales_tax_state and fein actually persist (the allow-list trap)', () => {
+  const id = createLead({ email: `allowlist-tax-${Date.now()}@example.com` });
+  updateLead(id, { sales_tax_id: '87-3951696', sales_tax_state: 'TX', fein: '12-3456789' });
+  const after = getLead(id);
+  assertEqual(after.sales_tax_id, '87-3951696');
+  assertEqual(after.sales_tax_state, 'TX');
+  assertEqual(after.fein, '12-3456789', 'fein must be writable through updateLead, not just createLead/upsertPortalLead');
+});
+
+await test('createLead accepts the address + tax fields directly (a manually-created lead can carry them from the start)', () => {
+  const id = createLead({
+    email: `create-addr-${Date.now()}@example.com`, address1: '1 Test Way', city: 'Austin',
+    state: 'TX', postal_code: '78701', country_code: 'US', sales_tax_id: 'TX-1', sales_tax_state: 'TX',
+  });
+  const lead = getLead(id);
+  assertEqual(lead.address1, '1 Test Way');
+  assertEqual(lead.sales_tax_id, 'TX-1');
 });
 
 console.log(`\n  ${passed} passed, ${failed} failed`);
