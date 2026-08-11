@@ -3004,6 +3004,27 @@ await test('GET /customers/101/activity → renders activity page', async () => 
   assert.ok(html.includes('data-table'), 'Should include data table');
 });
 
+// Regression (H19): the filter form must expose exactly ONE control named "from". It once carried
+// both a preset <select name="from"> and a date <input name="from">, so any manual submit sent
+// from=<preset>&from=<date>; qs parsed that into an array, the date comparison matched nothing, and
+// every filtered view rendered 0 events while the data was actually there.
+await test('GET /customers/101/activity → filter form has exactly one control named "from"', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/customers/101/activity`, { headers: { Cookie: cookie } });
+  const html = await res.text();
+  const fromControls = html.match(/name="from"/g) || [];
+  assert.equal(fromControls.length, 1,
+    `duplicate name="from" controls (${fromControls.length}) make every filter submit send an array param`);
+  const toControls = html.match(/name="to"/g) || [];
+  assert.equal(toControls.length, 1, 'expected exactly one control named "to"');
+});
+
+await test('GET /customers/101/activity?from=a&from=b → array date param does not 500', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/customers/101/activity?from=2026-01-01&from=2026-06-01&to=2026-07-01`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200, 'a bookmarked duplicate param must still render the page');
+});
+
 // ── Phase 16E: Partial invoices ──────────────────────────────────────────────
 
 await test('GET /api/admin/orders/1001/partial-invoices → requires auth', async () => {

@@ -11607,7 +11607,7 @@ app.get('/api/admin/customers/:id/active-cart', requireAuth, (req, res) => {
 });
 
 // WHAT: GET /customers/:id/activity — full HTML activity-log page with date presets, type filter, free-text path search, expandable per-row detail (IP hash, UA, session, impersonation admin), and a 'did they order on date?' quick-lookup widget.
-// CHANGE-GUARD: defaults to a 7-day window; pagination is 50/page (totalPages from data.total) and pagination links re-encode from/to/type/q — add any new filter to BOTH the form and the pagination/canned-view query strings or it drops on page change; the inline script fetches the /activity/lookup endpoint by interpolated numId.
+// CHANGE-GUARD: defaults to a 7-day window; the date-preset picker is id-only (`#date-preset`) and must never be given a `name` — the form already has one control per query key and a duplicate name makes qs hand the route an array; pagination is 50/page (totalPages from data.total) and pagination links re-encode from/to/type/q — add any new filter to BOTH the form and the pagination/canned-view query strings or it drops on page change; the inline script fetches the /activity/lookup endpoint by interpolated numId.
 // INVARIANT(S): customer displayName is best-effort (falls back to 'Customer <id>' on Shopify error, swallowed); row detail JSON is h()-escaped into a data-detail attribute and re-parsed client-side; this page is read-only.
 app.get('/customers/:id/activity', requireAuth, async (req, res) => {
   const numId = req.params.id;
@@ -11713,9 +11713,14 @@ app.get('/customers/:id/activity', requireAuth, async (req, res) => {
     <!-- Filters -->
     <div class="filter-bar" style="margin-bottom:1rem">
       <form method="GET" style="display:flex;gap:0.5rem;flex-wrap:wrap;align-items:center">
-        <select name="from" class="input input-sm" title="From date" onchange="this.form.submit()">
-          ${datePresets.map(p => `<option value="${h(p.from)}"${p.from === fromParam && p.to === toParam ? ' selected' : ''}>${h(p.label)}</option>`).join('')}
-          <option value="${h(fromParam)}"${!datePresets.some(p => p.from === fromParam) ? ' selected' : ''}>Custom</option>
+        <!-- DEPENDS: this preset picker must NOT carry the from name — the date input below already owns it,
+             and two controls sharing it made every manual submit send from=[preset]&from=[date],
+             which Express's qs parser turns into an array and the date filter then matches nothing.
+             It is id-only: it writes into the from/to date inputs and submits, so exactly one from
+             and one to ever reach the server. -->
+        <select id="date-preset" class="input input-sm" title="Date preset" onchange="var v=this.value;if(v){var f=this.form,d=v.split('|');f.elements.from.value=d[0];f.elements.to.value=d[1];f.submit();}">
+          ${datePresets.map(p => `<option value="${h(p.from)}|${h(p.to)}"${p.from === fromParam && p.to === toParam ? ' selected' : ''}>${h(p.label)}</option>`).join('')}
+          <option value=""${!datePresets.some(p => p.from === fromParam && p.to === toParam) ? ' selected' : ''}>Custom</option>
         </select>
         <input type="date" name="from" class="input input-sm" value="${h(fromParam)}" style="width:130px">
         <span style="font-size:0.85rem;color:#666">to</span>
