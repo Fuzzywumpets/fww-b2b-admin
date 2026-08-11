@@ -3,6 +3,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { reportEvent } from './fww-logsink.mjs';
+// SYNC: page-size constants live in lib/list-truncation.mjs so the SQL LIMIT here and the number
+// printed in the /orders + /customers footers (server.mjs) cannot drift apart.
+import { ORDERS_LIST_LIMIT, CUSTOMERS_LIST_LIMIT, LEADS_LIST_LIMIT } from './lib/list-truncation.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const MOCK = process.env.B2B_ADMIN_MOCK === '1';
@@ -362,6 +365,19 @@ db.exec(`
   if (!cols.has('fein'))           db.exec(`ALTER TABLE leads ADD COLUMN fein TEXT`);
 }
 
+// MIGRATION (2026-08-11, B2B-1/B2B-2): `leads` has never had address columns, so a lead like
+// #3 Hydref K-9 (street address only, no city/state/zip yet) has nowhere to store it -- it
+// survived only inside a hand-written note. Adds six nullable TEXT columns: address1, address2,
+// city, state, postal_code, country_code. All nullable so existing rows are unaffected and a
+// partial address (street only) is a valid, storable state, not an error.
+// Idempotent, same PRAGMA-then-ALTER shape as the portal_lead_id/fein migration above.
+{
+  const cols = new Set(db.prepare(`PRAGMA table_info(leads)`).all().map(c => c.name));
+  for (const col of ['address1', 'address2', 'city', 'state', 'postal_code', 'country_code']) {
+    if (!cols.has(col)) db.exec(`ALTER TABLE leads ADD COLUMN ${col} TEXT`);
+  }
+}
+
 export default db;
 
 export function createSession(sid, email, displayName, picture) {
@@ -490,22 +506,65 @@ export function logExportBatch(email, type, productCount, rowOrImageCount, bytes
 
 // ── Wholesale leads ────────────────────────────────────────────────────────────
 
+// WHAT: inserts a new lead. Accepts the six address columns and sales_tax_id/sales_tax_state in
+//   addition to the original field set -- before B2B-1/B2B-2 these existed on the table (or didn't
+//   exist at all, for the address columns) but were never writable here, so a manually-created lead
+//   could never carry a tax ID or an address (the concrete Hydref K-9 bug -- see HANDOFF-2026-08-11).
+// CHANGE-GUARD: the column list here must stay a superset of updateLead()'s `allowed` array below --
+//   both are the write surface for `leads` and both were missing these columns before this change.
 export function createLead(fields) {
   const now = Date.now();
   const r = db.prepare(`
     INSERT INTO leads (email, business_name, contact_name, phone, website, business_type,
       estimated_monthly_volume_usd, source, source_detail, status, custom_tags,
-      assigned_to, next_followup_due, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', ?, ?, ?, ?, ?)
+      assigned_to, next_followup_due, address1, address2, city, state, postal_code,
+      country_code, sales_tax_id, sales_tax_state, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     fields.email, fields.business_name || null, fields.contact_name || null,
     fields.phone || null, fields.website || null, fields.business_type || null,
     fields.estimated_monthly_volume_usd ? parseInt(fields.estimated_monthly_volume_usd, 10) : null,
     fields.source || null, fields.source_detail || null,
     fields.custom_tags || null, fields.assigned_to || null,
-    fields.next_followup_due || null, now, now
+    fields.next_followup_due || null,
+    fields.address1 || null, fields.address2 || null, fields.city || null,
+    fields.state || null, fields.postal_code || null, fields.country_code || null,
+    fields.sales_tax_id || null, fields.sales_tax_state || null,
+    now, now
   );
   return r.lastInsertRowid;
+}
+
+// WHAT: best-effort parse of the portal's free-text `row.address` ("City, ST 12345" or "City, ST")
+//   into the structured location columns (city/state/postal_code). Never guesses country -- see
+//   HANDOFF-2026-08-11 D1/validation: order #38656 shipped to Auckland NZ marked "United States"
+//   from exactly this kind of silent default, so an address with no explicit country stays flagged
+//   incomplete rather than assumed US.
+// CHANGE-GUARD: deliberately CONSERVATIVE -- only fills fields it can match with a real US state
+//   code, and never touches address1 (the portal's `address` column is documented as city/state/zip
+//   only, not a street). A non-matching string parses to all-null; the raw text is never lost
+//   either way because it also survives verbatim in application_data_json below.
+// INVARIANT(S): pure function, no I/O; returns {city, state, postal_code} with null for any field it
+//   isn't confident about.
+const US_STATE_CODES = new Set([
+  'AL','AK','AZ','AR','CA','CO','CT','DE','DC','FL','GA','HI','ID','IL','IN','IA','KS','KY','LA',
+  'ME','MD','MA','MI','MN','MS','MO','MT','NE','NV','NH','NJ','NM','NY','NC','ND','OH','OK','OR',
+  'PA','RI','SC','SD','TN','TX','UT','VT','VA','WA','WV','WI','WY',
+]);
+function parsePortalAddress(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return { city: null, state: null, postal_code: null };
+  // "City, ST 12345" or "City, ST 12345-6789"
+  let m = s.match(/^(.+?),\s*([A-Za-z]{2})\s+(\d{5}(?:-\d{4})?)$/);
+  if (m && US_STATE_CODES.has(m[2].toUpperCase())) {
+    return { city: m[1].trim(), state: m[2].toUpperCase(), postal_code: m[3] };
+  }
+  // "City, ST" with no zip
+  m = s.match(/^(.+?),\s*([A-Za-z]{2})$/);
+  if (m && US_STATE_CODES.has(m[2].toUpperCase())) {
+    return { city: m[1].trim(), state: m[2].toUpperCase(), postal_code: null };
+  }
+  return { city: null, state: null, postal_code: null };
 }
 
 // WHAT: ingests ONE portal wholesale_leads row into this app's `leads` table, idempotently.
@@ -524,7 +583,9 @@ export function upsertPortalLead(row) {
   if (already) return { action: 'skipped', id: already.id };
 
   // Everything the portal collected that has no first-class column here, kept verbatim so the lead
-  // detail page can render the full application rather than a lossy subset.
+  // detail page can render the full application rather than a lossy subset. Kept even for fields
+  // ALSO parsed into columns below (row.address) -- the raw text is the fallback when the parse
+  // below can't confidently extract a city/state/zip.
   const applicationJson = JSON.stringify({
     portalLeadId: row.id,
     address: row.address || null,
@@ -558,33 +619,91 @@ export function upsertPortalLead(row) {
     return { action: 'linked', id: existing.id };
   }
 
+  // D1 (HANDOFF-2026-08-11): city/state/postal_code are the LOCATION address, parsed best-effort
+  // from the portal's free-text row.address. This is deliberately separate from sales_tax_state
+  // below (row.state), which the portal maps to the tax-registration state, not location -- see
+  // D2 in the handoff: those can legitimately differ (a business registered for sales tax in a
+  // different state than it's located in) and this insert does NOT change that existing mapping.
+  const parsedAddr = parsePortalAddress(row.address);
+
   const info = db.prepare(`
     INSERT INTO leads (email, business_name, contact_name, phone, website,
       sales_tax_state, sales_tax_id, fein, source, source_detail,
+      city, state, postal_code,
       application_data_json, portal_lead_id, status, created_at, updated_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'wholesale_form', 'fuzzywumpets.com/pages/wholesale-1',
-      ?, ?, 'new', ?, ?)
+      ?, ?, ?, ?, ?, 'new', ?, ?)
   `).run(
     row.email, row.business_name || null, row.contact_name || null,
     row.phone || null, row.website || null,
     row.state || null, row.tax_id || null, row.fein || null,
+    parsedAddr.city, parsedAddr.state, parsedAddr.postal_code,
     applicationJson, row.id,
     row.submitted_at || now, now
   );
   return { action: 'inserted', id: info.lastInsertRowid };
 }
 
-export function getLeads({ status, search, limit = 100, offset = 0 } = {}) {
+// WHAT: SQL expression that strips the punctuation humans put in phone numbers, so a stored value
+//   can be compared against a digits-only search term.
+// WHY: phones are NOT stored in one shape. server.mjs normalizePhone() writes E.164 ('+18282160282')
+//   for NANP numbers, but it is only applied by POST /leads/new and /leads/:id/edit — rows created
+//   before it existed (lead #3 is plain '8282160282') and rows ingested from the portal by
+//   upsertPortalLead() keep whatever the applicant typed, e.g. '(828) 216-0282'. Matching the raw
+//   column would find some of those and miss others, which is worse than not searching at all.
+// INVARIANT(S): strips + - ( ) space and . only — it never strips digits, so it cannot make two
+//   different numbers collide.
+const PHONE_DIGITS_SQL =
+  "REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(IFNULL(phone,''),'+',''),'-',''),'(',''),')',''),' ',''),'.','')";
+
+// WHAT: single source of the leads WHERE clause + bound params, shared by getLeads and countLeads.
+// CHANGE-GUARD: both callers MUST use this. If the filter logic is ever duplicated instead, the
+//   count and the rows silently answer different questions and the "showing the first N" banner
+//   starts lying — which is the exact defect class this whole change exists to remove.
+// INVARIANT(S): every user-controlled value is bound with ?, never interpolated. The phone clause is
+//   added ONLY when the search term carries 3+ digits: a term with no digits would reduce to
+//   LIKE '%%', which matches every row that has a phone at all.
+function buildLeadsWhere({ status, search }) {
   let where = '1=1';
   const params = [];
   if (status && status !== 'all') { where += ' AND status = ?'; params.push(status); }
   if (search) {
-    where += ' AND (email LIKE ? OR business_name LIKE ? OR contact_name LIKE ?)';
     const like = `%${search}%`;
-    params.push(like, like, like);
+    const digits = String(search).replace(/\D/g, '');
+    if (digits.length >= 3) {
+      where += ` AND (email LIKE ? OR business_name LIKE ? OR contact_name LIKE ? OR ${PHONE_DIGITS_SQL} LIKE ?)`;
+      params.push(like, like, like, `%${digits}%`);
+    } else {
+      where += ' AND (email LIKE ? OR business_name LIKE ? OR contact_name LIKE ?)';
+      params.push(like, like, like);
+    }
   }
+  return { where, params };
+}
+
+// WHAT: one page of leads, newest activity first.
+// CHANGE-GUARD: `limit` defaults to the SHARED LEADS_LIST_LIMIT constant, not a local literal, so
+//   the SQL cap and the number the UI prints can never drift apart. The GET /leads route pairs this
+//   with countLeads() to decide whether to show the truncation banner — if you change the shape
+//   returned here, update that route and test/leads-list.test.mjs together.
+// INVARIANT(S): still returns a plain ARRAY (six call sites in test/leads-ingest.test.mjs index it
+//   directly) — the truncated flag is deliberately NOT bolted on here; ask countLeads instead.
+export function getLeads({ status, search, limit = LEADS_LIST_LIMIT, offset = 0 } = {}) {
+  const { where, params } = buildLeadsWhere({ status, search });
   return db.prepare(`SELECT * FROM leads WHERE ${where} ORDER BY updated_at DESC LIMIT ? OFFSET ?`)
     .all(...params, limit, offset);
+}
+
+// WHAT: total leads matching the SAME filters as getLeads, ignoring limit/offset.
+// WHY: the list is capped and has no pagination, so without a true total the page cannot tell the
+//   difference between "exactly 100 leads" and "the first 100 of 342" — and it used to render both
+//   identically. The status chips already showed unbounded per-status counts, so a chip reading
+//   "New (150)" sat directly above a 100-row table with nothing explaining the gap.
+// INVARIANT(S): shares buildLeadsWhere with getLeads (see its CHANGE-GUARD) so the count always
+//   answers the same question as the rows.
+export function countLeads({ status, search } = {}) {
+  const { where, params } = buildLeadsWhere({ status, search });
+  return db.prepare(`SELECT COUNT(*) AS n FROM leads WHERE ${where}`).get(...params).n;
 }
 
 export function getLeadCounts() {
@@ -598,10 +717,16 @@ export function getLead(id) {
   return db.prepare('SELECT * FROM leads WHERE id = ?').get(id) || null;
 }
 
+// DEPENDS: /leads/:id/edit and /leads/new (server.mjs) both write through this allow-list -- any
+//   column added to the `leads` schema that staff should be able to edit must be added HERE or it
+//   silently no-ops (this exact trap is what made sales_tax_id/sales_tax_state/fein unwritable
+//   despite existing as columns -- see HANDOFF-2026-08-11 "Verified starting facts" #3).
 export function updateLead(id, fields) {
   const allowed = ['email','business_name','contact_name','phone','website','business_type',
     'estimated_monthly_volume_usd','source','source_detail','status','custom_tags',
-    'assigned_to','next_followup_due','converted_at','shopify_customer_id','rejected_reason'];
+    'assigned_to','next_followup_due','converted_at','shopify_customer_id','rejected_reason',
+    'address1','address2','city','state','postal_code','country_code',
+    'sales_tax_id','sales_tax_state','fein'];
   const sets = [];
   const vals = [];
   for (const [k, v] of Object.entries(fields)) {
@@ -861,6 +986,25 @@ export function getOrderHistory(orderGid) {
 
 // ── Phase 24: Cache helpers ────────────────────────────────────────────────────
 
+// WHAT: coerce a caller-supplied list limit to a sane positive integer, falling back to the default.
+// INVARIANT(S): never returns 0/NaN/negative (that would make LIMIT limit+1 return a single row and
+// report every list as truncated); hard ceiling keeps a hostile ?limit= from scanning the cache.
+const LIST_LIMIT_MAX = 5000;
+function normalizeListLimit(value, fallback) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 1) return fallback;
+  return Math.min(Math.floor(n), LIST_LIMIT_MAX);
+}
+
+// WHAT: attach the truncation signal to a returned row array without changing its shape.
+// DEPENDS: server.mjs getOrdersData/getCustomersData read `.truncated` off these arrays to decide
+// whether the list page prints "showing the first N" plus a warning banner.
+// INVARIANT(S): non-enumerable on purpose — map/filter/JSON.stringify consumers stay unaffected.
+function withTruncatedFlag(rows, truncated) {
+  Object.defineProperty(rows, 'truncated', { value: !!truncated, enumerable: false });
+  return rows;
+}
+
 export function upsertCustomerCache(c) {
   const tags = Array.isArray(c.tags) ? c.tags.join(',') : (c.tags || '');
   db.prepare(`
@@ -884,6 +1028,15 @@ export function getCustomerFromCache(shopifyId) {
   return db.prepare('SELECT * FROM customers_cache WHERE shopify_id = ?').get(shopifyId) || null;
 }
 
+// WHAT: cache-backed customer list feeding /customers (and the dashboard Xero review queue).
+// CHANGE-GUARD: the page size now comes from filters.limit (default CUSTOMERS_LIST_LIMIT) and the
+// query fetches limit+1 so the caller can tell "exactly a full page" from "there is more". The
+// returned array carries a non-enumerable `truncated` boolean — server.mjs reads it to render the
+// "showing the first N" footer instead of printing the row count as a complete total.
+// NOTE: filters.limit used to be accepted-and-ignored (getCustomersPendingXeroReview passes 999),
+// so that caller silently saw only 100 B2B customers; it now gets what it asked for.
+// INVARIANT(S): return value is still a plain Array of the same row shape — `truncated` is extra,
+// non-enumerable, and invisible to JSON.stringify/map/filter consumers.
 export function listCustomersFromCache(filters = {}) {
   const where = [];
   const params = [];
@@ -902,10 +1055,14 @@ export function listCustomersFromCache(filters = {}) {
   let orderBy = 'amount_spent_total DESC';
   if (filters.sort === 'name_asc') orderBy = 'display_name ASC';
   else if (filters.sort === 'orders_desc') orderBy = 'orders_count DESC';
-  const sql = `SELECT * FROM customers_cache ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY ${orderBy} LIMIT 100`;
-  const rows = db.prepare(sql).all(...params);
+  const limit = normalizeListLimit(filters.limit, CUSTOMERS_LIST_LIMIT);
+  // fetch limit+1: the extra row is never returned, it only proves more rows exist
+  const sql = `SELECT * FROM customers_cache ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY ${orderBy} LIMIT ${limit + 1}`;
+  const all = db.prepare(sql).all(...params);
+  const truncated = all.length > limit;
+  const rows = truncated ? all.slice(0, limit) : all;
   // Map to the shape getCustomersData returns (matching live Shopify GraphQL response)
-  return rows.map(r => ({
+  return withTruncatedFlag(rows.map(r => ({
     id: r.gid,
     displayName: (r.company && r.company.trim()) ? r.company.trim() : r.display_name,
     personalName: r.display_name,
@@ -919,11 +1076,15 @@ export function listCustomersFromCache(filters = {}) {
     metafields: { edges: [] },
     _fromCache: true,
     _syncedAt: r.synced_at,
-  }));
+  })), truncated);
 }
 
 // WHAT: B2B-only order list (joins customers_cache where is_b2b=1) with q/status/date filters, feeding the /orders page and CSV.
-// CHANGE-GUARD: LIMIT 200 is hardcoded with no offset/cursor — beyond 200 matching orders are silently dropped and getOrdersData reports hasNextPage:false (see bugs[]); re-test filter SQL after any status-enum change.
+// CHANGE-GUARD: there is still no offset/cursor on the cache path — the page size is ORDERS_LIST_LIMIT
+// (overridable via filters.limit) and the query fetches limit+1 so overflow is DETECTED: the returned
+// array carries a non-enumerable `truncated` flag that server.mjs turns into a "showing the first N"
+// footer + warning banner. Dropped rows are now visible to the user, not silent; re-test filter SQL
+// after any status-enum change.
 // INVARIANT(S): the is_b2b=1 join is the B2B scoping guarantee — never widen it without an explicit segment flag; status buckets must mirror FINANCIAL_STATUS_FILTER in server.mjs; q is parameterized (no injection) but the LIKE has no escaping of %/_ .
 export function listOrdersFromCache(filters = {}) {
   // Phase 24D: B2B-only — joins customers_cache where is_b2b=1
@@ -953,13 +1114,17 @@ export function listOrdersFromCache(filters = {}) {
       params.push(cutoff);
     }
   }
+  const limit = normalizeListLimit(filters.limit, ORDERS_LIST_LIMIT);
+  // fetch limit+1: the extra row is never returned, it only proves more rows exist
   const sql = `SELECT o.*, c.display_name AS customer_display_name, c.email AS customer_email_cached, c.company AS customer_company
                FROM orders_cache o
                JOIN customers_cache c ON o.customer_shopify_id = c.shopify_id
                WHERE ${where.join(' AND ')}
-               ORDER BY o.created_at DESC LIMIT 200`;
-  const rows = db.prepare(sql).all(...params);
-  return rows.map(r => ({
+               ORDER BY o.created_at DESC LIMIT ${limit + 1}`;
+  const all = db.prepare(sql).all(...params);
+  const truncated = all.length > limit;
+  const rows = truncated ? all.slice(0, limit) : all;
+  return withTruncatedFlag(rows.map(r => ({
     id: r.gid,
     name: r.name,
     processedAt: new Date(r.processed_at || r.created_at).toISOString(),
@@ -985,7 +1150,7 @@ export function listOrdersFromCache(filters = {}) {
     tags: (r.tags || '').split(',').filter(Boolean),
     lineItems: { edges: [] },
     _fromCache: true,
-  }));
+  })), truncated);
 }
 
 export function getOrdersCacheStats() {
