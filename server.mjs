@@ -10500,16 +10500,27 @@ const LEAD_STATUSES = {
 // WHAT: the allowed lead state-machine edges — maps each status to the set of statuses it may move to.
 // CHANGE-GUARD: POST /leads/:id/status enforces membership here (rejects with flash=invalid_status otherwise); 'approved'->'converted' is the ONLY path that reaches the convert flow, so removing it disables conversion. Terminal states map to [].
 // INVARIANT(S): every key and every target must be a valid LEAD_STATUSES key; the machine is the single source of truth for legal transitions (the UI dropdown is built from it).
+// 2026-08-11 (Alex): 'approved' is reachable DIRECTLY from `new` and from every waiting_* state.
+//   Review is still available, it is just no longer compulsory. Two reasons it was in the way:
+//   - a known-good lead (someone Alex already deals with) needed two clicks to approve, purely to
+//     satisfy a workflow step nobody was actually performing;
+//   - the waiting_* states funnelled back through under_review, so when the W9 you were waiting on
+//     finally arrived you had to bounce through 'Under Review' before approving. That extra hop
+//     described the tool's model, not the business's.
+// Nothing is removed: under_review, the waiting_* states, dormant and rejected all still work.
+// CHANGE-GUARD: 'approved' -> 'converted' remains the ONLY path into the convert flow, and
+//   'approved' is what gates Send Portal Invite (POST /leads/:id/invite). So every edge added here
+//   is an edge into "this lead can now be given access" — do not add one from a terminal state.
 const LEAD_TRANSITIONS = {
-  new:                  ['under_review', 'rejected'],
+  new:                  ['under_review', 'approved', 'rejected'],
   under_review:         ['waiting_on_docs','waiting_on_sales_tax','waiting_on_w9','approved','rejected','dormant'],
-  waiting_on_docs:      ['under_review','dormant','rejected'],
-  waiting_on_sales_tax: ['under_review','dormant','rejected'],
-  waiting_on_w9:        ['under_review','dormant','rejected'],
+  waiting_on_docs:      ['under_review','approved','dormant','rejected'],
+  waiting_on_sales_tax: ['under_review','approved','dormant','rejected'],
+  waiting_on_w9:        ['under_review','approved','dormant','rejected'],
   approved:             ['converted','rejected'],
   converted:            [],
   rejected:             [],
-  dormant:              ['under_review','rejected'],
+  dormant:              ['under_review','approved','rejected'],
 };
 
 // WHAT: renders the leads index — a search box, per-status filter chips with live counts, and a table; overdue follow-ups render in text-danger.
