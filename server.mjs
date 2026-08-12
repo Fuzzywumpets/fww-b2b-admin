@@ -10708,7 +10708,10 @@ function renderLeadNew(session, { flash, prefill = {} }) {
 // WHAT: renders one lead — merged notes+status-history timeline (sorted by ts), a status-change form (options from LEAD_TRANSITIONS), an add-note form, a profile panel, and a follow-up editor; shows Convert button only when status==='approved'.
 // CHANGE-GUARD: timeline sort is `(a,b)=>a.ts-b.ts` over note.created_at and history.changed_at — both MUST be numeric epoch ms or the subtraction sorts wrongly (string timestamps would NaN-sort); transition <select> is built from LEAD_TRANSITIONS[lead.status].
 // INVARIANT(S): note bodies, author emails, websites and all lead fields are h()-escaped; the Convert link/button is gated on 'approved' here AND server-side in /leads/:id/convert (defense in depth).
-function renderLeadDetail(session, { lead, notes, history, flash }) {
+// `existingInvite` is the portal's invite row for this lead's email, or null. It is best-effort:
+// null also means "could not ask the portal", so it must never be treated as proof that no invite
+// exists — it only ever DOWNGRADES the UI from a button to a badge, never unlocks anything.
+function renderLeadDetail(session, { lead, notes, history, flash, existingInvite = null }) {
   const st = LEAD_STATUSES[lead.status] || { label: lead.status, color: 'muted' };
   const transitions = LEAD_TRANSITIONS[lead.status] || [];
   const flashHtml = flash ? `<div class="alert alert-success">${h(flash)}</div>` : '';
@@ -10744,28 +10747,42 @@ function renderLeadDetail(session, { lead, notes, history, flash }) {
     return `<option value="${h(t)}">${h(ts2.label)}</option>`;
   }).join('');
 
-  const convertBtn = lead.status === 'approved'
-    ? `<a href="/leads/${lead.id}/convert" class="btn btn-primary">Convert to Customer</a>`
-    : '';
+  // ── Invite vs Convert: ALTERNATIVE routes to an account, NOT sequential steps ──────────────────
+  // THE NORMAL PATH IS INVITE. The Shopify customer is created at the END of onboarding, by the
+  // portal's POST /api/onboard/complete (customerCreate + tagsAdd 'b2b'), once the customer has set
+  // a password, filled in their profile and the agreement is signed. So:
+  //
+  //     approve  ->  Send Portal Invite  ->  they onboard  ->  Shopify customer created for them
+  //
+  // CONVERT IS THE EXCEPTION. /leads/:id/convert creates the Shopify customer immediately with no
+  // login, no password and no agreement — for a customer who will never use the portal and whose
+  // orders staff will key in themselves (phone, email, trade show).
+  //
+  // DO NOT DO BOTH. Converting first does not "prepare" anything for onboarding: it just means
+  // /api/onboard/complete finds the email already taken and falls back to reusing that customer
+  // record. The tell that someone has done both is a converted lead whose invite is still 'pending'.
+  // An earlier version of this file offered both buttons side by side and claimed "neither implies
+  // the other", which invited exactly that mistake.
+  // CHANGE-GUARD: both are gated on 'approved' SERVER-SIDE as well (see POST /leads/:id/invite and
+  //   /leads/:id/convert) — these are the visible halves, not the checks.
+  const canAct = lead.status === 'approved';
 
-  // WHAT: "Send Portal Invite" — emails this lead a one-time /onboard link so they can create their
-  //   OWN portal login (set a password, complete their profile, sign the agreement).
-  // WHY it lives here and not in the portal: the portal's own invite page sits behind Shopify
-  //   Customer Account OAuth and demands the 'b2b' customer tag, which no member of staff has — so
-  //   it was unreachable by the people who need it. This posts to the portal's bearer-gated
-  //   /__internal__/invites instead. See POST /leads/:id/invite below.
-  // CHANGE-GUARD: gated on 'approved' for the same reason as Convert — an invite is a real grant of
-  //   access, so it must not be reachable from a lead nobody has reviewed. The server route enforces
-  //   the same rule; this is the visible half, not the check.
-  // NOTE: Convert and Invite are DIFFERENT things and both can be wanted. Convert creates the
-  //   Shopify customer (so staff can order FOR them); Invite gives the customer their own login.
-  //   Neither implies the other, so both buttons show on an approved lead.
-  const inviteBtn = lead.status === 'approved'
-    ? `<form method="POST" action="/leads/${lead.id}/invite" style="display:inline"
-             onsubmit="return confirm('Email a portal invite to ${h(lead.email)}?\\n\\nThey will be able to set their own password and complete onboarding.')">
-         <button type="submit" class="btn btn-secondary">Send Portal Invite</button>
-       </form>`
-    : '';
+  const inviteBtn = !canAct ? ''
+    : existingInvite
+      ? `<span class="badge badge-muted" title="An invite already exists for ${h(lead.email)} — resend or revoke it from the portal.">Invited · ${h(existingInvite.status || 'pending')}</span>`
+      : `<form method="POST" action="/leads/${lead.id}/invite" style="display:inline"
+               onsubmit="return confirm('Email a portal invite to ${h(lead.email)}?\\n\\nThey set their own password and complete onboarding, and their Shopify customer account is created automatically at the end.')">
+           <button type="submit" class="btn btn-primary">Send Portal Invite</button>
+         </form>`;
+
+  // Convert is deliberately DEMOTED to a ghost button with an explicit warning, and its label says
+  // what it actually does. It used to be btn-primary sitting next to nothing else, which read as
+  // "this is the thing to click".
+  const convertBtn = !canAct ? ''
+    : `<a href="/leads/${lead.id}/convert" class="btn btn-ghost btn-sm"
+          title="Creates the Shopify customer NOW with no portal login. Only for customers who will not use the portal — an invited customer gets this automatically when they finish onboarding."
+          onclick="return confirm('Create the Shopify customer now, with NO portal login?\\n\\nThis is only for customers who will never use the portal.\\n\\nIf they are going to use it, send a Portal Invite instead — their account is created automatically when they finish onboarding.')"
+       >Create customer without portal access…</a>`;
 
   // WHAT: address completeness display (B2B-1/B2B-2, HANDOFF-2026-08-11). "Complete" here means
   //   enough to actually ship to: a street line, a city, and a postal code, PLUS a country (never
@@ -11097,7 +11114,7 @@ app.post('/leads/new', requireAuth, (req, res) => {
 // WHAT: GET /leads/:id — lead detail with notes + status history; 404s with a styled page when the id is unknown.
 // CHANGE-GUARD: :id is passed straight to getLead (must be parameterized in the DB layer to avoid injection); flash codes created|saved|status_changed map to messages here.
 // INVARIANT(S): read-only; notes and history are loaded by lead.id (the canonical id from getLead, not the raw param).
-app.get('/leads/:id', requireAuth, (req, res) => {
+app.get('/leads/:id', requireAuth, async (req, res) => {
   const lead = getLead(req.params.id);
   if (!lead) return res.status(404).send(layout({ title: '404', session: req.adminSession, activePath: '/leads',
     content: '<h1>Lead not found</h1><a href="/leads" class="btn btn-secondary">← Leads</a>' }));
@@ -11116,7 +11133,21 @@ app.get('/leads/:id', requireAuth, (req, res) => {
     invite_failed: 'Could not send the invite. The portal did not accept it — check the logs.',
   };
   const flash = FLASH_MESSAGES[req.query.flash] || null;
-  res.send(renderLeadDetail(req.adminSession, { lead, notes, history, flash }));
+
+  // WHAT: has this lead already been invited to the portal? Drives which of Invite / Convert the
+  //   page offers, because they are ALTERNATIVE routes to an account, not sequential steps.
+  // CHANGE-GUARD: best-effort by design — a portal outage or an unset B2B_PORTAL_INTERNAL_TOKEN
+  //   must degrade to "unknown" and still render the lead, never 500 the page. callPortalInternal
+  //   already fails closed to {ok:false}, so the ?. chain below is the whole error path.
+  let existingInvite = null;
+  try {
+    const r = await callPortalInternal('GET', '/__internal__/invites', null);
+    if (r.ok && Array.isArray(r.invites)) {
+      existingInvite = r.invites.find(i => (i.email || '').toLowerCase() === (lead.email || '').toLowerCase()) || null;
+    }
+  } catch (_) { /* unknown — the page still renders, both actions stay available */ }
+
+  res.send(renderLeadDetail(req.adminSession, { lead, notes, history, flash, existingInvite }));
 });
 
 // WHAT: GET /leads/:id/edit — renders the contact/address/tax editor, pre-filled from the lead.
