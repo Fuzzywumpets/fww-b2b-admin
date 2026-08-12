@@ -10737,6 +10737,25 @@ function renderLeadDetail(session, { lead, notes, history, flash }) {
     ? `<a href="/leads/${lead.id}/convert" class="btn btn-primary">Convert to Customer</a>`
     : '';
 
+  // WHAT: "Send Portal Invite" — emails this lead a one-time /onboard link so they can create their
+  //   OWN portal login (set a password, complete their profile, sign the agreement).
+  // WHY it lives here and not in the portal: the portal's own invite page sits behind Shopify
+  //   Customer Account OAuth and demands the 'b2b' customer tag, which no member of staff has — so
+  //   it was unreachable by the people who need it. This posts to the portal's bearer-gated
+  //   /__internal__/invites instead. See POST /leads/:id/invite below.
+  // CHANGE-GUARD: gated on 'approved' for the same reason as Convert — an invite is a real grant of
+  //   access, so it must not be reachable from a lead nobody has reviewed. The server route enforces
+  //   the same rule; this is the visible half, not the check.
+  // NOTE: Convert and Invite are DIFFERENT things and both can be wanted. Convert creates the
+  //   Shopify customer (so staff can order FOR them); Invite gives the customer their own login.
+  //   Neither implies the other, so both buttons show on an approved lead.
+  const inviteBtn = lead.status === 'approved'
+    ? `<form method="POST" action="/leads/${lead.id}/invite" style="display:inline"
+             onsubmit="return confirm('Email a portal invite to ${h(lead.email)}?\\n\\nThey will be able to set their own password and complete onboarding.')">
+         <button type="submit" class="btn btn-secondary">Send Portal Invite</button>
+       </form>`
+    : '';
+
   // WHAT: address completeness display (B2B-1/B2B-2, HANDOFF-2026-08-11). "Complete" here means
   //   enough to actually ship to: a street line, a city, and a postal code, PLUS a country (never
   //   assumed — see validateLeadInput). Anything short of that reads as "Address incomplete" so
@@ -10806,6 +10825,7 @@ function renderLeadDetail(session, { lead, notes, history, flash }) {
       </div>
       <div class="detail-header-actions">
         <a href="/leads/${lead.id}/edit" class="btn btn-secondary">Edit</a>
+        ${inviteBtn}
         ${convertBtn}
       </div>
     </div>
@@ -11072,7 +11092,19 @@ app.get('/leads/:id', requireAuth, (req, res) => {
     content: '<h1>Lead not found</h1><a href="/leads" class="btn btn-secondary">← Leads</a>' }));
   const notes   = getLeadNotes(lead.id);
   const history = getLeadStatusHistory(lead.id);
-  const flash   = req.query.flash === 'created' ? 'Lead created.' : req.query.flash === 'saved' ? 'Saved.' : req.query.flash === 'status_changed' ? 'Status updated.' : null;
+  // SYNC: every flash code set by a /leads/:id/* route must have a message here, or the redirect
+  //   lands silently and the operator cannot tell whether the action worked. The invite codes are
+  //   set by POST /leads/:id/invite.
+  const FLASH_MESSAGES = {
+    created: 'Lead created.',
+    saved: 'Saved.',
+    status_changed: 'Status updated.',
+    invited: 'Portal invite emailed. The link expires in 14 days.',
+    invite_duplicate: 'No invite sent — this email already has a live invite or a portal login.',
+    invite_not_approved: 'Approve the lead before sending a portal invite.',
+    invite_failed: 'Could not send the invite. The portal did not accept it — check the logs.',
+  };
+  const flash = FLASH_MESSAGES[req.query.flash] || null;
   res.send(renderLeadDetail(req.adminSession, { lead, notes, history, flash }));
 });
 
@@ -11159,6 +11191,50 @@ app.get('/leads/:id/tax-doc', requireAuth, async (req, res) => {
 // WHAT: POST /leads/:id/status — transitions a lead, recording status history, a system note, and an audit entry.
 // CHANGE-GUARD: this is a read-modify-write (getLead then updateLead) with NO transaction/lock (see bugs[]) — two concurrent status changes can interleave and the audit `from` may not match the actual prior state; the transition is validated against LEAD_TRANSITIONS[lead.status] and rejected with flash=invalid_status if illegal.
 // INVARIANT(S): an illegal transition makes zero writes; a legal one writes history + a 'system' note + updateLead atomically-enough only if the DB serializes them; every change is auditLog'd lead:status with from/to.
+// WHAT: emails an approved lead a one-time /onboard link so they can create their own portal login.
+//   Proxies to the portal's bearer-gated POST /__internal__/invites via callPortalInternal.
+// WHY here: the portal's own invite page is behind Shopify Customer Account OAuth and requires the
+//   'b2b' CUSTOMER tag, which no member of staff has — it was unreachable by the people who need it.
+//   b2badmin authenticates staff via Google, so the action belongs here and the portal keeps owning
+//   the invite logic (token minting, expiry, the duplicate-invite guards).
+// CHANGE-GUARD: gated on lead.status === 'approved' — an invite is a real grant of access, so it
+//   must not be reachable from an unreviewed lead. This is the enforcing half; the button in
+//   renderLeadDetail is only the visible half. `invitedBy` is the logged-in operator's Google email
+//   and the portal REQUIRES it, so the audit trail on both sides names a human, not the tool.
+// INVARIANT(S): every outcome redirects back to the lead with a flash code (never a bare JSON error
+//   page); a 409 from the portal means an invite or login already exists and is reported as such,
+//   not as a generic failure; the invite is also recorded as a lead note so the timeline shows it.
+app.post('/leads/:id/invite', requireAuth, async (req, res) => {
+  const lead = getLead(req.params.id);
+  if (!lead) return res.redirect('/leads');
+  if (lead.status !== 'approved') return res.redirect(`/leads/${lead.id}?flash=invite_not_approved`);
+
+  const r = await callPortalInternal('POST', '/__internal__/invites', {
+    email: lead.email,
+    businessName: lead.business_name,
+    contactName: lead.contact_name,
+    phone: lead.phone,
+    website: lead.website,
+    state: lead.sales_tax_state,
+    invitedBy: req.adminSession.email,
+  });
+
+  if (r.ok) {
+    addLeadNote(lead.id, req.adminSession.email,
+      `Portal invite emailed to ${lead.email}. They can now set their own password and complete onboarding. Link expires in 14 days.`,
+      'system');
+    auditLog(req.adminSession.email, 'lead:invite', String(lead.id), null, { email: lead.email });
+    return res.redirect(`/leads/${lead.id}?flash=invited`);
+  }
+  // 409 = an invite or a portal login already exists for this email. That is a normal, expected
+  // outcome (someone already invited them), not an error worth alarming about — say so plainly.
+  if (r.error && /already exists|already has portal login/i.test(String(r.error))) {
+    return res.redirect(`/leads/${lead.id}?flash=invite_duplicate`);
+  }
+  console.warn(`[leads] invite failed for lead ${lead.id}: ${r.error || 'unknown'}`);
+  return res.redirect(`/leads/${lead.id}?flash=invite_failed`);
+});
+
 app.post('/leads/:id/status', requireAuth, (req, res) => {
   const lead = getLead(req.params.id);
   if (!lead) return res.redirect('/leads');

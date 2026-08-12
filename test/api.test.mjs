@@ -2205,6 +2205,50 @@ await test('GET /leads/:id → lead detail renders', async () => {
   assert.ok(html.includes('Change Status') || html.includes('Add Note'), 'Action sections missing');
 });
 
+// The Send Portal Invite action. The HAPPY path needs a live portal (this proxies to its
+// bearer-gated /__internal__/invites), so what is covered here is everything that can break WITHOUT
+// one: the approval gate, and that a portal outage degrades to a readable message instead of a
+// stack trace. In MOCK there is no PORTAL_INTERNAL_TOKEN, so callPortalInternal fails closed —
+// which makes this an accidental but genuine portal-down test.
+await test('SECURITY: POST /leads/:id/invite refuses a lead that is not approved', async () => {
+  const cookie = await seedSession();
+  const email  = `invite-gate-${Date.now()}@example.com`;
+  const createRes = await fetch(`${BASE}/leads/new`, {
+    method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ email, business_name: 'Invite Gate Co' }).toString(), redirect: 'manual',
+  });
+  const leadId = (createRes.headers.get('location') || '').split('/leads/')[1]?.replace('?flash=created', '');
+  // Lead is 'new', not 'approved' — an invite is a real grant of access and must not be reachable.
+  const r = await fetch(`${BASE}/leads/${leadId}/invite`, {
+    method: 'POST', headers: { Cookie: cookie }, redirect: 'manual',
+  });
+  assert.equal(r.status, 302, 'should redirect, not error');
+  const loc = r.headers.get('location') || '';
+  assert(loc.includes('flash=invite_not_approved'), `must report the approval gate, got ${loc}`);
+});
+
+await test('POST /leads/:id/invite degrades readably when the portal is unreachable', async () => {
+  const cookie = await seedSession();
+  const email  = `invite-down-${Date.now()}@example.com`;
+  const createRes = await fetch(`${BASE}/leads/new`, {
+    method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ email, business_name: 'Invite Down Co' }).toString(), redirect: 'manual',
+  });
+  const leadId = (createRes.headers.get('location') || '').split('/leads/')[1]?.replace('?flash=created', '');
+  for (const s of ['under_review', 'approved']) {
+    await fetch(`${BASE}/leads/${leadId}/status`, {
+      method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ new_status: s }).toString(), redirect: 'manual',
+    });
+  }
+  const r = await fetch(`${BASE}/leads/${leadId}/invite`, {
+    method: 'POST', headers: { Cookie: cookie }, redirect: 'manual',
+  });
+  assert.equal(r.status, 302, 'a portal outage must not 500 the admin UI');
+  const loc = r.headers.get('location') || '';
+  assert(/flash=invite_failed/.test(loc), `must land on a readable failure flash, got ${loc}`);
+});
+
 await test('POST /leads/:id/status → changes status correctly', async () => {
   const cookie = await seedSession();
   const email  = `status-lead-${Date.now()}@example.com`;
