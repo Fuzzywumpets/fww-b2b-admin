@@ -587,20 +587,37 @@ const US_STATE_CODES = new Set([
   'ME','MD','MA','MI','MN','MS','MO','MT','NE','NV','NH','NJ','NM','NY','NC','ND','OH','OK','OR',
   'PA','RI','SC','SD','TN','TX','UT','VT','VA','WA','WV','WI','WY',
 ]);
+// Parses BOTH shapes the portal's single free-text `address` column can hold, because the storefront
+// form changed underneath it:
+//   OLD  "Downers Grove, IL 60516"                     — one box labelled "City/State/Zip"
+//   NEW  "5734 Woodward Ave, Downers Grove, IL 60516"  — Street/City/State/ZIP composed by the form
+// CHANGE-GUARD: the first version only understood the OLD shape and used a lazy `^(.+?),` for the
+//   city. Against the NEW shape that swallowed the STREET into the city — a real lead landed with
+//   city="5734 Woodward Ave, Downers Grove" and an empty address1, which then also tripped the
+//   "address incomplete" badge. Split from the RIGHT: the last segment is the state+zip, the one
+//   before it is the city, and anything earlier is street. Do not reintroduce a leading lazy match.
+// INVARIANT(S): pure, no I/O. Returns nulls for anything it cannot identify with confidence — a
+//   segment only counts as the state when it is a REAL US state code, never just "two letters".
+//   country_code is 'US' ONLY when a valid US state was actually found; it is never assumed.
 function parsePortalAddress(raw) {
+  const empty = { address1: null, city: null, state: null, postal_code: null, country_code: null };
   const s = String(raw || '').trim();
-  if (!s) return { city: null, state: null, postal_code: null };
-  // "City, ST 12345" or "City, ST 12345-6789"
-  let m = s.match(/^(.+?),\s*([A-Za-z]{2})\s+(\d{5}(?:-\d{4})?)$/);
-  if (m && US_STATE_CODES.has(m[2].toUpperCase())) {
-    return { city: m[1].trim(), state: m[2].toUpperCase(), postal_code: m[3] };
-  }
-  // "City, ST" with no zip
-  m = s.match(/^(.+?),\s*([A-Za-z]{2})$/);
-  if (m && US_STATE_CODES.has(m[2].toUpperCase())) {
-    return { city: m[1].trim(), state: m[2].toUpperCase(), postal_code: null };
-  }
-  return { city: null, state: null, postal_code: null };
+  if (!s) return empty;
+
+  const parts = s.split(',').map(p => p.trim()).filter(Boolean);
+  if (parts.length < 2) return empty;
+
+  // Last segment: "IL 60516" | "IL 60516-1234" | "IL"
+  const tail = parts[parts.length - 1];
+  const m = tail.match(/^([A-Za-z]{2})(?:\s+(\d{5}(?:-\d{4})?))?$/);
+  if (!m || !US_STATE_CODES.has(m[1].toUpperCase())) return empty;
+
+  const state = m[1].toUpperCase();
+  const postal_code = m[2] || null;
+  const city = parts[parts.length - 2] || null;
+  const address1 = parts.length > 2 ? parts.slice(0, -2).join(', ') : null;
+
+  return { address1, city, state, postal_code, country_code: 'US' };
 }
 
 // WHAT: ingests ONE portal wholesale_leads row into this app's `leads` table, idempotently.
@@ -665,15 +682,21 @@ export function upsertPortalLead(row) {
   const info = db.prepare(`
     INSERT INTO leads (email, business_name, contact_name, phone, website,
       sales_tax_state, sales_tax_id, fein, source, source_detail,
-      city, state, postal_code,
+      address1, city, state, postal_code, country_code,
       application_data_json, portal_lead_id, status, created_at, updated_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'wholesale_form', 'fuzzywumpets.com/pages/wholesale-1',
-      ?, ?, ?, ?, ?, 'new', ?, ?)
+      ?, ?, ?, ?, ?, ?, ?, 'new', ?, ?)
   `).run(
     row.email, row.business_name || null, row.contact_name || null,
     row.phone || null, row.website || null,
+    // NOTE: sales_tax_state comes from the portal's `state` column, which is the BUSINESS's
+    // location, not where a resale certificate is registered. Those are different things — the
+    // application does not ask for a tax-registration state at all, so this is frequently empty
+    // and should not be presented as if the applicant supplied it. Tracked as discrepancy D2.
     row.state || null, row.tax_id || null, row.fein || null,
-    parsedAddr.city, parsedAddr.state, parsedAddr.postal_code,
+    // address1 + country_code added 2026-08-16: the parser previously returned neither, so the
+    // street was lost and every ingested lead showed "address incomplete" forever.
+    parsedAddr.address1, parsedAddr.city, parsedAddr.state, parsedAddr.postal_code, parsedAddr.country_code,
     applicationJson, row.id,
     row.submitted_at || now, now
   );

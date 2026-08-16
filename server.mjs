@@ -10987,7 +10987,7 @@ function renderLeadEdit(session, { lead, flash }) {
           <label>City</label>
           <input type="text" name="city" value="${h(lead.city||'')}" class="input">
           <label>State / province</label>
-          <input type="text" name="state" value="${h(lead.state||'')}" class="input" placeholder="TX">
+          <input type="text" name="state" value="${h(lead.state||'')}" class="input" placeholder="2-letter code" maxlength="2" autocapitalize="characters">
           <label>Postal code</label>
           <input type="text" name="postal_code" value="${h(lead.postal_code||'')}" class="input">
           <label>Country</label>
@@ -11000,7 +11000,8 @@ function renderLeadEdit(session, { lead, flash }) {
           <label>Resale tax ID</label>
           <input type="text" name="sales_tax_id" value="${h(lead.sales_tax_id||'')}" class="input">
           <label>Tax-registration state</label>
-          <input type="text" name="sales_tax_state" value="${h(lead.sales_tax_state||'')}" class="input" placeholder="TX">
+          <input type="text" name="sales_tax_state" value="${h(lead.sales_tax_state||'')}" class="input"
+                 placeholder="Not asked on the application — add if you know it" maxlength="2" autocapitalize="characters">
           <label>FEIN</label>
           <input type="text" name="fein" value="${h(lead.fein||'')}" class="input" placeholder="12-3456789">
         </div>
