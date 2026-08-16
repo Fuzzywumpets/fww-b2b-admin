@@ -798,10 +798,17 @@ body {
 .kv-row {
   display: flex;
   justify-content: space-between;
+  /* gap is load-bearing, not decoration: space-between only separates label and value while there
+     is slack. A long value (a source URL, a multi-line address) consumes it and the two then touch,
+     which rendered as "Sourcewholesale_form" and "Address5734 Woodward Ave" on the lead page. */
+  gap: 1.25rem;
   font-size: 0.875rem;
   color: var(--gray-600, #4B5563);
 }
-.kv-row strong { font-weight: 600; color: var(--gray-900); }
+/* Label holds its width; the value takes the slack and wraps within its own column. min-width:0 is
+   required or a long unbroken token (a URL) refuses to wrap and pushes the label off. */
+.kv-row > span:first-child { flex: 0 0 auto; }
+.kv-row strong { font-weight: 600; color: var(--gray-900); text-align: right; min-width: 0; overflow-wrap: anywhere; }
 
 /* ── Toggle ── */
 .toggle-row {

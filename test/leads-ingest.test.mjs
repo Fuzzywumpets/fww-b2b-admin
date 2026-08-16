@@ -238,5 +238,55 @@ await test('createLead accepts the address + tax fields directly (a manually-cre
   assertEqual(lead.sales_tax_id, 'TX-1');
 });
 
+// REGRESSION (2026-08-16): the storefront form was changed to compose "street, city, ST zip" into
+// the portal's single free-text `address` column, but parsePortalAddress still assumed the older
+// "City, ST zip". Its lazy `^(.+?),` swallowed the STREET into the city — a real submission landed
+// as city="5734 Woodward Ave, Downers Grove" with an empty address1, which then also tripped the
+// permanent "address incomplete" badge. Both shapes must parse, and the parser must refuse to guess.
+console.log('\n── Unit: portal address parsing (both storefront shapes) ──');
+
+await test('NEW shape: street is separated from city, not swallowed by it', async () => {
+  await upsertPortalLead({
+    id: 9101, email: 'addr-new@example.test', business_name: 'Addr New', contact_name: 'A N',
+    address: '5734 Woodward Ave, Downers Grove, IL 60516', submitted_at: Date.now(),
+  });
+  const lead = getLeads({ search: 'addr-new@example.test' })[0];
+  assertEqual(lead.address1, '5734 Woodward Ave');
+  assertEqual(lead.city, 'Downers Grove');
+  assertEqual(lead.state, 'IL');
+  assertEqual(lead.postal_code, '60516');
+  assertEqual(lead.country_code, 'US');
+});
+
+await test('OLD shape still parses (city/state/zip with no street)', async () => {
+  await upsertPortalLead({
+    id: 9102, email: 'addr-old@example.test', business_name: 'Addr Old', contact_name: 'A O',
+    address: 'Austin, TX 78701', submitted_at: Date.now(),
+  });
+  const lead = getLeads({ search: 'addr-old@example.test' })[0];
+  assertEqual(lead.address1, null);
+  assertEqual(lead.city, 'Austin');
+  assertEqual(lead.state, 'TX');
+  assertEqual(lead.postal_code, '78701');
+});
+
+await test('refuses to guess: a street with no city/state, and a non-US address', async () => {
+  await upsertPortalLead({
+    id: 9103, email: 'addr-partial@example.test', business_name: 'Addr Partial', contact_name: 'A P',
+    address: '604 Vengeance Creek Road', submitted_at: Date.now(),
+  });
+  const partial = getLeads({ search: 'addr-partial@example.test' })[0];
+  assertEqual(partial.city, null, 'a street alone must not be recorded as a city');
+  assertEqual(partial.country_code, null, 'country must never be assumed');
+
+  await upsertPortalLead({
+    id: 9104, email: 'addr-intl@example.test', business_name: 'Addr Intl', contact_name: 'A I',
+    address: 'Toronto, ON M5H 2N2', submitted_at: Date.now(),
+  });
+  const intl = getLeads({ search: 'addr-intl@example.test' })[0];
+  assertEqual(intl.country_code, null, 'ON is not a US state — must not be stamped US');
+  assertEqual(intl.state, null);
+});
+
 console.log(`\n  ${passed} passed, ${failed} failed`);
 process.exit(failed === 0 ? 0 : 1);
