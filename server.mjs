@@ -10867,10 +10867,6 @@ function renderLeadDetail(session, { lead, notes, history, flash, existingInvite
               <label class="field-label">New status</label>
               <select name="new_status" class="input input-sm">${transitionOpts}</select>
             </div>
-            <div style="flex:1;min-width:160px">
-              <label class="field-label">Note (optional)</label>
-              <input type="text" name="note" class="input input-sm" placeholder="Reason or context…">
-            </div>
             <button type="submit" class="btn btn-secondary btn-sm">Update</button>
           </form>
         </div>` : ''}
@@ -11128,7 +11124,9 @@ app.get('/leads/:id', requireAuth, async (req, res) => {
     created: 'Lead created.',
     saved: 'Saved.',
     status_changed: 'Status updated.',
-    invited: 'Portal invite emailed. The link expires in 14 days.',
+    // Deliberately does NOT say "emailed" — nothing drains the portal's email_queue, so claiming
+    // delivery would be a lie the operator only discovers when the customer never turns up.
+    invited: 'Invite created — the link is in the timeline below. Send it to them yourself; automated email is not running yet.',
     invite_duplicate: 'No invite sent — this email already has a live invite or a portal login.',
     invite_not_approved: 'Approve the lead before sending a portal invite.',
     invite_failed: 'Could not send the invite. The portal did not accept it — check the logs.',
@@ -11263,8 +11261,17 @@ app.post('/leads/:id/invite', requireAuth, async (req, res) => {
   });
 
   if (r.ok) {
+    // RECORD THE LINK, do not just say "emailed". The portal writes the invite email into its
+    // email_queue table — and nothing drains that queue: no worker, no timer, no cron, and the
+    // function that marks a row sent is never called. Every row since May 2026 still has a null
+    // sent_at. So an invite is CREATED and the recipient is told nothing.
+    // Until a real sender exists, the working path is for staff to send this link themselves, so it
+    // goes in the timeline where they can copy it. The token is single-use and expires in 14 days;
+    // treat this note as sensitive for that window.
+    // CHANGE-GUARD: when the queue gains a real sender, change this copy back to "emailed" — but
+    //   do not remove the link until delivery has actually been observed end to end.
     addLeadNote(lead.id, req.adminSession.email,
-      `Portal invite emailed to ${lead.email}. They can now set their own password and complete onboarding. Link expires in 14 days.`,
+      `Portal invite created for ${lead.email}. Automated delivery is NOT running, so send this link to them yourself — it is single-use and expires in 14 days:\n\n${r.inviteUrl || '(link missing from the portal response)'}`,
       'system');
     auditLog(req.adminSession.email, 'lead:invite', String(lead.id), null, { email: lead.email });
     return res.redirect(`/leads/${lead.id}?flash=invited`);
@@ -11284,9 +11291,13 @@ app.post('/leads/:id/status', requireAuth, (req, res) => {
   const newStatus = req.body.new_status;
   const allowed = LEAD_TRANSITIONS[lead.status] || [];
   if (!allowed.includes(newStatus)) return res.redirect('/leads/' + lead.id + '?flash=invalid_status');
-  const note = String(req.body.note || '').trim();
-  addLeadStatusHistory(lead.id, lead.status, newStatus, note || null, req.adminSession.email);
-  addLeadNote(lead.id, req.adminSession.email, `Status changed to ${LEAD_STATUSES[newStatus]?.label || newStatus}${note ? ': ' + note : ''}`, 'system');
+  // The status form no longer carries a note (owner decision, 2026-08-16): two note boxes on one
+  // page with no stated difference was confusing, and the status one also wrote its text TWICE —
+  // once into lead_status_history and again as a 'system' lead note — which the merged timeline
+  // then rendered as two entries for a single status change. The Add Note box below the timeline
+  // remains the one place to write a note. Do NOT re-add a note field here without also removing
+  // one of those two writes.
+  addLeadStatusHistory(lead.id, lead.status, newStatus, null, req.adminSession.email);
   updateLead(lead.id, { status: newStatus });
   auditLog(req.adminSession.email, 'lead:status', String(lead.id), lead.status, newStatus);
   res.redirect('/leads/' + lead.id + '?flash=status_changed');
