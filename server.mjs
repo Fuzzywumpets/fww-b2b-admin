@@ -2528,8 +2528,13 @@ function renderOrderDetail(session, order, flash, flashMsg) {
     ? `<div class="alert alert-success">Xero payment recorded.</div>`
     : flash === 'xero_failed'
     ? `<div class="alert alert-warning">Xero sync failed — queued for retry. Check /accounting.</div>`
+    // "Partial invoice" was a lie: the fulfilled-only scope has been rejected server-side since
+    // 2026-08-05, so every invoice this app issues bills the whole order. Invoices are named by
+    // their ORDER NUMBER, not by a scope they do not have (alexa 2026-08-17). The flash KEY stays
+    // `partial_invoice_created` — it is set by redirects elsewhere and renaming it would silently
+    // drop the banner for any in-flight redirect.
     : flash === 'partial_invoice_created'
-    ? `<div class="alert alert-success">Partial invoice generated.</div>`
+    ? `<div class="alert alert-success">Invoice generated for ${h(order.name || ('#' + numId))}.</div>`
     : flash === 'order_canceled' ? `<div class="alert alert-success">Order canceled.</div>` : flash === 'cancel_failed' ? `<div class="alert alert-warning">Cancel failed: ${h(flashMsg || 'see logs')}</div>` : flash === 'edit_failed'
     ? `<div class="alert alert-warning">Order edit failed — nothing was saved. ${flashMsg ? h(flashMsg) : 'Check server logs.'}</div>`
     : flash === 'fulfillment_failed' || flash === 'discount_failed'
@@ -3971,7 +3976,13 @@ function renderOrderDetail(session, order, flash, flashMsg) {
             ${partialInvoices.map(inv => `
               <div class="kv-row" style="align-items:flex-start">
                 <span>
-                  <strong>#${h(String(order.name||numId))}-${h(inv.invoice_letter)}</strong>
+                  ${/* An invoice is identified by its ORDER NUMBER, nothing else (alexa 2026-08-17).
+                        order.name ALREADY carries the leading '#' ("#37637"), so prepending another
+                        one rendered "##37637-A". Use the same `order.name || ('#' + numId)` form as
+                        the invoice viewer rather than hardcoding a '#'.
+                        SYNC: the invoice viewer's orderLabel (GET /orders/:id/invoice) builds this
+                        same label — the two must agree or the list and the screen name it differently. */''}
+                  <strong>${h(order.name || ('#' + numId))}-${h(inv.invoice_letter)}</strong>
                   ${/* Every invoice this app has ever produced billed ALL line items — the old
                        `fulfilled_only` path was a no-op (see POST /orders/:id/partial-invoice). So a
                        stored type of 'fulfilled_only' does NOT mean the row was partial, and badging
