@@ -260,20 +260,35 @@ export async function generateInvoicePdf(order, opts = {}) {
       total = parseFloat(curTot ?? order.totalPriceSet?.presentmentMoney?.amount ?? 0) || 0;
     }
 
+    // WHAT: geometry for the totals block — every cell right-aligns to the same edge as the lime rule.
+    // WHY: the amount cells were a hardcoded 62pt wide. "$3,205.95" at 13pt Inter-Bold is wider than
+    //   that, so pdfkit WRAPPED the TOTAL mid-number and the invoice read "TOTAL $3,205.9 / 5"
+    //   (alexa 2026-08-17). 62pt only ever fit 4-figure-and-under amounts at the smaller subtotal size.
+    // CHANGE-GUARD: AMT_W must stay wide enough for the largest realistic total at the TOTAL font size
+    //   (13pt bold) — 100pt clears $999,999.99. `lineBreak: false` is the belt-and-braces half: it
+    //   makes an over-wide amount overflow leftward on ONE line instead of splitting the digits, which
+    //   is the failure that shipped. Keep both; widening alone is not a guarantee.
+    // SYNC: the lime rule below and all three rows share TOTALS_RIGHT — move one, move them all.
+    const TOTALS_RIGHT = 562;
+    const AMT_W   = 100;
+    const AMT_X   = TOTALS_RIGHT - AMT_W;
+    const LABEL_W = 100;
+    const LABEL_X = AMT_X - LABEL_W;
+
     doc.fontSize(10).font('Inter').fillColor(BLACK);
-    doc.text('Subtotal', 400, y, { width: 100, align: 'right' });
-    doc.text(fmt(sub), 500, y, { width: 62, align: 'right' });
+    doc.text('Subtotal', LABEL_X, y, { width: LABEL_W, align: 'right', lineBreak: false });
+    doc.text(fmt(sub), AMT_X, y, { width: AMT_W, align: 'right', lineBreak: false });
     y += 16;
     if (ship > 0) {
-      doc.text('Shipping', 400, y, { width: 100, align: 'right' });
-      doc.text(fmt(ship), 500, y, { width: 62, align: 'right' });
+      doc.text('Shipping', LABEL_X, y, { width: LABEL_W, align: 'right', lineBreak: false });
+      doc.text(fmt(ship), AMT_X, y, { width: AMT_W, align: 'right', lineBreak: false });
       y += 16;
     }
-    doc.moveTo(400, y + 2).lineTo(562, y + 2).lineWidth(1.5).strokeColor(LIME).stroke();
+    doc.moveTo(400, y + 2).lineTo(TOTALS_RIGHT, y + 2).lineWidth(1.5).strokeColor(LIME).stroke();
     y += 10;
     doc.fontSize(13).font('Inter-Bold').fillColor(BLACK);
-    doc.text('TOTAL', 400, y, { width: 100, align: 'right' });
-    doc.text(fmt(total), 500, y, { width: 62, align: 'right' });
+    doc.text('TOTAL', LABEL_X, y, { width: LABEL_W, align: 'right', lineBreak: false });
+    doc.text(fmt(total), AMT_X, y, { width: AMT_W, align: 'right', lineBreak: false });
 
     // ─── Payment terms (B2B-specific) ──────────────────────────────
     if (opts.paymentTerms) {

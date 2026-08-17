@@ -2,11 +2,12 @@
 
 const {
   app, BrowserWindow, ipcMain, Tray, Menu, nativeImage,
-  shell, dialog, nativeTheme,
+  shell, dialog, nativeTheme, session,
 } = require('electron');
 const { autoUpdater } = require('electron-updater');
 const Store = require('electron-store').default || require('electron-store');
 const path = require('path');
+const { pdfAttachmentHeaders } = require('./lib/pdf-headers');
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -101,11 +102,69 @@ function openPdfWindow(url) {
   return win;
 }
 
+// ─── Downloads ────────────────────────────────────────────────────────────────
+//
+// WHY: invoices were being saved out of this app with NO file extension at all
+//   (`C:\Users\AlexLass\Downloads\August invoice`), so Windows could not open them — reported
+//   2026-08-17. With no will-download handler, Electron shows a bare OS save dialog carrying no
+//   file-type filter, so a name typed by the user is written verbatim and the `.pdf` is lost.
+//   The server now serves ?download=1 as an attachment, but the embedded PDF viewer's own Save
+//   button bypasses that entirely, so the extension has to be guaranteed HERE too.
+
+// WHAT: guarantees a `.pdf` suffix on a suggested download filename.
+// INVARIANT(S): never returns an empty name — a blank suggestion is what let the OS dialog open
+//   with no name and no extension in the first place.
+function pdfFilename(name) {
+  const base = String(name || '').trim() || 'invoice';
+  return /\.pdf$/i.test(base) ? base : `${base}.pdf`;
+}
+
+// WHAT: forces every PDF saved from ANY window in the admin session to keep its .pdf extension.
+// CHANGE-GUARD: attaches to the 'persist:b2badmin' partition, which is shared by the main window
+//   AND every openPdfWindow() — if a window is ever given a different partition, this handler stops
+//   applying to it and extension-less saves come back. The `filters` entry is what makes Windows
+//   append `.pdf` when the user retypes the name; do not drop it and keep only defaultPath.
+function setupDownloadHandling() {
+  const ses = session.fromPartition('persist:b2badmin');
+
+  ses.on('will-download', (event, item) => {
+    const isPdf = item.getMimeType() === 'application/pdf'
+      || /\.pdf($|[?#])/i.test(item.getURL() || '');
+    if (!isPdf) return;
+    item.setSaveDialogOptions({
+      defaultPath: path.join(app.getPath('downloads'), pdfFilename(item.getFilename())),
+      filters: [{ name: 'PDF document', extensions: ['pdf'] }],
+    });
+  });
+
+  // WHAT: stops any PDF from taking over the MAIN window, decided by Content-Type rather than by
+  //   the URL. An inline PDF here becomes a download, so the window never navigates away.
+  // WHY: `isAdminPdfUrl` matches only URLs containing `.pdf`. POST /orders/:id/partial-invoice has
+  //   none, so it sailed past will-navigate and rendered IN the main window — which has no back
+  //   button and whose X quits the whole app (see mainWindow's close handler). alexa hit this twice.
+  //   The URL rule stays as the fast path for `.pdf` previews; this is the net under it.
+  // CHANGE-GUARD: the resourceType/webContentsId scoping is load-bearing. 'mainFrame' excludes the
+  //   invoice viewer's <iframe> and the webContentsId check excludes openPdfWindow — both MUST keep
+  //   rendering inline or PDF preview turns into a download loop. Widen this and you break preview.
+  ses.webRequest.onHeadersReceived((details, callback) => {
+    if (details.resourceType !== 'mainFrame') return callback({});
+    if (!mainWindow || mainWindow.isDestroyed()) return callback({});
+    if (details.webContentsId !== mainWindow.webContents.id) return callback({});
+
+    const rewritten = pdfAttachmentHeaders(details.responseHeaders);
+    if (!rewritten) return callback({});
+    callback({ responseHeaders: rewritten });
+  });
+}
+
 // ─── App lifecycle ────────────────────────────────────────────────────────────
 
 app.whenReady().then(() => {
   nativeTheme.themeSource = 'dark';
   buildAppMenu();
+  // DEPENDS: must run BEFORE createMainWindow() — the handler has to be attached to the partition
+  //   before any window can start a download in it.
+  setupDownloadHandling();
   createMainWindow();
   createTray();
   setupAutoUpdater();
@@ -134,6 +193,16 @@ function buildAppMenu() {
       label: 'File',
       submenu: [
         { label: 'Reload', accelerator: 'CmdOrCtrl+R', click: () => mainWindow?.reload() },
+        // Insurance, not the fix: the PDF guard in setupDownloadHandling should mean the main window
+        // never strands the user on a document. But this window has no browser chrome at all, so
+        // when something DOES go wrong "Home" was the only way out and it was not discoverable —
+        // alexa's report was "I cannot x out of it without killing the whole B2B shell". Alt+Left is
+        // the reflex people already have.
+        { label: 'Back', accelerator: 'Alt+Left', click: () => {
+          const wc = mainWindow?.webContents;
+          if (wc?.navigationHistory?.canGoBack()) wc.navigationHistory.goBack();
+          else mainWindow?.loadURL(ADMIN_URL);
+        } },
         { label: 'Home', click: () => mainWindow?.loadURL(ADMIN_URL) },
         { type: 'separator' },
         { label: 'Quit', accelerator: 'CmdOrCtrl+Q', click: () => { quitting = true; app.quit(); } },

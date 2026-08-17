@@ -228,6 +228,42 @@ await test('GET /orders/1001/invoice.pdf returns PDF content-type', async () => 
   assert.ok(res.headers.get('content-type')?.includes('application/pdf'));
 });
 
+// REGRESSION (2026-08-17): invoices were saving to disk with NO extension ("August invoice"), because
+// these routes only ever answered `inline` — the sole way to get the file was the embedded PDF
+// viewer's Save button, which in the Electron shell opens an untyped OS dialog. ?download=1 must
+// answer `attachment` with a .pdf filename so the file is written by the server's name, not the
+// user's. The default (no query) MUST stay inline or the invoice viewer's iframe downloads instead
+// of rendering.
+await test('REGRESSION: invoice.pdf?download=1 is an attachment with a .pdf filename', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/orders/1001/invoice.pdf?download=1`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  assert.ok(res.headers.get('content-type')?.includes('application/pdf'));
+  const cd = res.headers.get('content-disposition') || '';
+  assert.ok(cd.startsWith('attachment'), `expected attachment, got: ${cd}`);
+  assert.ok(/filename="[^"]+\.pdf"/.test(cd), `filename must end in .pdf, got: ${cd}`);
+});
+
+await test('REGRESSION: invoice.pdf without ?download stays inline (viewer iframe must render)', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/orders/1001/invoice.pdf`, { headers: { Cookie: cookie } });
+  const cd = res.headers.get('content-disposition') || '';
+  assert.ok(cd.startsWith('inline'), `expected inline, got: ${cd}`);
+  assert.ok(/filename="[^"]+\.pdf"/.test(cd), `filename must end in .pdf, got: ${cd}`);
+});
+
+// The invoice screen is where alexa actually clicks. It must offer a control that DOWNLOADS, not one
+// that only re-opens the viewer — that missing affordance is what forced the manual Save.
+await test('REGRESSION: the invoice screen offers a real download link (?download=1)', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/orders/1001/invoice`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  assert.ok(html.includes('/orders/1001/invoice.pdf?download=1'),
+    'invoice screen must link to the ?download=1 attachment route');
+  assert.ok(/Download PDF/i.test(html), 'invoice screen must show a Download PDF control');
+});
+
 // CURRENT-FIELDS (2026-06-29): invoice CSV must reflect post-edit line qtys + Line Totals (currentQuantity,
 // fallback frozen quantity) and DROP lines removed in an edit (currentQuantity 0). Fixture #1008 is edited:
 //   - li1008a partial: quantity 2 -> currentQuantity 1 @ $30  => qty col '1', Line Total '30.00'
@@ -3151,6 +3187,26 @@ await test('POST /orders/1001/partial-invoice with type=full → returns PDF', a
   });
   assert.equal(res.status, 200, `Expected 200, got ${res.status}`);
   assert.equal(res.headers.get('content-type'), 'application/pdf', 'Should return PDF');
+});
+
+// REGRESSION (2026-08-17): this route's URL has no `.pdf` in it, so serving the PDF `inline` made the
+// viewer name the document after the URL's last segment — the window was titled "partial-invoice" and
+// saving from it produced a file called `partial-invoice` with NO extension. This is the route the
+// "Generate PDF" button submits to, so it must always be an attachment with a .pdf filename.
+await test('REGRESSION: POST partial-invoice is an attachment with a .pdf filename (URL has no .pdf)', async () => {
+  const cookie = await seedSession();
+  const body = new URLSearchParams({ type: 'full', shipping_handling: 'none' });
+  const res = await fetch(`${BASE}/orders/1002/partial-invoice`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: body.toString(),
+  });
+  assert.equal(res.status, 200, `Expected 200, got ${res.status}`);
+  const cd = res.headers.get('content-disposition') || '';
+  assert.ok(cd.startsWith('attachment'), `must not be inline (that is what dropped the extension), got: ${cd}`);
+  assert.ok(/filename="[^"]+\.pdf"/.test(cd), `filename must end in .pdf, got: ${cd}`);
+  const head = Buffer.from(await res.arrayBuffer()).subarray(0, 5).toString();
+  assert.equal(head, '%PDF-', `body must be a real PDF, got: ${head}`);
 });
 
 // REGRESSION: this test previously asserted that type=fulfilled_only returned a PDF — which it did,

@@ -96,6 +96,13 @@ if [ -f test/leads-list.test.mjs ]; then
   B2B_ADMIN_MOCK=1 node test/leads-list.test.mjs || UNIT_FAIL=$?
 fi
 
+# Electron shell code — never runs inside the Express server, so the HTTP suites cannot reach it.
+# Guards the PDF-in-the-main-window trap (no back button; its X quits the whole app).
+if [ -f test/desktop-pdf-headers.test.mjs ]; then
+  echo ""
+  node test/desktop-pdf-headers.test.mjs || UNIT_FAIL=$?
+fi
+
 # The allowlist gate is pure logic over env, and it guards the WHOLE dashboard. It gets its own run
 # because the HTTP suite short-circuits Google OAuth entirely in MOCK and never exercises it.
 if [ -f test/admin-allowlist.test.mjs ]; then
