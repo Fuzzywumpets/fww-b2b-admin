@@ -7,6 +7,7 @@ const {
 const { autoUpdater } = require('electron-updater');
 const Store = require('electron-store').default || require('electron-store');
 const path = require('path');
+const { pdfAttachmentHeaders } = require('./lib/pdf-headers');
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -124,7 +125,9 @@ function pdfFilename(name) {
 //   applying to it and extension-less saves come back. The `filters` entry is what makes Windows
 //   append `.pdf` when the user retypes the name; do not drop it and keep only defaultPath.
 function setupDownloadHandling() {
-  session.fromPartition('persist:b2badmin').on('will-download', (event, item) => {
+  const ses = session.fromPartition('persist:b2badmin');
+
+  ses.on('will-download', (event, item) => {
     const isPdf = item.getMimeType() === 'application/pdf'
       || /\.pdf($|[?#])/i.test(item.getURL() || '');
     if (!isPdf) return;
@@ -132,6 +135,25 @@ function setupDownloadHandling() {
       defaultPath: path.join(app.getPath('downloads'), pdfFilename(item.getFilename())),
       filters: [{ name: 'PDF document', extensions: ['pdf'] }],
     });
+  });
+
+  // WHAT: stops any PDF from taking over the MAIN window, decided by Content-Type rather than by
+  //   the URL. An inline PDF here becomes a download, so the window never navigates away.
+  // WHY: `isAdminPdfUrl` matches only URLs containing `.pdf`. POST /orders/:id/partial-invoice has
+  //   none, so it sailed past will-navigate and rendered IN the main window — which has no back
+  //   button and whose X quits the whole app (see mainWindow's close handler). alexa hit this twice.
+  //   The URL rule stays as the fast path for `.pdf` previews; this is the net under it.
+  // CHANGE-GUARD: the resourceType/webContentsId scoping is load-bearing. 'mainFrame' excludes the
+  //   invoice viewer's <iframe> and the webContentsId check excludes openPdfWindow — both MUST keep
+  //   rendering inline or PDF preview turns into a download loop. Widen this and you break preview.
+  ses.webRequest.onHeadersReceived((details, callback) => {
+    if (details.resourceType !== 'mainFrame') return callback({});
+    if (!mainWindow || mainWindow.isDestroyed()) return callback({});
+    if (details.webContentsId !== mainWindow.webContents.id) return callback({});
+
+    const rewritten = pdfAttachmentHeaders(details.responseHeaders);
+    if (!rewritten) return callback({});
+    callback({ responseHeaders: rewritten });
   });
 }
 
@@ -171,6 +193,16 @@ function buildAppMenu() {
       label: 'File',
       submenu: [
         { label: 'Reload', accelerator: 'CmdOrCtrl+R', click: () => mainWindow?.reload() },
+        // Insurance, not the fix: the PDF guard in setupDownloadHandling should mean the main window
+        // never strands the user on a document. But this window has no browser chrome at all, so
+        // when something DOES go wrong "Home" was the only way out and it was not discoverable —
+        // alexa's report was "I cannot x out of it without killing the whole B2B shell". Alt+Left is
+        // the reflex people already have.
+        { label: 'Back', accelerator: 'Alt+Left', click: () => {
+          const wc = mainWindow?.webContents;
+          if (wc?.navigationHistory?.canGoBack()) wc.navigationHistory.goBack();
+          else mainWindow?.loadURL(ADMIN_URL);
+        } },
         { label: 'Home', click: () => mainWindow?.loadURL(ADMIN_URL) },
         { type: 'separator' },
         { label: 'Quit', accelerator: 'CmdOrCtrl+Q', click: () => { quitting = true; app.quit(); } },
