@@ -103,6 +103,14 @@ if [ -f test/desktop-pdf-headers.test.mjs ]; then
   node test/desktop-pdf-headers.test.mjs || UNIT_FAIL=$?
 fi
 
+# Packaging allowlist. v1.0.3 shipped unlaunchable because main.js required a module that
+# build.files never packaged — the build, the tests and the publish all succeeded. This is the
+# source-level half of that guard; tools/verify-package.js checks the built artifact in CI.
+if [ -f test/desktop-packaging.test.mjs ]; then
+  echo ""
+  node test/desktop-packaging.test.mjs || UNIT_FAIL=$?
+fi
+
 # The allowlist gate is pure logic over env, and it guards the WHOLE dashboard. It gets its own run
 # because the HTTP suite short-circuits Google OAuth entirely in MOCK and never exercises it.
 if [ -f test/admin-allowlist.test.mjs ]; then
