@@ -2,7 +2,7 @@
 
 const {
   app, BrowserWindow, ipcMain, Tray, Menu, nativeImage,
-  shell, dialog, nativeTheme,
+  shell, dialog, nativeTheme, session,
 } = require('electron');
 const { autoUpdater } = require('electron-updater');
 const Store = require('electron-store').default || require('electron-store');
@@ -101,11 +101,48 @@ function openPdfWindow(url) {
   return win;
 }
 
+// ─── Downloads ────────────────────────────────────────────────────────────────
+//
+// WHY: invoices were being saved out of this app with NO file extension at all
+//   (`C:\Users\AlexLass\Downloads\August invoice`), so Windows could not open them — reported
+//   2026-08-17. With no will-download handler, Electron shows a bare OS save dialog carrying no
+//   file-type filter, so a name typed by the user is written verbatim and the `.pdf` is lost.
+//   The server now serves ?download=1 as an attachment, but the embedded PDF viewer's own Save
+//   button bypasses that entirely, so the extension has to be guaranteed HERE too.
+
+// WHAT: guarantees a `.pdf` suffix on a suggested download filename.
+// INVARIANT(S): never returns an empty name — a blank suggestion is what let the OS dialog open
+//   with no name and no extension in the first place.
+function pdfFilename(name) {
+  const base = String(name || '').trim() || 'invoice';
+  return /\.pdf$/i.test(base) ? base : `${base}.pdf`;
+}
+
+// WHAT: forces every PDF saved from ANY window in the admin session to keep its .pdf extension.
+// CHANGE-GUARD: attaches to the 'persist:b2badmin' partition, which is shared by the main window
+//   AND every openPdfWindow() — if a window is ever given a different partition, this handler stops
+//   applying to it and extension-less saves come back. The `filters` entry is what makes Windows
+//   append `.pdf` when the user retypes the name; do not drop it and keep only defaultPath.
+function setupDownloadHandling() {
+  session.fromPartition('persist:b2badmin').on('will-download', (event, item) => {
+    const isPdf = item.getMimeType() === 'application/pdf'
+      || /\.pdf($|[?#])/i.test(item.getURL() || '');
+    if (!isPdf) return;
+    item.setSaveDialogOptions({
+      defaultPath: path.join(app.getPath('downloads'), pdfFilename(item.getFilename())),
+      filters: [{ name: 'PDF document', extensions: ['pdf'] }],
+    });
+  });
+}
+
 // ─── App lifecycle ────────────────────────────────────────────────────────────
 
 app.whenReady().then(() => {
   nativeTheme.themeSource = 'dark';
   buildAppMenu();
+  // DEPENDS: must run BEFORE createMainWindow() — the handler has to be attached to the partition
+  //   before any window can start a download in it.
+  setupDownloadHandling();
   createMainWindow();
   createTray();
   setupAutoUpdater();

@@ -228,6 +228,42 @@ await test('GET /orders/1001/invoice.pdf returns PDF content-type', async () => 
   assert.ok(res.headers.get('content-type')?.includes('application/pdf'));
 });
 
+// REGRESSION (2026-08-17): invoices were saving to disk with NO extension ("August invoice"), because
+// these routes only ever answered `inline` — the sole way to get the file was the embedded PDF
+// viewer's Save button, which in the Electron shell opens an untyped OS dialog. ?download=1 must
+// answer `attachment` with a .pdf filename so the file is written by the server's name, not the
+// user's. The default (no query) MUST stay inline or the invoice viewer's iframe downloads instead
+// of rendering.
+await test('REGRESSION: invoice.pdf?download=1 is an attachment with a .pdf filename', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/orders/1001/invoice.pdf?download=1`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  assert.ok(res.headers.get('content-type')?.includes('application/pdf'));
+  const cd = res.headers.get('content-disposition') || '';
+  assert.ok(cd.startsWith('attachment'), `expected attachment, got: ${cd}`);
+  assert.ok(/filename="[^"]+\.pdf"/.test(cd), `filename must end in .pdf, got: ${cd}`);
+});
+
+await test('REGRESSION: invoice.pdf without ?download stays inline (viewer iframe must render)', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/orders/1001/invoice.pdf`, { headers: { Cookie: cookie } });
+  const cd = res.headers.get('content-disposition') || '';
+  assert.ok(cd.startsWith('inline'), `expected inline, got: ${cd}`);
+  assert.ok(/filename="[^"]+\.pdf"/.test(cd), `filename must end in .pdf, got: ${cd}`);
+});
+
+// The invoice screen is where alexa actually clicks. It must offer a control that DOWNLOADS, not one
+// that only re-opens the viewer — that missing affordance is what forced the manual Save.
+await test('REGRESSION: the invoice screen offers a real download link (?download=1)', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/orders/1001/invoice`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  assert.ok(html.includes('/orders/1001/invoice.pdf?download=1'),
+    'invoice screen must link to the ?download=1 attachment route');
+  assert.ok(/Download PDF/i.test(html), 'invoice screen must show a Download PDF control');
+});
+
 // CURRENT-FIELDS (2026-06-29): invoice CSV must reflect post-edit line qtys + Line Totals (currentQuantity,
 // fallback frozen quantity) and DROP lines removed in an edit (currentQuantity 0). Fixture #1008 is edited:
 //   - li1008a partial: quantity 2 -> currentQuantity 1 @ $30  => qty col '1', Line Total '30.00'

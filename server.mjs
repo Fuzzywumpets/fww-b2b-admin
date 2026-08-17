@@ -3985,7 +3985,11 @@ function renderOrderDetail(session, order, flash, flashMsg) {
                 <div style="text-align:right">
                   <div class="mono">${fmtMoney(inv.total)}</div>
                   <div style="font-size:11px;color:var(--muted)">${fmtDate(new Date(inv.created_at).toISOString())}</div>
-                  <a href="/orders/${h(numId)}/partial-invoice/${h(inv.invoice_letter)}.pdf" target="_blank" rel="noopener" class="link" style="font-size:11px">Download PDF</a>
+                  ${/* This link is LABELLED "Download" and must actually download. Without ?download=1
+                        the route answers `inline`, which opens the embedded PDF viewer instead — and
+                        saving from there produced extension-less files. Keep the query AFTER `.pdf`
+                        so the desktop shell's isAdminPdfUrl() still matches. */''}
+                  <a href="/orders/${h(numId)}/partial-invoice/${h(inv.invoice_letter)}.pdf?download=1" class="link" style="font-size:11px">Download PDF</a>
                 </div>
               </div>`).join('')}
           </div>
@@ -6112,7 +6116,26 @@ app.get('/orders/:id/invoice.csv', requireAuth, async (req, res) => {
   res.send('﻿' + csv);  // BOM for Excel UTF-8 detection
 });
 
-// WHAT: renders the full-order invoice PDF inline (Content-Disposition: inline) via generateInvoicePdf(order).
+// WHAT: builds the Content-Disposition for an invoice PDF — `attachment` when the caller asked to
+//   download it (?download=1), `inline` otherwise so the invoice viewer's <iframe> still renders.
+// WHY: until 2026-08-17 these routes were inline-ONLY, so there was no way to obtain the file except
+//   the embedded PDF viewer's Save button. In the Electron shell that opens a bare OS save dialog
+//   with no type filter, and invoices were landing in Downloads with NO extension at all
+//   (`Downloads\August invoice`) — unopenable, "undefined format". An attachment response makes the
+//   browser/shell write the server's filename, extension included, without a dialog.
+// CHANGE-GUARD: the `.pdf` suffix here is load-bearing in the desktop shell — isAdminPdfUrl() in
+//   desktop/main.js matches `\.pdf($|[?#])`, so the query string MUST stay AFTER the `.pdf` in every
+//   link (`/invoice.pdf?download=1`, never `/invoice?fmt=pdf`) or the URL stops opening in the
+//   PDF window. Keep the filename sanitizer regex in sync with the .csv route above.
+// SYNC: used by BOTH /orders/:id/invoice.pdf and /orders/:id/partial-invoice/:letter.pdf — a change
+//   here changes how every invoice download is named and dispatched.
+function invoicePdfDisposition(req, safeName) {
+  const download = String(req.query.download || '') === '1';
+  return `${download ? 'attachment' : 'inline'}; filename="${safeName}.pdf"`;
+}
+
+// WHAT: renders the full-order invoice PDF — inline for the viewer iframe, or as a download when
+//   ?download=1 (see invoicePdfDisposition).
 // CHANGE-GUARD: generateInvoicePdf is async and may throw — keep the try/catch; a 500 here means the PDF lib failed, not a missing order (that is a 404 above).
 // INVARIANT(S): 404 returns JSON but the success path returns binary PDF; callers must branch on Content-Type, not status alone.
 app.get('/orders/:id/invoice.pdf', requireAuth, async (req, res) => {
@@ -6122,7 +6145,7 @@ app.get('/orders/:id/invoice.pdf', requireAuth, async (req, res) => {
     const pdf = await generateInvoicePdf(order);
     const safeName = (order.name || 'invoice').replace(/[^a-z0-9#-]/gi, '-');
     res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `inline; filename="${safeName}-invoice.pdf"`);
+    res.setHeader('Content-Disposition', invoicePdfDisposition(req, `${safeName}-invoice`));
     res.send(pdf);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -6143,11 +6166,19 @@ app.get('/orders/:id/invoice', requireAuth, async (req, res) => {
   const pdfUrl = letter
     ? `/orders/${encodeURIComponent(numId)}/partial-invoice/${letter}.pdf`
     : `/orders/${encodeURIComponent(numId)}/invoice.pdf`;
+  // WHAT: the explicit Download control for this screen.
+  // WHY: the only way to save an invoice used to be the embedded viewer's own Save button, which in
+  //   the Electron shell opens an OS dialog with no file-type filter — invoices were being written to
+  //   Downloads with no extension and would not open. ?download=1 flips the route to `attachment` so
+  //   the shell writes "<order>-invoice.pdf" itself.
+  // DEPENDS: invoicePdfDisposition() honours ?download=1 on BOTH pdf routes reachable from here.
+  const downloadUrl = pdfUrl + '?download=1';
   const content = `
     <div class="page-header" style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:12px">
       <a href="/orders/${h(numId)}" class="btn btn-secondary">← Back to order ${h(orderLabel)}</a>
       <div style="display:flex;align-items:center;gap:8px">
         <h1 style="margin:0;font-size:16px">Invoice ${h(orderLabel)}${letter ? ('-' + h(letter)) : ''}</h1>
+        <a href="${h(downloadUrl)}" class="btn btn-primary btn-sm">⬇ Download PDF</a>
         <a href="${h(pdfUrl)}" target="_blank" rel="noopener" class="btn btn-ghost btn-sm">Open / print ↗</a>
       </div>
     </div>
@@ -6274,7 +6305,7 @@ app.get('/orders/:id/partial-invoice/:letter.pdf', requireAuth, async (req, res)
     });
     const safeName = (order.name || 'invoice').replace(/[^a-z0-9#-]/gi, '-');
     res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `inline; filename="${safeName}-${letter}-invoice.pdf"`);
+    res.setHeader('Content-Disposition', invoicePdfDisposition(req, `${safeName}-${letter}-invoice`));
     res.send(pdf);
   } catch (err) {
     res.status(500).json({ error: err.message });
