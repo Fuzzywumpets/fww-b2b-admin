@@ -62,6 +62,21 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # WHY THIS RUNS BEFORE THE PUBLISHING BUILD: `npm run dist` publishes as part of itself —
+      # electron-builder uploads the installer, blockmap and latest.yml during that step — so any
+      # check placed after it gates nothing; the broken artifact is already live and auto-updating.
+      # v1.0.3 shipped exactly that way: it built, published and reached staff while being
+      # unlaunchable, because main.js required './lib/pdf-headers' and build.files never packaged
+      # lib/. This packs the SAME asar (same files config) with publishing off, inspects it, and
+      # fails the job before a single byte is uploaded.
+      # CHANGE-GUARD: must stay ahead of the publishing build and must keep `--publish never`.
+      #   Do not "simplify" by verifying dist/ after `npm run dist` — that is the no-op this exists
+      #   to replace.
+      - name: Pack (no publish) and verify the packaged app
+        run: |
+          npx electron-builder --win --dir --publish never
+          node tools/verify-package.js dist/win-unpacked/resources/app.asar
+
       - name: Build NSIS installer
         run: npm run dist
         env:

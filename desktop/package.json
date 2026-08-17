@@ -1,7 +1,7 @@
 {
   "name": "fww-b2b-admin-desktop",
-  "version": "1.0.3",
-  "description": "Fuzzywumpets B2B Admin — desktop shell with auto-update",
+  "version": "1.0.4",
+  "description": "Fuzzywumpets B2B Admin \u2014 desktop shell with auto-update",
   "author": "Fuzzywumpets",
   "main": "main.js",
   "scripts": {
@@ -9,7 +9,8 @@
     "dist": "electron-builder --win",
     "dist:dir": "electron-builder --win --dir",
     "icons": "powershell -ExecutionPolicy Bypass -File tools/make-icons.ps1 && node tools/make-ico.js",
-    "postinstall": "electron-builder install-app-deps"
+    "postinstall": "electron-builder install-app-deps",
+    "verify:package": "node tools/verify-package.js dist/win-unpacked/resources/app.asar"
   },
   "dependencies": {
     "electron-store": "^8.2.0",
@@ -22,7 +23,7 @@
   "build": {
     "appId": "com.fuzzywumpets.b2badmin",
     "productName": "FWW B2B Admin",
-    "copyright": "Copyright © 2026 Fuzzywumpets",
+    "copyright": "Copyright \u00a9 2026 Fuzzywumpets",
     "icon": "assets/icon.png",
     "publish": {
       "provider": "github",
@@ -58,6 +59,7 @@
     "files": [
       "main.js",
       "preload.js",
+      "lib/**/*",
       "assets/**"
     ]
   }
