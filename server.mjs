@@ -6278,7 +6278,16 @@ app.post('/orders/:id/partial-invoice', requireAuth, async (req, res) => {
     });
     const safeName = (order.name || 'invoice').replace(/[^a-z0-9#-]/gi, '-');
     res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `inline; filename="${safeName}-${letter}-invoice.pdf"`);
+    // WHAT: the freshly-generated invoice is always sent as a DOWNLOAD, never inline.
+    // WHY: this route's URL has no `.pdf` in it (`POST /orders/123/partial-invoice`). Served inline,
+    //   the viewer took its document name from the URL's last segment — the window was literally
+    //   titled "partial-invoice" — and saving from it produced a file called `partial-invoice` with
+    //   NO extension. That is the reported bug, and it survived fixing the two GET routes because
+    //   this POST is what the "Generate PDF" button actually submits to (alexa 2026-08-17).
+    // CHANGE-GUARD: do NOT make this honour ?download=1 like the GET routes — there is no viewer
+    //   iframe pointing here, so `inline` has no legitimate caller and would only reintroduce the
+    //   extension-less save. The stored invoice stays previewable at GET /orders/:id/invoice?letter=X.
+    res.setHeader('Content-Disposition', `attachment; filename="${safeName}-${letter}-invoice.pdf"`);
     res.send(pdf);
   } catch (err) {
     res.status(500).json({ error: err.message });

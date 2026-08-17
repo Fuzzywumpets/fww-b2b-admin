@@ -3189,6 +3189,26 @@ await test('POST /orders/1001/partial-invoice with type=full → returns PDF', a
   assert.equal(res.headers.get('content-type'), 'application/pdf', 'Should return PDF');
 });
 
+// REGRESSION (2026-08-17): this route's URL has no `.pdf` in it, so serving the PDF `inline` made the
+// viewer name the document after the URL's last segment — the window was titled "partial-invoice" and
+// saving from it produced a file called `partial-invoice` with NO extension. This is the route the
+// "Generate PDF" button submits to, so it must always be an attachment with a .pdf filename.
+await test('REGRESSION: POST partial-invoice is an attachment with a .pdf filename (URL has no .pdf)', async () => {
+  const cookie = await seedSession();
+  const body = new URLSearchParams({ type: 'full', shipping_handling: 'none' });
+  const res = await fetch(`${BASE}/orders/1002/partial-invoice`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: body.toString(),
+  });
+  assert.equal(res.status, 200, `Expected 200, got ${res.status}`);
+  const cd = res.headers.get('content-disposition') || '';
+  assert.ok(cd.startsWith('attachment'), `must not be inline (that is what dropped the extension), got: ${cd}`);
+  assert.ok(/filename="[^"]+\.pdf"/.test(cd), `filename must end in .pdf, got: ${cd}`);
+  const head = Buffer.from(await res.arrayBuffer()).subarray(0, 5).toString();
+  assert.equal(head, '%PDF-', `body must be a real PDF, got: ${head}`);
+});
+
 // REGRESSION: this test previously asserted that type=fulfilled_only returned a PDF — which it did,
 // while billing the ENTIRE order. Both arms of the ternary behind it were `allLineItems`, so the
 // "partial invoice" the modal pre-selected was a full one wearing a "partial" badge. The scope is
