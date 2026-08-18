@@ -22,6 +22,8 @@ const {
   getOutstandingBalanceForCustomer,
   getOrderFromCache,
   getReportsDataFromCache,
+  deleteOrderFromCache,
+  getOrderShopifyIdsBatch,
   default: db,
 } = await import('../db.mjs');
 
@@ -141,6 +143,73 @@ await test('H15: a null fulfillment_status stays null (unfulfilled orders)', asy
     financial_status: 'paid', fulfillment_status: null,
   });
   assertEqual(getOrderFromCache('7500').fulfillment_status, null);
+});
+
+// ── deleteOrderFromCache: the /orders list must stop showing an order Shopify deleted ──────────
+
+await test('deleteOrderFromCache removes the order row', async () => {
+  upsertOrderCache({
+    shopify_id: '7600', gid: 'gid://shopify/Order/7600', name: '#7600',
+    customer_shopify_id: '9100', created_at: Date.now(), total_price: 40,
+    financial_status: 'PENDING',
+  });
+  assert(getOrderFromCache('7600'), 'sanity: order is cached before deletion');
+  deleteOrderFromCache('7600');
+  assertEqual(getOrderFromCache('7600'), null, 'a deleted order must not remain in orders_cache');
+});
+
+await test('deleteOrderFromCache also removes its cached line items (no orphan rows)', async () => {
+  upsertOrderCache({
+    shopify_id: '7601', gid: 'gid://shopify/Order/7601', name: '#7601',
+    customer_shopify_id: '9100', created_at: Date.now(), total_price: 65,
+    financial_status: 'PENDING',
+  });
+  upsertOrderLineItemsCache('7601', lines());
+  assertEqual(countLines('7601'), 2, 'sanity: line items are cached before deletion');
+  deleteOrderFromCache('7601');
+  assertEqual(countLines('7601'), 0, 'orphaned line-item rows must not survive the order they belong to');
+});
+
+await test('deleteOrderFromCache is scoped to one order — it must not touch another order\'s row', async () => {
+  upsertOrderCache({
+    shopify_id: '7602', gid: 'gid://shopify/Order/7602', name: '#7602',
+    customer_shopify_id: '9100', created_at: Date.now(), total_price: 15,
+    financial_status: 'PENDING',
+  });
+  upsertOrderCache({
+    shopify_id: '7603', gid: 'gid://shopify/Order/7603', name: '#7603',
+    customer_shopify_id: '9100', created_at: Date.now(), total_price: 15,
+    financial_status: 'PENDING',
+  });
+  deleteOrderFromCache('7602');
+  assertEqual(getOrderFromCache('7602'), null);
+  assert(getOrderFromCache('7603'), 'a sibling order must survive deleting a different order');
+});
+
+await test('a deleted order disappears from the /orders list (listOrdersFromCache)', async () => {
+  upsertOrderCache({
+    shopify_id: '7604', gid: 'gid://shopify/Order/7604', name: '#7604',
+    customer_shopify_id: '9100', created_at: Date.now(), total_price: 20,
+    financial_status: 'PENDING',
+  });
+  assert(listOrdersFromCache({}).some(o => o.name === '#7604'), 'sanity: order shows in the list before deletion');
+  deleteOrderFromCache('7604');
+  assert(!listOrdersFromCache({}).some(o => o.name === '#7604'), 'the order page must stop showing an order once Shopify has deleted it');
+});
+
+// ── getOrderShopifyIdsBatch: the reconciliation sweep's paging primitive ────────────────────────
+
+await test('getOrderShopifyIdsBatch pages through the cache deterministically', async () => {
+  const before = getOrderShopifyIdsBatch(0, 100000).length;
+  upsertOrderCache({ shopify_id: '7700', gid: 'gid://shopify/Order/7700', name: '#7700', created_at: Date.now() });
+  upsertOrderCache({ shopify_id: '7701', gid: 'gid://shopify/Order/7701', name: '#7701', created_at: Date.now() });
+  const all = getOrderShopifyIdsBatch(0, 100000);
+  assertEqual(all.length, before + 2, 'both new rows must appear exactly once across the full page');
+  assert(all.includes('7700') && all.includes('7701'));
+  const page1 = getOrderShopifyIdsBatch(0, 1);
+  const page2 = getOrderShopifyIdsBatch(1, 1);
+  assertEqual(page1.length, 1);
+  assert(page1[0] !== page2[0], 'consecutive offset pages must not overlap');
 });
 
 console.log(`\n  ${passed} passed, ${failed} failed`);
