@@ -36,6 +36,7 @@ import {
   listCustomersFromCache,
   getCustomerCacheStats,
   listOrdersFromCache, getOrdersCacheStats, getCustomerOrdersFromCache,
+  deleteOrderFromCache, getOrderShopifyIdsBatch,
   getReportsDataFromCache,
   getTopCustomersAllTime,
   listImpersonationsForCustomer,
@@ -2212,7 +2213,11 @@ function renderOrdersList(session, data, filters) {
 // CHANGE-GUARD: lineItems first:50 and transactions first:10 are HARD caps with no paging — an order with >50 lines or >10 transactions silently drops the overflow from the UI AND from createXeroInvoice's line build. Re-verify large orders invoice correctly. Returns null on any error (caller 404s).
 // INVARIANT(S): id is built via shopifyOrderGid(numericId); the selected fields are the contract consumed by renderOrderDetail, createXeroInvoice, and the ship/fulfill flows — adding a consumer means extending this query.
 // CURRENT-FIELDS (2026-06-29): each lineItems node carries BOTH quantity (frozen original) and currentQuantity (post-edit truth; 0 = removed). The order carries BOTH subtotal/totalPriceSet (frozen) and currentSubtotal/currentTotalPriceSet (post-edit truth). Consumers that mean "what is in the order NOW" (renderOrderDetail line rows + totals, fulfill/ship/cancel, createXeroInvoice) MUST read the current* variants; the frozen ones are kept only where the ORIGINAL value is intended.
-async function getOrderDetail(numericId) {
+// THROW-ON-ERROR (added for orders_cache eviction): every other caller wants the swallow-to-null
+// default — a Shopify hiccup should render "order not found" same as a genuine 404, not crash the
+// page. GET /orders/:id opts into throwOnError:true because it needs to tell those two cases apart
+// (see CHANGE-GUARD there) before it's safe to evict the order from orders_cache.
+async function getOrderDetail(numericId, { throwOnError = false } = {}) {
   if (MOCK) return getMockOrder(numericId);
   try {
     const result = await shopifyFetch(`
@@ -2245,6 +2250,7 @@ async function getOrderDetail(numericId) {
     return result.data?.order || null;
   } catch (err) {
     console.error('getOrderDetail error:', err.message);
+    if (throwOnError) throw err;
     return null;
   }
 }
@@ -5892,15 +5898,31 @@ app.get('/orders/export.csv', requireAuth, async (req, res) => {
 // WHAT: Order detail — fetch by id; if not found, treat :id as an order NAME/number and redirect to the canonical /orders/<shopify_id>; else 404. Attaches portal visibleNotes (read-only).
 // CHANGE-GUARD: keep this LAST among /orders/* GETs. The name-fallback (getOrderByName) lets bare numbers like '37055' resolve — don't remove without updating links. ?success/?error/?msg are passed to the renderer for flash.
 // INVARIANT(S): shopifyId is normalized to a gid:// form before getVisibleNotesForOrder; visibleNotes attach is best-effort and must not block rendering.
+// DEPENDS: uses getOrderDetail(..., {throwOnError:true}) specifically so it can tell "Shopify cleanly
+// says this order doesn't exist" apart from "the fetch itself failed" — see the CONFIRMED-DELETE
+// block below. Do not swap back to the default (swallow-to-null) call here.
 app.get('/orders/:id', requireAuth, async (req, res) => {
-  let order = await getOrderDetail(req.params.id);
+  let order, fetchFailed = false;
+  try {
+    order = await getOrderDetail(req.params.id, { throwOnError: true });
+  } catch {
+    order = null;
+    fetchFailed = true;
+  }
   if (!order) {
     // Fallback: treat req.params.id as an order name/number (e.g. "37055" for "#37055")
     const cached = getOrderByName(req.params.id);
     if (cached) return res.redirect(`/orders/${cached.shopify_id}`);
   }
-  if (!order) return res.status(404).send(layout({ title: '404', session: req.adminSession, activePath: '/orders',
-    content: '<div class="page-header"><h1>Order not found</h1></div><a href="/orders" class="btn btn-secondary">← Orders</a>' }));
+  if (!order) {
+    // CONFIRMED-DELETE: Shopify answered the query with no error and no order — that's the one
+    // signal that actually means "deleted," as opposed to a shopify-bridge timeout/outage, which
+    // also lands here as `!order` but with fetchFailed=true. Evicting on a fetch error would let a
+    // transient blip wipe a still-real order out of /orders; only a clean live "not found" does.
+    if (!fetchFailed) deleteOrderFromCache(req.params.id);
+    return res.status(404).send(layout({ title: '404', session: req.adminSession, activePath: '/orders',
+      content: '<div class="page-header"><h1>Order not found</h1></div><a href="/orders" class="btn btn-secondary">← Orders</a>' }));
+  }
   // Attach visible notes from portal db (readonly)
   const shopifyId = order.id.startsWith('gid://') ? order.id : `gid://shopify/Order/${order.id}`;
   order.visibleNotes = getVisibleNotesForOrder(shopifyId);
@@ -12233,11 +12255,47 @@ async function syncRecentFromShopify() {
   }
 }
 
+// WHAT: verifies a small rotating batch of cached orders still exist in Shopify (nodes(ids:) returns
+// a null entry for a deleted id) and evicts any that don't from orders_cache.
+// CHANGE-GUARD: syncRecentFromShopify (above) can only ADD/UPDATE — Shopify's orders() search
+// silently excludes deleted orders from its results, so polling recent updates can never learn that
+// one is GONE, only that it changed. This is the other half of that: a deleted order still has a
+// well-formed gid, so nodes(ids:) is the one query that distinguishes "deleted" from "never existed."
+// A rotating batch (not the whole cache) keeps the per-cycle query cheap; the offset just wraps
+// around the current total, so a bigger cache takes proportionally more cycles to fully sweep, not
+// more cost per cycle — nothing is permanently skipped.
+// INVARIANT(S): only a clean (non-throwing) nodes() response is trusted as eviction evidence — a
+// shopify-bridge error must leave the batch untouched, or an outage would misread the whole batch as
+// deleted and mass-evict real orders from /orders. Mirrors the CONFIRMED-DELETE guard in GET /orders/:id.
+let _reconcileOffset = 0;
+async function reconcileOrderDeletions() {
+  if (MOCK || !SHOPIFY_BEARER) return;
+  const RECONCILE_BATCH = 25;
+  const stats = getOrdersCacheStats();
+  if (!stats?.total) return;
+  const batch = getOrderShopifyIdsBatch(_reconcileOffset % stats.total, RECONCILE_BATCH);
+  _reconcileOffset = (_reconcileOffset + batch.length) % stats.total;
+  if (!batch.length) return;
+  try {
+    const result = await shopifyFetch(`query($ids:[ID!]!){ nodes(ids:$ids){ id } }`,
+      { ids: batch.map(shopifyOrderGid) });
+    const stillExists = new Set((result.data?.nodes || []).filter(Boolean).map(n => shopifyNumericId(n.id)));
+    for (const shopifyId of batch) {
+      if (!stillExists.has(shopifyId)) {
+        deleteOrderFromCache(shopifyId);
+        console.log('[reconcile] evicted deleted order from cache:', shopifyId);
+      }
+    }
+  } catch (err) {
+    console.error('[reconcile] order-existence check failed, batch left untouched:', err.message);
+  }
+}
+
 // Activity-gated polling (was a flat 5-min interval). Syncs every ~3 min WHILE the
 // dashboard is being used (fresher than before); zero Shopify calls when idle, and
 // refreshes within ~60s when someone returns after an idle period.
-// WHAT: activity-gated background scheduler — every 60s, if the dashboard is active and >=FRESH_TARGET_MS (~3min) since the last run, invokes syncRecentFromShopify; plus a daily GC of expired impersonation nonces.
-// CHANGE-GUARD: the _syncing flag + _lastSyncAt guard prevent overlapping/over-frequent Shopify calls — don't remove them or an idle-return storm could hammer the API; dashboardActive() is the gate that makes it zero-cost when nobody is looking.
+// WHAT: activity-gated background scheduler — every 60s, if the dashboard is active and >=FRESH_TARGET_MS (~3min) since the last run, invokes syncRecentFromShopify then reconcileOrderDeletions; plus a daily GC of expired impersonation nonces.
+// CHANGE-GUARD: the _syncing flag + _lastSyncAt guard prevent overlapping/over-frequent Shopify calls — don't remove them or an idle-return storm could hammer the API; dashboardActive() is the gate that makes it zero-cost when nobody is looking. reconcileOrderDeletions runs in the SAME gated tick (not its own interval) so it shares that throttling rather than adding a second independent source of Shopify calls.
 // INVARIANT(S): never runs in MOCK (the whole block is !MOCK-gated); a thrown sync error is swallowed (catch{}) and _syncing is always reset in finally so a crash can't wedge the poller permanently; the nonce GC interval is 24h.
 if (!MOCK) {
   const FRESH_TARGET_MS = 3 * 60 * 1000;
@@ -12246,7 +12304,7 @@ if (!MOCK) {
     if (!dashboardActive()) return;            // quiet when nobody is looking
     if (_syncing || (Date.now() - _lastSyncAt) < FRESH_TARGET_MS) return;
     _syncing = true;
-    try { await syncRecentFromShopify(); _lastSyncAt = Date.now(); }
+    try { await syncRecentFromShopify(); await reconcileOrderDeletions(); _lastSyncAt = Date.now(); }
     catch {} finally { _syncing = false; }
   }, 60 * 1000);
   // Daily GC for expired impersonation nonces

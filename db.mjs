@@ -1216,6 +1216,16 @@ export function getOrdersCacheStats() {
   return db.prepare('SELECT COUNT(*) AS total, MAX(synced_at) AS latest FROM orders_cache').get();
 }
 
+// WHAT: a stable, deterministic page of cached order ids (ORDER BY shopify_id, not synced_at/created_at
+// — those change as rows are touched, which would skip or repeat ids as a caller pages through with a
+// rotating offset). Used by reconcileOrderDeletions to sweep the whole cache a batch at a time without
+// a dedicated "last checked" column.
+// INVARIANT(S): offset wraps modulo the current total in the caller — this function just slices.
+export function getOrderShopifyIdsBatch(offset, limit) {
+  return db.prepare('SELECT shopify_id FROM orders_cache ORDER BY shopify_id LIMIT ? OFFSET ?')
+    .all(limit, offset).map(r => r.shopify_id);
+}
+
 export function getCustomerOrdersFromCache(customerShopifyId, opts = {}) {
   let sql = 'SELECT * FROM orders_cache WHERE customer_shopify_id = ?';
   const params = [customerShopifyId];
@@ -1313,6 +1323,23 @@ export function upsertOrderLineItemsCache(orderShopifyId, lineItems) {
     }
   });
   run(lineItems || []);
+}
+
+// WHAT: evicts one order (and its cached line items) from orders_cache entirely — used when the
+// live Shopify order(id:) query cleanly answers "no such order," meaning it was deleted.
+// CHANGE-GUARD: this is a hard DELETE, not an upsert with a cancelled/closed flag — the row must
+// disappear from /orders and /invoices, not just change status, because Shopify no longer has any
+// data to show for it. Only call this on a CONFIRMED-missing order (see server.mjs GET /orders/:id
+// and reconcileOrderDeletions) — a transient shopifyFetch error must never reach here.
+// INVARIANT(S): scoped to one shopify_id; leaves audit_log, xero_invoice_map, and partial-invoice
+// rows untouched — those are historical/accounting records that must survive the Shopify order
+// itself being deleted.
+export function deleteOrderFromCache(shopifyId) {
+  const run = db.transaction((id) => {
+    db.prepare('DELETE FROM order_line_items_cache WHERE order_shopify_id = ?').run(id);
+    db.prepare('DELETE FROM orders_cache WHERE shopify_id = ?').run(id);
+  });
+  run(String(shopifyId));
 }
 
 export function getOrdersFromCache({ customerId, from, to, limit = 250, offset = 0 } = {}) {
