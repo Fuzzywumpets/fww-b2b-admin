@@ -3177,36 +3177,57 @@ await test('POST /orders/1001/partial-invoice → requires auth', async () => {
   assert.ok(res.status === 302 || res.status === 303 || res.status === 401, 'Unauthenticated should redirect or 401');
 });
 
-await test('POST /orders/1001/partial-invoice with type=full → returns PDF', async () => {
+await test('POST /orders/1001/partial-invoice with type=full → redirects to the invoice viewer', async () => {
   const cookie = await seedSession();
   const body = new URLSearchParams({ type: 'full', shipping_handling: 'first' });
   const res = await fetch(`${BASE}/orders/1001/partial-invoice`, {
-    method: 'POST',
+    method: 'POST', redirect: 'manual',
     headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
     body: body.toString(),
   });
-  assert.equal(res.status, 200, `Expected 200, got ${res.status}`);
-  assert.equal(res.headers.get('content-type'), 'application/pdf', 'Should return PDF');
+  assert.ok(res.status === 302 || res.status === 303, `Expected a redirect, got ${res.status}`);
+  const loc = res.headers.get('location') || '';
+  assert.match(loc, /\/orders\/1001\/invoice\?letter=[A-Z]/, `should land on the viewer, got: ${loc}`);
 });
 
 // REGRESSION (2026-08-17): this route's URL has no `.pdf` in it, so serving the PDF `inline` made the
 // viewer name the document after the URL's last segment — the window was titled "partial-invoice" and
 // saving from it produced a file called `partial-invoice` with NO extension. This is the route the
 // "Generate PDF" button submits to, so it must always be an attachment with a .pdf filename.
-await test('REGRESSION: POST partial-invoice is an attachment with a .pdf filename (URL has no .pdf)', async () => {
+// REGRESSION (2026-08-18): "Generate PDF" must never leave the operator on an unchanged page. It
+// answered with the file itself — inline it hijacked the window, and as an attachment it downloaded
+// silently behind a modal that never closed ("Broke this page now. Can't get out of it once you
+// are."). It must navigate to the viewer, and the file must remain one click away FROM there.
+await test('REGRESSION: Generate PDF navigates away instead of answering with a file', async () => {
   const cookie = await seedSession();
   const body = new URLSearchParams({ type: 'full', shipping_handling: 'none' });
   const res = await fetch(`${BASE}/orders/1002/partial-invoice`, {
-    method: 'POST',
+    method: 'POST', redirect: 'manual',
     headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
     body: body.toString(),
   });
-  assert.equal(res.status, 200, `Expected 200, got ${res.status}`);
-  const cd = res.headers.get('content-disposition') || '';
-  assert.ok(cd.startsWith('attachment'), `must not be inline (that is what dropped the extension), got: ${cd}`);
+  assert.ok(res.status === 302 || res.status === 303, `must redirect, got ${res.status}`);
+  const ct = res.headers.get('content-type') || '';
+  assert.ok(!ct.includes('application/pdf'), `must NOT answer with the file itself, got: ${ct}`);
+
+  const loc = res.headers.get('location');
+  assert.match(loc, /\/orders\/1002\/invoice\?letter=([A-Z])/, `should land on the viewer, got: ${loc}`);
+  const letter = loc.match(/letter=([A-Z])/)[1];
+
+  // The viewer must actually offer the download, or the redirect just moved the dead end.
+  const view = await fetch(`${BASE}${loc}`, { headers: { Cookie: cookie } });
+  assert.equal(view.status, 200, 'viewer must render');
+  const html = await view.text();
+  assert.ok(html.includes(`/orders/1002/partial-invoice/${letter}.pdf?download=1`),
+    'viewer must link to the attachment download for the invoice just generated');
+
+  // And that link must still deliver a properly named PDF.
+  const dl = await fetch(`${BASE}/orders/1002/partial-invoice/${letter}.pdf?download=1`, { headers: { Cookie: cookie } });
+  const cd = dl.headers.get('content-disposition') || '';
+  assert.ok(cd.startsWith('attachment'), `download must be an attachment, got: ${cd}`);
   assert.ok(/filename="[^"]+\.pdf"/.test(cd), `filename must end in .pdf, got: ${cd}`);
-  const head = Buffer.from(await res.arrayBuffer()).subarray(0, 5).toString();
-  assert.equal(head, '%PDF-', `body must be a real PDF, got: ${head}`);
+  const head = Buffer.from(await dl.arrayBuffer()).subarray(0, 5).toString();
+  assert.equal(head, '%PDF-', `must be real PDF bytes, got: ${head}`);
 });
 
 // REGRESSION: this test previously asserted that type=fulfilled_only returned a PDF — which it did,
