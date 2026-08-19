@@ -6290,30 +6290,33 @@ app.post('/orders/:id/partial-invoice', requireAuth, async (req, res) => {
   });
   auditLog(session.email, 'partial_invoice_created', orderGid, null, { invoiceId: invId, letter, type, total });
 
+  // Built here only as validation. It costs ~100ms and means an invoice that cannot be rendered
+  // fails NOW, with a real error, rather than surfacing as a broken iframe on the viewer. The bytes
+  // are deliberately discarded — the viewer's GET route rebuilds from the stored snapshot.
   try {
-    const pdf = await generateInvoicePdf(order, {
+    await generateInvoicePdf(order, {
       lineItems,
       invoiceSuffix: letter,
       subtotal,
       shipping: shippingAmt,
       total,
     });
-    const safeName = (order.name || 'invoice').replace(/[^a-z0-9#-]/gi, '-');
-    res.setHeader('Content-Type', 'application/pdf');
-    // WHAT: the freshly-generated invoice is always sent as a DOWNLOAD, never inline.
-    // WHY: this route's URL has no `.pdf` in it (`POST /orders/123/partial-invoice`). Served inline,
-    //   the viewer took its document name from the URL's last segment — the window was literally
-    //   titled "partial-invoice" — and saving from it produced a file called `partial-invoice` with
-    //   NO extension. That is the reported bug, and it survived fixing the two GET routes because
-    //   this POST is what the "Generate PDF" button actually submits to (alexa 2026-08-17).
-    // CHANGE-GUARD: do NOT make this honour ?download=1 like the GET routes — there is no viewer
-    //   iframe pointing here, so `inline` has no legitimate caller and would only reintroduce the
-    //   extension-less save. The stored invoice stays previewable at GET /orders/:id/invoice?letter=X.
-    res.setHeader('Content-Disposition', `attachment; filename="${safeName}-${letter}-invoice.pdf"`);
-    res.send(pdf);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    return res.status(500).json({ error: err.message });
   }
+
+  // WHAT: send the operator to the invoice viewer instead of answering with the file itself.
+  // WHY: this POST used to reply with the PDF. Served inline it let the PDF take over the window;
+  //   as an attachment that was fixed, but then "Generate PDF" produced NO visible change at all —
+  //   the modal just sat there over the order page while the download happened silently behind it
+  //   (and in the desktop shell, a native save dialog on top of it). alexa 2026-08-18: "Broke this
+  //   page now. Can't get out of it once you are." Navigating closes the modal by definition, shows
+  //   the invoice that was just created, and puts Download and Back one click away.
+  // CHANGE-GUARD: do not "restore" a PDF body here. A response that is a file leaves the operator
+  //   staring at an unchanged modal with no way to tell whether anything happened — that is the bug.
+  // DEPENDS: GET /orders/:id/invoice?letter=X renders that viewer, and its Download PDF button
+  //   points at /orders/:id/partial-invoice/<letter>.pdf?download=1 (the attachment path).
+  res.redirect(`/orders/${encodeURIComponent(numId)}/invoice?letter=${encodeURIComponent(letter)}`);
 });
 
 // Re-download a previously generated partial invoice
