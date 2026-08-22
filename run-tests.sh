@@ -7,26 +7,52 @@ echo "======================================================"
 echo "         fww-b2b-admin test suite"
 echo "======================================================"
 
-PORT=8894
-echo ""
-echo "Starting mock server (B2B_ADMIN_MOCK=1, port $PORT)..."
-PORT=$PORT B2B_ADMIN_MOCK=1 B2B_IMPERSONATION_SECRET=test-impersonation-secret-mock SHOPIFY_WEBHOOK_SECRET=test-shopify-webhook-secret node server.mjs &
-MOCK_PID=$!
+API_PORT=8894
+UI_PORT=8898
+ALL_MOCK_PIDS=""
 
-cleanup() { kill "$MOCK_PID" 2>/dev/null || true; }
+# `kill` on a background job's $! can be a silent no-op under Git-Bash/MSYS on Windows (the bash PID
+# and the real Windows PID diverge), so a plain `kill "$MOCK_PID" || true` can appear to succeed while
+# the node process keeps running and keeps LISTENING on its port. taskkill is the real kill there.
+kill_pid() {
+  if command -v taskkill >/dev/null 2>&1; then
+    taskkill //F //PID "$1" >/dev/null 2>&1 || true
+  else
+    kill "$1" 2>/dev/null || true
+  fi
+  wait "$1" 2>/dev/null || true
+}
+cleanup() { for pid in $ALL_MOCK_PIDS; do kill_pid "$pid"; done; }
 trap cleanup EXIT
 
-for i in $(seq 1 20); do
-  if curl -sf "http://127.0.0.1:$PORT/healthz" >/dev/null 2>&1; then
-    echo "Mock server ready (pid $MOCK_PID)"
-    break
-  fi
-  sleep 0.5
-done
-if ! curl -sf "http://127.0.0.1:$PORT/healthz" >/dev/null 2>&1; then
+# MOCK_ORDERS lives in module-scope memory for the life of one `node server.mjs` process, so any
+# suite that mutates order state (custom lines, discounts, payments) leaves that state for whatever
+# suite runs against the SAME process next. api.test.mjs and ui.test.mjs both write to shared
+# fixture orders (1001/1007/1008/etc), so they need separate processes — otherwise ui.test.mjs sees
+# api.test.mjs's leftover custom lines/discounts and fails on counts that drift with however much the
+# prior suite happened to commit that run. They ALSO need separate PORTS, not just separate PIDs: if
+# kill_pid's kill silently no-ops (see above) and a stale process is still listening on the old port,
+# reusing that port would mean the "fresh" server for the next suite never actually binds — the still
+# stale process just keeps answering, and pollution carries on undetected. A distinct port per suite
+# means a fresh process only ever measures against a fresh process, regardless of whether the previous
+# one actually died.
+start_mock_server() {
+  local port="$1"
+  echo ""
+  echo "Starting mock server (B2B_ADMIN_MOCK=1, port $port)..."
+  PORT=$port B2B_ADMIN_MOCK=1 B2B_IMPERSONATION_SECRET=test-impersonation-secret-mock SHOPIFY_WEBHOOK_SECRET=test-shopify-webhook-secret node server.mjs &
+  MOCK_PID=$!
+  ALL_MOCK_PIDS="$ALL_MOCK_PIDS $MOCK_PID"
+  for i in $(seq 1 20); do
+    if curl -sf "http://127.0.0.1:$port/healthz" >/dev/null 2>&1; then
+      echo "Mock server ready (pid $MOCK_PID)"
+      return 0
+    fi
+    sleep 0.5
+  done
   echo "ERROR: mock server did not start" >&2
   exit 1
-fi
+}
 
 API_FAIL=0
 UI_FAIL=0
@@ -34,13 +60,17 @@ UNIT_FAIL=0
 AUTH_FAIL=0
 
 if [ -f test/api.test.mjs ]; then
+  start_mock_server "$API_PORT"
   echo ""
-  TEST_BASE="http://127.0.0.1:$PORT" node test/api.test.mjs || API_FAIL=$?
+  TEST_BASE="http://127.0.0.1:$API_PORT" node test/api.test.mjs || API_FAIL=$?
+  kill_pid "$MOCK_PID"
 fi
 
 if [ -f test/ui.test.mjs ]; then
+  start_mock_server "$UI_PORT"
   echo ""
-  TEST_BASE="http://127.0.0.1:$PORT" node test/ui.test.mjs || UI_FAIL=$?
+  TEST_BASE="http://127.0.0.1:$UI_PORT" node test/ui.test.mjs || UI_FAIL=$?
+  kill_pid "$MOCK_PID"
 fi
 
 # Standalone unit suites — run WITHOUT the mock HTTP server on purpose, because the code they cover
