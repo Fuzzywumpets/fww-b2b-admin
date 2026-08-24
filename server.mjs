@@ -36,7 +36,7 @@ import {
   listCustomersFromCache,
   getCustomerCacheStats,
   listOrdersFromCache, getOrdersCacheStats, getCustomerOrdersFromCache,
-  deleteOrderFromCache, getOrderShopifyIdsBatch,
+  deleteOrderFromCache, deleteCustomerFromCache, getOrderShopifyIdsBatch,
   getReportsDataFromCache,
   getTopCustomersAllTime,
   listImpersonationsForCustomer,
@@ -5734,6 +5734,12 @@ app.get('/auth/google/callback', async (req, res) => {
     auditLog(user.email, 'login', null, null, { ip: req.ip });
     res.setHeader('Set-Cookie', ['oauth_state=; Path=/; HttpOnly; Max-Age=0', sessionCookie(sid)]);
     res.redirect('/');
+    // Fire-and-forget: refresh the customer cache on login rather than waiting on the ~3min
+    // activity-gated poller. setImmediate keeps this off the redirect's critical path (same
+    // pattern as the webhook handler's cache upserts) — a slow/failed sync must never delay login.
+    if (typeof syncRecentCustomersFromShopify === 'function') {
+      setImmediate(() => { syncRecentCustomersFromShopify().catch(err => console.error('[sync] login-triggered customer sync failed:', err.message)); });
+    }
   } catch (err) {
     res.redirect(`/login?error=${encodeURIComponent('Authentication error: ' + err.message)}`);
   }
@@ -8575,6 +8581,11 @@ app.post('/api/admin/sync-now', requireAuth, async (req, res) => {
   try {
     if (typeof syncRecentFromShopify === 'function') {
       await syncRecentFromShopify();
+    }
+    // DEPENDS: syncRecentCustomersFromShopify (below) — sync-now used to only pull orders, so a
+    // Shopify-side customer merge/edit never showed up here (see its CHANGE-GUARD comment).
+    if (typeof syncRecentCustomersFromShopify === 'function') {
+      await syncRecentCustomersFromShopify();
     }
     res.json({ ok: true, syncedAt: Date.now() });
   } catch (err) {
@@ -12088,7 +12099,11 @@ app.post('/webhooks/shopify', (req, res) => {
   // Dispatch to cache upsert (non-blocking)
   setImmediate(() => {
     try {
-      if (topic.startsWith('customers/')) {
+      if (topic === 'customers/delete') {
+        // DEPENDS: deleteCustomerFromCache (db.mjs) — fires on both a real customer delete and the
+        // losing side of a customerMerge (Shopify sends customers/delete for the merged-away id).
+        deleteCustomerFromCache(String(payload.id));
+      } else if (topic.startsWith('customers/')) {
         const c = payload;
         const shopifyId = String(c.id);
         const tags = Array.isArray(c.tags) ? c.tags : (c.tags || '').split(',').map(s => s.trim()).filter(Boolean);
@@ -12255,6 +12270,57 @@ async function syncRecentFromShopify() {
   }
 }
 
+// WHAT: incremental customer backstop poller — pulls customers updated since last_synced_at (minus a
+// 60s overlap, or 6min on cold start) into customers_cache. Mirrors syncRecentFromShopify (orders)
+// but was missing entirely before 2026-08-24 — customers_cache was ONLY ever written by the one-off
+// backfill script and by webhooks, and the webhook path had no delete handling (see
+// deleteCustomerFromCache in db.mjs), so a Shopify-side customerMerge left a permanent ghost
+// duplicate in /customers until someone deleted it by hand (PRO-MOHS incident 2026-08-24).
+// CHANGE-GUARD: reads amountSpent/numberOfOrders/defaultAddress straight off the Customer node — keep
+// the field list in sync with what upsertCustomerCache (db.mjs) expects, same as the orders sync.
+// INVARIANT(S): no-ops in MOCK or without SHOPIFY_BEARER; success and error both call setSyncState so
+// last_synced_at always advances (mirrors syncRecentFromShopify's intentional best-effort semantics).
+async function syncRecentCustomersFromShopify() {
+  if (MOCK || !SHOPIFY_BEARER) return;
+  try {
+    const state = getSyncState('customers_recent');
+    const since = state?.last_synced_at
+      ? new Date(state.last_synced_at - 60000).toISOString()
+      : new Date(Date.now() - 6 * 60 * 1000).toISOString();
+    const result = await shopifyFetch(`
+      query($q:String!){
+        customers(first:50,query:$q,sortKey:UPDATED_AT,reverse:true){
+          edges{node{
+            id displayName firstName lastName email tags
+            amountSpent{amount} numberOfOrders
+            defaultAddress{address1 address2 city province zip country company}
+            createdAt updatedAt
+          }}
+        }
+      }`, { q: `updated_at:>${since}` });
+    const edges = result.data?.customers?.edges || [];
+    for (const { node: c } of edges) {
+      const shopifyId = shopifyNumericId(c.id);
+      upsertCustomerCache({
+        shopify_id: shopifyId, gid: c.id,
+        email: c.email, first_name: c.firstName, last_name: c.lastName,
+        display_name: c.displayName || c.email || shopifyId,
+        company: c.defaultAddress?.company || null,
+        tags: c.tags || [],
+        amount_spent_total: parseFloat(c.amountSpent?.amount) || 0,
+        orders_count: c.numberOfOrders || 0,
+        default_address_json: c.defaultAddress || null,
+        created_at: c.createdAt ? new Date(c.createdAt).getTime() : null,
+        updated_at: c.updatedAt ? new Date(c.updatedAt).getTime() : null,
+      });
+    }
+    setSyncState('customers_recent', { lastSyncedAt: Date.now(), totalSynced: edges.length });
+  } catch (err) {
+    console.error('[sync] customer polling error:', err.message);
+    setSyncState('customers_recent', { lastSyncedAt: Date.now(), lastError: err.message });
+  }
+}
+
 // WHAT: verifies a small rotating batch of cached orders still exist in Shopify (nodes(ids:) returns
 // a null entry for a deleted id) and evicts any that don't from orders_cache.
 // CHANGE-GUARD: syncRecentFromShopify (above) can only ADD/UPDATE — Shopify's orders() search
@@ -12304,7 +12370,7 @@ if (!MOCK) {
     if (!dashboardActive()) return;            // quiet when nobody is looking
     if (_syncing || (Date.now() - _lastSyncAt) < FRESH_TARGET_MS) return;
     _syncing = true;
-    try { await syncRecentFromShopify(); await reconcileOrderDeletions(); _lastSyncAt = Date.now(); }
+    try { await syncRecentFromShopify(); await syncRecentCustomersFromShopify(); await reconcileOrderDeletions(); _lastSyncAt = Date.now(); }
     catch {} finally { _syncing = false; }
   }, 60 * 1000);
   // Daily GC for expired impersonation nonces

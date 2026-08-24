@@ -1342,6 +1342,19 @@ export function deleteOrderFromCache(shopifyId) {
   run(String(shopifyId));
 }
 
+// WHAT: evicts one customer from customers_cache — used when Shopify reports the customer gone
+// (a `customers/delete` webhook, or a customerMerge that removed the losing side's id).
+// CHANGE-GUARD: this is a hard DELETE, not an upsert — a merged-away customer's shopify_id stops
+// existing in Shopify entirely, so leaving the row in place produces a permanent ghost duplicate in
+// /customers (see PRO-MOHS incident 2026-08-24: mward@pro-mohs.com stayed listed after being merged
+// into info@pro-mohs.com because the webhook handler only ever upserted, never deleted).
+// INVARIANT(S): leaves orders_cache/customer_notes/dropship_config_cache/impersonation_nonces/leads
+// untouched — those are keyed to orders or historical records that should survive, and (for a merge)
+// Shopify itself repoints the order's customer_id via a fresh orders/update webhook, not this call.
+export function deleteCustomerFromCache(shopifyId) {
+  db.prepare('DELETE FROM customers_cache WHERE shopify_id = ?').run(String(shopifyId));
+}
+
 export function getOrdersFromCache({ customerId, from, to, limit = 250, offset = 0 } = {}) {
   let where = '1=1';
   const params = [];
