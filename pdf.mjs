@@ -88,6 +88,36 @@ function registerBrandFonts(doc) {
 // WHAT: renders a branded B2B invoice PDF (pdfkit) from a Shopify order, with optional opts overrides for partial invoices (lineItems/subtotal/shipping/total/invoiceSuffix/paymentTerms).
 // CHANGE-GUARD: line rows use fixed heights + lineBreak:false + ellipsis and an explicit y>680 page-break; long titles/skus or added columns can overlap or push the footer off-page — re-render a multi-page order and an unpaid order (PAYMENT PENDING watermark) after layout edits.
 // INVARIANT(S): unit price falls back discountedUnitPrice -> originalUnitPrice -> 0; when opts.subtotal is supplied the totals come entirely from opts (partial-invoice path) and must already be reconciled by the caller; all text is black per brand spec (lime is accent-only).
+/**
+ * splitBackordered(lineItems, backorderedIds) -> { shipped, backordered }
+ *
+ * PURE. Separates the lines that actually shipped from the ones held back, so
+ * both the invoice renderer and any caller reconciling totals work off the same
+ * split rather than each deciding for itself.
+ *
+ * A backordered line still APPEARS on the invoice — struck through at $0.00,
+ * with a summary at the bottom — because the customer needs to see that we know
+ * it is owed. It contributes NOTHING to the money.
+ *
+ * Matching is by line-item id. Ids are compared as strings: a Shopify gid and a
+ * synthesized partial-invoice id are both strings, but a caller holding numeric
+ * ids would otherwise silently match nothing and quietly invoice the customer for
+ * goods that never shipped.
+ */
+export function splitBackordered(lineItems, backorderedIds) {
+  const items = Array.isArray(lineItems) ? lineItems : [];
+  const held = new Set((Array.isArray(backorderedIds) ? backorderedIds : [])
+    .filter((id) => id != null)
+    .map((id) => String(id)));
+  if (!held.size) return { shipped: items, backordered: [] };
+  const shipped = [];
+  const backordered = [];
+  for (const it of items) {
+    (held.has(String(it && it.id)) ? backordered : shipped).push(it);
+  }
+  return { shipped, backordered };
+}
+
 export async function generateInvoicePdf(order, opts = {}) {
   return new Promise((resolve, reject) => {
     const doc = new PDFDocument({ margin: 50, size: 'LETTER', autoFirstPage: true });
@@ -201,6 +231,19 @@ export async function generateInvoicePdf(order, opts = {}) {
 
     let y = tableTop + 30;
     const lineItems = opts.lineItems ?? (order.lineItems?.edges?.map(e => e.node) || []);
+    // BACKORDERS: lines held back still print, struck through at $0.00, with a
+    // summary block after the totals. `heldIds` drives both.
+    const { backordered: heldLines } = splitBackordered(lineItems, opts.backorderedIds);
+    const heldIds = new Set(heldLines.map((li) => String(li && li.id)));
+    // MONEY GUARD: the computed-totals branch below reads Shopify's authoritative
+    // aggregates, which cover the WHOLE order — including the lines being held.
+    // Rendering those totals next to struck-through $0.00 rows would invoice the
+    // customer for goods that did not ship. The caller must reconcile and pass
+    // opts.subtotal/shipping/total (the partial-invoice path already does). Fail
+    // loudly rather than produce a plausible, wrong invoice.
+    if (heldIds.size && opts.subtotal === undefined) {
+      throw new Error('generateInvoicePdf: backorderedIds requires caller-reconciled opts.subtotal/shipping/total — refusing to bill the full-order totals against a partial shipment');
+    }
     doc.font('Inter').fillColor(BLACK);
 
     // Truncate-with-ellipsis helper that respects column width
@@ -218,8 +261,11 @@ export async function generateInvoicePdf(order, opts = {}) {
         doc.addPage();
         y = 50;
       }
-      const unitPrice = lineItemTrueUnit(item);
-      const rowTotal = lineItemTrueTotal(item);
+      const isHeld = heldIds.has(String(item && item.id));
+      // A held line shows its real quantity — that is what is owed — but zero
+      // money, so the column totals still add up to what is being charged.
+      const unitPrice = isHeld ? 0 : lineItemTrueUnit(item);
+      const rowTotal = isHeld ? 0 : lineItemTrueTotal(item);
       // Use fixed height: 1 line per row, truncate overflow. height:14 + ellipsis prevents wrap.
       const variantTitle = (item.variant?.title && item.variant.title !== 'Default Title') ? item.variant.title : null;
       const rowH = variantTitle ? 32 : 20;
@@ -236,6 +282,18 @@ export async function generateInvoicePdf(order, opts = {}) {
       doc.text(String(qty), 385, y, { width: 40, height: 14, align: 'right', lineBreak: false });
       doc.text(fmt(unitPrice), 430, y, { width: 65, height: 14, align: 'right', lineBreak: false });
       doc.text(fmt(rowTotal), 500, y, { width: 62, height: 14, align: 'right', lineBreak: false });
+      if (isHeld) {
+        // pdfkit has no text-decoration — a strike is a drawn rule. Two segments
+        // rather than one across the row: through the title/SKU block and through
+        // the money columns, so it reads as "this line is struck" without crossing
+        // the quantity, which is still meaningful.
+        const midY = y + 6;
+        doc.moveTo(56, midY).lineTo(375, midY).lineWidth(0.7).strokeColor('#B00020').stroke();
+        doc.moveTo(430, midY).lineTo(562, midY).lineWidth(0.7).strokeColor('#B00020').stroke();
+        doc.fontSize(7).font('Inter-Bold').fillColor('#B00020')
+          .text('BACK-ORDERED', 285, y + 11, { width: 90, height: 10, lineBreak: false });
+        doc.fontSize(9.5).font('Inter').fillColor(BLACK);
+      }
       doc.moveTo(50, y + rowH - 4).lineTo(562, y + rowH - 4).lineWidth(0.5).strokeColor('#E5E5E5').stroke();
       y += rowH;
     }
@@ -289,6 +347,24 @@ export async function generateInvoicePdf(order, opts = {}) {
     doc.fontSize(13).font('Inter-Bold').fillColor(BLACK);
     doc.text('TOTAL', LABEL_X, y, { width: LABEL_W, align: 'right', lineBreak: false });
     doc.text(fmt(total), AMT_X, y, { width: AMT_W, align: 'right', lineBreak: false });
+
+    // ─── Back-ordered summary ──────────────────────────────────────
+    // Restates what is owed, apart from the priced lines above, so the customer
+    // does not have to re-scan the table for struck-through rows.
+    if (heldLines.length) {
+      y += 34;
+      if (y > 660) { doc.addPage(); y = 50; }
+      doc.fontSize(8).font('Inter-Bold').fillColor('#B00020').text('BACK-ORDERED — TO FOLLOW, NOT CHARGED ON THIS INVOICE', 50, y);
+      y += 13;
+      doc.fontSize(9).font('Inter').fillColor(BLACK);
+      for (const li of heldLines) {
+        if (y > 700) { doc.addPage(); y = 50; }
+        const q = lineItemCurrentQty(li) || li.quantity || 0;
+        const sku = (li.variant && li.variant.sku) ? `  ·  ${li.variant.sku}` : '';
+        doc.text(`${q} × ${String(li.title || '—')}${sku}`, 56, y, { width: 500, height: 12, lineBreak: false, ellipsis: true });
+        y += 13;
+      }
+    }
 
     // ─── Payment terms (B2B-specific) ──────────────────────────────
     if (opts.paymentTerms) {
