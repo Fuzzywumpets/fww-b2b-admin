@@ -96,6 +96,14 @@ if [ -f test/leads-list.test.mjs ]; then
   B2B_ADMIN_MOCK=1 node test/leads-list.test.mjs || UNIT_FAIL=$?
 fi
 
+# Edited orders must be shown and summed at their CURRENT total. total_price/subtotal_price FREEZE at
+# the pre-edit amount, so reading them overstates every edited order. DB-layer + template strings —
+# the mock HTTP server reaches neither (the cache paths are gated on `if (!MOCK)`).
+if [ -f test/order-display-totals.test.mjs ]; then
+  echo ""
+  node test/order-display-totals.test.mjs || UNIT_FAIL=$?
+fi
+
 # The #38953 lock-up: a permanently-failing line edit armed a beforeunload guard, and the Electron
 # shell cancels a prevented unload SILENTLY — every link, the back button, "Generate PDF" and Quit
 # died at once. Standalone: it spans desktop shell code (never loaded by the server) and source-level

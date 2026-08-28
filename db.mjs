@@ -832,12 +832,14 @@ export function getBackordersForOrder(orderId) {
     .all(orderId, 'pending');
 }
 
-// WHAT: sums orders_cache.total_price for a customer across PENDING/PARTIALLY_PAID/UNPAID, non-cancelled orders (the customer-detail outstanding-balance widget).
+// WHAT: sums each order's CURRENT total for a customer across PENDING/PARTIALLY_PAID/UNPAID, non-cancelled orders (the customer-detail outstanding-balance widget).
+// CURRENT-TOTALS (2026-08-28): COALESCE(current_total, total_price), not total_price. total_price is FROZEN at the pre-edit amount, so every edited order inflated this widget — #38953 alone by $302 after it was edited down to $4,469.82. COALESCE (not `||`/OR) because a fully-removed order's current total is legitimately 0 and must stay 0; only NULL — an un-resynced or pre-migration row — may fall back to the frozen value.
+// SYNC: lib/order-display-totals.mjs is the JS half of this same rule; getOrderSpendFromCache below carries the identical COALESCE.
 // CHANGE-GUARD: customer_shopify_id stores the NUMERIC id, but renderCustomerDetail calls this with customer.id which is a gid:// GID — the WHERE never matches and the widget always shows $0 (see bugs[]); pass shopifyNumericId(customer.id).
 // INVARIANT(S): the status list must match the financial_status strings Shopify actually returns; total is ROUND()ed to 2dp; cancelled orders must be excluded.
 export function getOutstandingBalanceForCustomer(customerId) {
   const rows = db.prepare(
-    'SELECT ROUND(SUM(total_price), 2) AS total, COUNT(*) AS count FROM orders_cache WHERE customer_shopify_id = ? AND cancelled_at IS NULL AND financial_status IN (\'PENDING\',\'PARTIALLY_PAID\',\'UNPAID\')'
+    'SELECT ROUND(SUM(COALESCE(current_total, total_price)), 2) AS total, COUNT(*) AS count FROM orders_cache WHERE customer_shopify_id = ? AND cancelled_at IS NULL AND financial_status IN (\'PENDING\',\'PARTIALLY_PAID\',\'UNPAID\')'
   ).get(customerId);
   return { total: rows?.total || 0, count: rows?.count || 0 };
 }
@@ -1369,7 +1371,7 @@ export function getOrderSpendFromCache(customerId, from, to) {
   if (from) { where += ' AND created_at >= ?'; params.push(new Date(from).getTime()); }
   if (to)   { where += ' AND created_at <= ?'; params.push(new Date(to).getTime()); }
   return db.prepare(`
-    SELECT COUNT(*) as count, COALESCE(SUM(total_price), 0) as total
+    SELECT COUNT(*) as count, COALESCE(SUM(COALESCE(current_total, total_price)), 0) as total
     FROM orders_cache WHERE ${where}
   `).get(...params) || { count: 0, total: 0 };
 }
