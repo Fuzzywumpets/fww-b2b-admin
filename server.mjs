@@ -46,6 +46,7 @@ import {
 import { generateInvoicePdf, lineItemTrueTotal, lineItemTrueUnit, lineItemCurrentQty } from './pdf.mjs';
 // Extracted so they can be unit-tested without booting this server (house pattern: lib/*.mjs).
 import { isTerminalEditError } from './lib/order-edit-errors.mjs';
+import { cacheRowTotal, listRowTotalAmount } from './lib/order-display-totals.mjs';
 import { LINE_PAGE_MAX, drainLineItems } from './lib/line-item-paging.mjs';
 import { renderLabelSheet, expandItems, TEMPLATES as LABEL_TEMPLATES, DEFAULT_FIELDS } from './labels.mjs';
 import { isInsider, resolveXeroContact, syncCustomerToXero, getXeroSyncStatus } from './lib/xero-customer-sync.mjs';
@@ -1873,7 +1874,9 @@ function renderDashboard(session, data) {
       ${data.openOrders.map(o => `<tr>
         <td><a href="/orders/${shopifyNumericId(o.id)}">${h(o.name)}</a></td>
         <td>${h(o.customer?.displayName || '—')}</td>
-        <td>${fmtMoney(o.totalPriceSet?.presentmentMoney?.amount, o.totalPriceSet?.presentmentMoney?.currencyCode)}</td>
+        ${/* listRowTotalAmount, not totalPriceSet: on an edited order totalPriceSet is FROZEN at the
+              pre-edit amount. This widget showed #38953 at $4,771.82 while the order was $4,469.82. */''}
+        <td>${fmtMoney(listRowTotalAmount(o), o.totalPriceSet?.presentmentMoney?.currencyCode)}</td>
         <td><span class="badge badge-${h((o.displayFinancialStatus||'').toLowerCase())}">${h(o.displayFinancialStatus)}</span></td>
       </tr>`).join('')}</tbody></table>`
     : '<p class="empty-state">No open orders</p>';
@@ -2075,15 +2078,10 @@ async function getOrdersData(filters) {
   }
 }
 
-// WHAT: the LIST total for one order row — prefers the CURRENT (post-edit) total, falling back to the frozen
-// original. On an EDITED order (e.g. #37639) totalPriceSet is FROZEN at $921.72 while currentTotalPriceSet is
-// the truth ($601.24); on an unedited or un-resynced order currentTotalPriceSet is absent and we use the frozen
-// total. Mirrors the cache fields populated by listOrdersFromCache and the live currentTotalPriceSet on Shopify.
-function listRowTotalAmount(o) {
-  const cur = o.currentTotalPriceSet?.presentmentMoney?.amount;
-  if (cur != null && cur !== '') return cur;
-  return o.totalPriceSet?.presentmentMoney?.amount;
-}
+// listRowTotalAmount moved to lib/order-display-totals.mjs (imported at the top of this file) and now
+// sits beside cacheRowTotal, the raw-orders_cache-row equivalent. It lived here alone while four other
+// money-rendering sites read the frozen total directly — one shared accessor is what stops that
+// recurring. The WHY, and the #38953 evidence, are in that module.
 
 // WHAT: renders the orders table + filter bar + bulk-select form (mark-paid) + pagination.
 // CHANGE-GUARD: the bulk form POSTs /orders/bulk with checked `ids`; the inline select-all/upd() script wires the bulk bar — keep input name="ids" stable. 'Sync now' button only shows when data._fromCache. Re-test bulk mark-paid after table column changes.
@@ -4398,6 +4396,11 @@ async function getCustomerRecentOrders(customerId) {
           displayFinancialStatus: o.financial_status || o.display_financial_status,
           displayFulfillmentStatus: o.fulfillment_status || o.display_fulfillment_status,
           totalPriceSet: { presentmentMoney: { amount: String(o.total_price || 0), currencyCode: o.currency || 'USD' } },
+          // DEPENDS: listRowTotalAmount prefers this. Without it the cache path had ONLY the frozen
+          // total to offer, so the fallback fired on every edited order and the widget under-reported
+          // the fix while looking correct.
+          currentTotalPriceSet: o.current_total != null
+            ? { presentmentMoney: { amount: String(o.current_total), currencyCode: o.currency || 'USD' } } : null,
           lineItems: { edges: [] },
           _fromCache: true,
         }));
@@ -8786,7 +8789,8 @@ app.get('/api/admin/customers/:id/spend', requireAuth, async (req, res) => {
       if (cust && stats && stats.total > 0) {
         const allOrders = getCustomerOrdersFromCache(numId);
         const rangeOrders = allOrders.filter(o => o.created_at >= fromTs && o.created_at <= toTs);
-        const rangeTotal = rangeOrders.reduce((s, o) => s + (o.total_price || 0), 0);
+        // cacheRowTotal, not total_price: an edited order's frozen total is not what is owed.
+        const rangeTotal = rangeOrders.reduce((s, o) => s + cacheRowTotal(o), 0);
         return res.json({
           lifetimeTotal: String(cust.amount_spent_total || 0),
           lifetimeCount: cust.orders_count || 0,
@@ -8796,7 +8800,7 @@ app.get('/api/admin/customers/:id/spend', requireAuth, async (req, res) => {
             id: o.shopify_id,
             name: o.name,
             processedAt: new Date(o.processed_at || o.created_at).toISOString(),
-            total: String(o.total_price || 0),
+            total: String(cacheRowTotal(o)),
             financialStatus: o.financial_status || o.display_financial_status,
             fulfillmentStatus: o.fulfillment_status || o.display_fulfillment_status,
           })),
@@ -12519,7 +12523,9 @@ app.get('/invoices', requireAuth, (req, res) => {
       <td><a href="/orders/${h(ordNum)}" class="link">${h(o.name || `#${ordNum}`)}</a></td>
       <td>${o.customer_name ? `<a href="/customers/${h(o.customer_shopify_id)}" class="link">${h(o.customer_name)}</a>` : h(o.customer_email || '—')}</td>
       <td class="text-muted">${fmtDate(o.created_at ? new Date(o.created_at).toISOString() : null)}</td>
-      <td class="text-right mono">${fmtMoney(o.total_price)}</td>
+      ${/* cacheRowTotal: the frozen total_price overstates every edited order — this table is the
+            one staff reconcile against Xero, so it is the worst place to show a stale amount. */''}
+      <td class="text-right mono">${fmtMoney(cacheRowTotal(o))}</td>
       <td><span class="badge badge-${(o.financial_status||'').toLowerCase()}">${h(o.display_financial_status||o.financial_status||'—')}</span></td>
       <td>${hasXero ? `<span class="badge badge-success">Xero ✓</span> <small class="text-muted">${(xero?.xero_invoice_id||'').slice(0,8)}…</small>` : '<span class="badge badge-secondary">No Xero</span>'}</td>
       <td>${partialInvs.length ? partialInvs.map(p => `<a href="/orders/${h(ordNum)}/invoice?letter=${p.invoice_letter}" target="_blank" rel="noopener" class="link">#${ordNum}-${p.invoice_letter}</a>`).join(' ') : `<a href="/orders/${h(ordNum)}/invoice" target="_blank" rel="noopener" class="link btn btn-ghost btn-xs">PDF</a>`}</td>
