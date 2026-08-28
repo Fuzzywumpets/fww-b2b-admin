@@ -832,10 +832,11 @@ export function getBackordersForOrder(orderId) {
     .all(orderId, 'pending');
 }
 
-// WHAT: sums each order's CURRENT total for a customer across PENDING/PARTIALLY_PAID/UNPAID, non-cancelled orders (the customer-detail outstanding-balance widget).
 // CURRENT-TOTALS (2026-08-28): COALESCE(current_total, total_price), not total_price. total_price is FROZEN at the pre-edit amount, so every edited order inflated this widget — #38953 alone by $302 after it was edited down to $4,469.82. COALESCE (not `||`/OR) because a fully-removed order's current total is legitimately 0 and must stay 0; only NULL — an un-resynced or pre-migration row — may fall back to the frozen value.
-// SYNC: lib/order-display-totals.mjs is the JS half of this same rule; getOrderSpendFromCache below carries the identical COALESCE.
-// CHANGE-GUARD: customer_shopify_id stores the NUMERIC id, but renderCustomerDetail calls this with customer.id which is a gid:// GID — the WHERE never matches and the widget always shows $0 (see bugs[]); pass shopifyNumericId(customer.id).
+// HISTORY (2026-08-28): this widget rendered $0 for EVERY customer for as long as the CHANGE-GUARD below had described why — renderCustomerDetail passed the GID. The call site now passes shopifyNumericId(customer.id). Until that was fixed the COALESCE above was inert here: a query returning no rows cannot sum the wrong column either.
+// SYNC: lib/order-display-totals.mjs is the JS half of the current-vs-frozen rule; getOrderSpendFromCache below carries the identical COALESCE.
+// WHAT: sums each order's CURRENT total for a customer across PENDING/PARTIALLY_PAID/UNPAID, non-cancelled orders (the customer-detail outstanding-balance widget).
+// CHANGE-GUARD: customer_shopify_id stores the NUMERIC id. Callers holding a GraphQL customer object must pass shopifyNumericId(customer.id), NOT customer.id — a gid:// value matches no row and the widget silently shows $0 instead of erroring.
 // INVARIANT(S): the status list must match the financial_status strings Shopify actually returns; total is ROUND()ed to 2dp; cancelled orders must be excluded.
 export function getOutstandingBalanceForCustomer(customerId) {
   const rows = db.prepare(

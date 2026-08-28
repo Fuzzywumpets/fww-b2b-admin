@@ -46,6 +46,10 @@ import {
 import { generateInvoicePdf, lineItemTrueTotal, lineItemTrueUnit, lineItemCurrentQty } from './pdf.mjs';
 // Extracted so they can be unit-tested without booting this server (house pattern: lib/*.mjs).
 import { isTerminalEditError } from './lib/order-edit-errors.mjs';
+// DEPENDS: every money surface in this file picks its amount through these two — cacheRowTotal for a
+// raw orders_cache row, listRowTotalAmount for a Shopify/GraphQL-shaped one. A query that feeds one
+// of them MUST also select currentTotalPriceSet (or carry current_total), or the accessor silently
+// falls back to the frozen pre-edit amount and the surface looks correct while being wrong.
 import { cacheRowTotal, listRowTotalAmount } from './lib/order-display-totals.mjs';
 import { LINE_PAGE_MAX, drainLineItems } from './lib/line-item-paging.mjs';
 import { renderLabelSheet, expandItems, TEMPLATES as LABEL_TEMPLATES, DEFAULT_FIELDS } from './labels.mjs';
@@ -1807,7 +1811,8 @@ async function getDashboardData() {
     const [ordersResult, productsResult] = await Promise.all([
       shopifyFetch(`query($q:String!){ orders(first:50,query:$q,sortKey:PROCESSED_AT,reverse:true){
         edges{node{id name processedAt customer{id displayName email} displayFinancialStatus
-          totalPriceSet{presentmentMoney{amount currencyCode}} tags}}
+          totalPriceSet{presentmentMoney{amount currencyCode}}
+          currentTotalPriceSet{presentmentMoney{amount currencyCode}} tags}}
         pageInfo{hasNextPage}}}`, { q: `tag:b2b-portal created_at:>${ninetyDaysAgo}` }),
 // WHAT: low-stock source query — pulls first:100 published products with publishedOnPublication(B2B_PUB_ID) and first:10 variants each.
 // CHANGE-GUARD: DOUBLE truncation risk — first:100 products AND first:10 variants/product with no paging; a catalog beyond those caps drops products/variants from the low-stock widget silently. B2B_PUB_ID is the hardcoded publication gid (199709720811) gating B2B visibility.
@@ -1824,7 +1829,7 @@ async function getDashboardData() {
     for (const o of orders) {
       if (!o.customer) continue;
       const { id, displayName, email } = o.customer;
-      const amt = parseFloat(o.totalPriceSet?.presentmentMoney?.amount || 0);
+      const amt = parseFloat(listRowTotalAmount(o) || 0);
       if (!spend.has(id)) spend.set(id, { id, name: displayName, email, spend: 0 });
       spend.get(id).spend += amt;
     }
@@ -4396,9 +4401,11 @@ async function getCustomerRecentOrders(customerId) {
           displayFinancialStatus: o.financial_status || o.display_financial_status,
           displayFulfillmentStatus: o.fulfillment_status || o.display_fulfillment_status,
           totalPriceSet: { presentmentMoney: { amount: String(o.total_price || 0), currencyCode: o.currency || 'USD' } },
-          // DEPENDS: listRowTotalAmount prefers this. Without it the cache path had ONLY the frozen
-          // total to offer, so the fallback fired on every edited order and the widget under-reported
-          // the fix while looking correct.
+          // DEPENDS: renderCustomerDetail's Recent Orders table reads this through listRowTotalAmount.
+          // Without it the cache path had ONLY the frozen total to offer, so the accessor's fallback
+          // fired on every edited order and the table looked correct while showing the pre-edit amount.
+          // SYNC: the live branch of this same function must select currentTotalPriceSet too, or the
+          // displayed figure changes depending on whether the cache happened to be warm.
           currentTotalPriceSet: o.current_total != null
             ? { presentmentMoney: { amount: String(o.current_total), currencyCode: o.currency || 'USD' } } : null,
           lineItems: { edges: [] },
@@ -4418,6 +4425,7 @@ async function getCustomerRecentOrders(customerId) {
       query($q:String!){ orders(first:10,query:$q,sortKey:PROCESSED_AT,reverse:true){
         edges{node{id name processedAt displayFinancialStatus displayFulfillmentStatus
           totalPriceSet{presentmentMoney{amount currencyCode}}
+          currentTotalPriceSet{presentmentMoney{amount currencyCode}}
         }}}}`,
       { q: `customer_id:${customerId}` });
     return result.data?.orders?.edges?.map(e => e.node) || [];
@@ -4581,7 +4589,13 @@ async function applyB2bConfigUpdate(numericId, body) {
 // INVARIANT(S): numId derives from shopifyNumericId(customer.id) and is interpolated into MANY inline-script URLs — it must be a clean numeric string (no gid). Outstanding-balance badge is best-effort (try/catch -> {total:0}). impHistory 'Used?' badge logic depends on ev.expiresAt vs Date.now() — keep ms units.
 function renderCustomerDetail(session, customer, recentOrders, notes, _dropshipCache, b2bConfig, flash, impHistory = []) {
   const numId      = shopifyNumericId(customer.id);
-  const outstanding = (() => { try { return getOutstandingBalanceForCustomer(customer.id); } catch(e) { return { total: 0, count: 0 }; } })();
+  // shopifyNumericId, NOT customer.id. orders_cache.customer_shopify_id stores the BARE NUMERIC id
+  // while customer.id here is a gid://shopify/Customer/... — so the WHERE matched nothing and this
+  // widget silently rendered $0 for every customer, no matter what they owed. db.mjs's CHANGE-GUARD
+  // on getOutstandingBalanceForCustomer has described this exact defect since it was written; the
+  // call site was simply never corrected. It also made the COALESCE(current_total, …) fix in #33
+  // inert here — a query that returns no rows cannot sum the wrong column either. (Qodo #9 on PR#33.)
+  const outstanding = (() => { try { return getOutstandingBalanceForCustomer(shopifyNumericId(customer.id)); } catch(e) { return { total: 0, count: 0 }; } })();
 
   // Phase 22H: Impersonation history card
   const impHistoryHtml = (impHistory && impHistory.length > 0)
@@ -4610,7 +4624,7 @@ function renderCustomerDetail(session, customer, recentOrders, notes, _dropshipC
         ${recentOrders.map(o => `<tr>
           <td><a href="/orders/${shopifyNumericId(o.id)}">${h(o.name)}</a></td>
           <td class="text-muted">${fmtDate(o.processedAt)}</td>
-          <td class="text-right mono">${fmtMoney(o.totalPriceSet?.presentmentMoney?.amount)}</td>
+          <td class="text-right mono">${fmtMoney(listRowTotalAmount(o), o.totalPriceSet?.presentmentMoney?.currencyCode)}</td>
           <td><span class="badge badge-${h((o.displayFinancialStatus||'').toLowerCase())}">${h(o.displayFinancialStatus)}</span></td>
         </tr>`).join('')}
       </tbody></table>`
@@ -8814,12 +8828,14 @@ app.get('/api/admin/customers/:id/spend', requireAuth, async (req, res) => {
   if (MOCK) {
     const gid = shopifyCustomerGid(numId);
     const all = MOCK_ORDERS.filter(o => o.customer?.id === gid);
-    const lifetimeTotal = all.reduce((s, o) => s + parseFloat(o.totalPriceSet?.presentmentMoney?.amount || 0), 0);
+    // The MOCK branch is the one the tests exercise, so it has to agree with the other two or the
+    // suite green-lights an overstatement it never actually evaluated.
+    const lifetimeTotal = all.reduce((s, o) => s + parseFloat(listRowTotalAmount(o) || 0), 0);
     const range = all.filter(o => {
       const d = new Date(o.processedAt).getTime();
       return d >= fromTs && d <= toTs;
     });
-    const rangeTotal = range.reduce((s, o) => s + parseFloat(o.totalPriceSet?.presentmentMoney?.amount || 0), 0);
+    const rangeTotal = range.reduce((s, o) => s + parseFloat(listRowTotalAmount(o) || 0), 0);
     return res.json({
       lifetimeTotal: lifetimeTotal.toFixed(2),
       lifetimeCount: all.length,
@@ -8829,7 +8845,7 @@ app.get('/api/admin/customers/:id/spend', requireAuth, async (req, res) => {
         id:   shopifyNumericId(o.id),
         name: o.name,
         processedAt: o.processedAt,
-        total: o.totalPriceSet?.presentmentMoney?.amount || '0.00',
+        total: listRowTotalAmount(o) || '0.00',
         financialStatus: o.displayFinancialStatus,
         fulfillmentStatus: o.displayFulfillmentStatus,
       })),
@@ -8849,6 +8865,7 @@ app.get('/api/admin/customers/:id/spend', requireAuth, async (req, res) => {
             edges{node{
               id name processedAt displayFinancialStatus displayFulfillmentStatus
               totalPriceSet{presentmentMoney{amount currencyCode}}
+              currentTotalPriceSet{presentmentMoney{amount currencyCode}}
             }}
           }
         }
@@ -8856,7 +8873,10 @@ app.get('/api/admin/customers/:id/spend', requireAuth, async (req, res) => {
     const cust = r.data?.customer;
     if (!cust) return res.status(404).json({ error: 'not found' });
     const orders = cust.orders.edges.map(e => e.node);
-    const rangeTotal = orders.reduce((s, o) => s + parseFloat(o.totalPriceSet?.presentmentMoney?.amount || 0), 0);
+    // listRowTotalAmount on BOTH the sum and the rows. #33 changed only the cache branch, so the
+    // answer this endpoint gave depended on whether the cache was warm — a cold cache reproduced the
+    // edited-order overstatement the fix existed to remove. (Qodo #11 on PR#33.)
+    const rangeTotal = orders.reduce((s, o) => s + parseFloat(listRowTotalAmount(o) || 0), 0);
     res.json({
       lifetimeTotal: cust.amountSpent?.amount || '0.00',
       lifetimeCount: cust.numberOfOrders || 0,
@@ -8866,7 +8886,7 @@ app.get('/api/admin/customers/:id/spend', requireAuth, async (req, res) => {
         id:   shopifyNumericId(o.id),
         name: o.name,
         processedAt: o.processedAt,
-        total: o.totalPriceSet?.presentmentMoney?.amount || '0.00',
+        total: listRowTotalAmount(o) || '0.00',
         financialStatus: o.displayFinancialStatus,
         fulfillmentStatus: o.displayFulfillmentStatus,
       })),
