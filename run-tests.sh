@@ -104,6 +104,14 @@ if [ -f test/order-display-totals.test.mjs ]; then
   node test/order-display-totals.test.mjs || UNIT_FAIL=$?
 fi
 
+# The orders backstop poller: pagination + honest cursor advance (lib/order-sync-paging.mjs, plus
+# source guards on the syncRecentFromShopify wiring). Standalone because the poller short-circuits
+# in MOCK and calls the real shopifyFetch otherwise — no HTTP suite can ever reach the drain loop.
+if [ -f test/order-sync-paging.test.mjs ]; then
+  echo ""
+  node test/order-sync-paging.test.mjs || UNIT_FAIL=$?
+fi
+
 # The #38953 lock-up: a permanently-failing line edit armed a beforeunload guard, and the Electron
 # shell cancels a prevented unload SILENTLY — every link, the back button, "Generate PDF" and Quit
 # died at once. Standalone: it spans desktop shell code (never loaded by the server) and source-level

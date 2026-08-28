@@ -51,6 +51,7 @@ import { isTerminalEditError } from './lib/order-edit-errors.mjs';
 // of them MUST also select currentTotalPriceSet (or carry current_total), or the accessor silently
 // falls back to the frozen pre-edit amount and the surface looks correct while being wrong.
 import { cacheRowTotal, listRowTotalAmount, restRowCurrentTotals } from './lib/order-display-totals.mjs';
+import { ORDER_SYNC_PAGE_SIZE, drainRecentOrders, nextSyncCursorMs } from './lib/order-sync-paging.mjs';
 import { LINE_PAGE_MAX, drainLineItems } from './lib/line-item-paging.mjs';
 import { renderLabelSheet, expandItems, TEMPLATES as LABEL_TEMPLATES, DEFAULT_FIELDS } from './labels.mjs';
 import { isInsider, resolveXeroContact, syncCustomerToXero, getXeroSyncStatus } from './lib/xero-customer-sync.mjs';
@@ -12409,38 +12410,61 @@ app.post('/webhooks/shopify', (req, res) => {
 
 // ── Phase 24C: Background polling sync ────────────────────────────────────────
 
-// WHAT: incremental order poller — pulls orders updated since last_synced_at (minus 60s overlap) into orders_cache; the backstop for missed webhooks.
-// CHANGE-GUARD: it queries shopMoney (not presentmentMoney) and assumes currency 'USD'; the webhook path and backfill scripts use different money fields — keep the three in sync or cached totals diverge.
-// INVARIANT(S): runs only when dashboardActive() and at most every FRESH_TARGET_MS (~3min) guarded by the _syncing flag; the 60s lookback overlap is required so updates landing between polls aren't lost; never runs in MOCK or without SHOPIFY_BEARER.
-// WHAT: incremental order backstop poller — pulls orders updated since last_synced_at (minus a 60s overlap, or 6min on cold start) into orders_cache; covers webhooks that were missed.
-// CHANGE-GUARD: it reads totalPriceSet/subtotalPriceSet/totalTaxSet.shopMoney and HARDCODES currency:'USD' — the webhook path and any backfill must use the same money fields or cached totals diverge; query is sortKey:UPDATED_AT reverse with first:50 (no pagination loop, so a burst of >50 updates between polls can drop the oldest — the 60s overlap only helps at the boundary).
-// INVARIANT(S): no-ops in MOCK or without SHOPIFY_BEARER; the 60s lookback overlap is REQUIRED so updates landing between polls aren't lost; success and error both call setSyncState so last_synced_at always advances (an error still moves the cursor, meaning a failed page is not retried — intentional best-effort).
+// WHAT: incremental order backstop poller — pulls ALL orders updated since the stored cursor (minus a
+// 60s overlap, or a 6min lookback on cold start) into orders_cache, paginating oldest-update-first.
+// The order webhooks (receiver above) are the real-time path since 2026-08-28; this catches missed
+// deliveries and anything that changed while the service was down.
+// CHANGE-GUARD: it reads totalPriceSet/subtotalPriceSet/currentTotalPriceSet/currentSubtotalPriceSet/
+// totalTaxSet.shopMoney and HARDCODES currency:'USD' — the webhook path and any backfill must use the
+// same money fields or cached totals diverge. Page size, the per-run page cap and the cursor-advance
+// rules live in lib/order-sync-paging.mjs; test/order-sync-paging.test.mjs pins the wiring AND the
+// semantics — change them there, not inline here.
+// INVARIANT(S): no-ops in MOCK or without SHOPIFY_BEARER; never throws (the scheduler and
+// /api/admin/sync-now rely on that); the 60s lookback overlap is REQUIRED so updates landing between
+// polls — and `updated_at:>` boundary ties — aren't lost; sortKey stays UPDATED_AT ASCENDING
+// (reverse:false) because a partial run then holds a contiguous oldest-first prefix, the only shape
+// the cursor can safely advance over (reverse:true would keep the NEWEST and advancing would lose
+// the middle); sync_state.last_synced_at means "the cache is current through this instant" and NEVER
+// advances past data that wasn't ingested — full drain -> sync start, partial (page cap or mid-run
+// error) -> newest ingested updatedAt, nothing ingested -> cursor unmoved. This SUPERSEDES the
+// pre-2026-08-28 "an error still moves the cursor" best-effort semantics, which permanently dropped
+// the window of every failed poll, and the first:50-no-pagination shape, which permanently dropped
+// everything past 50 in a busy window while selecting a pageInfo it never read.
 async function syncRecentFromShopify() {
   if (MOCK || !SHOPIFY_BEARER) return;
+  const syncStartMs = Date.now();
+  const ingested = [];
+  let prevCursorMs = null, sinceMs = syncStartMs - 6 * 60 * 1000, drained = false, pagesFetched = 0, failure = null;
   try {
     const state = getSyncState('orders_recent');
-    const since = state?.last_synced_at
-      ? new Date(state.last_synced_at - 60000).toISOString()
-      : new Date(Date.now() - 6 * 60 * 1000).toISOString();
-    const result = await shopifyFetch(`
-      query($q:String!){
-        orders(first:50,query:$q,sortKey:UPDATED_AT,reverse:true){
-          edges{node{
-            id name processedAt updatedAt createdAt cancelledAt
-            displayFinancialStatus displayFulfillmentStatus
-            totalPriceSet{shopMoney{amount}}
-            subtotalPriceSet{shopMoney{amount}}
-            currentTotalPriceSet{shopMoney{amount}}
-            currentSubtotalPriceSet{shopMoney{amount}}
-            totalTaxSet{shopMoney{amount}}
-            customer{id email firstName lastName}
-            tags sourceName note
-          }}
-          pageInfo{hasNextPage}
-        }
-      }`, { q: `updated_at:>${since}` });
-    const edges = result.data?.orders?.edges || [];
-    for (const { node: o } of edges) {
+    prevCursorMs = state?.last_synced_at ?? null;
+    if (prevCursorMs != null) sinceMs = prevCursorMs - 60000;
+    const since = new Date(sinceMs).toISOString();
+    const fetchPage = async (after) => {
+      const result = await shopifyFetch(`
+        query($q:String!,$after:String){
+          orders(first:${ORDER_SYNC_PAGE_SIZE},query:$q,sortKey:UPDATED_AT,reverse:false,after:$after){
+            edges{node{
+              id name processedAt updatedAt createdAt cancelledAt
+              displayFinancialStatus displayFulfillmentStatus
+              totalPriceSet{shopMoney{amount}}
+              subtotalPriceSet{shopMoney{amount}}
+              currentTotalPriceSet{shopMoney{amount}}
+              currentSubtotalPriceSet{shopMoney{amount}}
+              totalTaxSet{shopMoney{amount}}
+              customer{id email firstName lastName}
+              tags sourceName note
+            }}
+            pageInfo{hasNextPage endCursor}
+          }
+        }`, { q: `updated_at:>${since}`, after });
+      return result.data?.orders || { edges: [], pageInfo: { hasNextPage: false } };
+    };
+    const drainResult = await drainRecentOrders(fetchPage);
+    pagesFetched = drainResult.pagesFetched;
+    drained = drainResult.drained;
+    failure = drainResult.error;
+    for (const o of drainResult.nodes) {
       const shopifyId = shopifyNumericId(o.id);
       const custId = o.customer?.id ? shopifyNumericId(o.customer.id) : null;
       upsertOrderCache({
@@ -12465,12 +12489,30 @@ async function syncRecentFromShopify() {
         tags: o.tags || [], source_name: o.sourceName || null, note: o.note || null,
         customer_email: o.customer?.email || null,
       });
+      // ingested only AFTER a successful upsert — the cursor below may advance over exactly these.
+      ingested.push(o);
     }
-    setSyncState('orders_recent', { lastSyncedAt: Date.now(), totalSynced: edges.length });
   } catch (err) {
-    console.error('[sync] polling error:', err.message);
-    setSyncState('orders_recent', { lastSyncedAt: Date.now(), lastError: err.message });
+    // upsertOrderCache (or the sync-state read) failed mid-run; whatever landed stays in ingested
+    // so the cursor advances over exactly that prefix and no further.
+    failure = err;
+    drained = false;
   }
+  try {
+    const cursorMs = nextSyncCursorMs({ drained, nodes: ingested, syncStartMs, prevCursorMs });
+    setSyncState('orders_recent', {
+      // DEPENDS: setSyncState treats a falsy lastSyncedAt as now() — the ?? fallback (a cold-start
+      // run that ingested nothing) must therefore stay an explicit timestamp: since + the 60s
+      // overlap, so the retry re-queries EXACTLY the window this run attempted.
+      lastSyncedAt: cursorMs ?? (sinceMs + 60000),
+      totalSynced: ingested.length,
+      lastError: failure ? String(failure.message || failure) : null,
+    });
+  } catch (err) {
+    console.error('[sync] sync_state write failed:', err.message);
+  }
+  if (failure) console.error('[sync] polling error:', String(failure.message || failure));
+  else if (!drained) console.warn(`[sync] backstop hit the page cap (${pagesFetched} pages, ${ingested.length} orders) — cursor held at the newest ingested update; the next run resumes from there`);
 }
 
 // WHAT: verifies a small rotating batch of cached orders still exist in Shopify (nodes(ids:) returns
