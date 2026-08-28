@@ -50,7 +50,7 @@ import { isTerminalEditError } from './lib/order-edit-errors.mjs';
 // raw orders_cache row, listRowTotalAmount for a Shopify/GraphQL-shaped one. A query that feeds one
 // of them MUST also select currentTotalPriceSet (or carry current_total), or the accessor silently
 // falls back to the frozen pre-edit amount and the surface looks correct while being wrong.
-import { cacheRowTotal, listRowTotalAmount } from './lib/order-display-totals.mjs';
+import { cacheRowTotal, listRowTotalAmount, restRowCurrentTotals } from './lib/order-display-totals.mjs';
 import { LINE_PAGE_MAX, drainLineItems } from './lib/line-item-paging.mjs';
 import { renderLabelSheet, expandItems, TEMPLATES as LABEL_TEMPLATES, DEFAULT_FIELDS } from './labels.mjs';
 import { isInsider, resolveXeroContact, syncCustomerToXero, getXeroSyncStatus } from './lib/xero-customer-sync.mjs';
@@ -12343,10 +12343,16 @@ app.post('/webhooks/shopify', (req, res) => {
           display_fulfillment_status: o.fulfillment_status?.toUpperCase(),
           total_price: parseFloat(o.total_price) || 0,
           subtotal_price: parseFloat(o.subtotal_price) || 0,
-          // CURRENT-TOTALS (2026-06-29): the REST orders webhook returns CURRENT (post-edit) totals in
-          // total_price/subtotal_price, so they double as current_total/current_subtotal for the list.
-          current_total: o.total_price != null ? parseFloat(o.total_price) || 0 : null,
-          current_subtotal: o.subtotal_price != null ? parseFloat(o.subtotal_price) || 0 : null,
+          // CURRENT-TOTALS (corrected 2026-08-28): the comment that stood here since 2026-06-29 said
+          // "the REST orders webhook returns CURRENT (post-edit) totals in total_price/subtotal_price".
+          // It does not. REST sends BOTH pairs and total_price is the FROZEN one — see
+          // restRowCurrentTotals for the live verification against #38953.
+          // WHY THIS NEVER BIT: Shopify's four order webhooks (ORDERS_CREATE/UPDATED/FULFILLED/
+          // CANCELLED) all point at fww-shopify-cache.alex-037.workers.dev, not at this service, so
+          // this branch has never received an orders/* topic. It was a landmine under the
+          // current-vs-frozen fix, not a live defect — repoint a webhook here and it would have
+          // overwritten current_total with the pre-edit amount on every edited order.
+          ...restRowCurrentTotals(o),
           total_tax: parseFloat(o.total_tax) || 0,
           total_shipping: parseFloat(o.total_shipping_price_set?.shop_money?.amount || o.total_shipping_price || 0),
           total_discounts: parseFloat(o.total_discounts) || 0,
