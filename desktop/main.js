@@ -8,6 +8,7 @@ const { autoUpdater } = require('electron-updater');
 const Store = require('electron-store').default || require('electron-store');
 const path = require('path');
 const { pdfAttachmentHeaders } = require('./lib/pdf-headers');
+const { unloadPromptOptions, shouldAllowUnload } = require('./lib/unload-prompt');
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -312,6 +313,26 @@ function createMainWindow() {
       event.preventDefault();
       shell.openExternal(url);
     }
+  });
+
+  // WHAT: gives `beforeunload` a visible Leave/Stay dialog, the way a browser does.
+  // WHY: Electron shows NOTHING for beforeunload by default — with no listener here, a page that
+  //   cancels its unload cancels it SILENTLY. On 2026-08-28 one line-item edit that Shopify would
+  //   never accept left the order page permanently "dirty", and from that moment every nav link,
+  //   the back button, "Generate PDF" (a form POST, hence a navigation) and Quit itself all did
+  //   nothing, with no message: "I can't even quit the electron shell app. impossible to quit
+  //   without End Task." The page's own guard was reasonable; the missing dialog is what turned it
+  //   into a lock on the whole application.
+  // CHANGE-GUARD: preventDefault() here is INVERTED versus every other Electron event — it means
+  //   "ignore the page's beforeunload and ALLOW the unload". Not calling it is what keeps the user
+  //   on the page. shouldAllowUnload() is named for what it returns; do not negate it at this call
+  //   site. Never remove this listener without replacing it with another way out of a dirty page.
+  // DEPENDS: server-rendered pages register the beforeunload guards this answers — the order-detail
+  //   autosave controller and the new-order form in server.mjs. Their "Leave anyway" control is the
+  //   fallback for operators still running an older build of this shell.
+  mainWindow.webContents.on('will-prevent-unload', (event) => {
+    const choice = dialog.showMessageBoxSync(mainWindow, unloadPromptOptions());
+    if (shouldAllowUnload(choice)) event.preventDefault();
   });
 
   mainWindow.once('ready-to-show', () => {

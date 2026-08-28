@@ -96,6 +96,15 @@ if [ -f test/leads-list.test.mjs ]; then
   B2B_ADMIN_MOCK=1 node test/leads-list.test.mjs || UNIT_FAIL=$?
 fi
 
+# The #38953 lock-up: a permanently-failing line edit armed a beforeunload guard, and the Electron
+# shell cancels a prevented unload SILENTLY — every link, the back button, "Generate PDF" and Quit
+# died at once. Standalone: it spans desktop shell code (never loaded by the server) and source-level
+# guards on call sites, neither of which the HTTP suites can reach.
+if [ -f test/order-edit-nav-deadlock.test.mjs ]; then
+  echo ""
+  node test/order-edit-nav-deadlock.test.mjs || UNIT_FAIL=$?
+fi
+
 # Electron shell code — never runs inside the Express server, so the HTTP suites cannot reach it.
 # Guards the PDF-in-the-main-window trap (no back button; its X quits the whole app).
 if [ -f test/desktop-pdf-headers.test.mjs ]; then

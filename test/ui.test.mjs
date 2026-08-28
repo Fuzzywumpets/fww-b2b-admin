@@ -1732,6 +1732,150 @@ await test('REGRESSION: qty typed after a FAILED add is flushed by the chip retr
     `SILENT LOSS: row shows 12 with a green chip but server holds ${line?.currentQuantity}`);
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Order #38953, 2026-08-28: the page locked the whole desktop app.
+//
+// An operator typed 0 into a line's quantity box. Quantity 0 is a REMOVAL in Shopify's order-edit
+// model, so the line was destroyed with no confirmation; typing a number back then failed with "The
+// line item cannot be edited because it is removed" — permanently. The autosave controller counted
+// that unfixable failure as unsaved work and armed a beforeunload guard on it, and Electron cancels
+// a prevented unload SILENTLY (no dialog unless the app answers will-prevent-unload, which it did
+// not). Result: "Generate PDF" (a form POST), the ← Orders link, every nav item and Quit itself all
+// stopped responding, with no error, and the app had to be ended from Task Manager.
+//
+// These tests probe the guard DIRECTLY — dispatching a cancelable beforeunload and reading
+// defaultPrevented — rather than trying to navigate. Playwright auto-dismisses beforeunload dialogs,
+// so a successful goto() here would prove nothing about what Electron does; defaultPrevented is the
+// exact bit Electron reads.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const unloadBlocked = (page) => page.evaluate(() => {
+  const e = new Event('beforeunload', { cancelable: true });
+  window.dispatchEvent(e);
+  return e.defaultPrevented;
+});
+
+async function openEditMode(page, ctx, orderId = 1001) {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/orders/${orderId}`);
+  await page.waitForSelector('#edit-btn');
+  await page.click('#edit-btn');
+  await page.waitForSelector('#edit-form tr[data-existing="1"] .edit-qty-input', { state: 'visible' });
+  return page.locator('#edit-form tr[data-existing="1"]').first();
+}
+
+await test('THE #38953 LOCK-UP: a TERMINAL rejection must not make the page unleavable', async (page, ctx) => {
+  // Exactly what Shopify answers for a line a prior edit removed.
+  await page.route('**/line/qty', route => route.fulfill({
+    status: 422, contentType: 'application/json',
+    body: JSON.stringify({ ok: false, terminal: true, errors: ['The line item cannot be edited because it is removed'] }),
+  }));
+
+  const row = await openEditMode(page, ctx);
+  assert.equal(await unloadBlocked(page), false, 'a freshly opened edit mode must not block navigation');
+
+  await row.locator('.edit-qty-input').fill('3');
+  await page.keyboard.press('Tab');
+  await page.waitForFunction(() => {
+    const c = document.querySelector('#edit-form tr[data-existing="1"] .row-save-chip');
+    return c && c.dataset.state === 'failed';
+  }, { timeout: 10000 });
+
+  // The operator MUST still see that it did not save...
+  const chip = row.locator('.row-save-chip');
+  assert.equal(await chip.getAttribute('data-terminal'), '1', 'the rejection must be marked terminal');
+  assert.match(await chip.textContent(), /Rejected/, 'the row has to show the edit did not land');
+  assert.match(await chip.getAttribute('title'), /cannot be edited because it is removed/,
+    'the real Shopify reason must be readable, not swallowed');
+
+  // ...and must NOT be held on the page for it. This assertion is the whole bug.
+  assert.equal(await unloadBlocked(page), false,
+    'THE LOCK-UP: an unfixable rejection armed beforeunload, and Electron then killed every link, ' +
+    'the back button, Generate PDF and Quit with no dialog at all');
+  assert.notEqual(await page.locator('#autosave-pill').getAttribute('data-state'), 'failed',
+    'a rejection nothing can save is not "unsaved work"');
+
+  // A retry click would only re-run a guaranteed failure, so it must not be offered.
+  assert.equal(await chip.evaluate(el => el.style.cursor), 'default', 'terminal chips offer no retry');
+});
+
+await test('a RETRYABLE failure still warns — and "Leave anyway" gets the operator out', async (page, ctx) => {
+  await page.route('**/line/qty', route => route.fulfill({
+    status: 422, contentType: 'application/json',
+    body: JSON.stringify({ ok: false, errors: ['Throttled'] }),   // no `terminal` — this one can be retried
+  }));
+
+  const row = await openEditMode(page, ctx);
+  await row.locator('.edit-qty-input').fill('4');
+  await page.keyboard.press('Tab');
+  await page.waitForFunction(() => document.getElementById('autosave-pill')?.dataset.state === 'failed', { timeout: 10000 });
+
+  // Warning is CORRECT here: the edit really could still be saved, so leaving really would lose it.
+  assert.equal(await unloadBlocked(page), true, 'genuinely unsaved work must still warn');
+  assert.equal(await row.locator('.row-save-chip').getAttribute('data-terminal'), null, 'transient failures stay retryable');
+  await page.waitForSelector('#autosave-leave-anyway', { state: 'visible' });
+
+  // But it must always be escapable from inside the page — an operator on an older desktop build
+  // has no Leave/Stay dialog, and this button is the only thing standing between them and Task Manager.
+  await page.click('#autosave-leave-anyway');
+  assert.equal(await unloadBlocked(page), false, '"Leave anyway" must actually release the page');
+  assert.match(await page.locator('#autosave-pill').textContent(), /unlocked/i, 'and say so, so the state is not a mystery');
+});
+
+await test('quantity 0 never reaches the wire — the box reverts instead of destroying the line', async (page, ctx) => {
+  const qtyPosts = [];
+  page.on('request', r => { if (/\/line\/qty$/.test(new URL(r.url()).pathname) && r.method() === 'POST') qtyPosts.push(r); });
+
+  const row = await openEditMode(page, ctx);
+  const qty = row.locator('.edit-qty-input');
+  const before = await qty.inputValue();
+
+  await qty.fill('0');
+  await page.keyboard.press('Tab');
+  // Proving a NEGATIVE: wait past the 500ms debounce, or "no request yet" means nothing.
+  await page.waitForTimeout(900);
+
+  assert.equal(qtyPosts.length, 0,
+    'qty 0 is an IRREVERSIBLE removal in Shopify — it must never be sent as an ordinary quantity edit');
+  assert.equal(await qty.inputValue(), before, `the box must revert to its last accepted value (${before})`);
+  const chip = row.locator('.row-save-chip');
+  assert.match(await chip.getAttribute('title'), /at least 1/i, 'and say why, pointing at the Remove control');
+  assert.equal(await chip.getAttribute('data-terminal'), '1', 'a refusal we made ourselves is not retryable work');
+  assert.equal(await unloadBlocked(page), false, 'refusing to send something must not strand the operator');
+
+  // min= is only advisory while typing, but it must still be right — it is one of the three copies
+  // of this floor, and the browser's own spinner obeys it.
+  assert.equal(await qty.getAttribute('min'), '1');
+});
+
+await test('a committed removal LOCKS its row — no un-toggle, no editable inputs', async (page, ctx) => {
+  // Stubbed so the shared mock fixture is not mutated for later runs; the server half of removal is
+  // covered in api.test.mjs.
+  await page.route('**/line/remove', route => route.fulfill({
+    status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true }),
+  }));
+
+  const row = await openEditMode(page, ctx);
+  await row.locator('button.edit-remove-btn:not(.bo-action-btn)').click();
+  await page.waitForFunction(() => document.querySelector('#edit-form tr[data-existing="1"]')?.dataset.lineRemoved === '1',
+    { timeout: 10000 });
+
+  assert.equal(await row.locator('.edit-qty-input').isDisabled(), true, 'a removed line must not look editable');
+  assert.equal(await row.locator('.edit-price-input').isDisabled(), true);
+  assert.equal(await row.locator('button.edit-remove-btn:not(.bo-action-btn)').isDisabled(), true,
+    'markRemove was a TOGGLE — clicking ✕ again un-dimmed the row while the line stayed gone from the order');
+
+  // Leaving and re-entering edit mode must not resurrect it either.
+  await page.click('#edit-mode-bar button.btn-ghost');
+  await page.click('#edit-btn');
+  await page.waitForSelector('#edit-form tr[data-existing="1"] .edit-qty-input', { state: 'visible' });
+  assert.equal(await row.evaluate(el => el.dataset.lineRemoved), '1', 'the removal must survive an edit-mode round trip');
+  assert.equal(await row.locator('.edit-qty-input').isDisabled(), true,
+    'toggleEditMode re-enabled the inputs of a removed line — the next edit could then only ever fail');
+  assert.equal(await unloadBlocked(page), false);
+});
+
 await browser.close();
 
 console.log(`\n  ${passed} passed, ${failed} failed`);
