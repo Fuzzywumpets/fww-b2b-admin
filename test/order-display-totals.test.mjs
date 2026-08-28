@@ -21,7 +21,7 @@ import { readFile } from 'node:fs/promises';
 // DEPENDS: these three accessors ARE the contract under test — the current-vs-frozen choice, and the
 // `??` semantics that keep a legitimate 0 from falling back to the pre-edit amount. If their
 // fallback rule changes, the expectations below change with it.
-import { cacheRowTotal, cacheRowSubtotal, listRowTotalAmount } from '../lib/order-display-totals.mjs';
+import { cacheRowTotal, cacheRowSubtotal, listRowTotalAmount, restRowCurrentTotals } from '../lib/order-display-totals.mjs';
 
 // DEPENDS: orders_cache's schema (total_price/current_total, customer_shopify_id storing the BARE
 // NUMERIC id) and the COALESCE in both aggregate queries. A column rename, or a WHERE keyed on a
@@ -248,6 +248,50 @@ await test('all three branches of the spend API agree on which total they use', 
   assert.equal(frozen, 0, 'a branch is still summing the frozen total — the result changes with cache state');
   assert.ok((body.match(/listRowTotalAmount\(o\)/g) || []).length >= 4,
     'each branch needs the accessor for BOTH its range sum and its per-order rows');
+});
+
+// ── the WRITE side: a REST webhook payload must not poison current_total ────
+//
+// Everything above protects the readers. This protects the column they read. The webhook handler
+// carried a comment asserting REST's `total_price` was already the post-edit total; it is not, and
+// storing it as current_total would have overwritten the truth with the pre-edit amount on every
+// order that path touched — undoing the whole fix, as wrong money, with no error. It never fired only
+// because Shopify's order webhooks point at fww-shopify-cache rather than at this service.
+
+await test('a REST payload stores the CURRENT totals, not the frozen ones', () => {
+  // Exactly what Shopify REST returned for #38953 after the edit (verified live 2026-08-28).
+  const payload = {
+    id: 7142533726443, name: '#38953',
+    total_price: '4831.82', current_total_price: '4469.82',
+    subtotal_price: '4831.82', current_subtotal_price: '4469.82',
+  };
+  assert.deepEqual(restRowCurrentTotals(payload), { current_total: 4469.82, current_subtotal: 4469.82 });
+});
+
+await test('a payload with no current_* fields falls back to the frozen values', () => {
+  // A pre-order-edit payload, or a Shopify version that omits them.
+  assert.deepEqual(restRowCurrentTotals({ total_price: '250.00', subtotal_price: '240.00' }),
+    { current_total: 250, current_subtotal: 240 });
+});
+
+await test('a REST current total of ZERO is stored as 0, never as the frozen amount', () => {
+  assert.deepEqual(restRowCurrentTotals({ total_price: '900.00', current_total_price: '0.00', subtotal_price: '900.00', current_subtotal_price: '0.00' }),
+    { current_total: 0, current_subtotal: 0 },
+    'an order edited down to nothing must not be stored back at its original value');
+});
+
+await test('an empty or absent payload yields NULL, meaning "unknown — use the frozen value"', () => {
+  assert.deepEqual(restRowCurrentTotals({}), { current_total: null, current_subtotal: null });
+  assert.deepEqual(restRowCurrentTotals(null), { current_total: null, current_subtotal: null });
+  assert.deepEqual(restRowCurrentTotals({ total_price: '', current_total_price: '' }),
+    { current_total: null, current_subtotal: null }, 'empty strings are absent, not zero');
+});
+
+await test('the orders webhook branch writes through the accessor', () => {
+  assert.match(serverSrc, /\.\.\.restRowCurrentTotals\(o\),/,
+    'the webhook must not derive current_total inline again');
+  assert.ok(!/current_total: o\.total_price != null/.test(serverSrc),
+    'the old frozen-into-current assignment is back');
 });
 
 console.log(`\n  ${passed} passed, ${failed} failed`);
