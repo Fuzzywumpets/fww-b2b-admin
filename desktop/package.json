@@ -1,6 +1,6 @@
 {
   "name": "fww-b2b-admin-desktop",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "description": "Fuzzywumpets B2B Admin \u2014 desktop shell with auto-update",
   "author": "Fuzzywumpets",
   "main": "main.js",
