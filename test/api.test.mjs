@@ -967,6 +967,27 @@ await test('POST /orders/1001/line/qty changes an existing line and returns curr
   assert.equal(r.json.line.currentQuantity, 7, 'returns the updated currentQuantity');
 });
 
+// REGRESSION (order #38953, 2026-08-28): quantity 0 is a REMOVAL in Shopify's order-edit model, and
+// removals are irreversible — a line zeroed through this route could never be edited again ("The
+// line item cannot be edited because it is removed"), and the operator got no confirmation before
+// destroying it. That permanent failure then armed the page's beforeunload guard, which the Electron
+// shell obeys silently: links, back, "Generate PDF" and Quit all stopped working.
+await test('REGRESSION: POST /orders/1001/line/qty REFUSES qty 0 — it is a removal, not an edit', async () => {
+  const cookie = await seedSession();
+  const lineState = async () => (await (await fetch(`${BASE}/api/orders/1001/line-state`, { headers: { Cookie: cookie } })).json());
+  const had = ((await lineState()).lines || []).find(l => l.liId === 'li1')?.currentQuantity;
+
+  const r = await postJson('/orders/1001/line/qty', cookie, { idemKey: uuid(), liId: 'li1', qty: 0 });
+  assert.equal(r.status, 400, `qty 0 must be refused, got ${r.status}`);
+  assert.equal(r.json.ok, false);
+  assert.match((r.json.errors || []).join(' '), /at least 1/i, 'the message must point at Remove');
+  assert.equal(r.json.terminal, true,
+    'must be TERMINAL so the client shows it without arming the unload guard or offering a retry');
+
+  const still = ((await lineState()).lines || []).find(l => l.liId === 'li1')?.currentQuantity;
+  assert.equal(still, had, `the refusal must not touch the line (was ${had}, now ${still})`);
+});
+
 await test('POST /orders/1001/line/remove zeroes currentQuantity (line retained)', async () => {
   const cookie = await seedSession();
   const r = await postJson('/orders/1001/line/remove', cookie, { idemKey: uuid(), liId: 'li2' });

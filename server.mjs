@@ -44,6 +44,9 @@ import {
   getOrderInternalNote, setOrderInternalNote,
 } from './db.mjs';
 import { generateInvoicePdf, lineItemTrueTotal, lineItemTrueUnit, lineItemCurrentQty } from './pdf.mjs';
+// Extracted so they can be unit-tested without booting this server (house pattern: lib/*.mjs).
+import { isTerminalEditError } from './lib/order-edit-errors.mjs';
+import { LINE_PAGE_MAX, drainLineItems } from './lib/line-item-paging.mjs';
 import { renderLabelSheet, expandItems, TEMPLATES as LABEL_TEMPLATES, DEFAULT_FIELDS } from './labels.mjs';
 import { isInsider, resolveXeroContact, syncCustomerToXero, getXeroSyncStatus } from './lib/xero-customer-sync.mjs';
 import { parseLinePrices, applyLinePriceChanges, bulkMarkOrdersPaid } from './lib/order-money.mjs';
@@ -2443,7 +2446,17 @@ function renderOrderDetail(session, order, flash, flashMsg) {
       <td class="mono">${h(item.variant?.sku || '—')}</td>
       <td class="text-right">
         <span class="edit-qty-static">${currentQty}</span>
-        <input type="number" name="qtys[${h(item.id)}]" value="${currentQty}" min="0" class="edit-qty-input" style="display:none;width:60px">
+        ${/* min=1, NOT 0. Quantity 0 is a REMOVAL in Shopify's order-edit model, and Shopify cannot
+             undo one: once it commits, every later edit to that line returns "The line item cannot
+             be edited because it is removed" — permanently. Typing 0 here was therefore an
+             irreversible destructive action with no confirmation in front of it (alexa, #38953,
+             2026-08-28). Removal keeps its own explicit control, the ✕ button.
+             data-last carries the last ACCEPTED quantity so the client guard can revert an
+             out-of-range entry instead of sending it.
+             SYNC: three places enforce this same floor and must move together — this min=, the
+             change handler in wireExisting(), and POST /orders/:id/line/qty. min= is only advisory
+             while typing, so it is the weakest of the three and never the only one. */''}
+        <input type="number" name="qtys[${h(item.id)}]" value="${currentQty}" min="1" data-last="${currentQty}" class="edit-qty-input" style="display:none;width:60px">
         <button type="button" class="btn btn-ghost btn-xs edit-remove-btn" style="display:none;margin-left:4px" onclick="markRemove('${h(item.id)}',this)">✕</button>
       </td>
       <td class="text-right">
@@ -2559,15 +2572,26 @@ function renderOrderDetail(session, order, flash, flashMsg) {
     var discBar = document.getElementById('edit-discount-bar'); if (discBar) discBar.style.display = enable ? 'block' : 'none';
     if (!enable) { document.querySelectorAll('tr.custom-line-new').forEach(function(r){ r.remove(); }); document.querySelectorAll('tr.catalog-line-new').forEach(function(r){ r.remove(); }); var avi = document.getElementById('addVariantLinesInput'); if (avi) avi.value = '[]'; var eps = document.getElementById('edit-product-search'); if (eps) eps.value = ''; var epr = document.getElementById('edit-product-results'); if (epr) { epr.style.display='none'; epr.innerHTML=''; } if (window.__newCustomLines) window.__newCustomLines = []; var db2 = document.getElementById('edit-discount-bar'); if (db2) db2.querySelectorAll('input').forEach(function(i){ i.value=''; }); }
     document.getElementById('edit-btn').style.display = enable ? 'none' : 'inline-flex';
-    document.querySelectorAll('.edit-qty-input').forEach(el => { el.style.display = enable ? 'inline-block' : 'none'; el.disabled = !enable; });
+    // data-line-removed marks a removal Shopify has already COMMITTED. Such a row stays disabled and
+    // dimmed through every later edit-mode toggle: re-enabling its inputs invites an edit that can
+    // only ever fail ("...cannot be edited because it is removed"), and un-dimming it tells the
+    // operator the line is back on the order when it is gone. Both were live defects.
+    const liveRow = el => !el.closest('tr[data-line-removed="1"]');
+    document.querySelectorAll('.edit-qty-input').forEach(el => { el.style.display = enable ? 'inline-block' : 'none'; el.disabled = !enable || !liveRow(el); });
     document.querySelectorAll('.edit-qty-static').forEach(el => { el.style.display = enable ? 'none' : 'inline'; });
-    document.querySelectorAll('.edit-price-input').forEach(el => { el.style.display = enable ? 'inline-block' : 'none'; el.disabled = !enable; });
+    document.querySelectorAll('.edit-price-input').forEach(el => { el.style.display = enable ? 'inline-block' : 'none'; el.disabled = !enable || !liveRow(el); });
     document.querySelectorAll('.edit-price-static').forEach(el => { el.style.display = enable ? 'none' : 'inline'; });
-    document.querySelectorAll('.edit-remove-btn').forEach(el => { el.style.display = enable ? 'inline-flex' : 'none'; });
-    if (!enable) { document.querySelectorAll('tr[data-removed]').forEach(r => { r.dataset.removed = '0'; r.style.opacity = '1'; }); }
+    document.querySelectorAll('.edit-remove-btn').forEach(el => { el.style.display = enable ? 'inline-flex' : 'none'; el.disabled = !liveRow(el); });
+    // This reset clears STAGED (not yet sent) remove toggles. A committed removal is not staged —
+    // it is done — so it is skipped rather than un-dimmed.
+    if (!enable) { document.querySelectorAll('tr[data-removed]').forEach(r => { if (r.dataset.lineRemoved === '1') return; r.dataset.removed = '0'; r.style.opacity = '1'; }); }
   }
   function markRemove(liId, btn) {
     const row = btn.closest('tr');
+    // A COMMITTED removal is not a toggle. Shopify cannot un-remove a removed line, so the second
+    // click used to un-dim the row and re-enable its inputs while the line stayed gone from the
+    // order — the UI lying about live state, and the setup for a permanently failing edit.
+    if (row.dataset.lineRemoved === '1') return;
     const removed = row.dataset.removed === '1';
     row.dataset.removed = removed ? '0' : '1';
     row.style.opacity = removed ? '1' : '0.4';
@@ -2895,6 +2919,16 @@ function renderOrderDetail(session, order, flash, flashMsg) {
             <span id="edit-mode-bar" style="display:none">
               <span style="font-size:12px;color:var(--muted);margin-right:8px">✏ Edit mode</span>
               <span id="autosave-pill" data-state="saved" style="font-size:12px;font-weight:600;padding:2px 10px;border-radius:12px;margin-right:8px;background:#e8f5ea;color:#1b7a3d">All changes saved</span>
+              ${/* Shown ONLY while a save has failed. It exists because the unload guard below is not
+                    negotiable in the desktop shell: Electron cancels a prevented unload with NO
+                    dialog, so one stuck failure killed every link, the back button, "Generate PDF"
+                    (a form POST) and even Quit — the app had to be ended from Task Manager (alexa,
+                    #38953, 2026-08-28). desktop/main.js now answers will-prevent-unload with a real
+                    Leave/Stay dialog, but that ships inside the Electron app and an operator on an
+                    older build has no dialog; this button is served from the same deploy as the
+                    guard itself, so it frees them the moment the SERVER updates.
+                    DEPENDS: showLeaveAnyway() in the autosave controller finds it by this exact id. */''}
+              <button type="button" id="autosave-leave-anyway" style="display:none;font-size:12px;font-weight:600;padding:2px 10px;border-radius:12px;margin-right:8px;background:#fff;border:1px solid #c00;color:#c00;cursor:pointer" title="Stop blocking navigation. The failed change stays unsaved.">Leave anyway</button>
               <button type="button" class="btn btn-ghost btn-sm" onclick="toggleEditMode(false)">Cancel</button>
             </span>
           </div>
@@ -3166,6 +3200,9 @@ function renderOrderDetail(session, order, flash, flashMsg) {
                 var ORDER_ID = '${h(numId)}';
                 function uuid(){ try { return crypto.randomUUID(); } catch(e){ return 'k-'+Date.now()+'-'+Math.random().toString(16).slice(2); } }
                 var inflight = 0, anyFailed = false;
+                // The operator's explicit "yes, leave" override for the unload guard. Set only by a
+                // click on #autosave-leave-anyway; never cleared, because the decision was theirs.
+                var allowLeave = false;
                 var pill = document.getElementById('autosave-pill');
                 // Edits that are SCHEDULED but not yet sent. debouncedLine waits 500ms before it
                 // increments inflight, so for that window inflight is 0 — the pill would read
@@ -3192,28 +3229,71 @@ function renderOrderDetail(session, order, flash, flashMsg) {
                     saveBtn.title = busy > 0 ? 'Waiting for in-progress changes to save…' : '';
                   }
                   if (!pill) return;
-                  if (anyFailed) { pill.textContent = 'Changes not saved — review'; pill.dataset.state='failed'; pill.style.background='#fdecec'; pill.style.color='#c00'; }
-                  else if (busy > 0) { pill.textContent = 'Saving ' + busy + ' change' + (busy===1?'':'s') + '…'; pill.dataset.state='saving'; pill.style.background='#fff6e6'; pill.style.color='#b45309'; }
-                  else { pill.textContent = 'All changes saved'; pill.dataset.state='saved'; pill.style.background='#e8f5ea'; pill.style.color='#1b7a3d'; }
+                  if (anyFailed) {
+                    pill.textContent = allowLeave ? 'Not saved — navigation unlocked' : 'Changes not saved — review';
+                    pill.dataset.state='failed'; pill.style.background='#fdecec'; pill.style.color='#c00';
+                    pill.style.cursor='pointer'; pill.title='Click to jump to the line that did not save';
+                    showLeaveAnyway(!allowLeave);
+                  }
+                  else if (busy > 0) { pill.textContent = 'Saving ' + busy + ' change' + (busy===1?'':'s') + '…'; pill.dataset.state='saving'; pill.style.background='#fff6e6'; pill.style.color='#b45309'; pill.style.cursor='default'; pill.title=''; showLeaveAnyway(false); }
+                  else { pill.textContent = 'All changes saved'; pill.dataset.state='saved'; pill.style.background='#e8f5ea'; pill.style.color='#1b7a3d'; pill.style.cursor='default'; pill.title=''; showLeaveAnyway(false); }
                 }
-                function recomputeFailed(){ anyFailed = document.querySelectorAll('.row-save-chip[data-state="failed"]').length > 0; }
+                var leaveBtnEl;
+                function leaveAnywayBtn(){
+                  if (leaveBtnEl === undefined) leaveBtnEl = document.getElementById('autosave-leave-anyway');
+                  return leaveBtnEl;
+                }
+                function showLeaveAnyway(on){ var b = leaveAnywayBtn(); if (b) b.style.display = on ? 'inline-block' : 'none'; }
+                function firstFailedRow(){
+                  var c = document.querySelector('.row-save-chip[data-state="failed"]');
+                  return c ? c.closest('tr') : null;
+                }
+                // TERMINAL failures are excluded deliberately. anyFailed feeds the unload guard, and a
+                // rejection Shopify will never accept on retry (a removed line, a quantity below 1) is
+                // NOT unsaved work — there is nothing left to save, so holding the page hostage for it
+                // buys the operator nothing and cost them the whole app on #38953.
+                // DEPENDS: the server sets terminal:true on those responses (editErrorResponse +
+                // TERMINAL_EDIT_ERRORS); setChip stamps it onto the chip as data-terminal.
+                function recomputeFailed(){ anyFailed = document.querySelectorAll('.row-save-chip[data-state="failed"]:not([data-terminal="1"])').length > 0; }
                 function chipOf(tr){ return tr ? tr.querySelector('.row-save-chip') : null; }
-                function setChip(tr, state, msg){
+                // terminal=true marks a rejection that retrying cannot fix. It still shows on the row —
+                // the operator must see that the edit did not land — but it gets no retry click (the
+                // retry would fail identically) and it does not arm the unload guard.
+                function setChip(tr, state, msg, terminal){
                   var c = chipOf(tr); if (!c) return;
                   c.dataset.state = state; c.title = msg || '';
+                  if (terminal) c.dataset.terminal = '1'; else delete c.dataset.terminal;
                   c.style.cursor = 'default'; c.onclick = null;
                   if (state === 'saving'){ c.style.display='inline'; c.style.color='var(--muted)'; c.textContent='● Saving…'; }
                   else if (state === 'saved'){ c.style.display='inline'; c.style.color='#1b7a3d'; c.textContent='✓ Saved';
                     setTimeout(function(){ if (c.dataset.state==='saved'){ c.style.display='none'; c.textContent=''; } }, 2000); }
-                  else if (state === 'failed'){ c.style.display='inline'; c.style.color='#c00'; c.style.cursor='pointer'; c.textContent='⚠ Not saved'; }
+                  else if (state === 'failed'){ c.style.display='inline'; c.style.color='#c00'; c.textContent = terminal ? '⚠ Rejected' : '⚠ Not saved';
+                    if (!terminal) c.style.cursor='pointer'; }
                   else { c.style.display='none'; c.textContent=''; }
                   recomputeFailed(); setPill();
                 }
                 window.addEventListener('beforeunload', function(e){
                   // unsettledWrites() (not inflight) so a qty still sitting in the 500ms debounce
                   // also warns — otherwise navigating away in that window loses it silently.
+                  // CHANGE-GUARD: whatever this grows to cover, it must stay ESCAPABLE from inside
+                  // the page. In the desktop shell a prevented unload is cancelled with no dialog,
+                  // so every condition added here is a potential trap for the entire app — pair any
+                  // new one with a way for the operator to clear it.
+                  if (allowLeave) return;
                   if (unsettledWrites() > 0 || anyFailed){ e.preventDefault(); e.returnValue=''; return ''; }
                 });
+                if (pill) pill.addEventListener('click', function(){
+                  var tr = firstFailedRow(); if (!tr) return;
+                  tr.scrollIntoView({ block: 'center', behavior: 'smooth' });
+                  var prev = tr.style.backgroundColor;
+                  tr.style.transition = 'background-color .3s';
+                  tr.style.backgroundColor = '#fdecec';
+                  setTimeout(function(){ tr.style.backgroundColor = prev; }, 1600);
+                });
+                (function(){
+                  var b = leaveAnywayBtn(); if (!b) return;
+                  b.addEventListener('click', function(){ allowLeave = true; setPill(); });
+                })();
 
                 // POST helper. Returns {ok, json} ; ok=false on 422/5xx/network.
                 // A 30s ceiling is REQUIRED, not a nicety: inflight gates the batch Save button, so
@@ -3292,13 +3372,16 @@ function renderOrderDetail(session, order, flash, flashMsg) {
                       return run(tr, nk, path, body, onOk, true);
                     } else {
                       var msg = (res.json && res.json.errors) ? res.json.errors.join('; ') : 'Save failed';
-                      setChip(tr, 'failed', msg);
+                      // terminal => the server has told us this body can never succeed. Offering a
+                      // retry button there is a lie that also keeps the unload guard armed forever.
+                      var terminal = !!(res.json && res.json.terminal);
+                      setChip(tr, 'failed', msg, terminal);
                       var c = chipOf(tr);
                       // RETURN the retry so callers can still chain off it. Without this the retry
                       // was fire-and-forget: any continuation attached to the ORIGINAL run()
                       // promise had already settled on the failure, so work queued between the
                       // failure and the retry (see flushDirty) was never performed.
-                      if (c) c.onclick = function(){ return run(tr, idemKey, path, body, onOk); }; // retry, SAME idemKey
+                      if (c && !terminal) c.onclick = function(){ return run(tr, idemKey, path, body, onOk); }; // retry, SAME idemKey
                       reconcile();
                     }
                     // Cleared on BOTH settle paths (success and failure). On failure the row must
@@ -3468,6 +3551,20 @@ function renderOrderDetail(session, order, flash, flashMsg) {
                     var idemKey = uuid();
                     run(tr, idemKey, '/orders/' + ORDER_ID + '/line/remove', { idemKey: idemKey, liId: liId }, function(){
                       tr.style.opacity = '0.4'; tr.dataset.removed = '1';
+                      // LOCK the row now that Shopify has ACCEPTED the removal. Everything below is
+                      // one point: a removed line must stop looking editable. markRemove() was a
+                      // toggle, and toggling back un-dimmed the row and re-enabled its inputs while
+                      // the line stayed gone — so the next qty edit hit "...cannot be edited because
+                      // it is removed", which armed the unload guard and locked the app.
+                      // DEPENDS: toggleEditMode() and markRemove() both read data-line-removed.
+                      tr.dataset.lineRemoved = '1';
+                      Array.prototype.forEach.call(tr.querySelectorAll('.edit-qty-input,.edit-price-input'), function(el){
+                        el.disabled = true; el.title = 'Removed from this order.';
+                      });
+                      Array.prototype.forEach.call(tr.querySelectorAll('.edit-remove-btn'), function(el){
+                        el.disabled = true; el.style.opacity = '0.4'; el.style.cursor = 'not-allowed';
+                        el.title = 'Removed. Shopify cannot restore a removed line — add it again as a new line.';
+                      });
                     });
                   },
                 };
@@ -3495,12 +3592,16 @@ function renderOrderDetail(session, order, flash, flashMsg) {
                     if (res.ok && res.json && res.json.ok){ setChip(p.tr, 'saved'); totals(res.json.order); }
                     else {
                       var msg = (res.json && res.json.errors) ? res.json.errors.join('; ') : 'Save failed';
-                      setChip(p.tr, 'failed', msg);
+                      var terminal = !!(res.json && res.json.terminal);
+                      setChip(p.tr, 'failed', msg, terminal);
                       // FAILURE: mark failed + offer a CLICKABLE manual retry. Do NOT re-queue into
                       // linePending here — the trailing auto-flush (below) would then re-fire the
                       // just-failed action instantly and loop forever (stuck "Saving N change…").
                       // The retry click re-queues THEN flushes, exactly once.
-                      var c = chipOf(p.tr); if (c) c.onclick = function(){ linePending[key] = { tr: p.tr, extra: p.extra, path: p.path, liId: p.liId }; flushLine(key); };
+                      // A terminal rejection gets NO retry: this is the exact path that stuck on
+                      // #38953 (a qty typed back onto a line Shopify had already removed), and a
+                      // clickable retry there only re-runs a guaranteed failure.
+                      var c = chipOf(p.tr); if (c && !terminal) c.onclick = function(){ linePending[key] = { tr: p.tr, extra: p.extra, path: p.path, liId: p.liId }; flushLine(key); };
                       reconcile();
                     }
                     setPill();
@@ -3522,7 +3623,25 @@ function renderOrderDetail(session, order, flash, flashMsg) {
                       // "15" briefly sent "1" then "15", and clicking into a field could fire a save at
                       // the unchanged current value — which Shopify rejects with "at least one change"
                       // and painted the red pill. 'change' fires once when the user leaves the field.
-                      qtyEl.addEventListener('change', function(){ var q = parseInt(qtyEl.value,10); if (q>=0) window.__autosave.qtyChange(tr, liId, q); });
+                      qtyEl.addEventListener('change', function(){
+                        var q = parseInt(qtyEl.value, 10);
+                        // Quantity 0 is a REMOVAL in Shopify's order-edit model, and a removal is
+                        // irreversible: the line is gone, and every later edit to it comes back
+                        // "The line item cannot be edited because it is removed" — forever. So
+                        // typing 0 into this box used to (a) destroy a line with no confirmation and
+                        // (b) arm a failure the operator could never clear, which in the desktop
+                        // shell silently locked the entire app (alexa, #38953, 2026-08-28).
+                        // Removal keeps its own explicit control: the ✕ button -> markRemove() ->
+                        // __autosave.removeLine, which restocks and then LOCKS the row.
+                        // SYNC: same floor as min="1" on this input and POST /orders/:id/line/qty.
+                        if (!(q >= 1)) {
+                          qtyEl.value = qtyEl.dataset.last || '1';
+                          setChip(tr, 'failed', 'Quantity must be at least 1 — use ✕ to remove this line.', true);
+                          return;
+                        }
+                        qtyEl.dataset.last = String(q);
+                        window.__autosave.qtyChange(tr, liId, q);
+                      });
                     }
                     if (priceEl && !priceEl.dataset.asWired){ priceEl.dataset.asWired='1';
                       priceEl.addEventListener('change', function(){ var pr = parseFloat(priceEl.value); if (pr>=0) window.__autosave.priceChange(tr, liId, pr); });
@@ -6411,6 +6530,7 @@ function editErrorResponse(res, idemKey, err, label) {
   console.error(`[${label}] failed:`, msgs.join('; '));
   const body = { ok: false, idemKey, errors: msgs };
   if (err.code) body.code = err.code;
+  if (isTerminalEditError(msgs)) body.terminal = true;
   return res.status(err.code === 'IDEM_PAYLOAD_MISMATCH' ? 409 : 422).json(body);
 }
 
@@ -6501,6 +6621,43 @@ function summarizeOrderDiscount(lines) {
 // post-removal basis read silently falls back to stale pre-removal prices. `description` and `id`
 // are on the CalculatedDiscountApplication INTERFACE (verified against live 2024-10), so no inline
 // fragment is needed on this side — unlike the committed-order read in readCommittedLineState.
+// CHANGE-GUARD: if you add another lineItems query to the order-edit path, page it through these
+//   helpers (LINE_PAGE_MAX / drainLineItems, imported from lib/line-item-paging.mjs — the WHY and
+//   the #38953 evidence live there). A bare `first:N` is only safe where N provably exceeds any
+//   real order, and this file already proved that assumption wrong once.
+
+// One cursor-addressed page of order.lineItems / CalculatedOrder.lineItems. `node` is the only way
+// into a CalculatedOrder in 2024-10 — there is no root calculatedOrder query field.
+const orderLineItemsPage = (orderId, fields) => (after) =>
+  shopifyFetch(`query($id:ID!,$after:String){order(id:$id){lineItems(first:${LINE_PAGE_MAX},after:$after){
+    pageInfo{hasNextPage endCursor} edges{node{ ${fields} }} }}}`, { id: orderId, after })
+    .then(r => r.data?.order?.lineItems);
+
+const calcLineItemsPage = (calcId, fields) => (after) =>
+  shopifyFetch(`query($id:ID!,$after:String){node(id:$id){ ... on CalculatedOrder {
+    lineItems(first:${LINE_PAGE_MAX},after:$after){ pageInfo{hasNextPage endCursor} edges{node{ ${fields} }} } } }}`,
+    { id: calcId, after })
+    .then(r => r.data?.node?.lineItems);
+
+async function fetchAllOrderLineItems(orderId, fields, label = 'order') {
+  const page = orderLineItemsPage(orderId, fields);
+  const first = await page(null);
+  if (!first) throw new OrderEditError(`${label}: line items unavailable`);
+  return drainLineItems(first, label, page);
+}
+
+async function fetchAllCalcLineItems(calcId, fields, label = 'calculated order') {
+  const page = calcLineItemsPage(calcId, fields);
+  const first = await page(null);
+  if (!first) throw new OrderEditError(`${label}: line items unavailable`);
+  return drainLineItems(first, label, page);
+}
+
+// SYNC: ORIG_LINE_FIELDS — the original-order LineItem selection used to pair original line ids with
+// calculated ones. Two call sites read it (the batch /edit handler and the per-line price editor);
+// they matched by copy-paste before, which is how one of them would have drifted.
+const ORIG_LINE_FIELDS = `id title variant{id} originalUnitPriceSet{presentmentMoney{amount}} discountedUnitPriceSet{presentmentMoney{amount}}`;
+
 const CALC_LINE_FIELDS = `
   id title quantity variant{id}
   discountedUnitPriceSet{presentmentMoney{amount}}
@@ -6525,13 +6682,9 @@ const CALC_LINE_FIELDS = `
 // verifyFn cannot check anything. `description` lives on ManualDiscountApplication, NOT on the
 // DiscountApplication interface, so the inline fragment is REQUIRED here (verified against live
 // 2024-10; contrast the CALCULATED side, where description IS on the interface).
-async function readCommittedLineState(orderId) {
-  const r = await shopifyFetch(`query($id:ID!){order(id:$id){
-    subtotalPriceSet{presentmentMoney{amount}}
-    totalPriceSet{presentmentMoney{amount}}
-    currentSubtotalPriceSet{presentmentMoney{amount}}
-    currentTotalPriceSet{presentmentMoney{amount}}
-    lineItems(first:100){edges{node{
+// SYNC: LINE_STATE_FIELDS is selected twice — inline in the first-page query below and again by the
+// cursor-addressed follow-up pages. One const so a field added to one is added to both.
+const LINE_STATE_FIELDS = `
       id title quantity currentQuantity sku
       variant{id}
       discountedUnitPriceSet{presentmentMoney{amount}}
@@ -6540,10 +6693,25 @@ async function readCommittedLineState(orderId) {
         allocatedAmountSet{presentmentMoney{amount}}
         discountApplication{ targetSelection ... on ManualDiscountApplication { description } }
       }
-    }}}
+`;
+
+async function readCommittedLineState(orderId) {
+  const r = await shopifyFetch(`query($id:ID!){order(id:$id){
+    subtotalPriceSet{presentmentMoney{amount}}
+    totalPriceSet{presentmentMoney{amount}}
+    currentSubtotalPriceSet{presentmentMoney{amount}}
+    currentTotalPriceSet{presentmentMoney{amount}}
+    lineItems(first:${LINE_PAGE_MAX}){ pageInfo{hasNextPage endCursor} edges{node{ ${LINE_STATE_FIELDS} }}}
   }}`, { id: orderId });
   const o = r.data?.order || {};
-  const edges = o?.lineItems?.edges?.map(e => e.node) || [];
+  // EVERY line, not the first page. This function is the verify-or-fail oracle for every incremental
+  // edit AND the source of the reconciled totals the operator sees — a truncated read here meant a
+  // line past the cap could never be verified (its liId simply was not in `lines`), and it silently
+  // shortened the Σ-lines subtotal fallback in deriveCurrentOrderTotals below.
+  const edges = await drainLineItems(o.lineItems, 'order line state', orderLineItemsPage(orderId, LINE_STATE_FIELDS));
+  // Hand the COMPLETE set to deriveCurrentOrderTotals — it recomputes lineCount and the fallback
+  // subtotal from exactly this array.
+  o.lineItems = { edges: edges.map(node => ({ node })) };
   const lines = edges.map(n => ({
     liId: n.id,
     title: n.title,
@@ -6588,11 +6756,14 @@ async function removePriorOrderDiscounts(calcId, calcItems) {
   for (const did of priorIds) {
     const remRes = await shopifyFetch(`mutation rem($id:ID!,$did:ID!){
       orderEditRemoveDiscount(id:$id,discountApplicationId:$did){
-        calculatedOrder{ id lineItems(first:100){edges{node{ ${CALC_LINE_FIELDS} }}} }
+        calculatedOrder{ id lineItems(first:${LINE_PAGE_MAX}){ pageInfo{hasNextPage endCursor} edges{node{ ${CALC_LINE_FIELDS} }}} }
         userErrors{field message}}}`, { id: calcId, did });
     const remErrs = remRes.data?.orderEditRemoveDiscount?.userErrors || [];
     if (remErrs.length) throw new OrderEditError(remErrs.map(e => e.message));
-    const fresh = remRes.data?.orderEditRemoveDiscount?.calculatedOrder?.lineItems?.edges?.map(e => e.node);
+    const freshConn = remRes.data?.orderEditRemoveDiscount?.calculatedOrder?.lineItems;
+    const fresh = freshConn
+      ? await drainLineItems(freshConn, 'calculated order', calcLineItemsPage(calcId, CALC_LINE_FIELDS))
+      : null;
     if (fresh?.length) lines = fresh;
   }
   return { removed: priorIds.length, lines };
@@ -6602,9 +6773,7 @@ async function removePriorOrderDiscounts(calcId, calcItems) {
 // field in 2024-10 — `node` is the only way in). Needed by the batch /edit handler, whose cached
 // calcItems are stale by the time the discount is staged (qty + price mutations ran first).
 async function readCalcLines(calcId) {
-  const r = await shopifyFetch(`query($id:ID!){node(id:$id){ ... on CalculatedOrder {
-    id lineItems(first:100){edges{node{ ${CALC_LINE_FIELDS} }}} } }}`, { id: calcId });
-  return r.data?.node?.lineItems?.edges?.map(e => e.node) || [];
+  return fetchAllCalcLineItems(calcId, CALC_LINE_FIELDS, 'calculated order');
 }
 
 // WHAT: stages an order-level discount onto an OPEN calculatedOrder — replace-then-apply, all inside
@@ -6730,7 +6899,7 @@ async function runOrderEdit(orderId, idemKey, editedBy, action, payload, stageFn
     try {
       const beginResult = await shopifyFetch(`
         mutation begin($id:ID!){orderEditBegin(id:$id){
-          calculatedOrder{ id lineItems(first:100){edges{node{ ${CALC_LINE_FIELDS} }}} }
+          calculatedOrder{ id lineItems(first:${LINE_PAGE_MAX}){ pageInfo{hasNextPage endCursor} edges{node{ ${CALC_LINE_FIELDS} }}} }
           userErrors{field message}
         }}
       `, { id: orderId });
@@ -6739,7 +6908,11 @@ async function runOrderEdit(orderId, idemKey, editedBy, action, payload, stageFn
       const calcOrder = beginResult.data?.orderEditBegin?.calculatedOrder;
       const calcId = calcOrder?.id;
       if (!calcId) { console.error(`[order-edit] ${action} orderEditBegin returned no calculatedOrder; raw=`, JSON.stringify(beginResult.data?.orderEditBegin || beginResult.errors || beginResult).slice(0, 600)); throw new OrderEditError('orderEditBegin returned no calculatedOrder'); }
-      const calcItems = calcOrder.lineItems?.edges?.map(e => e.node) || [];
+      // EVERY calculated line, not just the first page. calcItems is what mapOrigToCalc searches to
+      // turn an original line id into the calculated one it must mutate — a line missing from here
+      // reports "line not found on order" no matter how many times the operator retries.
+      const calcItems = await drainLineItems(calcOrder.lineItems, 'calculated order',
+        calcLineItemsPage(calcId, CALC_LINE_FIELDS));
 
       const ctx = { calcOrder, calcItems, warnings: [] };
       await stageFn(calcId, ctx);
@@ -6936,23 +7109,21 @@ app.post('/orders/:id/edit', requireAuth, async (req, res) => {
     // Build map original_li_id -> calc_li_id by matching variant + title.
     // orderEditBegin (starts a CalculatedOrder edit session) and the read of the original line
     // items are independent — run them concurrently to save a round-trip.
-    const [beginResult, origRes] = await Promise.all([
+    const [beginResult, origItems] = await Promise.all([
       shopifyFetch(`
       mutation begin($id:ID!){orderEditBegin(id:$id){
         calculatedOrder{
           id
-          lineItems(first:100){edges{node{
-            id title quantity variant{id}
-            calculatedDiscountAllocations{
-              discountApplication{id targetType targetSelection}
-            }
-          }}}
+          lineItems(first:${LINE_PAGE_MAX}){ pageInfo{hasNextPage endCursor} edges{node{ ${CALC_LINE_FIELDS} }}}
         }
         userErrors{field message}
       }}
     `, { id: orderId }),
-      // Original order line items, to pair original IDs with variant/title
-      shopifyFetch(`query($id:ID!){order(id:$id){lineItems(first:100){edges{node{id title variant{id} originalUnitPriceSet{presentmentMoney{amount}} discountedUnitPriceSet{presentmentMoney{amount}}}}}}}`, { id: orderId }),
+      // Original order line items, to pair original IDs with variant/title. PAGED: on order #38953
+      // (131 lines) the old first:100 dropped 31 of them, and every dropped line then failed to map
+      // — "[order-edit] no calc map for <id>" ×31, silently skipped, and the handler still logged
+      // "commit was a NO-OP — treating as success". Save reported success having written nothing.
+      fetchAllOrderLineItems(orderId, ORIG_LINE_FIELDS, 'order'),
     ]);
     const calcOrder = beginResult.data?.orderEditBegin?.calculatedOrder;
     const calcId = calcOrder?.id;
@@ -6960,8 +7131,8 @@ app.post('/orders/:id/edit', requireAuth, async (req, res) => {
       const errs = beginResult.data?.orderEditBegin?.userErrors || [];
       throw new Error(errs.map(e => e.message).join(', ') || 'orderEditBegin failed');
     }
-    const origItems = origRes.data?.order?.lineItems?.edges?.map(e => e.node) || [];
-    const calcItems = calcOrder.lineItems?.edges?.map(e => e.node) || [];
+    const calcItems = await drainLineItems(calcOrder.lineItems, 'calculated order',
+      calcLineItemsPage(calcId, CALC_LINE_FIELDS));
     // Map original_li_id -> calc_li_id
     const idMap = {};
     for (const orig of origItems) {
@@ -7190,8 +7361,11 @@ app.post('/orders/:id/edit', requireAuth, async (req, res) => {
 // logged "removed". Keep the suffix match first; the variant+title heuristic is a last-ditch
 // fallback only for the (rare) case where Shopify does NOT preserve the suffix.
 async function mapOrigToCalc(orderId, calcItems, origLiId) {
-  const origRes = await shopifyFetch(`query($id:ID!){order(id:$id){lineItems(first:100){edges{node{id title variant{id} originalUnitPriceSet{presentmentMoney{amount}} discountedUnitPriceSet{presentmentMoney{amount}}}}}}}`, { id: orderId });
-  const origItems = origRes.data?.order?.lineItems?.edges?.map(e => e.node) || [];
+  // PAGED, and this one is not cosmetic: origItems is searched for origLiId itself. Under the old
+  // first:100, editing line 101+ of an order found nothing here, returned calcLiId:null, and the
+  // caller answered "line not found on order" — for a line plainly visible on the page, on every
+  // attempt. That is a permanent failure caused purely by where the line sits in the list.
+  const origItems = await fetchAllOrderLineItems(orderId, ORIG_LINE_FIELDS, 'order');
   const orig = origItems.find(o => o.id === origLiId);
   if (!orig) return { calcLiId: null, orig: null, calcItem: null };
   // PRIMARY: exact numeric-suffix match (1:1, collision-free).
@@ -7356,7 +7530,18 @@ app.post('/orders/:id/line/qty', requireAuth, async (req, res) => {
   const { idemKey, liId, qty } = req.body || {};
   if (!idemKey) return res.status(400).json({ ok: false, errors: ['idemKey required'] });
   const q = parseInt(qty, 10);
-  if (!liId || !(q >= 0)) return res.status(400).json({ ok: false, errors: ['liId and qty>=0 required'] });
+  // qty >= 1, NOT >= 0. Quantity 0 is a REMOVAL in Shopify's order-edit model and a removal cannot
+  // be undone — a line zeroed through this route could never be edited again, and the operator had
+  // no confirmation step in front of that. Removal has its own route (POST /orders/:id/line/remove),
+  // which is what the ✕ button calls and which restocks. Answering terminal:true keeps the client
+  // from offering a retry that cannot succeed (and from arming its unload guard on it).
+  // SYNC: the same floor is enforced client-side by min="1" on .edit-qty-input and by the change
+  // handler in wireExisting(). This one is the authoritative copy — the other two are convenience.
+  if (!liId) return res.status(400).json({ ok: false, errors: ['liId required'] });
+  if (!(q >= 1)) {
+    return res.status(400).json({ ok: false, terminal: true,
+      errors: ['Quantity must be at least 1 — use Remove to take a line off the order.'] });
+  }
   const payload = { liId: String(liId), qty: q };
   const dup = getEditAction(idemKey);
   if (dup && dup.status === 'committed') {
