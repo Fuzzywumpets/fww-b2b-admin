@@ -18,8 +18,15 @@ process.env.B2B_ADMIN_MOCK = '1';
 
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
+// DEPENDS: these three accessors ARE the contract under test — the current-vs-frozen choice, and the
+// `??` semantics that keep a legitimate 0 from falling back to the pre-edit amount. If their
+// fallback rule changes, the expectations below change with it.
 import { cacheRowTotal, cacheRowSubtotal, listRowTotalAmount } from '../lib/order-display-totals.mjs';
 
+// DEPENDS: orders_cache's schema (total_price/current_total, customer_shopify_id storing the BARE
+// NUMERIC id) and the COALESCE in both aggregate queries. A column rename, or a WHERE keyed on a
+// different id form, breaks these tests — which is the point: they are the only coverage the cache
+// paths get, being gated on `if (!MOCK)` and unreachable from the HTTP suites.
 const {
   upsertOrderCache,
   upsertCustomerCache,
@@ -174,6 +181,73 @@ await test('listRowTotalAmount is defined exactly once, in the shared module', (
   assert.equal((serverSrc.match(/function listRowTotalAmount/g) || []).length, 0,
     'a second local copy is how the reader and the writer drifted apart in the first place');
   assert.match(serverSrc, /from '\.\/lib\/order-display-totals\.mjs'/);
+});
+
+// ── the production call path, not just the helper (Qodo #9 on PR#33) ────────
+//
+// The balance SUM was corrected to COALESCE(current_total, total_price) while the widget it feeds was
+// still passing a gid://shopify/Customer/… into a column holding the bare numeric id. The query
+// matched nothing, so it returned $0 for every customer and the corrected SUM never ran at all. The
+// tests above missed it because they called the helper with a numeric literal — the one thing the
+// production caller did not do.
+
+await test('a GID matches NOTHING — which is why the caller must convert first', () => {
+  const bal = getOutstandingBalanceForCustomer('gid://shopify/Customer/9310');
+  assert.equal(bal.count, 0, 'the column holds a bare numeric id; a GID can never match');
+  assert.equal(bal.total, 0);
+  // …and the same customer, keyed correctly, has real money outstanding.
+  assert.equal(getOutstandingBalanceForCustomer('9310').total, 4569.82);
+});
+
+await test('renderCustomerDetail converts the GID before querying', () => {
+  const call = serverSrc.match(/getOutstandingBalanceForCustomer\(([^)]*)\)/g) || [];
+  assert.ok(call.length > 0, 'the widget should still call the balance helper');
+  for (const c of call) {
+    assert.ok(!/getOutstandingBalanceForCustomer\(\s*customer\.id\s*\)/.test(c),
+      'passing customer.id (a GID) silently yields $0 — pass shopifyNumericId(customer.id)');
+  }
+  assert.match(serverSrc, /getOutstandingBalanceForCustomer\(shopifyNumericId\(customer\.id\)\)/);
+});
+
+// ── an accessor can only prefer a value the QUERY actually fetched ───────────
+//
+// PR #33 shipped three surfaces reading through listRowTotalAmount off queries that never selected
+// currentTotalPriceSet, so the fallback fired every time and they looked fixed while showing the
+// pre-edit amount. Absent field and unedited order are indistinguishable to the accessor, so this
+// can only be caught here.
+
+await test('every orders query feeding a money surface selects currentTotalPriceSet', () => {
+  const flat = serverSrc.replace(/\s+/g, ' ');
+  // Each entry: a distinct orders(...) query whose rows reach a rendered/summed amount.
+  const feeds = [
+    ['dashboard open orders + 90d spend', 'orders(first:50,query:$q,sortKey:PROCESSED_AT'],
+    ['customer Recent Orders',            'orders(first:10,query:$q,sortKey:PROCESSED_AT'],
+    ['customer spend API',                'orders(first:250,query:$q,sortKey:PROCESSED_AT'],
+  ];
+  for (const [label, marker] of feeds) {
+    const at = flat.indexOf(marker);
+    assert.notEqual(at, -1, `could not find the ${label} query — did it move?`);
+    const body = flat.slice(at, at + 500);
+    assert.ok(body.includes('currentTotalPriceSet'),
+      `${label}: selects only the FROZEN total, so listRowTotalAmount silently falls back to it`);
+  }
+});
+
+await test('the customer Recent Orders table renders through the accessor', () => {
+  assert.ok(!/recentOrders\.map[\s\S]{0,400}?fmtMoney\(o\.totalPriceSet/.test(serverSrc),
+    'the Recent Orders row must not read totalPriceSet directly');
+  assert.match(serverSrc, /recentOrders\.map[\s\S]{0,400}?fmtMoney\(listRowTotalAmount\(o\)/);
+});
+
+await test('all three branches of the spend API agree on which total they use', () => {
+  // cache / MOCK / live. #33 fixed only the cache one, so the answer depended on cache warmth.
+  const spendAt = serverSrc.indexOf("app.get('/api/admin/customers/:id/spend'");
+  assert.notEqual(spendAt, -1);
+  const body = serverSrc.slice(spendAt, serverSrc.indexOf("app.get('/api/customers/search'", spendAt));
+  const frozen = (body.match(/parseFloat\(o\.totalPriceSet\?\.presentmentMoney\?\.amount/g) || []).length;
+  assert.equal(frozen, 0, 'a branch is still summing the frozen total — the result changes with cache state');
+  assert.ok((body.match(/listRowTotalAmount\(o\)/g) || []).length >= 4,
+    'each branch needs the accessor for BOTH its range sum and its per-order rows');
 });
 
 console.log(`\n  ${passed} passed, ${failed} failed`);
