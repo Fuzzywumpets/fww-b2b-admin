@@ -42,6 +42,7 @@ import {
   listImpersonationsForCustomer,
   getOrderByName,
   getOrderInternalNote, setOrderInternalNote,
+  getHelcimInvoiceMap, upsertHelcimInvoiceMap, setHelcimInvoiceDelivery,
 } from './db.mjs';
 import { generateInvoicePdf, lineItemTrueTotal, lineItemTrueUnit, lineItemCurrentQty } from './pdf.mjs';
 // Extracted so they can be unit-tested without booting this server (house pattern: lib/*.mjs).
@@ -56,6 +57,7 @@ import { renderLabelSheet, expandItems, TEMPLATES as LABEL_TEMPLATES, DEFAULT_FI
 import { isInsider, resolveXeroContact, syncCustomerToXero, getXeroSyncStatus } from './lib/xero-customer-sync.mjs';
 import { parseLinePrices, applyLinePriceChanges, bulkMarkOrdersPaid } from './lib/order-money.mjs';
 import { assertNoUserErrors } from './lib/shopify-user-errors.mjs';
+import { createCreditCardInvoice } from './helcim.mjs';
 // SYNC: same module db.mjs uses for the SQL LIMIT — the banner/footer copy and the query page size
 // must agree, otherwise the list lies about how much it is showing.
 import { ORDERS_LIST_LIMIT, CUSTOMERS_LIST_LIMIT, LEADS_LIST_LIMIT, listCountLabel, truncationNoticeHtml } from './lib/list-truncation.mjs';
@@ -1512,7 +1514,8 @@ function summarizeAudit(action, afterJson) {
     case 'xero:sync':              return 'synced the order to Xero';
     case 'xero:payment_recorded':  return `recorded a Xero payment${after.amount != null ? ` of ${fmtMoney(after.amount)}` : ''}`;
     case 'xero:invoice_failed':    return 'Xero invoice sync failed';
-    case 'chase_invoice_queued':   return 'queued a Chase invoice link';
+    case 'helcim_invoice_sent':    return `sent a Helcim credit card invoice${after.amount != null ? ` for ${fmtMoney(after.amount)}` : ''}`;
+    case 'helcim_invoice_email_failed': return 'created a Helcim invoice, but email delivery failed';
     default:                       return String(action || 'activity').replace(/[/_:]/g, ' ');
   }
 }
@@ -2339,6 +2342,9 @@ function variantLabel(variant) {
 // INVARIANT(S): flash strings map 1:1 to alert banners — adding a server flash value needs a branch here or it renders silently; client-side ship rates JS sorts by amount and posts to <path>/ship/rates then /ship/label; line-item product links resolve via variant.product.id or the MOCK_VARIANT_PRODUCT fallback.
 function renderOrderDetail(session, order, flash, flashMsg) {
   const numId    = shopifyNumericId(order.id);
+  // DEPENDS: POST /orders/:id/send-credit-card-invoice persists this row before emailing so a
+  // failed Re:amaze delivery can expose the existing invoice for recovery without creating another.
+  const helcimInvoice = getHelcimInvoiceMap(shopifyOrderGid(numId));
   const isPaid   = order.displayFinancialStatus === 'PAID';
   // Second build (Build C): outstanding balance for the Record-payment button + modal prefill.
   // Prefer the authoritative totalOutstandingSet from Shopify; fall back to a status-derived
@@ -2534,8 +2540,10 @@ function renderOrderDetail(session, order, flash, flashMsg) {
     ? `<div class="alert alert-success">Note saved.</div>`
     : flash === 'address_saved'
     ? `<div class="alert alert-success">Shipping address updated.</div>`
-    : flash === 'chase_invoice_queued'
-    ? `<div class="alert alert-success">Chase invoice intent logged. Wire Chase API to send the real link.</div>`
+    : flash === 'credit_card_invoice_sent'
+    ? `<div class="alert alert-success">Credit card invoice sent to ${h(order.customer?.email || 'the customer')} through Helcim.</div>`
+    : flash === 'credit_card_invoice_failed'
+    ? `<div class="alert alert-warning">Credit card invoice failed or email delivery was not confirmed. ${flashMsg ? h(flashMsg) : 'Check server logs.'}${helcimInvoice?.url ? ` <a href="${h(helcimInvoice.url)}" target="_blank" rel="noopener">Open the existing Helcim invoice</a>.` : ''}</div>`
     : flash === 'order_edited'
     ? `<div class="alert alert-success">Order updated.${flashMsg ? ` <span style="color:#b45309">Note: ${h(flashMsg)}</span>` : ''}</div>`
     : flash === 'discount_applied'
@@ -2903,8 +2911,8 @@ function renderOrderDetail(session, order, flash, flashMsg) {
         <button class="btn btn-secondary" onclick="toggleFulfillModal(true)">Fulfill items</button>
         <button class="btn btn-ghost" onclick="toggleDiscountModal(true)">Apply discount</button>
         <button class="btn btn-secondary" onclick="toggleInvoiceModal(true)">Generate Invoice</button>
-        <form method="POST" action="/orders/${h(numId)}/send-chase-invoice" style="display:inline">
-          <button class="btn btn-secondary" onclick="return confirm('Queue Chase invoice link for ${h(order.name)}?\\n\\nNote: Chase API not yet wired — this logs the intent.')">Send Chase Invoice</button>
+        <form method="POST" action="/orders/${h(numId)}/send-credit-card-invoice" style="display:inline" onsubmit="if(!confirm('Send this Helcim credit card invoice to the customer?')) return false; this.querySelector('button').disabled=true;">
+          <button class="btn btn-secondary">Send Credit Card Invoice</button>
         </form>
         <form method="POST" action="/orders/${h(numId)}/xero/sync" style="display:inline">
           <button class="btn btn-ghost" title="Create or refresh Xero invoice for this order">${xeroMap?.status === 'synced' ? '✓ Xero synced' : 'Sync to Xero'}</button>
@@ -6192,24 +6200,82 @@ app.post('/orders/:id/shipping-address', requireAuth, async (req, res) => {
   res.redirect(`/orders/${numId}?success=address_saved`);
 });
 
-// WHAT: STUB — logs intent to send a Chase Pay invoice link; returns success without calling any real Chase API.
-// CHANGE-GUARD: when wiring the real Chase API, replace the auditLog-only body; the route currently 404s only if the order is missing and otherwise always 'succeeds'. Responds JSON when content-type is JSON, else redirects with success=chase_invoice_queued.
-// INVARIANT(S): no payment is actually requested yet — callers/UI must not imply the customer was charged. Audit note explicitly records 'not yet wired'.
-app.post('/orders/:id/send-chase-invoice', requireAuth, async (req, res) => {
+// WHAT: creates (or reuses) a DUE Helcim invoice for the order's exact outstanding balance, then asks the Portal's Re:amaze bridge to email its secure online-payment link.
+// CHANGE-GUARD: the helcim_invoice_map write MUST happen before the email attempt; on delivery failure a retry reuses that invoice rather than creating a duplicate bill. JSON callers receive a non-2xx on every failure; form callers receive a truthful warning flash.
+// INVARIANT(S): no card data touches this app; paid/zero-balance orders and orders without customer email are rejected; audit rows never contain the invoice token or online-view URL.
+app.post('/orders/:id/send-credit-card-invoice', requireAuth, async (req, res) => {
   const numId = req.params.id;
   const order = await getOrderDetail(numId);
   if (!order) return res.status(404).json({ error: 'Order not found' });
-  const customerEmail = order.customer?.email || 'unknown';
-  // Stub mode: log intent, return success. When Chase API is wired, replace this with real call.
-  auditLog(req.adminSession.email, 'chase_invoice_queued', shopifyOrderGid(numId), null, {
-    order_name: order.name,
-    customer_email: customerEmail,
-    note: 'Chase API not yet wired — logged intent only',
-  });
-  if (req.headers['content-type']?.includes('application/json')) {
-    return res.json({ ok: true, status: 'stubbed', message: 'Chase invoice intent logged. Wire Chase API to send real link.' });
+  const wantsJson = req.headers['content-type']?.includes('application/json');
+  const fail = (status, message) => wantsJson
+    ? res.status(status).json({ ok: false, error: message })
+    : res.redirect(`/orders/${numId}?success=credit_card_invoice_failed&msg=${encodeURIComponent(message)}`);
+  const customerEmail = order.customer?.email;
+  if (!customerEmail) return fail(400, 'This order has no customer email address.');
+
+  const totalMoney = order.currentTotalPriceSet?.presentmentMoney || order.totalPriceSet?.presentmentMoney || {};
+  const currency = String(totalMoney.currencyCode || 'USD').toUpperCase();
+  const outstandingValue = order.totalOutstandingSet?.presentmentMoney?.amount;
+  const outstanding = Math.round(Math.max(0, Number(outstandingValue ?? deriveCurrentOrderTotals(order).total) || 0) * 100) / 100;
+  if (outstanding <= 0) return fail(409, 'This order has no outstanding balance.');
+
+  const orderGid = shopifyOrderGid(numId);
+  let invoice = getHelcimInvoiceMap(orderGid);
+  const reused = !!invoice;
+  if (invoice && (Math.abs(Number(invoice.amount) - outstanding) >= 0.005 || invoice.currency !== currency)) {
+    return fail(409, `The existing Helcim invoice is for ${fmtMoney(invoice.amount)} ${invoice.currency}, but the current balance is ${fmtMoney(outstanding)} ${currency}. Resolve the existing invoice in Helcim before sending another.`);
   }
-  res.redirect(`/orders/${numId}?success=chase_invoice_queued`);
+
+  try {
+    if (!invoice) {
+      const created = MOCK
+        ? {
+            invoiceId: `mock-helcim-${numId}`, invoiceNumber: `MOCK-${numId}`,
+            token: `mock-token-${numId}`, url: `https://fuzzywumpets.myhelcim.com/order/?token=mock-token-${numId}`,
+            amount: outstanding, currency,
+          }
+        : await createCreditCardInvoice({ orderName: order.name, amount: outstanding, currency });
+      // SYNC: db.mjs helcim_invoice_map is the retry ledger for this exact write-before-send ordering.
+      invoice = upsertHelcimInvoiceMap(orderGid, created);
+    }
+
+    const noteBody = `Your credit card invoice for ${order.name} is ready for ${fmtMoney(outstanding)} ${currency}.\n\nPay securely with Helcim:\n${invoice.url}`;
+    const delivery = MOCK
+      ? { ok: true, email: { sent: true, via: 'mock' } }
+      : await callPortalInternal('POST', '/__internal__/visible-note', {
+          orderId: orderGid,
+          body: noteBody,
+          addedBy: req.adminSession.email,
+          emailCustomer: true,
+          sendAs: 'wholesale',
+        });
+    if (!delivery.ok || !delivery.email?.sent) {
+      const deliveryError = String(delivery.error || delivery.email?.error || 'Portal/Re:amaze did not confirm delivery');
+      setHelcimInvoiceDelivery(orderGid, 'delivery_failed', deliveryError);
+      auditLog(req.adminSession.email, 'helcim_invoice_email_failed', orderGid, null, {
+        invoiceId: invoice.invoice_id, invoiceNumber: invoice.invoice_number, amount: outstanding, currency,
+      });
+      return fail(502, `Helcim invoice ${invoice.invoice_number || invoice.invoice_id} was created, but customer email delivery was not confirmed: ${deliveryError}`);
+    }
+
+    setHelcimInvoiceDelivery(orderGid, 'sent');
+    auditLog(req.adminSession.email, 'helcim_invoice_sent', orderGid, null, {
+      invoiceId: invoice.invoice_id, invoiceNumber: invoice.invoice_number,
+      amount: outstanding, currency, customerEmail, reused,
+    });
+    if (wantsJson) {
+      return res.json({
+        ok: true, status: reused ? 'resent' : 'sent',
+        invoice: { invoiceId: invoice.invoice_id, invoiceNumber: invoice.invoice_number, amount: outstanding, currency },
+        email: { sent: true, to: customerEmail },
+      });
+    }
+    return res.redirect(`/orders/${numId}?success=credit_card_invoice_sent`);
+  } catch (error) {
+    console.error('Helcim credit card invoice failed:', error.message);
+    return fail(502, error.message || 'Helcim invoice request failed.');
+  }
 });
 
 

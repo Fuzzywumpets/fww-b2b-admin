@@ -62,6 +62,22 @@ db.exec(`
     updated_by TEXT NOT NULL DEFAULT ''
   );
 
+  -- DEPENDS: server.mjs POST /orders/:id/send-credit-card-invoice uses this as the retry ledger.
+  -- A Re:amaze failure must reuse the already-created Helcim invoice instead of billing twice.
+  CREATE TABLE IF NOT EXISTS helcim_invoice_map (
+    order_id TEXT PRIMARY KEY,
+    invoice_id TEXT NOT NULL,
+    invoice_number TEXT,
+    token TEXT NOT NULL,
+    url TEXT NOT NULL,
+    amount REAL NOT NULL,
+    currency TEXT NOT NULL,
+    delivery_status TEXT NOT NULL DEFAULT 'created',
+    delivery_error TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+  );
+
   CREATE TABLE IF NOT EXISTS dropship_config_cache (
     customer_id TEXT PRIMARY KEY,
     enabled INTEGER NOT NULL DEFAULT 0,
@@ -468,6 +484,41 @@ export function auditLog(email, action, target, before, after) {
       ts,
     });
   } catch (_) { /* never let audit-forward affect the write */ }
+}
+
+// WHAT: returns the one Helcim invoice created for an order, including the private online-view token needed for delivery retries.
+// CHANGE-GUARD: this is operational state, not customer-facing data; never expose the row wholesale through an HTTP response or audit log.
+// INVARIANT(S): one row per Shopify order gid.
+export function getHelcimInvoiceMap(orderId) {
+  return db.prepare('SELECT * FROM helcim_invoice_map WHERE order_id = ?').get(String(orderId)) || null;
+}
+
+// WHAT: persists a newly created Helcim invoice before attempting Re:amaze delivery, allowing a failed delivery to be retried without creating another invoice.
+// CHANGE-GUARD: order_id is the conflict key; updates preserve created_at and replace only the current Helcim invoice metadata.
+// INVARIANT(S): caller supplies a validated Helcim invoiceId, token, URL, positive amount, and USD/CAD currency.
+export function upsertHelcimInvoiceMap(orderId, invoice) {
+  const now = Date.now();
+  db.prepare(`
+    INSERT INTO helcim_invoice_map
+      (order_id, invoice_id, invoice_number, token, url, amount, currency, delivery_status, delivery_error, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 'created', NULL, ?, ?)
+    ON CONFLICT(order_id) DO UPDATE SET
+      invoice_id=excluded.invoice_id, invoice_number=excluded.invoice_number, token=excluded.token,
+      url=excluded.url, amount=excluded.amount, currency=excluded.currency,
+      delivery_status='created', delivery_error=NULL, updated_at=excluded.updated_at
+  `).run(String(orderId), String(invoice.invoiceId), invoice.invoiceNumber || null, String(invoice.token),
+    String(invoice.url), Number(invoice.amount), String(invoice.currency), now, now);
+  return getHelcimInvoiceMap(orderId);
+}
+
+// WHAT: records whether the Portal/Re:amaze handoff delivered the stored Helcim invoice link.
+// CHANGE-GUARD: status is constrained here because SQLite has no CHECK on the existing production table migration.
+// INVARIANT(S): does not alter invoice identity, amount, token, or URL.
+export function setHelcimInvoiceDelivery(orderId, status, error = null) {
+  if (!['sent', 'delivery_failed'].includes(status)) throw new TypeError('Invalid Helcim invoice delivery status');
+  db.prepare('UPDATE helcim_invoice_map SET delivery_status = ?, delivery_error = ?, updated_at = ? WHERE order_id = ?')
+    .run(status, error ? String(error).slice(0, 500) : null, Date.now(), String(orderId));
+  return getHelcimInvoiceMap(orderId);
 }
 
 export function getCustomerNotes(customerId) {
