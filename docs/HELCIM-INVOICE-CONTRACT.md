@@ -9,16 +9,20 @@ particular interchange rate.
 `fww-b2b-admin` is the sole owner of B2B Helcim invoice creation. It already owns the staff action,
 Shopify order read, durable invoice map, and write-before-email ordering. Portal remains the
 customer communication boundary through `POST /__internal__/visible-note`; Portal PR #42 accepts
-`subject` plus `creditCardInvoice: { amount, currency, paymentUrl }`, renders fixed escaped branded
-HTML, and sends through its existing Gmail token broker as `wholesale@fuzzywumpets.com`. Admin does
-not receive Gmail credentials or render customer HTML. No separate Helcim bridge is needed.
+`subject` plus `creditCardInvoice: { invoiceNumber, amount, taxAmount, currency, paymentUrl }`.
+Portal mints a 256-bit public payment id, stores only its digest, renders fixed escaped branded HTML,
+and sends `https://b2b.fuzzywumpets.com/pay/<id>` through its existing Gmail token broker as
+`wholesale@fuzzywumpets.com`. Admin does not receive Gmail credentials or render customer HTML.
 
 1. Read the current Shopify order, including current quantities/totals, discounts, shipping, tax,
    tax-exempt status, and addresses.
 2. Build and validate one Invoice API payload entirely in integer cents.
 3. Acquire `helcim_invoice_claims.order_id` before the Invoice API POST.
-4. Create the invoice, atomically persist `helcim_invoice_map`, then email the private online-view
-   link. Delivery retries reuse the mapped invoice.
+4. Create the invoice, atomically persist `helcim_invoice_map`, then pass its exact identity/money to
+   Portal. Portal emails its opaque public URL; delivery retries reuse the mapped invoice.
+5. The public page requires no Portal session. Its server reconciles the current Helcim invoice,
+   initializes a 60-minute HelcimPay.js session, and returns only `checkoutToken` to the browser.
+   The `secretToken` stays server-side and validates exact invoice/amount/currency before local paid state.
 
 ## Confirmed API behavior
 
@@ -60,6 +64,8 @@ not receive Gmail credentials or render customer HTML. No separate Helcim bridge
   invoice number in Helcim.
 - API tokens and response bodies are never logged or returned. Audit events exclude invoice tokens
   and payment URLs. Card data never enters either B2B service.
+- A lost browser callback cannot authorize another payment blindly: before minting a new session,
+  Portal reads the invoice by exact number and refuses anything other than the expected DUE amount.
 
 ## Visa CEDP note
 
@@ -73,7 +79,10 @@ the monthly merchant statement; no bps or qualification guarantee is hardcoded.
 
 Configuration remains `HELCIM_API_TOKEN` and the allow-listed `HELCIM_SUBDOMAIN_URL` in Doppler
 `fww-shared/prd`. Deploy Portal PR #42 before this Admin change so the structured Gmail-delivery
-contract is accepted.
+contract is accepted. Before public checkout deployment, enable HelcimPay checkout permission and
+allow-list `https://b2b.fuzzywumpets.com` in the Helcim API Access Configuration; production HelcimPay
+will not render on an unlisted domain. Roll back Portal and Admin code together; existing raw Helcim
+online-view links remain usable, while stored public-id digests and additive tables can remain.
 Rollback is an Admin code rollback; the additive claims table can remain. A retained claim means
 "reconcile in Helcim before retry," not "delete the row and try again."
 

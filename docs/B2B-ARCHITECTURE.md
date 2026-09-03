@@ -13,7 +13,7 @@ Where something is unverified it says so.
 | | `fww-b2b-portal` | `fww-b2b-admin` |
 |---|---|---|
 | For | **customers** | **staff** |
-| Domain | b2b.fuzzyreporting.com | b2badmin.fuzzywumpets.com |
+| Domain | b2b.fuzzyreporting.com (OAuth portal); b2b.fuzzywumpets.com/pay/* (public payments) | b2badmin.fuzzywumpets.com |
 | Port (localhost only) | 8793 | 8794 |
 | DB | `data/portal.db` | `data/admin.db` |
 | Login | **Shopify** Customer Account OAuth | **Google** OAuth |
@@ -91,10 +91,11 @@ than once. Correct check:
 
 The Helcim credit-card invoice action additionally requires `HELCIM_API_TOKEN` and
 `HELCIM_SUBDOMAIN_URL` (`https://fuzzywumpets.myhelcim.com`) from the shared Doppler config. The API
-token remains server-side; customers receive only Helcim's per-invoice online-view URL. Admin owns
-itemized invoice creation and its durable duplicate-prevention ledger; Portal renders and sends the
-branded message through its existing Gmail broker. See `docs/HELCIM-INVOICE-CONTRACT.md` for the
-verified API and arithmetic invariants. Portal PR #42 must deploy before the Admin structured-message consumer.
+token remains server-side. Admin owns itemized invoice creation and its durable duplicate-prevention
+ledger. Portal stores only a digest of a 256-bit public payment id, emails
+`https://b2b.fuzzywumpets.com/pay/<id>`, initializes short-lived HelcimPay.js sessions, and validates
+the payment response with the server-only secret token. Card data stays in Helcim's iframe. See
+`docs/HELCIM-INVOICE-CONTRACT.md` for the verified API and arithmetic invariants.
 
 ```sh
 P=$(systemctl show -p MainPID --value <unit>)
@@ -120,6 +121,10 @@ via `callPortalInternal()` → `PORTAL_INTERNAL_URL` (default `http://127.0.0.1:
 Live endpoints: `visible-note`, `customer-messages`, `conversations/:slug/messages`,
 `tax-exempt/:id/{approve,reject}`, `settings`, `leads/:id/tax-doc`, `theme-feedback`,
 **`invites` (POST create + GET list)**.
+
+`POST /__internal__/visible-note` also carries the invoice checkout contract from Admin to Portal:
+`{invoiceNumber,amount,taxAmount,currency,paymentUrl}`. Portal validates the original allow-listed
+Helcim URL but never forwards it to the customer; it replaces it with its own opaque `/pay/<id>` URL.
 
 Rules for adding one: share the implementation with the session-authenticated route (a drifting
 invite path is how you email a second live token to someone who already has one); require the
