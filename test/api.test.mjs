@@ -1921,34 +1921,50 @@ await test('POST /labels/print with thermal template returns PDF', async () => {
   assert.ok(res.headers.get('content-type')?.includes('pdf'), 'Should be PDF');
 });
 
-// ── Phase 13: Chase invoice link stub ──
-console.log('\nAPI tests — Phase 13: Chase invoice link stub:');
+// ── Phase 13: Helcim credit card invoice ──
+console.log('\nAPI tests — Phase 13: Helcim credit card invoice:');
 
-await test('POST /orders/1001/send-chase-invoice (JSON) → stub response', async () => {
+await test('order detail offers Send Credit Card Invoice and no Chase stub', async () => {
   const cookie = await seedSession();
-  const res = await fetch(`${BASE}/orders/1001/send-chase-invoice`, {
+  const res = await fetch(`${BASE}/orders/1001`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  assert.ok(html.includes('Send Credit Card Invoice'));
+  assert.ok(html.includes('/orders/1001/send-credit-card-invoice'));
+  assert.ok(!html.includes('Send Chase Invoice'));
+});
+
+await test('POST /orders/1001/send-credit-card-invoice (JSON) → creates and emails Helcim invoice', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/orders/1001/send-credit-card-invoice`, {
     method: 'POST',
     headers: { Cookie: cookie, 'Content-Type': 'application/json' },
   });
   assert.equal(res.status, 200);
   const j = await res.json();
   assert.equal(j.ok, true);
-  assert.equal(j.status, 'stubbed');
+  assert.equal(j.status, 'sent');
+  assert.equal(j.invoice.invoiceId, 'mock-helcim-1001');
+  // Earlier edit-route tests intentionally mutate mock #1001; invoice the resulting CURRENT
+  // outstanding balance rather than asserting its frozen $450 fixture total.
+  assert.ok(j.invoice.amount > 0);
+  assert.equal(j.invoice.currency, 'USD');
+  assert.deepEqual(j.email, { sent: true, to: 'buyer@acme.com' });
 });
 
-await test('POST /orders/1001/send-chase-invoice (form) → redirects to order with success', async () => {
+await test('POST /orders/1001/send-credit-card-invoice retry reuses the invoice and redirects with success', async () => {
   const cookie = await seedSession();
-  const res = await fetch(`${BASE}/orders/1001/send-chase-invoice`, {
+  const res = await fetch(`${BASE}/orders/1001/send-credit-card-invoice`, {
     method: 'POST',
     headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
     redirect: 'manual',
   });
   assert.equal(res.status, 302);
-  assert.ok(res.headers.get('location')?.includes('chase_invoice_queued'));
+  assert.ok(res.headers.get('location')?.includes('credit_card_invoice_sent'));
 });
 
-await test('POST /orders/1001/send-chase-invoice requires auth', async () => {
-  const res = await fetch(`${BASE}/orders/1001/send-chase-invoice`, {
+await test('POST /orders/1001/send-credit-card-invoice requires auth', async () => {
+  const res = await fetch(`${BASE}/orders/1001/send-credit-card-invoice`, {
     method: 'POST', redirect: 'manual',
   });
   assert.equal(res.status, 302);

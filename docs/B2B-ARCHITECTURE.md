@@ -89,6 +89,10 @@ Both services start under `doppler run`, so secrets exist **only in the live pro
 `.env` greps return false negatives — this has produced wrong "it's unset in prod" conclusions more
 than once. Correct check:
 
+The Helcim credit-card invoice action additionally requires `HELCIM_API_TOKEN` and
+`HELCIM_SUBDOMAIN_URL` (`https://fuzzywumpets.myhelcim.com`) from the shared Doppler config. The API
+token remains server-side; customers receive only Helcim's per-invoice online-view URL.
+
 ```sh
 P=$(systemctl show -p MainPID --value <unit>)
 C=$(pgrep -P $P -f node | head -1)   # MainPID is doppler/bash; the CHILD holds the env

@@ -74,6 +74,12 @@ if [ -f test/order-money.test.mjs ]; then
   node test/order-money.test.mjs || UNIT_FAIL=$?
 fi
 
+if [ -f test/helcim.test.mjs ]; then
+  echo ""
+  echo "── Unit: Helcim invoice client (standalone, no server) ──"
+  node test/helcim.test.mjs || UNIT_FAIL=$?
+fi
+
 # Order-edit userErrors: the batch /edit handler returns from its MOCK branch before any Shopify
 # mutation, so this path can ONLY be covered standalone.
 if [ -f test/order-edit-user-errors.test.mjs ]; then
