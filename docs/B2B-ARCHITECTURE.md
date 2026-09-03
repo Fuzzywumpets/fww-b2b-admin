@@ -91,7 +91,10 @@ than once. Correct check:
 
 The Helcim credit-card invoice action additionally requires `HELCIM_API_TOKEN` and
 `HELCIM_SUBDOMAIN_URL` (`https://fuzzywumpets.myhelcim.com`) from the shared Doppler config. The API
-token remains server-side; customers receive only Helcim's per-invoice online-view URL.
+token remains server-side; customers receive only Helcim's per-invoice online-view URL. Admin owns
+itemized invoice creation and its durable duplicate-prevention ledger; Portal renders and sends the
+branded message through its existing Gmail broker. See `docs/HELCIM-INVOICE-CONTRACT.md` for the
+verified API and arithmetic invariants. Portal PR #42 must deploy before the Admin structured-message consumer.
 
 ```sh
 P=$(systemctl show -p MainPID --value <unit>)

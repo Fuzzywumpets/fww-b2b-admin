@@ -78,6 +78,17 @@ db.exec(`
     updated_at INTEGER NOT NULL
   );
 
+  -- DEPENDS: server.mjs acquires this before the non-idempotent Helcim Invoice API POST.
+  -- A row is retained when the remote outcome is uncertain so retries cannot create a second bill.
+  CREATE TABLE IF NOT EXISTS helcim_invoice_claims (
+    order_id TEXT PRIMARY KEY,
+    invoice_number TEXT NOT NULL,
+    amount_cents INTEGER NOT NULL,
+    currency TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+  );
+
   CREATE TABLE IF NOT EXISTS dropship_config_cache (
     customer_id TEXT PRIMARY KEY,
     enabled INTEGER NOT NULL DEFAULT 0,
@@ -493,21 +504,49 @@ export function getHelcimInvoiceMap(orderId) {
   return db.prepare('SELECT * FROM helcim_invoice_map WHERE order_id = ?').get(String(orderId)) || null;
 }
 
-// WHAT: persists a newly created Helcim invoice before attempting Re:amaze delivery, allowing a failed delivery to be retried without creating another invoice.
+// WHAT: durably elects one caller to perform an Invoice API POST for an order.
+// CHANGE-GUARD: Invoice API creation has no documented idempotency header; never replace this with
+// an in-memory lock, and never clear a claim after a timeout/network/5xx outcome.
+// INVARIANT(S): INSERT OR IGNORE plus the primary key makes concurrent double-submit single-winner.
+export function claimHelcimInvoiceCreation(orderId, { invoiceNumber, amountCents, currency }) {
+  const now = Date.now();
+  const result = db.prepare(`
+    INSERT OR IGNORE INTO helcim_invoice_claims
+      (order_id, invoice_number, amount_cents, currency, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(String(orderId), String(invoiceNumber), Number(amountCents), String(currency), now, now);
+  return {
+    acquired: result.changes === 1,
+    claim: db.prepare('SELECT * FROM helcim_invoice_claims WHERE order_id = ?').get(String(orderId)) || null,
+  };
+}
+
+// WHAT: releases a creation claim only after a definitive rejection proves Helcim did not create an invoice.
+// INVARIANT(S): callers must retain the claim for every ambiguous mutating outcome.
+export function releaseHelcimInvoiceClaim(orderId) {
+  return db.prepare('DELETE FROM helcim_invoice_claims WHERE order_id = ?').run(String(orderId)).changes === 1;
+}
+
+// WHAT: persists a newly created Helcim invoice before attempting customer-email delivery, allowing a failed delivery to be retried without creating another invoice.
 // CHANGE-GUARD: order_id is the conflict key; updates preserve created_at and replace only the current Helcim invoice metadata.
 // INVARIANT(S): caller supplies a validated Helcim invoiceId, token, URL, positive amount, and USD/CAD currency.
 export function upsertHelcimInvoiceMap(orderId, invoice) {
   const now = Date.now();
-  db.prepare(`
-    INSERT INTO helcim_invoice_map
-      (order_id, invoice_id, invoice_number, token, url, amount, currency, delivery_status, delivery_error, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, 'created', NULL, ?, ?)
-    ON CONFLICT(order_id) DO UPDATE SET
-      invoice_id=excluded.invoice_id, invoice_number=excluded.invoice_number, token=excluded.token,
-      url=excluded.url, amount=excluded.amount, currency=excluded.currency,
-      delivery_status='created', delivery_error=NULL, updated_at=excluded.updated_at
-  `).run(String(orderId), String(invoice.invoiceId), invoice.invoiceNumber || null, String(invoice.token),
-    String(invoice.url), Number(invoice.amount), String(invoice.currency), now, now);
+  db.transaction(() => {
+    db.prepare(`
+      INSERT INTO helcim_invoice_map
+        (order_id, invoice_id, invoice_number, token, url, amount, currency, delivery_status, delivery_error, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'created', NULL, ?, ?)
+      ON CONFLICT(order_id) DO UPDATE SET
+        invoice_id=excluded.invoice_id, invoice_number=excluded.invoice_number, token=excluded.token,
+        url=excluded.url, amount=excluded.amount, currency=excluded.currency,
+        delivery_status='created', delivery_error=NULL, updated_at=excluded.updated_at
+    `).run(String(orderId), String(invoice.invoiceId), invoice.invoiceNumber || null, String(invoice.token),
+      String(invoice.url), Number(invoice.amount), String(invoice.currency), now, now);
+    // SYNC: helcim_invoice_claims is consumed atomically with the retry-ledger write so there is no
+    // window where a successful remote create can be followed by a second local winner.
+    db.prepare('DELETE FROM helcim_invoice_claims WHERE order_id = ?').run(String(orderId));
+  })();
   return getHelcimInvoiceMap(orderId);
 }
 
