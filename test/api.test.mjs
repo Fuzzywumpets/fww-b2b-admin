@@ -84,6 +84,58 @@ await test('GET / with valid session returns dashboard HTML', async () => {
   assert.ok(html.includes('Open Orders'));
   assert.ok(html.includes('Top Customers'));
   assert.ok(html.includes('Low Stock'));
+  assert.ok(html.includes('class="mobile-nav-menu"'), 'Responsive navigation menu missing');
+  assert.ok(html.includes('rel="icon" href="/favicon.ico"'), 'Favicon link missing');
+});
+
+await test('GET /favicon.ico returns the generated PNG without authentication', async () => {
+  const res = await fetch(`${BASE}/favicon.ico`);
+  assert.equal(res.status, 200);
+  assert.match(res.headers.get('content-type') || '', /^image\/png/);
+  const bytes = new Uint8Array(await res.arrayBuffer());
+  assert.deepEqual([...bytes.slice(0, 8)], [137, 80, 78, 71, 13, 10, 26, 10]);
+});
+
+await test('primary list filters and selection controls have accessible names', async () => {
+  const cookie = await seedSession();
+  const [orders, customers, catalog, leads] = await Promise.all([
+    fetch(`${BASE}/orders`, { headers: { Cookie: cookie } }).then(r => r.text()),
+    fetch(`${BASE}/customers`, { headers: { Cookie: cookie } }).then(r => r.text()),
+    fetch(`${BASE}/catalog`, { headers: { Cookie: cookie } }).then(r => r.text()),
+    fetch(`${BASE}/leads`, { headers: { Cookie: cookie } }).then(r => r.text()),
+  ]);
+  assert.ok(orders.includes('aria-label="Search orders"'));
+  assert.ok(orders.includes('aria-label="Select all orders"'));
+  assert.ok(customers.includes('aria-label="Search customers"'));
+  assert.ok(catalog.includes('aria-label="Select all products"'));
+  assert.ok(leads.includes('aria-label="Search leads"'));
+});
+
+await test('Gauntlet-identified settings, customer-tag, and label inputs have accessible names', async () => {
+  const cookie = await seedSession();
+  const [settings, customer, labels] = await Promise.all([
+    fetch(`${BASE}/settings`, { headers: { Cookie: cookie } }).then(r => r.text()),
+    fetch(`${BASE}/customers/101`, { headers: { Cookie: cookie } }).then(r => r.text()),
+    fetch(`${BASE}/labels?source=order`, { headers: { Cookie: cookie } }).then(r => r.text()),
+  ]);
+  for (const id of ['settings-b2b-discount', 'settings-order-minimum', 'settings-payment-terms', 'settings-private-tags']) {
+    assert.ok(settings.includes(`for="${id}"`), `Missing settings label association for ${id}`);
+    assert.ok(settings.includes(`id="${id}"`), `Missing settings control id ${id}`);
+  }
+  assert.ok(settings.includes('aria-label="Admin email to allow"'));
+  assert.ok(customer.includes('aria-label="New customer tag"'));
+  assert.ok(labels.includes('aria-label="Order number for labels"'));
+});
+
+await test('new-lead form labels are associated with their controls', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/leads/new`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  for (const id of ['lead-email', 'lead-business-name', 'lead-contact-name', 'lead-phone', 'lead-website', 'lead-business-type', 'lead-monthly-volume', 'lead-source', 'lead-source-detail', 'lead-follow-up']) {
+    assert.ok(html.includes(`for="${id}"`), `Missing label association for ${id}`);
+    assert.ok(html.includes(`id="${id}"`), `Missing control id ${id}`);
+  }
 });
 
 await test('Dashboard shows mock data (order names, customer names)', async () => {
@@ -2725,6 +2777,17 @@ await test('GET /products/201 → returns product detail for Elite Collar', asyn
   assert.ok(html.includes('Elite Collar'), 'Product title missing');
   assert.ok(html.includes('EC-001-S-NV'), 'Variant SKU missing');
   assert.ok(html.includes('Edit in Shopify'), 'Edit in Shopify link missing');
+  assert.ok(html.includes("onclick=\"return confirm('Remove Elite Collar from B2B publication?')\""), 'Remove from B2B must require confirmation');
+  assert.ok(html.includes('class="btn btn-danger btn-sm"'), 'Remove from B2B must use destructive styling');
+  assert.ok(html.includes('/mock-product-image/elite-collar-1.svg'), 'Mock product images must be same-origin fixtures');
+  assert.ok(!html.includes('cdn.shopify.com/mock'), 'Mock product page must not trigger deliberate CDN failures');
+});
+
+await test('GET /mock-product-image/:name.svg serves a local mock image', async () => {
+  const res = await fetch(`${BASE}/mock-product-image/elite-collar-1.svg`);
+  assert.equal(res.status, 200);
+  assert.match(res.headers.get('content-type') || '', /^image\/svg\+xml/);
+  assert.match(await res.text(), /^<svg/);
 });
 
 await test('GET /products/9999 → returns 404 for non-existent product', async () => {

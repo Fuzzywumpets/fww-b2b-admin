@@ -1009,13 +1009,14 @@ const MOCK_CUSTOMERS = [
 // In-memory override store for mock mode (Phase 7). Key = numericId string.
 const mockB2bConfigOverrides = new Map();
 
+// DEPENDS: the MOCK-only /mock-product-image/:name.svg route serves every URL below; keep mock product pages fully same-origin so QA runtime failures represent app defects rather than deliberately nonexistent CDN fixtures.
 const MOCK_PRODUCTS = [
   { id: 'gid://shopify/Product/201', title: 'Elite Collar', handle: 'elite-collar',
     vendor: 'Fuzzywumpets', productType: 'Dog Collar', tags: ['Style_Elite', 'b2b'],
-    featuredImage: { url: 'https://cdn.shopify.com/mock/elite-collar-1.jpg', altText: 'Elite Collar' },
+    featuredImage: { url: '/mock-product-image/elite-collar-1.svg', altText: 'Elite Collar' },
     images: { edges: [
-      { node: { url: 'https://cdn.shopify.com/mock/elite-collar-1.jpg', altText: '' } },
-      { node: { url: 'https://cdn.shopify.com/mock/elite-collar-2.jpg', altText: '' } },
+      { node: { url: '/mock-product-image/elite-collar-1.svg', altText: 'Elite Collar front' } },
+      { node: { url: '/mock-product-image/elite-collar-2.svg', altText: 'Elite Collar detail' } },
     ]},
     variants: { edges: [
       { node: { id: 'gid://shopify/ProductVariant/301', title: 'Small / Navy', sku: 'EC-001-S-NV', price: '36.00', compareAtPrice: '54.00', barcode: '012345678901', inventoryQuantity: 24, selectedOptions: [{ name: 'Size', value: 'Small' }, { name: 'Color', value: 'Navy' }] } },
@@ -1025,9 +1026,9 @@ const MOCK_PRODUCTS = [
   },
   { id: 'gid://shopify/Product/202', title: 'Luxe Leash', handle: 'luxe-leash',
     vendor: 'Fuzzywumpets', productType: 'Dog Leash', tags: ['Style_Luxe', 'b2b'],
-    featuredImage: { url: 'https://cdn.shopify.com/mock/luxe-leash-1.jpg', altText: 'Luxe Leash' },
+    featuredImage: { url: '/mock-product-image/luxe-leash-1.svg', altText: 'Luxe Leash' },
     images: { edges: [
-      { node: { url: 'https://cdn.shopify.com/mock/luxe-leash-1.jpg', altText: '' } },
+      { node: { url: '/mock-product-image/luxe-leash-1.svg', altText: 'Luxe Leash' } },
     ]},
     variants: { edges: [
       { node: { id: 'gid://shopify/ProductVariant/303', title: 'Default Title', sku: 'LL-005', price: '75.00', compareAtPrice: '112.00', barcode: '012345678903', inventoryQuantity: 5 } },
@@ -1035,11 +1036,11 @@ const MOCK_PRODUCTS = [
   },
   { id: 'gid://shopify/Product/203', title: 'Simplicity Collar', handle: 'simplicity-collar',
     vendor: 'Fuzzywumpets', productType: 'Dog Collar', tags: ['Style_Simplicity', 'b2b'],
-    featuredImage: { url: 'https://cdn.shopify.com/mock/simplicity-collar-1.jpg', altText: 'Simplicity Collar' },
+    featuredImage: { url: '/mock-product-image/simplicity-collar-1.svg', altText: 'Simplicity Collar' },
     images: { edges: [
-      { node: { url: 'https://cdn.shopify.com/mock/simplicity-collar-1.jpg', altText: '' } },
-      { node: { url: 'https://cdn.shopify.com/mock/simplicity-collar-2.jpg', altText: '' } },
-      { node: { url: 'https://cdn.shopify.com/mock/simplicity-collar-3.jpg', altText: '' } },
+      { node: { url: '/mock-product-image/simplicity-collar-1.svg', altText: 'Simplicity Collar front' } },
+      { node: { url: '/mock-product-image/simplicity-collar-2.svg', altText: 'Simplicity Collar detail' } },
+      { node: { url: '/mock-product-image/simplicity-collar-3.svg', altText: 'Simplicity Collar reverse' } },
     ]},
     variants: { edges: [
       { node: { id: 'gid://shopify/ProductVariant/304', title: 'Medium / Red', sku: 'SC-002-M-RD', price: '22.00', compareAtPrice: '33.00', barcode: '012345678904', inventoryQuantity: 7  } },
@@ -1048,9 +1049,9 @@ const MOCK_PRODUCTS = [
   },
   { id: 'gid://shopify/Product/204', title: 'Everyday Collar Bundle', handle: 'everyday-collar-bundle',
     vendor: 'Fuzzywumpets', productType: 'Dog Collar', tags: ['Style_Everyday', 'b2b'],
-    featuredImage: { url: 'https://cdn.shopify.com/mock/everyday-bundle-1.jpg', altText: 'Everyday Collar Bundle' },
+    featuredImage: { url: '/mock-product-image/everyday-bundle-1.svg', altText: 'Everyday Collar Bundle' },
     images: { edges: [
-      { node: { url: 'https://cdn.shopify.com/mock/everyday-bundle-1.jpg', altText: '' } },
+      { node: { url: '/mock-product-image/everyday-bundle-1.svg', altText: 'Everyday Collar Bundle' } },
     ]},
     variants: { edges: [
       { node: { id: 'gid://shopify/ProductVariant/306', title: 'XL', sku: 'ECB-010-XL', price: '60.00', compareAtPrice: '90.00', barcode: '012345678906', inventoryQuantity: 8, selectedOptions: [{ name: 'Size', value: 'XL' }] } },
@@ -1059,8 +1060,8 @@ const MOCK_PRODUCTS = [
   // Two-dimension product (Width × Size) — exercises the grouped picker's width sub-headers.
   { id: 'gid://shopify/Product/205', title: 'Pinpoint Limited Slip', handle: 'pinpoint-limited-slip',
     vendor: 'Fuzzywumpets', productType: 'Dog Collar', tags: ['Style_Pinpoint', 'b2b'],
-    featuredImage: { url: 'https://cdn.shopify.com/mock/pinpoint-1.jpg', altText: 'Pinpoint Limited Slip' },
-    images: { edges: [ { node: { url: 'https://cdn.shopify.com/mock/pinpoint-1.jpg', altText: '' } } ]},
+    featuredImage: { url: '/mock-product-image/pinpoint-1.svg', altText: 'Pinpoint Limited Slip' },
+    images: { edges: [ { node: { url: '/mock-product-image/pinpoint-1.svg', altText: 'Pinpoint Limited Slip' } } ]},
     variants: { edges: [
       { node: { id: 'gid://shopify/ProductVariant/350', title: '1/2" / SM',  sku: 'PLS-12-SM',  price: '28.00', compareAtPrice: '42.00', barcode: '', inventoryQuantity: 10, selectedOptions: [{ name: 'Width', value: '1/2"' }, { name: 'Size', value: 'SM' }] } },
       { node: { id: 'gid://shopify/ProductVariant/351', title: '1/2" / MED', sku: 'PLS-12-MED', price: '28.00', compareAtPrice: '42.00', barcode: '', inventoryQuantity: 6,  selectedOptions: [{ name: 'Width', value: '1/2"' }, { name: 'Size', value: 'MED' }] } },
@@ -1577,8 +1578,9 @@ function gfonts() {
 }
 
 // WHAT: master page shell — renders header/nav/user-email + injects content; also ships the global keyboard-shortcut handler and syncCacheNow() helper inline.
-// CHANGE-GUARD: navItems is the single source of the top-nav; the keyboard 'g+<key>' map in the inline script must mirror these hrefs or shortcuts dead-link. title is escaped via h() but `content` is injected RAW — callers are responsible for escaping their own dynamic values before passing them in.
+// CHANGE-GUARD: navItems is the single source of both desktop and mobile navigation; the keyboard 'g+<key>' map in the inline script must mirror these hrefs or shortcuts dead-link. title is escaped via h() but `content` is injected RAW — callers are responsible for escaping their own dynamic values before passing them in.
 // INVARIANT(S): activePath drives the .active nav class via exact-equality match; session?.email is the only user-identity shown and is h()-escaped.
+// DEPENDS: public/admin.css .header-nav/.mobile-nav-menu switch between the two renderings at 480px; both renderings must keep using navItems rather than duplicating the route list.
 function layout({ title, session, activePath = '/', content, extraHead = '' }) {
   const navItems = [
     ['/', 'Dashboard'], ['/orders', 'Orders'], ['/customers', 'Customers'],
@@ -1594,6 +1596,7 @@ function layout({ title, session, activePath = '/', content, extraHead = '' }) {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>${h(title)} — FWW Admin</title>
   <link rel="manifest" href="/manifest.json">
+  <link rel="icon" href="/favicon.ico" sizes="192x192" type="image/png">
   <meta name="theme-color" content="#9BBC0E">
   ${gfonts()}
   <link rel="stylesheet" href="/admin.css">
@@ -1605,11 +1608,19 @@ function layout({ title, session, activePath = '/', content, extraHead = '' }) {
       <a href="/" class="header-logo">
         <span class="logo-fw">FW</span><span class="logo-admin">admin</span>
       </a>
-      <nav class="header-nav">
+      <nav class="header-nav" aria-label="Primary navigation">
         ${navItems.map(([href, label]) =>
           `<a href="${href}" class="nav-link${activePath === href ? ' active' : ''}">${label}</a>`
         ).join('')}
       </nav>
+      <details class="mobile-nav-menu">
+        <summary>Menu</summary>
+        <nav class="mobile-nav-links" aria-label="Primary navigation">
+          ${navItems.map(([href, label]) =>
+            `<a href="${href}" class="nav-link${activePath === href ? ' active' : ''}">${label}</a>`
+          ).join('')}
+        </nav>
+      </details>
       <div class="header-user">
         <span class="user-email">${h(session?.email || '')}</span>
         <a href="/login" id="signout-link" class="btn-signout" role="button">Sign out</a>
@@ -2116,7 +2127,7 @@ function renderOrdersList(session, data, filters) {
     const srcLabel = ORDER_SOURCE_LABELS[src] || src;
     const srcColor = ORDER_SOURCE_COLORS[src] || 'muted';
     return `<tr>
-      <td class="col-check"><input type="checkbox" name="ids" value="${h(numId)}"></td>
+      <td class="col-check"><input type="checkbox" name="ids" value="${h(numId)}" aria-label="Select order ${h(o.name)}"></td>
       <td><a href="/orders/${h(numId)}" class="order-link">${h(o.name)}</a></td>
       <td>${o.customer ? `<a href="/customers/${shopifyNumericId(o.customer.id)}">${h(o.customer.displayName)}</a><br><small>${h(o.customer.email)}</small>` : '—'}</td>
       <td class="text-muted">${fmtDate(o.processedAt)}</td>
@@ -2164,8 +2175,8 @@ function renderOrdersList(session, data, filters) {
     <div class="filter-chips">${sourceChips}</div>
     <form class="filter-bar" method="GET" action="/orders">
       ${filters.source ? `<input type="hidden" name="source" value="${h(filters.source)}">` : ''}
-      <input type="search" name="q" value="${h(filters.q||'')}" placeholder="Order #, customer, SKU…" class="filter-input search-input">
-      <select name="status" class="filter-select" onchange="this.form.submit()">
+      <input type="search" name="q" value="${h(filters.q||'')}" placeholder="Order #, customer, SKU…" class="filter-input search-input" aria-label="Search orders">
+      <select name="status" class="filter-select" onchange="this.form.submit()" aria-label="Filter orders by status">
         <option value="">All statuses</option>
         <option value="open"    ${filters.status==='open'?'selected':''}>Open (unpaid)</option>
         <option value="pending" ${filters.status==='pending'?'selected':''}>Pending</option>
@@ -2173,7 +2184,7 @@ function renderOrdersList(session, data, filters) {
         <option value="refunded" ${filters.status==='refunded'?'selected':''}>Refunded</option>
         <option value="voided"  ${filters.status==='voided'?'selected':''}>Voided</option>
       </select>
-      <select name="date" class="filter-select" onchange="this.form.submit()">
+      <select name="date" class="filter-select" onchange="this.form.submit()" aria-label="Filter orders by date">
         <option value="">All time</option>
         <option value="7d"  ${filters.date==='7d'?'selected':''}>Last 7 days</option>
         <option value="30d" ${filters.date==='30d'?'selected':''}>Last 30 days</option>
@@ -2190,7 +2201,7 @@ function renderOrdersList(session, data, filters) {
       <div class="table-wrap">
         <table class="data-table">
           <thead><tr>
-            <th class="col-check"><input type="checkbox" id="select-all"></th>
+            <th class="col-check"><input type="checkbox" id="select-all" aria-label="Select all orders"></th>
             <th>Order</th><th>Customer</th><th>Date</th><th>Items</th>
             <th class="text-right">Amount</th><th>Payment</th><th>Fulfillment</th><th></th>
           </tr></thead>
@@ -4032,7 +4043,7 @@ function renderOrderDetail(session, order, flash, flashMsg) {
             <span class="text-muted" style="font-size:11px">prints on the order invoice</span>
           </div>
           <form method="POST" action="/orders/${h(numId)}/note" style="margin-top:10px">
-            <textarea name="note" class="textarea" rows="3" placeholder="Add a customer note for this order…">${h(order.note||'')}</textarea>
+            <textarea name="note" class="textarea" rows="3" placeholder="Add a customer note for this order…" aria-label="Customer note">${h(order.note||'')}</textarea>
             <div style="margin-top:0.5rem;display:flex;gap:8px;align-items:center">
               <button type="submit" class="btn btn-secondary btn-sm">Save note</button>
               ${order.note && String(order.note).trim() ? `<button type="button" class="btn btn-ghost btn-sm" style="color:#a32d2d" onclick="if(confirm('Delete this customer note?')){this.form.note.value='';this.form.submit();}">Delete</button>` : ''}
@@ -4045,7 +4056,7 @@ function renderOrderDetail(session, order, flash, flashMsg) {
             <span class="text-muted" style="font-size:11px">staff only · never on the invoice or synced to Shopify</span>
           </div>
           <form method="POST" action="/orders/${h(numId)}/internal-note" style="margin-top:10px">
-            <textarea name="note" class="textarea" rows="3" placeholder="Private staff note (e.g. how the order was created, SparkLayer unreachable)…">${h(order.internalNote||'')}</textarea>
+            <textarea name="note" class="textarea" rows="3" placeholder="Private staff note (e.g. how the order was created, SparkLayer unreachable)…" aria-label="Internal staff note">${h(order.internalNote||'')}</textarea>
             <div style="margin-top:0.5rem;display:flex;gap:8px;align-items:center">
               <button type="submit" class="btn btn-secondary btn-sm">Save internal note</button>
               ${order.internalNote && String(order.internalNote).trim() ? `<button type="button" class="btn btn-ghost btn-sm" style="color:#a32d2d" onclick="if(confirm('Delete this internal note?')){this.form.note.value='';this.form.submit();}">Delete</button>` : ''}
@@ -4057,7 +4068,7 @@ function renderOrderDetail(session, order, flash, flashMsg) {
           <div class="card-header"><h2>Note visible to customer</h2></div>
           <div id="visible-notes-list" style="margin-bottom:10px">${renderVisibleNotesList(order.visibleNotes || [])}</div>
           <form id="visible-note-form" onsubmit="submitVisibleNote(event, ${h(JSON.stringify(numId))})">
-            <textarea id="visible-note-body" class="textarea" rows="3" placeholder="Write a note the customer can see on their order…"></textarea>
+            <textarea id="visible-note-body" class="textarea" rows="3" placeholder="Write a note the customer can see on their order…" aria-label="Note visible to customer"></textarea>
             <div style="margin-top:0.5rem;display:flex;gap:8px;align-items:center">
               <button type="submit" class="btn btn-primary btn-sm">Send note to customer</button>
               <span id="visible-note-status" style="font-size:12px;color:var(--muted)"></span>
@@ -4086,20 +4097,20 @@ function renderOrderDetail(session, order, flash, flashMsg) {
           <details style="margin-top:8px">
             <summary style="cursor:pointer;font-size:13px;color:var(--link,#2086ba)">✏️ Edit shipping address</summary>
             <form method="POST" action="/orders/${h(numId)}/shipping-address" style="margin-top:10px;display:grid;gap:6px">
-              <div style="display:flex;gap:6px">
-                <input name="firstName" class="filter-input" placeholder="First name" value="${h(addr?.firstName||'')}" style="flex:1">
-                <input name="lastName" class="filter-input" placeholder="Last name" value="${h(addr?.lastName||'')}" style="flex:1">
+              <div class="shipping-address-row shipping-address-row-2">
+                <input name="firstName" class="filter-input" placeholder="First name" value="${h(addr?.firstName||'')}" aria-label="Shipping first name">
+                <input name="lastName" class="filter-input" placeholder="Last name" value="${h(addr?.lastName||'')}" aria-label="Shipping last name">
               </div>
-              <input name="address1" class="filter-input" placeholder="Address line 1" value="${h(addr?.address1||'')}">
-              <input name="address2" class="filter-input" placeholder="Address line 2 (optional)" value="${h(addr?.address2||'')}">
-              <div style="display:flex;gap:6px">
-                <input name="city" class="filter-input" placeholder="City" value="${h(addr?.city||'')}" style="flex:2">
-                <input name="province" class="filter-input" placeholder="State" value="${h(addr?.province||'')}" style="flex:1">
-                <input name="zip" class="filter-input" placeholder="ZIP" value="${h(addr?.zip||'')}" style="flex:1">
+              <input name="address1" class="filter-input" placeholder="Address line 1" value="${h(addr?.address1||'')}" aria-label="Shipping address line 1">
+              <input name="address2" class="filter-input" placeholder="Address line 2 (optional)" value="${h(addr?.address2||'')}" aria-label="Shipping address line 2">
+              <div class="shipping-address-row shipping-address-row-3">
+                <input name="city" class="filter-input" placeholder="City" value="${h(addr?.city||'')}" aria-label="Shipping city">
+                <input name="province" class="filter-input" placeholder="State" value="${h(addr?.province||'')}" aria-label="Shipping state or province">
+                <input name="zip" class="filter-input" placeholder="ZIP" value="${h(addr?.zip||'')}" aria-label="Shipping postal code">
               </div>
-              <div style="display:flex;gap:6px">
-                <input name="country" class="filter-input" placeholder="Country" value="${h(addr?.country||'')}" style="flex:1">
-                <input name="phone" class="filter-input" placeholder="Phone (optional)" value="${h(addr?.phone||'')}" style="flex:1">
+              <div class="shipping-address-row shipping-address-row-2">
+                <input name="country" class="filter-input" placeholder="Country" value="${h(addr?.country||'')}" aria-label="Shipping country">
+                <input name="phone" class="filter-input" placeholder="Phone (optional)" value="${h(addr?.phone||'')}" aria-label="Shipping phone">
               </div>
               <div><button type="submit" class="btn btn-primary btn-sm">Save address</button></div>
             </form>
@@ -4344,14 +4355,14 @@ function renderCustomersList(session, data, filters) {
     <div class="filter-chips">${segmentChips}</div>
     <form class="filter-bar" method="GET" action="/customers">
       ${filters.segment ? `<input type="hidden" name="segment" value="${h(filters.segment)}">` : ''}
-      <input type="search" name="q" value="${h(filters.q||'')}" placeholder="Name, email, phone…" class="filter-input search-input">
-      <select name="tag" class="filter-select">
+      <input type="search" name="q" value="${h(filters.q||'')}" placeholder="Name, email, phone…" class="filter-input search-input" aria-label="Search customers">
+      <select name="tag" class="filter-select" aria-label="Filter customers by tag">
         <option value="">All tags</option>
         <option value="b2b-tier:gold"   ${filters.tag==='b2b-tier:gold'?'selected':''}>Gold tier</option>
         <option value="b2b-tier:silver" ${filters.tag==='b2b-tier:silver'?'selected':''}>Silver tier</option>
         <option value="b2b-dropship"    ${filters.tag==='b2b-dropship'?'selected':''}>Dropship</option>
       </select>
-      <select name="sort" class="filter-select" onchange="this.form.submit()">
+      <select name="sort" class="filter-select" onchange="this.form.submit()" aria-label="Sort customers">
         ${sortOptions.map(o => `<option value="${h(o.value)}"${currentSort===o.value?' selected':''}>${h(o.label)}</option>`).join('')}
       </select>
       <button type="submit" class="btn btn-secondary">Filter</button>
@@ -4911,7 +4922,7 @@ function renderCustomerDetail(session, customer, recentOrders, notes, _dropshipC
         <div class="card">
           <div class="card-header"><h2>Internal Notes</h2></div>
           <form method="POST" action="/customers/${h(numId)}/notes">
-            <textarea name="body" class="textarea" rows="4" placeholder="Internal notes about this customer (not shown to them)…">${h(notes?.body||'')}</textarea>
+            <textarea name="body" class="textarea" rows="4" placeholder="Internal notes about this customer (not shown to them)…" aria-label="Internal customer notes">${h(notes?.body||'')}</textarea>
             ${notes?.updated_at ? `<p class="text-muted small-text" style="margin-top:0.25rem">Last updated ${fmtDate(new Date(notes.updated_at).toISOString())} by ${h(notes.updated_by)}</p>` : ''}
             <div style="margin-top:0.5rem"><button type="submit" class="btn btn-secondary btn-sm">Save Notes</button></div>
           </form>
@@ -4925,7 +4936,7 @@ function renderCustomerDetail(session, customer, recentOrders, notes, _dropshipC
             <div class="b2b-settings-grid">
               <div class="b2b-field-row">
                 <div>
-                  <div class="b2b-field-label">Discount %</div>
+                  <label class="b2b-field-label" for="discount_pct">Discount %</label>
                   <div class="b2b-field-help">What percent off MSRP this customer pays. Default ${h(String(b2bConfig.defaults.discount_pct))}% comes from store settings.</div>
                 </div>
                 <div class="b2b-field-control">
@@ -4941,20 +4952,20 @@ function renderCustomerDetail(session, customer, recentOrders, notes, _dropshipC
               </div>
               <div class="b2b-field-row">
                 <div>
-                  <div class="b2b-field-label">Drop-ship allowed</div>
+                  <label class="b2b-field-label" for="dropship_enabled">Drop-ship allowed</label>
                   <div class="b2b-field-help">If on, this customer can ship orders directly to their end customer. Useful for resellers who don't carry inventory.</div>
                 </div>
                 <div class="b2b-field-control">
-                  <label class="toggle-label">
+                  <span class="toggle-label">
                     <input type="checkbox" name="dropship_enabled" id="dropship_enabled" class="toggle"
                       ${b2bConfig.effective.dropship_enabled ? 'checked' : ''}
                       onchange="document.getElementById('dropship_margin_pct').disabled=!this.checked">
-                  </label>
+                  </span>
                 </div>
               </div>
               <div class="b2b-field-row">
                 <div>
-                  <div class="b2b-field-label">Drop-ship discount %</div>
+                  <label class="b2b-field-label" for="dropship_margin_pct">Drop-ship discount %</label>
                   <div class="b2b-field-help">Discount on drop-ship orders only (separate from standard discount). Typical 25–35%.</div>
                 </div>
                 <div class="b2b-field-control">
@@ -4966,20 +4977,20 @@ function renderCustomerDetail(session, customer, recentOrders, notes, _dropshipC
               </div>
               <div class="b2b-field-row">
                 <div>
-                  <div class="b2b-field-label">Allow order on invoice</div>
+                  <label class="b2b-field-label" for="allow_order_on_invoice">Allow order on invoice</label>
                   <div class="b2b-field-help">If on, customer can place orders without upfront payment — we invoice them. If off, must pay at checkout.</div>
                 </div>
                 <div class="b2b-field-control">
-                  <label class="toggle-label">
+                  <span class="toggle-label">
                     <input type="checkbox" name="allow_order_on_invoice" id="allow_order_on_invoice" class="toggle"
                       ${b2bConfig.effective.allow_order_on_invoice !== false ? 'checked' : ''}>
-                  </label>
+                  </span>
                 </div>
               </div>
             </div>
               <div class="b2b-field-row">
                 <div>
-                  <div class="b2b-field-label">Custom catalog tags</div>
+                  <label class="b2b-field-label" for="catalog_access_tags">Custom catalog tags</label>
                   <div class="b2b-field-help">Comma-separated private product tags this customer can access (e.g. <code>private-acme,deerskin-trade</code>). Products with these tags are hidden from customers who don't have them listed here.</div>
                 </div>
                 <div class="b2b-field-control">
@@ -5018,7 +5029,7 @@ function renderCustomerDetail(session, customer, recentOrders, notes, _dropshipC
               </form>`).join(' ')}
           </div>
           <form method="POST" action="/customers/${h(numId)}/tags/add" id="tag-add-form" hidden style="margin-top:0.5rem;display:flex;gap:0.5rem">
-            <input type="text" name="tag" placeholder="New tag…" class="input input-sm" style="flex:1">
+            <input type="text" name="tag" placeholder="New tag…" aria-label="New customer tag" class="input input-sm" style="flex:1">
             <button type="submit" class="btn btn-secondary btn-sm">Add</button>
           </form>
           <script>
@@ -5772,6 +5783,17 @@ if (!fs.existsSync(ICON_PATH)) {
 // INVARIANT(S): must stay above requireAuth-protected routes so probes never redirect to /login.
 app.get('/healthz', (_req, res) => {
   res.json({ ok: true, app: 'fww-b2b-admin', ts: Date.now() });
+});
+
+// DEPENDS: layout() links /favicon.ico and the manifest links /icon-192.png; both must serve the same generated PNG so a fresh browser load has no missing-icon request.
+app.get('/favicon.ico', (_req, res) => {
+  res.type('png').sendFile(ICON_PATH);
+});
+
+if (MOCK) app.get('/mock-product-image/:name.svg', (_req, res) => {
+  res.type('image/svg+xml').set('Cache-Control', 'public, max-age=3600').send(
+    '<svg xmlns="http://www.w3.org/2000/svg" width="160" height="160" viewBox="0 0 160 160" role="img" aria-label="Mock product image"><rect width="160" height="160" rx="12" fill="#f3f4f6"/><path d="M28 80c18-28 86-28 104 0-18 28-86 28-104 0Z" fill="#9bbc0e"/><circle cx="80" cy="80" r="18" fill="#2086ba"/></svg>'
+  );
 });
 
 // WHAT: PWA web app manifest (standalone display, lime theme, single 192x192 icon).
@@ -9296,21 +9318,21 @@ function renderCatalog(session, data, filters) {
     <div class="filter-chips" id="catalog-status-chips">${statusChips}</div>
     <form method="GET" action="/catalog" class="filter-bar">
       ${filters.status && filters.status !== 'active' ? `<input type="hidden" name="status" value="${h(filters.status)}">` : ''}
-      <select name="vendor" onchange="this.form.submit()" title="Vendor filter — defaults to Fuzzywumpets">
+      <select name="vendor" onchange="this.form.submit()" title="Vendor filter — defaults to Fuzzywumpets" aria-label="Filter catalog by vendor">
         <option value=""${vendorIsDefault ? ' selected' : ''}>Fuzzywumpets (default)</option>
         <option value="all"${filters.vendor === 'all' ? ' selected' : ''}>All vendors</option>
         ${(vendors||[]).filter(v => v && v !== 'Fuzzywumpets').map(v => `<option value="${h(v)}"${filters.vendor===v?' selected':''}>${h(v)}</option>`).join('')}
       </select>
-      <select name="style" onchange="this.form.submit()">
+      <select name="style" onchange="this.form.submit()" aria-label="Filter catalog by style">
         <option value="">All styles</option>
         ${(styles||[]).map(s => `<option value="${h(s)}"${filters.style===s?' selected':''}>${h(s)}</option>`).join('')}
       </select>
-      <select name="stock" onchange="this.form.submit()">
+      <select name="stock" onchange="this.form.submit()" aria-label="Filter catalog by stock">
         <option value="">All stock</option>
         <option value="low"${filters.stock==='low'?' selected':''}>Low stock (&lt;10)</option>
         <option value="out"${filters.stock==='out'?' selected':''}>Out of stock</option>
       </select>
-      <select name="b2b" onchange="this.form.submit()">
+      <select name="b2b" onchange="this.form.submit()" aria-label="Filter catalog by B2B status">
         <option value="">All B2B status</option>
         <option value="1"${filters.b2b==='1'?' selected':''}>On B2B publication</option>
         <option value="0"${filters.b2b==='0'?' selected':''}>Not on B2B</option>
@@ -9345,7 +9367,7 @@ function renderCatalog(session, data, filters) {
         : '';
     const rowClass = pStatus === 'archived' ? ' class="row-archived"' : '';
     return `<tr data-id="${h(numId)}"${rowClass}>
-      <td><input type="checkbox" name="ids" value="${h(numId)}" class="row-check" onchange="updateBulkBar()"></td>
+      <td><input type="checkbox" name="ids" value="${h(numId)}" class="row-check" onchange="updateBulkBar()" aria-label="Select product ${h(p.title)}"></td>
       <td><a href="/catalog/${h(numId)}" class="link-primary">${h(p.title)}</a>${statusBadge}</td>
       <td class="text-muted">${h(p.vendor||'—')}</td>
       <td>${style ? `<span class="tag-chip">${h(style)}</span>` : '—'}</td>
@@ -9365,7 +9387,7 @@ function renderCatalog(session, data, filters) {
     <div class="table-wrap">
     <table class="data-table" id="catalog-table">
       <thead><tr>
-        <th style="width:32px"><input type="checkbox" id="select-all" onchange="selectAll(this)"></th>
+        <th style="width:32px"><input type="checkbox" id="select-all" onchange="selectAll(this)" aria-label="Select all products"></th>
         <th>Product</th><th>Vendor</th><th>Style</th><th>SKUs</th>
         <th title="Total inventory across variants">Qty</th>
         <th>B2B Status</th><th>Actions</th>
@@ -9612,11 +9634,12 @@ function renderProductDetail(session, product) {
           ${tags.map(t => tagChip(t)).join('')}
         </div>
       </div>
-      <div class="detail-header-actions">
+      <div class="detail-header-actions product-detail-actions">
         <a href="${h(shopifyEditUrl)}" target="_blank" rel="noopener" class="btn btn-secondary">Edit in Shopify ↗</a>
         ${isB2B
           ? `<form method="POST" action="/catalog/${numId}/unpublish" style="display:inline">
-              <button class="btn btn-ghost btn-sm">Remove from B2B</button></form>`
+              <!-- DEPENDS: test/api.test.mjs asserts this state-changing action remains confirmed before submission. -->
+              <button class="btn btn-danger btn-sm" aria-label="Remove ${h(product.title)} from B2B" onclick="return confirm('Remove ${h(product.title)} from B2B publication?')">Remove from B2B</button></form>`
           : `<form method="POST" action="/catalog/${numId}/publish" style="display:inline">
               <button class="btn btn-primary btn-sm">Publish to B2B</button></form>`}
       </div>
@@ -9950,23 +9973,23 @@ function renderSettings(session, { settings, allowlist, flash }) {
         <h2>B2B Config</h2>
         <form method="POST" action="/settings" class="settings-form">
           <div class="form-row">
-            <label>B2B Discount %</label>
-            <input type="number" name="b2b_discount_pct" value="${h(settings.b2b_discount_pct)}" min="0" max="100" step="1" class="form-input" style="width:80px">
+            <label for="settings-b2b-discount">B2B Discount %</label>
+            <input id="settings-b2b-discount" type="number" name="b2b_discount_pct" value="${h(settings.b2b_discount_pct)}" min="0" max="100" step="1" class="form-input" style="width:80px">
             <small class="text-muted">Applied to all B2B orders (default 50%)</small>
           </div>
           <div class="form-row">
-            <label>Order Minimum ($)</label>
-            <input type="number" name="order_minimum" value="${h(settings.order_minimum)}" min="0" step="0.01" class="form-input" style="width:100px">
+            <label for="settings-order-minimum">Order Minimum ($)</label>
+            <input id="settings-order-minimum" type="number" name="order_minimum" value="${h(settings.order_minimum)}" min="0" step="0.01" class="form-input" style="width:100px">
             <small class="text-muted">Minimum order value for B2B checkout (0 = no minimum)</small>
           </div>
           <div class="form-row">
-            <label>Payment Terms</label>
-            <input type="text" name="payment_terms" value="${h(settings.payment_terms)}" maxlength="100" class="form-input" style="width:200px">
+            <label for="settings-payment-terms">Payment Terms</label>
+            <input id="settings-payment-terms" type="text" name="payment_terms" value="${h(settings.payment_terms)}" maxlength="100" class="form-input" style="width:200px">
             <small class="text-muted">Shown on invoices (e.g. "Net 30", "Due on receipt")</small>
           </div>
           <div class="form-row">
-            <label>Private catalog tags</label>
-            <input type="text" name="catalog_private_tags" value="${h(settings.catalog_private_tags || '')}" maxlength="500" class="form-input" style="width:300px">
+            <label for="settings-private-tags">Private catalog tags</label>
+            <input id="settings-private-tags" type="text" name="catalog_private_tags" value="${h(settings.catalog_private_tags || '')}" maxlength="500" class="form-input" style="width:300px">
             <small class="text-muted">Comma-separated Shopify product tags treated as "private." Products with these tags are only visible to customers whose Custom catalog tags (on their B2B settings) include a match.</small>
           </div>
           <button type="submit" class="btn btn-primary">Save Config</button>
@@ -9980,7 +10003,7 @@ function renderSettings(session, { settings, allowlist, flash }) {
           ${allowlist.map(e => `<li>${h(e)}</li>`).join('')}
         </ul>
         <form method="POST" action="/settings/allowlist/add" class="settings-form" style="margin-top:0.75rem;display:flex;gap:0.5rem;align-items:center">
-          <input type="email" name="email" placeholder="new@fuzzywumpets.com" class="form-input" style="width:240px" required>
+          <input type="email" name="email" placeholder="new@fuzzywumpets.com" aria-label="Admin email to allow" class="form-input" style="width:240px" required>
           <button type="submit" class="btn btn-secondary">+ Add</button>
         </form>
       </section>
@@ -10387,7 +10410,7 @@ function renderLabelsPage(session, { source, orderData, productItems, flash, sav
     <div>
       <form method="GET" action="/labels" style="display:flex;gap:0.5rem;align-items:center;margin-bottom:0.75rem">
         <input type="hidden" name="source" value="order">
-        <input type="text" name="order" placeholder="Order # (e.g. 1001)" class="form-input search-input" style="width:220px" value="${h(queryOrder)}">
+        <input type="text" name="order" placeholder="Order # (e.g. 1001)" aria-label="Order number for labels" class="form-input search-input" style="width:220px" value="${h(queryOrder)}">
         <button type="submit" class="btn btn-secondary">Load Order</button>
       </form>
       ${source === 'order' && orderData ? `<p class="text-muted text-sm">Loaded order ${h(orderData.order?.name || '')}</p>` : ''}
@@ -10957,7 +10980,7 @@ function renderLeadsList(session, { leads, counts, flash, q, status, total, trun
     <div class="filter-bar" style="margin-bottom:0.75rem">
       <form method="GET" action="/leads" style="display:flex;gap:0.5rem;align-items:center;flex:1">
         <input type="hidden" name="status" value="${h(status || 'all')}">
-        <input type="text" name="q" value="${h(q || '')}" class="input search-input" placeholder="Search name, email, business…" style="max-width:320px">
+        <input type="text" name="q" value="${h(q || '')}" class="input search-input" placeholder="Search name, email, business…" style="max-width:320px" aria-label="Search leads">
         <button type="submit" class="btn btn-secondary btn-sm">Search</button>
         ${q ? `<a href="/leads?status=${h(status || 'all')}" class="btn btn-ghost btn-sm">Clear</a>` : ''}
       </form>
@@ -11060,36 +11083,36 @@ function renderLeadNew(session, { flash, prefill = {} }) {
     <div class="card" style="max-width:640px">
       <form method="POST" action="/leads/new">
         <div class="settings-grid">
-          <label>Email *</label>
-          <input type="email" name="email" value="${h(prefill.email||'')}" required class="input" placeholder="buyer@boutique.com">
-          <label>Business name</label>
-          <input type="text" name="business_name" value="${h(prefill.business_name||'')}" class="input" placeholder="Paws & Co.">
-          <label>Contact name</label>
-          <input type="text" name="contact_name" value="${h(prefill.contact_name||'')}" class="input">
-          <label>Phone</label>
-          <input type="tel" name="phone" value="${h(prefill.phone||'')}" class="input">
-          <label>Website</label>
-          <input type="url" name="website" value="${h(prefill.website||'')}" class="input" placeholder="https://…">
-          <label>Business type</label>
-          <select name="business_type" class="input">
+          <label for="lead-email">Email *</label>
+          <input id="lead-email" type="email" name="email" value="${h(prefill.email||'')}" required class="input" placeholder="buyer@boutique.com">
+          <label for="lead-business-name">Business name</label>
+          <input id="lead-business-name" type="text" name="business_name" value="${h(prefill.business_name||'')}" class="input" placeholder="Paws & Co.">
+          <label for="lead-contact-name">Contact name</label>
+          <input id="lead-contact-name" type="text" name="contact_name" value="${h(prefill.contact_name||'')}" class="input">
+          <label for="lead-phone">Phone</label>
+          <input id="lead-phone" type="tel" name="phone" value="${h(prefill.phone||'')}" class="input">
+          <label for="lead-website">Website</label>
+          <input id="lead-website" type="url" name="website" value="${h(prefill.website||'')}" class="input" placeholder="https://…">
+          <label for="lead-business-type">Business type</label>
+          <select id="lead-business-type" name="business_type" class="input">
             <option value="">— select —</option>
             ${LEAD_BUSINESS_TYPES.map(t =>
               `<option value="${t}"${prefill.business_type===t?' selected':''}>${h(t)}</option>`
             ).join('')}
           </select>
-          <label>Est. monthly volume ($)</label>
-          <input type="number" name="estimated_monthly_volume_usd" value="${h(String(prefill.estimated_monthly_volume_usd||''))}" class="input" min="0" step="100">
-          <label>Source</label>
-          <select name="source" class="input">
+          <label for="lead-monthly-volume">Est. monthly volume ($)</label>
+          <input id="lead-monthly-volume" type="number" name="estimated_monthly_volume_usd" value="${h(String(prefill.estimated_monthly_volume_usd||''))}" class="input" min="0" step="100">
+          <label for="lead-source">Source</label>
+          <select id="lead-source" name="source" class="input">
             <option value="">— select —</option>
             ${['tradeshow','website-form','instagram','referral','cold-outreach','other'].map(s =>
               `<option value="${s}"${prefill.source===s?' selected':''}>${h(s)}</option>`
             ).join('')}
           </select>
-          <label>Source detail</label>
-          <input type="text" name="source_detail" value="${h(prefill.source_detail||'')}" class="input" placeholder="IKC 2026, @petboutique referred…">
-          <label>Follow-up date</label>
-          <input type="date" name="next_followup_due" value="${h(prefill.next_followup_due||'')}" class="input">
+          <label for="lead-source-detail">Source detail</label>
+          <input id="lead-source-detail" type="text" name="source_detail" value="${h(prefill.source_detail||'')}" class="input" placeholder="IKC 2026, @petboutique referred…">
+          <label for="lead-follow-up">Follow-up date</label>
+          <input id="lead-follow-up" type="date" name="next_followup_due" value="${h(prefill.next_followup_due||'')}" class="input">
         </div>
         <div style="margin-top:1.25rem;display:flex;gap:0.75rem">
           <button type="submit" class="btn btn-primary">Create Lead</button>
@@ -11420,18 +11443,18 @@ function renderLeadConvert(session, { lead, flash, settings }) {
       <p class="text-muted" style="margin-bottom:1rem">This will create a Shopify customer with the <strong>b2b</strong> tag and configure their B2B settings. The lead will be marked as converted.</p>
       <form method="POST" action="/leads/${lead.id}/convert">
         <div class="settings-grid">
-          <label>Display name *</label>
-          <input type="text" name="display_name" value="${h(lead.contact_name || lead.business_name || '')}" required class="input">
-          <label>Email *</label>
-          <input type="email" name="email" value="${h(lead.email)}" required class="input">
-          <label>Phone</label>
-          <input type="tel" name="phone" value="${h(lead.phone||'')}" class="input">
-          <label>B2B discount %</label>
-          <input type="number" name="discount_pct" value="${h(discountDefault)}" min="0" max="95" class="input" style="width:100px">
-          <label>Allow order on invoice</label>
-          <label class="toggle-label"><input type="checkbox" name="allow_order_on_invoice" class="toggle" checked></label>
-          <label>Drop-ship allowed</label>
-          <label class="toggle-label"><input type="checkbox" name="dropship_enabled" class="toggle"></label>
+          <label for="convert-display-name">Display name *</label>
+          <input id="convert-display-name" type="text" name="display_name" value="${h(lead.contact_name || lead.business_name || '')}" required class="input">
+          <label for="convert-email">Email *</label>
+          <input id="convert-email" type="email" name="email" value="${h(lead.email)}" required class="input">
+          <label for="convert-phone">Phone</label>
+          <input id="convert-phone" type="tel" name="phone" value="${h(lead.phone||'')}" class="input">
+          <label for="convert-discount">B2B discount %</label>
+          <input id="convert-discount" type="number" name="discount_pct" value="${h(discountDefault)}" min="0" max="95" class="input" style="width:100px">
+          <label for="convert-invoice">Allow order on invoice</label>
+          <span class="toggle-label"><input id="convert-invoice" type="checkbox" name="allow_order_on_invoice" class="toggle" checked></span>
+          <label for="convert-dropship">Drop-ship allowed</label>
+          <span class="toggle-label"><input id="convert-dropship" type="checkbox" name="dropship_enabled" class="toggle"></span>
         </div>
         <div style="margin-top:1.25rem;display:flex;gap:0.75rem">
           <button type="submit" class="btn btn-primary">Convert to Customer</button>
