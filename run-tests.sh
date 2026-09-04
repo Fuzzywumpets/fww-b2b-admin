@@ -80,6 +80,24 @@ if [ -f test/helcim.test.mjs ]; then
   node test/helcim.test.mjs || UNIT_FAIL=$?
 fi
 
+if [ -f test/helcim-payload.test.mjs ]; then
+  echo ""
+  echo "── Unit: Helcim itemized payload assembler (standalone, no server) ──"
+  node test/helcim-payload.test.mjs || UNIT_FAIL=$?
+fi
+
+if [ -f test/helcim-dedupe.test.mjs ]; then
+  echo ""
+  echo "── Unit: Helcim durable creation claim (standalone, no server) ──"
+  B2B_ADMIN_MOCK=1 node test/helcim-dedupe.test.mjs || UNIT_FAIL=$?
+fi
+
+if [ -f test/helcim-message.test.mjs ]; then
+  echo ""
+  echo "── Unit: Helcim branded email contract (standalone, no server) ──"
+  node test/helcim-message.test.mjs || UNIT_FAIL=$?
+fi
+
 # Order-edit userErrors: the batch /edit handler returns from its MOCK branch before any Shopify
 # mutation, so this path can ONLY be covered standalone.
 if [ -f test/order-edit-user-errors.test.mjs ]; then

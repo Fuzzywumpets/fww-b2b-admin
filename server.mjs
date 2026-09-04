@@ -42,7 +42,8 @@ import {
   listImpersonationsForCustomer,
   getOrderByName,
   getOrderInternalNote, setOrderInternalNote,
-  getHelcimInvoiceMap, upsertHelcimInvoiceMap, setHelcimInvoiceDelivery,
+  getHelcimInvoiceMap, claimHelcimInvoiceCreation, releaseHelcimInvoiceClaim,
+  upsertHelcimInvoiceMap, setHelcimInvoiceDelivery,
 } from './db.mjs';
 import { generateInvoicePdf, lineItemTrueTotal, lineItemTrueUnit, lineItemCurrentQty } from './pdf.mjs';
 // Extracted so they can be unit-tested without booting this server (house pattern: lib/*.mjs).
@@ -58,6 +59,8 @@ import { isInsider, resolveXeroContact, syncCustomerToXero, getXeroSyncStatus } 
 import { parseLinePrices, applyLinePriceChanges, bulkMarkOrdersPaid } from './lib/order-money.mjs';
 import { assertNoUserErrors } from './lib/shopify-user-errors.mjs';
 import { createCreditCardInvoice } from './helcim.mjs';
+import { buildHelcimInvoicePayload, HelcimInvoiceValidationError } from './lib/helcim-invoice-payload.mjs';
+import { buildHelcimInvoiceMessage } from './lib/helcim-invoice-message.mjs';
 // SYNC: same module db.mjs uses for the SQL LIMIT — the banner/footer copy and the query page size
 // must agree, otherwise the list lies about how much it is showing.
 import { ORDERS_LIST_LIMIT, CUSTOMERS_LIST_LIMIT, LEADS_LIST_LIMIT, listCountLabel, truncationNoticeHtml } from './lib/list-truncation.mjs';
@@ -2238,8 +2241,12 @@ async function getOrderDetail(numericId, { throwOnError = false } = {}) {
         subtotalPriceSet{presentmentMoney{amount currencyCode}}
         currentSubtotalPriceSet{presentmentMoney{amount currencyCode}}
         currentTotalPriceSet{presentmentMoney{amount currencyCode}}
+        currentShippingPriceSet{presentmentMoney{amount currencyCode}}
+        currentTotalTaxSet{presentmentMoney{amount currencyCode}}
         totalShippingPriceSet{presentmentMoney{amount currencyCode}}
         totalTaxSet{presentmentMoney{amount currencyCode}}
+        currentTaxLines{title}
+        taxExempt taxesIncluded
         totalOutstandingSet{presentmentMoney{amount currencyCode}}
         totalReceivedSet{presentmentMoney{amount currencyCode}}
         note tags
@@ -6200,9 +6207,12 @@ app.post('/orders/:id/shipping-address', requireAuth, async (req, res) => {
   res.redirect(`/orders/${numId}?success=address_saved`);
 });
 
-// WHAT: creates (or reuses) a DUE Helcim invoice for the order's exact outstanding balance, then asks the Portal's Re:amaze bridge to email its secure online-payment link.
-// CHANGE-GUARD: the helcim_invoice_map write MUST happen before the email attempt; on delivery failure a retry reuses that invoice rather than creating a duplicate bill. JSON callers receive a non-2xx on every failure; form callers receive a truthful warning flash.
-// INVARIANT(S): no card data touches this app; paid/zero-balance orders and orders without customer email are rejected; audit rows never contain the invoice token or online-view URL.
+// WHAT: creates (or reuses) an exact itemized DUE Helcim invoice, then asks Portal's Gmail delivery boundary to email its secure online-payment link.
+// CHANGE-GUARD: the durable creation claim MUST precede the non-idempotent Invoice API POST, and
+// helcim_invoice_map MUST be written before email. Ambiguous remote outcomes retain the claim;
+// delivery retries reuse the mapped invoice. JSON callers receive non-2xx on every failure.
+// INVARIANT(S): no card data touches this app; partial/unreconciled balances, paid orders, and
+// missing customer email are rejected; audit rows never contain invoice tokens or online-view URLs.
 app.post('/orders/:id/send-credit-card-invoice', requireAuth, async (req, res) => {
   const numId = req.params.id;
   const order = await getOrderDetail(numId);
@@ -6214,38 +6224,64 @@ app.post('/orders/:id/send-credit-card-invoice', requireAuth, async (req, res) =
   const customerEmail = order.customer?.email;
   if (!customerEmail) return fail(400, 'This order has no customer email address.');
 
-  const totalMoney = order.currentTotalPriceSet?.presentmentMoney || order.totalPriceSet?.presentmentMoney || {};
-  const currency = String(totalMoney.currencyCode || 'USD').toUpperCase();
   const outstandingValue = order.totalOutstandingSet?.presentmentMoney?.amount;
-  const outstanding = Math.round(Math.max(0, Number(outstandingValue ?? deriveCurrentOrderTotals(order).total) || 0) * 100) / 100;
-  if (outstanding <= 0) return fail(409, 'This order has no outstanding balance.');
+  const expectedAmount = outstandingValue ?? String(deriveCurrentOrderTotals(order).total);
+  if (!(Number(expectedAmount) > 0)) return fail(409, 'This order has no outstanding balance.');
+
+  let assembled;
+  try {
+    assembled = buildHelcimInvoicePayload({ order, expectedAmount });
+  } catch (error) {
+    if (error instanceof HelcimInvoiceValidationError) return fail(422, error.message);
+    throw error;
+  }
+  const { amountCents, currency, invoiceNumber, taxExempt, taxStatus, itemCount, omittedSkuLines } = assembled;
+  const outstanding = amountCents / 100;
 
   const orderGid = shopifyOrderGid(numId);
   let invoice = getHelcimInvoiceMap(orderGid);
   const reused = !!invoice;
-  if (invoice && (Math.abs(Number(invoice.amount) - outstanding) >= 0.005 || invoice.currency !== currency)) {
+  if (invoice && (Math.round(Number(invoice.amount) * 100) !== amountCents || invoice.currency !== currency)) {
     return fail(409, `The existing Helcim invoice is for ${fmtMoney(invoice.amount)} ${invoice.currency}, but the current balance is ${fmtMoney(outstanding)} ${currency}. Resolve the existing invoice in Helcim before sending another.`);
   }
 
+  let creationClaimAcquired = false;
+  let remoteInvoiceCreated = false;
   try {
     if (!invoice) {
+      const claim = claimHelcimInvoiceCreation(orderGid, { invoiceNumber, amountCents, currency });
+      if (!claim.acquired) {
+        return fail(409, `Helcim invoice creation for ${invoiceNumber} is already in progress or has an uncertain outcome. Reconcile that invoice number in Helcim before retrying.`);
+      }
+      creationClaimAcquired = true;
       const created = MOCK
         ? {
             invoiceId: `mock-helcim-${numId}`, invoiceNumber: `MOCK-${numId}`,
             token: `mock-token-${numId}`, url: `https://fuzzywumpets.myhelcim.com/order/?token=mock-token-${numId}`,
             amount: outstanding, currency,
           }
-        : await createCreditCardInvoice({ orderName: order.name, amount: outstanding, currency });
-      // SYNC: db.mjs helcim_invoice_map is the retry ledger for this exact write-before-send ordering.
+        : await createCreditCardInvoice({ payload: assembled.payload, amountCents, currency });
+      remoteInvoiceCreated = true;
+      // SYNC: db.mjs upsertHelcimInvoiceMap atomically consumes helcim_invoice_claims and writes the
+      // retry ledger before this route attempts delivery.
       invoice = upsertHelcimInvoiceMap(orderGid, created);
+      creationClaimAcquired = false;
     }
 
-    const noteBody = `Your credit card invoice for ${order.name} is ready for ${fmtMoney(outstanding)} ${currency}.\n\nPay securely with Helcim:\n${invoice.url}`;
+    const message = buildHelcimInvoiceMessage({
+      orderName: order.name,
+      amount: outstanding,
+      amountText: fmtMoney(outstanding),
+      currency,
+      paymentUrl: invoice.url,
+    });
     const delivery = MOCK
       ? { ok: true, email: { sent: true, via: 'mock' } }
       : await callPortalInternal('POST', '/__internal__/visible-note', {
           orderId: orderGid,
-          body: noteBody,
+          body: message.body,
+          subject: message.subject,
+          creditCardInvoice: message.creditCardInvoice,
           addedBy: req.adminSession.email,
           emailCustomer: true,
           sendAs: 'wholesale',
@@ -6254,7 +6290,8 @@ app.post('/orders/:id/send-credit-card-invoice', requireAuth, async (req, res) =
       const deliveryError = String(delivery.error || delivery.email?.error || 'Portal/Re:amaze did not confirm delivery');
       setHelcimInvoiceDelivery(orderGid, 'delivery_failed', deliveryError);
       auditLog(req.adminSession.email, 'helcim_invoice_email_failed', orderGid, null, {
-        invoiceId: invoice.invoice_id, invoiceNumber: invoice.invoice_number, amount: outstanding, currency,
+        invoiceId: invoice.invoice_id, invoiceNumber: invoice.invoice_number, amount: outstanding,
+        currency, taxStatus, itemCount, omittedSkuCount: omittedSkuLines.length,
       });
       return fail(502, `Helcim invoice ${invoice.invoice_number || invoice.invoice_id} was created, but customer email delivery was not confirmed: ${deliveryError}`);
     }
@@ -6262,7 +6299,8 @@ app.post('/orders/:id/send-credit-card-invoice', requireAuth, async (req, res) =
     setHelcimInvoiceDelivery(orderGid, 'sent');
     auditLog(req.adminSession.email, 'helcim_invoice_sent', orderGid, null, {
       invoiceId: invoice.invoice_id, invoiceNumber: invoice.invoice_number,
-      amount: outstanding, currency, customerEmail, reused,
+      amount: outstanding, currency, customerEmail, reused, taxExempt, taxStatus,
+      itemCount, omittedSkuCount: omittedSkuLines.length,
     });
     if (wantsJson) {
       return res.json({
@@ -6273,8 +6311,12 @@ app.post('/orders/:id/send-credit-card-invoice', requireAuth, async (req, res) =
     }
     return res.redirect(`/orders/${numId}?success=credit_card_invoice_sent`);
   } catch (error) {
+    if (creationClaimAcquired && !remoteInvoiceCreated && !error.outcomeUnknown) releaseHelcimInvoiceClaim(orderGid);
     console.error('Helcim credit card invoice failed:', error.message);
-    return fail(502, error.message || 'Helcim invoice request failed.');
+    const message = error.outcomeUnknown
+      ? `Helcim invoice creation for ${invoiceNumber} has an uncertain outcome. Do not retry until that invoice number is reconciled in Helcim.`
+      : (error.message || 'Helcim invoice request failed.');
+    return fail(502, message);
   }
 });
 
