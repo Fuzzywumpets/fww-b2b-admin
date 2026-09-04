@@ -356,6 +356,17 @@ await testMobile('mobile dashboard has at least 1 visible widget', async (page, 
   assert.ok(widgets.length >= 1, 'No widgets visible on mobile');
 });
 
+await testMobile('mobile menu exposes every primary module', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+
+  await page.goto(`${BASE}/`);
+  await page.click('.mobile-nav-menu summary');
+  const links = await page.$$('.mobile-nav-links .nav-link');
+  assert.equal(links.length, 12, `Expected all 12 mobile nav links, got ${links.length}`);
+  assert.equal(await page.isVisible('.mobile-nav-links a[href="/settings"]'), true, 'Settings is not reachable from the mobile menu');
+});
+
 await testMobile('orders list fits 390px without horizontal scroll', async (page, ctx) => {
   const sid = await seedSession();
   await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
@@ -365,6 +376,20 @@ await testMobile('orders list fits 390px without horizontal scroll', async (page
   const scrollWidth = await page.evaluate(() => document.documentElement.scrollWidth);
   const clientWidth = await page.evaluate(() => document.documentElement.clientWidth);
   assert.ok(scrollWidth <= clientWidth + 4, `Horizontal overflow on /orders: scrollWidth=${scrollWidth} clientWidth=${clientWidth}`);
+});
+
+await testMobile('order detail and shipping editor fit 390px without document overflow', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+
+  await page.goto(`${BASE}/orders/1001`);
+  await page.click('summary:has-text("Edit shipping address")');
+  const dimensions = await page.evaluate(() => ({
+    scrollWidth: document.documentElement.scrollWidth,
+    clientWidth: document.documentElement.clientWidth,
+  }));
+  assert.ok(dimensions.scrollWidth <= dimensions.clientWidth + 4, `Horizontal overflow on /orders/1001: scrollWidth=${dimensions.scrollWidth} clientWidth=${dimensions.clientWidth}`);
+  assert.equal(await page.getAttribute('input[name="zip"]', 'aria-label'), 'Shipping postal code');
 });
 
 console.log('\nUI tests — Phase 3:');
@@ -833,6 +858,20 @@ await test('/products/201 renders product detail page', async (page, ctx) => {
   assert.ok(html.includes('Elite Collar'), 'Product title missing');
   assert.ok(html.includes('Variants'), 'Variants section missing');
   assert.ok(html.includes('Edit in Shopify'), 'Edit in Shopify link missing');
+});
+
+await test('/products/201 requires confirmation before removal', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/products/201`);
+  let dialogText = '';
+  page.once('dialog', async dialog => {
+    dialogText = dialog.message();
+    await dialog.dismiss();
+  });
+  await page.click('button[aria-label="Remove Elite Collar from B2B"]');
+  assert.match(dialogText, /Remove Elite Collar from B2B publication/);
+  assert.ok(page.url().endsWith('/products/201'), 'Dismissed removal confirmation must not navigate');
 });
 
 await test('/orders/1001 order detail has Edit order button', async (page, ctx) => {
