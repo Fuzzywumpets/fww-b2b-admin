@@ -29,7 +29,7 @@ test('creates a DUE invoice for the exact balance and returns its online view', 
     env: ENV,
     fetchImpl: async (url, options) => {
       captured = { url: String(url), options };
-      return jsonResponse({ invoiceId: 42, invoiceNumber: 'FWW-1001', token: 'abc123', amount: 115 });
+      return jsonResponse({ invoiceId: 42, token: 'abc123', amount: 115 });
     },
   });
   assert.equal(captured.url, 'https://api.helcim.com/v2/invoices');

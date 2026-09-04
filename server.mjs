@@ -6235,7 +6235,7 @@ app.post('/orders/:id/send-credit-card-invoice', requireAuth, async (req, res) =
     if (error instanceof HelcimInvoiceValidationError) return fail(422, error.message);
     throw error;
   }
-  const { amountCents, currency, invoiceNumber, taxExempt, taxStatus, itemCount, omittedSkuLines } = assembled;
+  const { amountCents, taxCents, currency, invoiceNumber, taxExempt, taxStatus, itemCount, omittedSkuLines } = assembled;
   const outstanding = amountCents / 100;
 
   const orderGid = shopifyOrderGid(numId);
@@ -6270,7 +6270,9 @@ app.post('/orders/:id/send-credit-card-invoice', requireAuth, async (req, res) =
 
     const message = buildHelcimInvoiceMessage({
       orderName: order.name,
+      invoiceNumber: invoice.invoice_number || invoiceNumber,
       amount: outstanding,
+      taxAmount: taxCents / 100,
       amountText: fmtMoney(outstanding),
       currency,
       paymentUrl: invoice.url,

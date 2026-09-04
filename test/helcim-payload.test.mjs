@@ -44,6 +44,7 @@ test('itemizes current quantities with discrete shipping, tax, addresses, and re
   assert.equal(result.amountCents, 2665);
   assert.equal(result.invoiceNumber, 'FWW-1001');
   assert.equal(result.taxStatus, 'taxable');
+  assert.equal(result.taxCents, 165);
   assert.deepEqual(result.payload.lineItems, [{ description: 'Collar - R and D', quantity: 2, price: 10, sku: 'COL-1' }]);
   assert.deepEqual(result.payload.tax, { amount: 1.65, details: 'IL Sales Tax' });
   assert.equal(result.payload.shipping.amount, 5);

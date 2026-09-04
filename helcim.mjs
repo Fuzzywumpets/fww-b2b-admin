@@ -141,7 +141,9 @@ export async function createCreditCardInvoice({ payload, amountCents, currency }
   url.searchParams.set('token', String(invoice.token));
   return {
     invoiceId: invoice.invoiceId,
-    invoiceNumber: invoice.invoiceNumber || null,
+    // DEPENDS: Portal's public HelcimPay session links the payment to this exact invoice number.
+    // Helcim may omit it from a create response, so retain the validated request value.
+    invoiceNumber: invoice.invoiceNumber || payload.invoiceNumber || null,
     token: String(invoice.token),
     url: url.toString(),
     amount: amountCents / 100,
