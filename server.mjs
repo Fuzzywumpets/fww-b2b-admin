@@ -683,7 +683,10 @@ const MOCK_ORDERS = [
   },
   {
     id: 'gid://shopify/Order/1002', name: '#1002', processedAt: '2026-05-23T14:00:00Z',
-    customer: { id: 'gid://shopify/Customer/102', displayName: 'Happy Paws Boutique', email: 'orders@happypaws.com' },
+    // SYNC: `company` mirrors the field getOrderDetail flattens from defaultAddress.company on the live
+    // path — the displayName/company split here is what the order-detail + invoice company tests exercise.
+    // displayName stays 'Happy Paws Boutique' because other mock orders + MOCK_CUSTOMERS key on it.
+    customer: { id: 'gid://shopify/Customer/102', displayName: 'Happy Paws Boutique', company: 'Happy Paws Boutique LLC', email: 'orders@happypaws.com' },
     displayFinancialStatus: 'PENDING', displayFulfillmentStatus: 'UNFULFILLED',
     totalPriceSet: { presentmentMoney: { amount: '285.50', currencyCode: 'USD' } },
     sourceName: 'web', tags: ['b2b-portal'], note: 'Ship by Friday',
@@ -2240,13 +2243,24 @@ function renderOrdersList(session, data, filters) {
 // default — a Shopify hiccup should render "order not found" same as a genuine 404, not crash the
 // page. GET /orders/:id opts into throwOnError:true because it needs to tell those two cases apart
 // (see CHANGE-GUARD there) before it's safe to evict the order from orders_cache.
+// WHAT: the two names an order-detail customer is shown under. `primary` is the business name when
+// Shopify has one, else the person; `secondary` is the person when it differs from the business.
+// INVARIANT(S): mirrors pdf.mjs BILL TO (company, then "c/o displayName") so the page and the invoice
+// name the same party. Never returns an empty primary — falls back to '—'.
+function orderCustomerNames(customer) {
+  const company = (customer?.company || '').trim();
+  const person = (customer?.displayName || '').trim();
+  if (!company) return { primary: person || '—', secondary: null };
+  return { primary: company, secondary: person && person !== company ? person : null };
+}
+
 async function getOrderDetail(numericId, { throwOnError = false } = {}) {
   if (MOCK) return getMockOrder(numericId);
   try {
     const result = await shopifyFetch(`
       query($id:ID!){ order(id:$id){
         id name processedAt createdAt cancelledAt
-        customer{id displayName email phone}
+        customer{id displayName email phone defaultAddress{company}}
         displayFinancialStatus displayFulfillmentStatus
         totalPriceSet{presentmentMoney{amount currencyCode}}
         subtotalPriceSet{presentmentMoney{amount currencyCode}}
@@ -2261,8 +2275,8 @@ async function getOrderDetail(numericId, { throwOnError = false } = {}) {
         totalOutstandingSet{presentmentMoney{amount currencyCode}}
         totalReceivedSet{presentmentMoney{amount currencyCode}}
         note tags
-        shippingAddress{firstName lastName address1 address2 city province zip country phone}
-        billingAddress{firstName lastName address1 address2 city province zip country}
+        shippingAddress{company firstName lastName address1 address2 city province zip country phone}
+        billingAddress{company firstName lastName address1 address2 city province zip country}
         lineItems(first:250){edges{node{id title quantity currentQuantity
           variant{id title sku barcode selectedOptions{name value} price inventoryQuantity product{id title}}
           discountedUnitPriceSet{presentmentMoney{amount currencyCode}}
@@ -2274,7 +2288,20 @@ async function getOrderDetail(numericId, { throwOnError = false } = {}) {
         transactions(first:10){id status kind gateway createdAt
           amountSet{presentmentMoney{amount currencyCode}}}
       }}`, { id: shopifyOrderGid(numericId) });
-    return result.data?.order || null;
+    const order = result.data?.order || null;
+    // COMPANY-NAME (2026-09-08): Shopify keeps a wholesale account's business name on the
+    // customer's DEFAULT ADDRESS (`defaultAddress.company`), not on the Customer node — displayName
+    // is the person ("Emily Stoddard"), the company is "Canine Sports Dog Training". Order #39028-A
+    // invoiced and rendered under the person's name because this query never asked for it. Flatten
+    // it onto customer.company so consumers read one field regardless of source.
+    // DEPENDS: pdf.mjs generateInvoicePdf BILL TO reads customer.company (and shipping/billingAddress
+    // .company, selected above); renderOrderDetail's header + Customer card read it via
+    // orderCustomerNames(). MOCK_ORDERS carries `company` on customer directly — keep the shape equal.
+    if (order?.customer) {
+      const co = (order.customer.defaultAddress?.company || '').trim();
+      order.customer.company = co || null;
+    }
+    return order;
   } catch (err) {
     console.error('getOrderDetail error:', err.message);
     if (throwOnError) throw err;
@@ -2914,7 +2941,7 @@ function renderOrderDetail(session, order, flash, flashMsg) {
         <h1><a href="https://admin.shopify.com/store/parttwoenterprises/orders/${h(numId)}" target="_blank" rel="noopener" class="link" title="Open ${h(order.name)} in Shopify admin">${h(order.name)} ↗</a> <span class="badge badge-${h(finStatus)}">${h(order.displayFinancialStatus)}</span>
             <span class="badge badge-ff-${h(fulStatus)}">${h(order.displayFulfillmentStatus)}</span></h1>
         <p class="text-muted">
-          ${order.customer ? `<a href="/customers/${shopifyNumericId(order.customer.id)}">${h(order.customer.displayName)}</a> · ` : ''}
+          ${order.customer ? (() => { const n = orderCustomerNames(order.customer); return `<a href="/customers/${shopifyNumericId(order.customer.id)}">${h(n.primary)}</a>${n.secondary ? ` (${h(n.secondary)})` : ''} · `; })() : ''}
           ${fmtDate(order.processedAt)}
         </p>
       </div>
@@ -4087,7 +4114,7 @@ function renderOrderDetail(session, order, flash, flashMsg) {
       <div class="detail-side">
         ${order.customer ? `<div class="card">
           <div class="card-header"><h2>Customer</h2></div>
-          <p><a href="/customers/${shopifyNumericId(order.customer.id)}" class="link-strong">${h(order.customer.displayName)}</a></p>
+          ${(() => { const n = orderCustomerNames(order.customer); return `<p><a href="/customers/${shopifyNumericId(order.customer.id)}" class="link-strong">${h(n.primary)}</a></p>${n.secondary ? `<p class="text-muted" data-testid="order-customer-person">${h(n.secondary)}</p>` : ''}`; })()}
           <p class="text-muted">${h(order.customer.email)}</p>
           ${order.customer.phone ? `<p class="text-muted"><a href="${h(telHref(order.customer.phone))}" class="link">${h(fmtPhone(order.customer.phone))}</a></p>` : ''}
         </div>` : ''}

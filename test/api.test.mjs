@@ -246,6 +246,29 @@ await test('GET /orders/1001 returns order detail', async () => {
   assert.ok(html.includes('Generate Invoice'), 'Missing Generate Invoice button');
 });
 
+// COMPANY-NAME regression (order #39028-A, 2026-09-08): Shopify holds the wholesale business name on
+// customer.defaultAddress.company; getOrderDetail flattens it to customer.company. The order page must
+// lead with the business and still show the person, and the invoice must render with that shape.
+await test('GET /orders/1002 leads with the company name and keeps the person', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/orders/1002`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  assert.ok(html.includes('Happy Paws Boutique LLC'), 'Missing company name on order detail');
+  assert.ok(html.includes('data-testid="order-customer-person"'), 'Missing person line under the company in the Customer card');
+  // header line: company first, person in parentheses
+  assert.ok(/Happy Paws Boutique LLC<\/a> \(Happy Paws Boutique\)/.test(html), 'Header should read "Company (Person)"');
+});
+
+await test('GET /orders/1002/invoice.pdf renders with a company on the customer', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/orders/1002/invoice.pdf`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const buf = Buffer.from(await res.arrayBuffer());
+  assert.equal(buf.subarray(0, 5).toString(), '%PDF-', 'invoice.pdf did not return a PDF');
+  assert.ok(buf.length > 1000, 'PDF suspiciously small');
+});
+
 await test('GET /orders/9999 returns 404 for non-existent order', async () => {
   const cookie = await seedSession();
   const res = await fetch(`${BASE}/orders/9999`, { headers: { Cookie: cookie } });
