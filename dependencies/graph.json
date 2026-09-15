@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "repository": "Fuzzywumpets/fww-b2b-admin",
+  "purpose": "Machine-checked record of externally coupled B2B contracts.",
+  "edges": [
+    {"id":"shopify-bridge","target":"Fuzzywumpets/shopify-bridge-b2b","kind":"cross-repo-api-contract","requiredPatterns":[{"file":"APIWATCH_NOTES.md","pattern":"fww-b2b-admin project shares a Shopify backend via shopify-bridge"},{"file":"APIWATCH_NOTES.md","pattern":"fetch(BRIDGE"}]},
+    {"id":"shopify-local-cache","target":"Shopify order and customer cache","kind":"local-state-contract","requiredPatterns":[{"file":"db.mjs","pattern":"customer_shopify_id TEXT"},{"file":"db.mjs","pattern":"shopify_id TEXT PRIMARY KEY"}]},
+    {"id":"desktop-shell","target":"Fuzzywumpets/fww-b2b-admin-desktop","kind":"desktop-release-contract","requiredPatterns":[{"file":"desktop/package.json","pattern":"\"repo\": \"fww-b2b-admin\""}]},
+    {"id":"backfill-scripts","target":"Shopify cache backfill scripts","kind":"intra-repo-data-contract","requiredPatterns":[{"file":"db.mjs","pattern":"scripts/backfill-orders-per-customer.mjs and scripts/backfill-shopify.mjs must keep"}]}
+  ]
+}

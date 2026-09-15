@@ -6,7 +6,8 @@
   "main": "server.mjs",
   "scripts": {
     "start": "node server.mjs",
-    "test": "./run-tests.sh"
+    "test": "./run-tests.sh",
+    "dependency:check": "node scripts/check-dependency-graph.mjs"
   },
   "engines": {
     "node": ">=20"
