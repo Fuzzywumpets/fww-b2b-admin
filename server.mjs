@@ -57,6 +57,7 @@ import { renderLabelSheet, expandItems, TEMPLATES as LABEL_TEMPLATES, DEFAULT_FI
 import { isInsider, resolveXeroContact, syncCustomerToXero, getXeroSyncStatus } from './lib/xero-customer-sync.mjs';
 import { parseLinePrices, applyLinePriceChanges, bulkMarkOrdersPaid } from './lib/order-money.mjs';
 import { assertNoUserErrors } from './lib/shopify-user-errors.mjs';
+import { currentShippingAmount, parseShippingAmount, stageShippingReplacement } from './lib/order-shipping.mjs';
 import { createCreditCardInvoice } from './helcim.mjs';
 // SYNC: same module db.mjs uses for the SQL LIMIT — the banner/footer copy and the query page size
 // must agree, otherwise the list lies about how much it is showing.
@@ -2239,6 +2240,8 @@ async function getOrderDetail(numericId, { throwOnError = false } = {}) {
         currentSubtotalPriceSet{presentmentMoney{amount currencyCode}}
         currentTotalPriceSet{presentmentMoney{amount currencyCode}}
         totalShippingPriceSet{presentmentMoney{amount currencyCode}}
+        currencyCode presentmentCurrencyCode
+        shippingLines(first:100){nodes{id title}}
         totalTaxSet{presentmentMoney{amount currencyCode}}
         totalOutstandingSet{presentmentMoney{amount currencyCode}}
         totalReceivedSet{presentmentMoney{amount currencyCode}}
@@ -2482,7 +2485,7 @@ function renderOrderDetail(session, order, flash, flashMsg) {
   // the same belt-and-braces fallback as the post-edit reconcile path. Shipping is unchanged by line edits.
   const curTotals = deriveCurrentOrderTotals(order);
   const sub   = fmtMoney(curTotals.subtotal);
-  const ship  = fmtMoney(order.totalShippingPriceSet?.presentmentMoney?.amount);
+  const ship  = fmtMoney(currentShippingAmount(order));
   const total = fmtMoney(curTotals.total);
   // DISCOUNT-VISIBILITY (2026-08-05): an order discount used to render as its own (negative) line-item
   // ROW in the table above — the ONLY place staff could see one existed or clear it. It is now a
@@ -2538,6 +2541,10 @@ function renderOrderDetail(session, order, flash, flashMsg) {
     ? `<div class="alert alert-warning">Payment amount is invalid${flashMsg ? `: ${h(flashMsg)}` : ' — must be greater than 0 and no more than the outstanding balance.'}</div>`
     : flash === 'note_saved'
     ? `<div class="alert alert-success">Note saved.</div>`
+    : flash === 'shipping_saved'
+    ? `<div class="alert alert-success">Shipping charge updated.</div>`
+    : flash === 'shipping_failed'
+    ? `<div class="alert alert-warning">Shipping update could not be confirmed. ${h(flashMsg || 'Reload the order before retrying.')}</div>`
     : flash === 'address_saved'
     ? `<div class="alert alert-success">Shipping address updated.</div>`
     : flash === 'credit_card_invoice_sent'
@@ -4073,6 +4080,18 @@ function renderOrderDetail(session, order, flash, flashMsg) {
           <p class="text-muted">${h(order.customer.email)}</p>
           ${order.customer.phone ? `<p class="text-muted"><a href="${h(telHref(order.customer.phone))}" class="link">${h(fmtPhone(order.customer.phone))}</a></p>` : ''}
         </div>` : ''}
+        <div class="card">
+          <div class="card-header"><h2>Shipping charge</h2></div>
+          <p>Current charge: <strong>${ship}</strong></p>
+          <form method="POST" action="/orders/${h(numId)}/shipping-charge" style="display:grid;gap:8px">
+            <input type="hidden" name="idemKey" value="${crypto.randomUUID()}">
+            <input type="hidden" name="expectedAmount" value="${currentShippingAmount(order).toFixed(2)}">
+            <label>Service <input class="filter-input" name="title" maxlength="100" required value="${h(order.shippingLines?.nodes?.[0]?.title || 'Shipping')}"></label>
+            <label>Amount (USD) <input class="filter-input" name="amount" type="number" min="0" step="0.01" required value="${currentShippingAmount(order).toFixed(2)}"></label>
+            <p class="text-muted small-text">Replaces all existing shipping charges with this amount.</p>
+            <button class="btn btn-primary" type="submit">Save shipping charge</button>
+          </form>
+        </div>
         <div class="card">
           <div class="card-header"><h2>Shipping Address</h2></div>
           <p class="address-block">${addrHtml}</p>
@@ -6164,6 +6183,51 @@ app.post('/orders/:id/internal-note', requireAuth, async (req, res) => {
   res.redirect(`/orders/${numId}?success=note_saved`);
 });
 
+// WHAT: replace the order's shipping charge using the same serialized, idempotent edit path as lines.
+// DEPENDS: stageShippingReplacement must throw before commit on any failed removal/addition;
+// readCommittedLineState.shipping verifies the result before a success banner or audit entry.
+app.post('/orders/:id/shipping-charge', requireAuth, async (req, res) => {
+  const numId = req.params.id;
+  try {
+    const amount = parseShippingAmount(req.body.amount);
+    const expectedAmount = parseShippingAmount(req.body.expectedAmount);
+    const title = String(req.body.title || '').trim();
+    const idemKey = String(req.body.idemKey || '');
+    if (!title || title.length > 100 || !/^[a-zA-Z0-9-]{16,100}$/.test(idemKey)) throw new Error('Reload the order and enter a shipping service and amount.');
+    const order = await getOrderDetail(numId, { throwOnError: true });
+    if (!order) return res.status(404).send('Order not found');
+    if (order.cancelledAt) throw new Error('Canceled orders cannot be edited.');
+    if ((order.currencyCode || 'USD') !== 'USD' || (order.presentmentCurrencyCode || 'USD') !== 'USD') throw new Error('Edit shipping for this currency in Shopify.');
+    const payload = { amount, title, expectedAmount };
+    if (MOCK) {
+      const existing = getEditAction(idemKey);
+      if (existing?.status === 'committed') {
+        assertReplayPayloadMatches(existing, 'shipping/replace', payload);
+      } else {
+        if (Math.abs(currentShippingAmount(order) - expectedAmount) > 0.005) throw new Error('Shipping changed since this page was loaded. Reload the order.');
+        const totals = deriveCurrentOrderTotals(order);
+        const prev = mockOrderOverrides.get(numId) || {};
+        const money = value => ({ presentmentMoney: { amount: value.toFixed(2), currencyCode: 'USD' } });
+        mockOrderOverrides.set(numId, { ...prev,
+          currentShippingPriceSet: money(amount),
+          currentSubtotalPriceSet: money(totals.subtotal),
+          currentTotalPriceSet: money(totals.total - currentShippingAmount(order) + amount),
+          shippingLines: { nodes: [{ title }] },
+        });
+        putEditAction({ idemKey, orderId: order.id, action: 'shipping/replace', payload, result: { ok: true }, status: 'committed', editedBy: req.adminSession.email });
+      }
+    } else {
+      await runOrderEdit(order.id, idemKey, req.adminSession.email, 'shipping/replace', payload,
+        calcId => stageShippingReplacement({ shopifyFetch, calcId, amount, title, expectedAmount }),
+        state => { if (!Number.isFinite(state.shipping) || Math.abs(state.shipping - amount) > 0.005) throw new Error('The saved shipping amount differs from the requested amount. Reload and inspect the order before retrying.'); });
+    }
+    auditLog(req.adminSession.email, 'update_shipping_charge', order.id, null, { amount, title });
+    res.redirect('/orders/' + encodeURIComponent(numId) + '?success=shipping_saved');
+  } catch (err) {
+    res.redirect('/orders/' + encodeURIComponent(numId) + '?error=shipping_failed&msg=' + encodeURIComponent(err.message));
+  }
+});
+
 // WHAT: Update the order's shipping address via Shopify orderUpdate (OrderInput.shippingAddress).
 // CHANGE-GUARD: province/country are passed as the values the form was prefilled with (Shopify
 // returns names like "Illinois"/"United States"); Shopify resolves names or codes. address2/phone
@@ -6470,7 +6534,7 @@ app.post('/orders/:id/partial-invoice', requireAuth, async (req, res) => {
   // from the flat {unitPrice,quantity} shape, without discountedTotalSet/allocations) renders identically.
   const subtotal = lineItems.reduce((sum, item) => sum + lineItemTrueTotal(item), 0);
   const shippingAmt = (isFirstInvoice && shipping_handling !== 'none')
-    ? parseFloat(order.totalShippingPriceSet?.presentmentMoney?.amount || 0)
+    ? currentShippingAmount(order)
     : 0;
   const taxAmt  = isFirstInvoice
     ? parseFloat(order.totalTaxSet?.presentmentMoney?.amount || 0)
@@ -6787,6 +6851,7 @@ async function readCommittedLineState(orderId) {
     totalPriceSet{presentmentMoney{amount}}
     currentSubtotalPriceSet{presentmentMoney{amount}}
     currentTotalPriceSet{presentmentMoney{amount}}
+    currentShippingPriceSet{presentmentMoney{amount}}
     lineItems(first:${LINE_PAGE_MAX}){ pageInfo{hasNextPage endCursor} edges{node{ ${LINE_STATE_FIELDS} }}}
   }}`, { id: orderId });
   const o = r.data?.order || {};
@@ -6810,7 +6875,8 @@ async function readCommittedLineState(orderId) {
   // first-paint totals in renderOrderDetail (deriveCurrentOrderTotals). Both honor the same
   // belt-and-braces fallback (prefer current*; trust Σ currentQuantity*unitPrice when current* lags).
   const { subtotal, total, lineCount } = deriveCurrentOrderTotals(o);
-  return { lines, subtotal, total, lineCount };
+  // DEPENDS: shipping-charge verification reads shipping after commit, never the historical total.
+  return { lines, subtotal, total, lineCount, shipping: Number(o.currentShippingPriceSet?.presentmentMoney?.amount ?? NaN) };
 }
 
 // True when the calculated line already carries an order-level / stacked discount
@@ -7080,7 +7146,7 @@ function mockIncrementalEdit({ numId, idemKey, action, payload, editFn, editedBy
     const price = parseFloat(e.node.discountedUnitPriceSet?.presentmentMoney?.amount || 0);
     subtotal += price * (cq || 0);
   }
-  const ship = parseFloat(order.totalShippingPriceSet?.presentmentMoney?.amount || 0);
+  const ship = currentShippingAmount(order);
   overrides.lineItems = { edges };
   overrides.subtotalPriceSet = { presentmentMoney: { amount: subtotal.toFixed(2), currencyCode: 'USD' } };
   overrides.totalPriceSet    = { presentmentMoney: { amount: (subtotal + ship).toFixed(2), currencyCode: 'USD' } };
@@ -7182,7 +7248,7 @@ app.post('/orders/:id/edit', requireAuth, async (req, res) => {
     if (discountPct) subtotal = subtotal * (1 - parseFloat(discountPct) / 100);
     if (discountFixed) subtotal = subtotal - parseFloat(discountFixed);
     overrides.subtotalPriceSet = { presentmentMoney: { amount: subtotal.toFixed(2), currencyCode: 'USD' } };
-    overrides.totalPriceSet    = { presentmentMoney: { amount: (subtotal + parseFloat(order.totalShippingPriceSet?.presentmentMoney?.amount || 0)).toFixed(2), currencyCode: 'USD' } };
+    overrides.totalPriceSet    = { presentmentMoney: { amount: (subtotal + currentShippingAmount(order)).toFixed(2), currencyCode: 'USD' } };
     mockOrderOverrides.set(numId, overrides);
     logOrderEdit(`gid://shopify/Order/${numId}`, session.email, staffNote, changes);
     auditLog(session.email, 'order_edit', `gid://shopify/Order/${numId}`, null, changes);
@@ -8013,7 +8079,7 @@ app.get('/api/orders/:id/line-state', requireAuth, async (req, res) => {
       subtotal += up * (cq || 0);
       return { liId: e.node.id, title: e.node.title || '', currentQuantity: cq, unitPrice: up, discounts: normalizeAllocations(e.node.discountAllocations) };
     });
-    const ship = parseFloat(order.totalShippingPriceSet?.presentmentMoney?.amount || 0);
+    const ship = currentShippingAmount(order);
     return res.json({ ok: true, lines: lines.map(shape), subtotal, total: subtotal + ship, lineCount: lines.filter(l => (l.currentQuantity || 0) > 0).length, discount: summarizeOrderDiscount(lines) });
   }
   try {
