@@ -2346,6 +2346,9 @@ function variantLabel(variant) {
 // INVARIANT(S): flash strings map 1:1 to alert banners — adding a server flash value needs a branch here or it renders silently; client-side ship rates JS sorts by amount and posts to <path>/ship/rates then /ship/label; line-item product links resolve via variant.product.id or the MOCK_VARIANT_PRODUCT fallback.
 function renderOrderDetail(session, order, flash, flashMsg) {
   const numId    = shopifyNumericId(order.id);
+  // DEPENDS: both the order heading and the local-note warning link to this exact Shopify order.
+  // Keep the store slug aligned with the production Shopify store handle.
+  const shopifyAdminOrderUrl = `https://admin.shopify.com/store/parttwoenterprises/orders/${numId}`;
   // DEPENDS: POST /orders/:id/send-credit-card-invoice persists this row before emailing so a
   // failed Re:amaze delivery can expose the existing invoice for recovery without creating another.
   const helcimInvoice = getHelcimInvoiceMap(shopifyOrderGid(numId));
@@ -2540,8 +2543,10 @@ function renderOrderDetail(session, order, flash, flashMsg) {
     ? `<div class="alert alert-warning">A payment method is required to record a payment.</div>`
     : flash === 'bad_amount'
     ? `<div class="alert alert-warning">Payment amount is invalid${flashMsg ? `: ${h(flashMsg)}` : ' — must be greater than 0 and no more than the outstanding balance.'}</div>`
-    : flash === 'note_saved'
-    ? `<div class="alert alert-success">Note saved.</div>`
+    : flash === 'shopify_note_saved'
+    ? `<div class="alert alert-success">Shopify order note saved.</div>`
+    : flash === 'local_note_saved'
+    ? `<div class="alert alert-success">B2B Admin-only note saved. This note was not sent to Shopify.</div>`
     : flash === 'shipping_saved'
     ? `<div class="alert alert-success">Shipping charge updated.</div>`
     : flash === 'shipping_failed'
@@ -2901,7 +2906,7 @@ function renderOrderDetail(session, order, flash, flashMsg) {
     ${flashHtml}
     <div class="detail-header">
       <div class="detail-header-left">
-        <h1><a href="https://admin.shopify.com/store/parttwoenterprises/orders/${h(numId)}" target="_blank" rel="noopener" class="link" title="Open ${h(order.name)} in Shopify admin">${h(order.name)} ↗</a> <span class="badge badge-${h(finStatus)}">${h(order.displayFinancialStatus)}</span>
+        <h1><a href="${h(shopifyAdminOrderUrl)}" target="_blank" rel="noopener" class="link" title="Open ${h(order.name)} in Shopify admin">${h(order.name)} ↗</a> <span class="badge badge-${h(finStatus)}">${h(order.displayFinancialStatus)}</span>
             <span class="badge badge-ff-${h(fulStatus)}">${h(order.displayFulfillmentStatus)}</span></h1>
         <p class="text-muted">
           ${order.customer ? `<a href="/customers/${shopifyNumericId(order.customer.id)}">${h(order.customer.displayName)}</a> · ` : ''}
@@ -2993,9 +2998,10 @@ function renderOrderDetail(session, order, flash, flashMsg) {
             </div>
           </div>
           <div id="edit-save-bar" style="display:none;padding:12px 0;border-top:1px solid var(--border);margin-top:8px">
-            <input type="text" name="staffNote" placeholder="Staff note (optional)" class="filter-input" style="width:60%;margin-right:8px">
+            <input type="text" name="staffNote" placeholder="Shopify timeline note for this edit (optional)" aria-label="Shopify timeline note for this edit" class="filter-input" style="width:60%;margin-right:8px">
             <button type="submit" id="edit-save-btn" class="btn btn-primary" onclick="serializeCustomLines()">Save changes</button>
             <button type="button" class="btn btn-ghost" onclick="toggleEditMode(false)" style="margin-left:4px">Cancel</button>
+            <div style="font-size:11px;color:var(--muted);margin-top:6px">Saved with the edit and shown in Shopify's timeline. Shopify does not let apps add a timeline comment after an edit has already been committed.</div>
           </div>
           </form>
           <script>
@@ -4029,11 +4035,11 @@ function renderOrderDetail(session, order, flash, flashMsg) {
         </div>
         <div class="card" id="customer-notes-card">
           <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
-            <h2>Customer notes <span class="badge badge-muted" style="margin-left:6px">${order.note && String(order.note).trim() ? 1 : 0}</span></h2>
-            <span class="text-muted" style="font-size:11px">prints on the order invoice</span>
+            <h2>Shopify order note <span class="badge badge-muted" style="margin-left:6px">${order.note && String(order.note).trim() ? 1 : 0}</span></h2>
+            <span class="text-muted" style="font-size:11px">syncs to Shopify · prints on the invoice</span>
           </div>
           <form method="POST" action="/orders/${h(numId)}/note" style="margin-top:10px">
-            <textarea name="note" class="textarea" rows="3" placeholder="Add a customer note for this order…">${h(order.note||'')}</textarea>
+            <textarea name="note" class="textarea" rows="3" placeholder="Add a Shopify order note…" aria-label="Shopify order note">${h(order.note||'')}</textarea>
             <div style="margin-top:0.5rem;display:flex;gap:8px;align-items:center">
               <button type="submit" class="btn btn-secondary btn-sm">Save note</button>
               ${order.note && String(order.note).trim() ? `<button type="button" class="btn btn-ghost btn-sm" style="color:#a32d2d" onclick="if(confirm('Delete this customer note?')){this.form.note.value='';this.form.submit();}">Delete</button>` : ''}
@@ -4042,13 +4048,14 @@ function renderOrderDetail(session, order, flash, flashMsg) {
         </div>
         <div class="card" id="internal-note-card">
           <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
-            <h2>Internal note <span class="badge badge-muted" style="margin-left:6px">${order.internalNote && String(order.internalNote).trim() ? 1 : 0}</span></h2>
-            <span class="text-muted" style="font-size:11px">staff only · never on the invoice or synced to Shopify</span>
+            <h2>B2B Admin-only note <span class="badge badge-muted" style="margin-left:6px">${order.internalNote && String(order.internalNote).trim() ? 1 : 0}</span></h2>
+            <span class="text-muted" style="font-size:11px;font-weight:600;color:#a32d2d">stored only here · not in Shopify</span>
           </div>
           <form method="POST" action="/orders/${h(numId)}/internal-note" style="margin-top:10px">
-            <textarea name="note" class="textarea" rows="3" placeholder="Private staff note (e.g. how the order was created, SparkLayer unreachable)…">${h(order.internalNote||'')}</textarea>
+            <div class="alert alert-warning" style="margin-bottom:10px">Shopify does not allow apps to create timeline comments after an edit. To add one now, <a href="${h(shopifyAdminOrderUrl)}" target="_blank" rel="noopener">open this order in Shopify ↗</a>.</div>
+            <textarea name="note" class="textarea" rows="3" placeholder="Private note stored only in B2B Admin…" aria-label="B2B Admin-only note">${h(order.internalNote||'')}</textarea>
             <div style="margin-top:0.5rem;display:flex;gap:8px;align-items:center">
-              <button type="submit" class="btn btn-secondary btn-sm">Save internal note</button>
+              <button type="submit" class="btn btn-secondary btn-sm">Save in B2B Admin only</button>
               ${order.internalNote && String(order.internalNote).trim() ? `<button type="button" class="btn btn-ghost btn-sm" style="color:#a32d2d" onclick="if(confirm('Delete this internal note?')){this.form.note.value='';this.form.submit();}">Delete</button>` : ''}
             </div>
           </form>
@@ -6171,17 +6178,19 @@ app.post('/orders/:id/note', requireAuth, async (req, res) => {
     }
   }
   auditLog(req.adminSession.email, 'update_note', shopifyOrderGid(numId), null, { note });
-  res.redirect(`/orders/${numId}?success=note_saved`);
+  res.redirect(`/orders/${numId}?success=shopify_note_saved`);
 });
 
-// WHAT: Save the staff-only INTERNAL order note (admin-local order_internal_notes table).
-// Never synced to Shopify, never on the invoice. Empty body clears it (delete).
+// WHAT: Save the B2B-Admin-only order note (admin-local order_internal_notes table).
+// CHANGE-GUARD: Shopify exposes timeline comments as read-only to apps. Do not claim this route
+// syncs there; the order page must keep the local-only warning + direct Shopify link visible.
+// INVARIANT(S): never synced to Shopify, never on the invoice; empty body clears it (delete).
 app.post('/orders/:id/internal-note', requireAuth, async (req, res) => {
   const numId = req.params.id;
   const note  = String(req.body.note || '').slice(0, 4000);
   setOrderInternalNote(numId, note, req.adminSession.email);
   auditLog(req.adminSession.email, note.trim() ? 'update_internal_note' : 'delete_internal_note', shopifyOrderGid(numId), null, null);
-  res.redirect(`/orders/${numId}?success=note_saved`);
+  res.redirect(`/orders/${numId}?success=local_note_saved`);
 });
 
 // WHAT: replace the order's shipping charge using the same serialized, idempotent edit path as lines.
