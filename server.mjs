@@ -2240,6 +2240,7 @@ async function getOrderDetail(numericId, { throwOnError = false } = {}) {
         currentSubtotalPriceSet{presentmentMoney{amount currencyCode}}
         currentTotalPriceSet{presentmentMoney{amount currencyCode}}
         totalShippingPriceSet{presentmentMoney{amount currencyCode}}
+        currentShippingPriceSet{presentmentMoney{amount currencyCode}}
         currencyCode presentmentCurrencyCode
         shippingLines(first:100){nodes{id title}}
         totalTaxSet{presentmentMoney{amount currencyCode}}
