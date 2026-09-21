@@ -57,7 +57,7 @@ import { renderLabelSheet, expandItems, TEMPLATES as LABEL_TEMPLATES, DEFAULT_FI
 import { isInsider, resolveXeroContact, syncCustomerToXero, getXeroSyncStatus } from './lib/xero-customer-sync.mjs';
 import { parseLinePrices, applyLinePriceChanges, bulkMarkOrdersPaid } from './lib/order-money.mjs';
 import { assertNoUserErrors } from './lib/shopify-user-errors.mjs';
-import { currentShippingAmount, parseShippingAmount, stageShippingReplacement } from './lib/order-shipping.mjs';
+import { currentShippingAmount, findShippingInvoice, parseShippingAmount, stageShippingReplacement } from './lib/order-shipping.mjs';
 import { createCreditCardInvoice } from './helcim.mjs';
 // SYNC: same module db.mjs uses for the SQL LIMIT — the banner/footer copy and the query page size
 // must agree, otherwise the list lies about how much it is showing.
@@ -2369,6 +2369,7 @@ function renderOrderDetail(session, order, flash, flashMsg) {
   const xeroMap  = getXeroMap(numId);
   // Partial invoices (read from SQLite)
   const partialInvoices = getPartialInvoices(`gid://shopify/Order/${numId}`);
+  const shippingInvoice = findShippingInvoice(partialInvoices);
   // Second build (Build D): read-only order-history timeline (edits + non-edit audit verbs).
   const orderHistory = getOrderHistory(`gid://shopify/Order/${numId}`);
   const isFulfilled = ['FULFILLED','PARTIALLY_FULFILLED'].includes(order.displayFulfillmentStatus);
@@ -3999,15 +4000,18 @@ function renderOrderDetail(session, order, flash, flashMsg) {
               <div style="margin-bottom:16px">
                 <div style="font-size:13px;font-weight:500;margin-bottom:6px">Shipping charge</div>
                 <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-bottom:4px">
-                  <input type="radio" name="shipping_handling" value="first" checked>
+                  <input type="radio" name="shipping_handling" value="first" ${shippingInvoice ? 'disabled' : 'checked'}>
                   Include shipping on this invoice (common for wholesale)
                 </label>
                 <label style="display:flex;align-items:center;gap:8px;font-size:13px">
-                  <input type="radio" name="shipping_handling" value="none">
+                  <input type="radio" name="shipping_handling" value="none" ${shippingInvoice ? 'checked' : ''}>
                   No shipping on this invoice
                 </label>
                 <div style="font-size:11px;color:var(--muted);margin-top:6px">
-                  Shipping and tax are billed once per order, on the first invoice only.
+                  ${shippingInvoice
+                    ? `Shipping was already included on <a href="/orders/${h(numId)}/invoice?letter=${h(shippingInvoice.invoice_letter)}">invoice ${h(order.name)}-${h(shippingInvoice.invoice_letter)}</a> (${fmtMoney(shippingInvoice.shipping)}). Open that invoice to view or download it again.`
+                    : `Current shipping charge: ${fmtMoney(currentShippingAmount(order))}. Shipping can be included once, even if an earlier invoice had no shipping.`}
+                  Tax is included on the first invoice only.
                 </div>
               </div>
               <div style="display:flex;gap:8px">
@@ -6498,9 +6502,10 @@ app.get('/orders/:id/invoice', requireAuth, async (req, res) => {
 
 // ── Phase 16E: Partial invoices ──────────────────────────────────────────────
 
-// WHAT: Phase 16E — creates a lettered partial invoice (A,B,C...) row via createPartialInvoice and streams its PDF; body {type:'full'|'fulfilled_only', shipping_handling:'first'|other}.
-// CHANGE-GUARD: 'fulfilled_only' is NOT actually implemented — both branches use allLineItems (see inline 'simplified' note); if you wire real fulfilled-line detection, re-test subtotal/tax/total math and the lineItemsJson snapshot shape consumed by the re-download route.
-// INVARIANT(S): getNextInvoiceLetter+createPartialInvoice are a non-atomic read-modify-write keyed on orderGid — two concurrent POSTs can collide on the same letter (see bugs[]); shipping is only billed when shipping_handling==='first' so it is charged on exactly one partial.
+// WHAT: creates a lettered full-order invoice snapshot and redirects to its PDF viewer.
+// CHANGE-GUARD: fulfilled_only remains rejected until real per-line fulfillment billing exists.
+// INVARIANT(S): inspect history and save synchronously after fetching the order; no await may split
+// the shipping guard/letter allocation from createPartialInvoice or concurrent requests can double-bill.
 app.post('/orders/:id/partial-invoice', requireAuth, async (req, res) => {
   const numId = req.params.id;
   const session = req.adminSession;
@@ -6528,13 +6533,11 @@ app.post('/orders/:id/partial-invoice', requireAuth, async (req, res) => {
   }
   const lineItems = allLineItems;
 
-  // WHAT: shipping and tax are charged ONCE per order, on the first invoice only, and the decision is
-  //   made HERE rather than trusted from the request body.
-  // WHY: `shipping_handling` arrived from the client with the modal defaulting it to 'first', and tax
-  //   had no gate at all. Generating two invoices without touching the radio therefore billed the full
-  //   shipping twice and the full tax twice: a $100 + $10 ship + $8 tax order invoiced $118 then $108.
-  // INVARIANT(S): an operator may still suppress shipping explicitly ('none'); they cannot cause it to
-  //   be charged a second time. Tax follows the same once-per-order rule.
+  // WHAT: shipping is included once, on the first invoice that actually bills it.
+  // WHY: #39394 had three $0-shipping PDFs; the old first-invoice-only gate silently discarded
+  // the later $35 charge despite Include shipping being selected. A prior $0 is not a charge.
+  // DEPENDS: the dialog uses findShippingInvoice too, but this fresh read also guards stale forms.
+  // Tax retains its existing first-invoice-only rule independently of the shipping selection.
   const priorInvoices = getPartialInvoices(orderGid);
   const isFirstInvoice = priorInvoices.length === 0;
 
@@ -6543,7 +6546,7 @@ app.post('/orders/:id/partial-invoice', requireAuth, async (req, res) => {
   // qty) and snapshot the post-discount unit + current qty so the re-download path (which reconstructs
   // from the flat {unitPrice,quantity} shape, without discountedTotalSet/allocations) renders identically.
   const subtotal = lineItems.reduce((sum, item) => sum + lineItemTrueTotal(item), 0);
-  const shippingAmt = (isFirstInvoice && shipping_handling !== 'none')
+  const shippingAmt = (!findShippingInvoice(priorInvoices) && shipping_handling !== 'none')
     ? currentShippingAmount(order)
     : 0;
   const taxAmt  = isFirstInvoice

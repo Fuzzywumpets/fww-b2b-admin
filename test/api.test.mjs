@@ -3284,34 +3284,51 @@ await test('REGRESSION: type=fulfilled_only is REFUSED, not silently billed in f
   assert.ok(/full/i.test(j.error || ''), `error should explain the order can only be invoiced in full, got: ${j.error}`);
 });
 
-// REGRESSION: shipping and tax were billed IN FULL on every invoice — shipping because
-// shipping_handling came from the client (modal default 'first') with no server-side check against
-// existing invoices, tax because it had no gate at all. Two invoices on a $100+$10 ship+$8 tax order
-// billed $118 then $108 = $226 for a $118 order. Both figures were persisted.
-await test('REGRESSION: shipping and tax are billed ONCE per order, not on every invoice', async () => {
+// #39394: zero-shipping invoices must not consume the once-per-order shipping allowance.
+// Exercise shipping added later, explicit omission, inclusion, then duplicate protection.
+await test('REGRESSION: shipping added after an invoice can be included once; tax stays once per order', async () => {
   const cookie = await seedSession();
-  const post = () => fetch(`${BASE}/orders/1010/partial-invoice`, {
+  const post = (shipping_handling = 'first') => fetch(`${BASE}/orders/1010/partial-invoice`, {
     method: 'POST',
     headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({ type: 'full', shipping_handling: 'first' }).toString(),
+    body: new URLSearchParams({ type: 'full', shipping_handling }).toString(),
   });
-  assert.equal((await post()).status, 200, 'first invoice should succeed');
-  assert.equal((await post()).status, 200, 'second invoice should succeed');
+  const setShipping = async (expectedAmount, amount) => {
+    const res = await fetch(`${BASE}/orders/1010/shipping-charge`, {
+      method: 'POST', redirect: 'manual',
+      headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ expectedAmount, amount, title: 'UPS', idemKey: crypto.randomUUID() }),
+    });
+    assert.match(res.headers.get('location'), /success=shipping_saved/);
+  };
+  await setShipping('10.00', '0.00');
+  assert.equal((await post()).status, 200, 'invoice before shipping is added should succeed');
+  await setShipping('0.00', '35.00');
+  assert.equal((await post('none')).status, 200, 'explicit no-shipping invoice should succeed');
+  assert.equal((await post()).status, 200, 'later invoice should include the new shipping');
+  assert.equal((await post()).status, 200, 'another invoice should not duplicate shipping');
 
   const list = await (await fetch(`${BASE}/api/admin/orders/1010/partial-invoices`, { headers: { Cookie: cookie } })).json();
   const invs = list.invoices || list;
-  assert.ok(invs.length >= 2, `expected at least 2 invoices, got ${invs.length}`);
-  const [a, b] = invs.slice(0, 2).sort((x, y) => String(x.invoice_letter).localeCompare(String(y.invoice_letter)));
-
-  assert.equal(Number(a.shipping), 10, 'the FIRST invoice carries the shipping');
+  assert.equal(invs.length, 4);
+  const [a, b, c, d] = invs.slice().sort((x, y) => String(x.invoice_letter).localeCompare(String(y.invoice_letter)));
+  assert.equal(Number(a.shipping), 0, 'current zero must override historical shipping');
+  assert.equal(Number(b.shipping), 0, 'No shipping must be honored');
+  assert.equal(Number(c.shipping), 35, 'Include shipping must work after zero-shipping invoices');
+  assert.equal(Number(c.total), 135, 'stored total must include the new shipping');
+  assert.equal(Number(d.shipping), 0, 'already invoiced shipping must not be billed again');
   assert.equal(Number(a.tax), 8, 'the FIRST invoice carries the tax');
-  assert.equal(Number(b.shipping), 0, 'the SECOND invoice must NOT re-bill shipping');
-  assert.equal(Number(b.tax), 0, 'the SECOND invoice must NOT re-bill tax');
-  // The order is $118 all-in; the extras must appear exactly once across all invoices.
+  assert.deepEqual([b.tax, c.tax, d.tax].map(Number), [0, 0, 0]);
   const totalShipping = invs.reduce((s, i) => s + Number(i.shipping || 0), 0);
   const totalTax      = invs.reduce((s, i) => s + Number(i.tax || 0), 0);
-  assert.equal(totalShipping, 10, `shipping billed ${totalShipping} across invoices, expected 10`);
+  assert.equal(totalShipping, 35, `shipping billed ${totalShipping} across invoices, expected 35`);
   assert.equal(totalTax, 8, `tax billed ${totalTax} across invoices, expected 8`);
+  const page = await (await fetch(`${BASE}/orders/1010`, { headers: { Cookie: cookie } })).text();
+  assert.match(page, /Shipping was already included on/);
+  assert.ok(page.includes('/orders/1010/invoice?letter=C'));
+  const pdf = await fetch(`${BASE}/orders/1010/partial-invoice/C.pdf`, { headers: { Cookie: cookie } });
+  assert.equal(pdf.status, 200);
+  assert.equal(pdf.headers.get('content-type'), 'application/pdf');
 });
 
 // REGRESSION: a 100%-comped line was invoiced at FULL LIST price. liNum() ends in `|| 0`, so a
