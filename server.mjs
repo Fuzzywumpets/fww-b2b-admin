@@ -55,7 +55,7 @@ import { cacheRowTotal, listRowTotalAmount, restRowCurrentTotals } from './lib/o
 import { LINE_PAGE_MAX, drainLineItems } from './lib/line-item-paging.mjs';
 import { renderLabelSheet, expandItems, TEMPLATES as LABEL_TEMPLATES, DEFAULT_FIELDS } from './labels.mjs';
 import { isInsider, resolveXeroContact, syncCustomerToXero, getXeroSyncStatus } from './lib/xero-customer-sync.mjs';
-import { parseLinePrices, applyLinePriceChanges, bulkMarkOrdersPaid } from './lib/order-money.mjs';
+import { parseLinePrices, applyLinePriceChanges, bulkMarkOrdersPaid, addLineDiscountsBatched } from './lib/order-money.mjs';
 import { assertNoUserErrors } from './lib/shopify-user-errors.mjs';
 import { currentShippingAmount, findShippingInvoice, parseShippingAmount, stageShippingReplacement } from './lib/order-shipping.mjs';
 import { createCreditCardInvoice } from './helcim.mjs';
@@ -3322,13 +3322,13 @@ function renderOrderDetail(session, order, flash, flashMsg) {
                 })();
 
                 // POST helper. Returns {ok, json} ; ok=false on 422/5xx/network.
-                // A 30s ceiling is REQUIRED, not a nicety: inflight gates the batch Save button, so
-                // a request that never settles would leave Save disabled forever and the operator
-                // unable to save at all. Aborting resolves the promise, so inflight always drains.
-                function post(path, body){
+                // A finite ceiling is REQUIRED, not a nicety: inflight gates the batch Save button,
+                // so a request that never settles would leave Save disabled forever. Ordinary edits
+                // default to 30s; callers with bounded large-order work may supply a longer ceiling.
+                function post(path, body, timeoutMs){
                   var opts = { method:'POST', credentials:'same-origin',
                     headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) };
-                  try { if (window.AbortSignal && AbortSignal.timeout) opts.signal = AbortSignal.timeout(30000); } catch (e) {}
+                  try { if (window.AbortSignal && AbortSignal.timeout) opts.signal = AbortSignal.timeout(timeoutMs || 30000); } catch (e) {}
                   return fetch(path, opts)
                     .then(function(r){ return r.json().then(function(j){ return { ok:r.ok, json:j }; }, function(){ return { ok:false, json:{ errors:['bad response'] } }; }); })
                     .catch(function(e){ return { ok:false, json:{ errors:[(e && e.name === 'TimeoutError') ? 'timed out — not saved' : 'network error'] } }; });
@@ -3720,7 +3720,10 @@ function renderOrderDetail(session, order, flash, flashMsg) {
                     applying = true;
                     if (btn){ btn.disabled = true; btn.textContent = 'Applying…'; }
                     setDiscChip('saving'); inflight++; setPill();
-                    post('/orders/' + ORDER_ID + '/discount/order', { idemKey: idemKey, discountPct: pct||'', discountFixed: fixed||'', discountReason: reason }).then(function(res){
+                    // DEPENDS: server-side discount staging batches large orders, but Shopify still
+                    // executes every aliased mutation field serially. #39355 has 286 active lines;
+                    // the ordinary 30s request ceiling aborted its valid atomic edit before commit.
+                    post('/orders/' + ORDER_ID + '/discount/order', { idemKey: idemKey, discountPct: pct||'', discountFixed: fixed||'', discountReason: reason }, 120000).then(function(res){
                       inflight--; applying = false;
                       if (btn){ btn.disabled = false; btn.textContent = 'Apply discount'; }
                       if (res.ok && res.json && res.json.ok){
@@ -6996,12 +6999,16 @@ async function stageOrderDiscount(calcId, ctx, { pct, fixed, reason }) {
     ctx.warnings.push(`a fixed $ discount is applied as ${effPct}% across ${eligible.length} lines, landing at ${fmtMoney(expectedAmt)}`);
   }
 
-  for (const l of eligible) {
-    const r = await shopifyFetch(`mutation addDisc($id:ID!,$li:ID!,$d:OrderEditAppliedDiscountInput!){
-      orderEditAddLineItemDiscount(id:$id,lineItemId:$li,discount:$d){ calculatedOrder{id} userErrors{field message}}}`,
-      { id: calcId, li: l.id, d: { percentValue: effPct, description } });
-    const errs = r.data?.orderEditAddLineItemDiscount?.userErrors || [];
-    if (errs.length) throw new OrderEditError(errs.map(e => `"${l.title}": ${e.message}`));
+  // LARGE-ORDER SAFETY: one request per line timed out on #39355 (286 active lines) before commit.
+  // Aliased chunks preserve Shopify's serial mutation semantics while collapsing 286 HTTP round
+  // trips to 15. Any batch error throws, so runOrderEdit abandons the calculated order atomically.
+  try {
+    await addLineDiscountsBatched({
+      shopifyFetch, calcId, lines: eligible,
+      discount: { percentValue: effPct, description },
+    });
+  } catch (err) {
+    throw new OrderEditError(err.message || String(err));
   }
   return { expectedAmt, effPct, basis, description, lineCount: eligible.length };
 }

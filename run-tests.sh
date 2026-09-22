@@ -74,6 +74,13 @@ if [ -f test/order-money.test.mjs ]; then
   node test/order-money.test.mjs || UNIT_FAIL=$?
 fi
 
+# Large-order discount staging is a pure Shopify batching contract. The mock server cannot expose
+# the timeout that occurred on live #39355 (286 lines), so exercise the generated aliases directly.
+if [ -f test/order-discount-batching.test.mjs ]; then
+  echo ""
+  node test/order-discount-batching.test.mjs || UNIT_FAIL=$?
+fi
+
 if [ -f test/helcim.test.mjs ]; then
   echo ""
   echo "── Unit: Helcim invoice client (standalone, no server) ──"
