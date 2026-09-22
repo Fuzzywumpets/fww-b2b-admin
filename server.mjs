@@ -1767,12 +1767,12 @@ function renderComingSoon(session, label, activePath) {
 // WHAT: single choke-point for all live Shopify GraphQL via the shopify-bridge worker with Bearer SHOPIFY_BRIDGE_BEARER.
 // CHANGE-GUARD: hardcoded worker URL (shopify-bridge.alex-037.workers.dev/api/graphql) — if the bridge host or bearer env name changes, EVERY order/customer/product/catalog read+mutation breaks at once; re-test one read and one mutation.
 // INVARIANT(S): throws on !res.ok and on json.errors[] (transport/top-level), but does NOT inspect per-mutation userErrors — callers running mutations must check userErrors themselves; bearer is empty-string default so a missing env yields 401s from the bridge, not a local throw.
-async function shopifyFetch(query, variables = {}) {
+async function shopifyFetch(query, variables = {}, { timeoutMs = 15000 } = {}) {
   const res = await fetch('https://shopify-bridge.alex-037.workers.dev/api/graphql', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${SHOPIFY_BEARER}` },
     body: JSON.stringify({ query, variables }),
-    signal: AbortSignal.timeout(15000),
+    signal: AbortSignal.timeout(timeoutMs),
   });
   if (!res.ok) throw new Error(`shopify-bridge ${res.status}: ${await res.text()}`);
   const json = await res.json();
@@ -3723,7 +3723,7 @@ function renderOrderDetail(session, order, flash, flashMsg) {
                     // DEPENDS: server-side discount staging batches large orders, but Shopify still
                     // executes every aliased mutation field serially. #39355 has 286 active lines;
                     // the ordinary 30s request ceiling aborted its valid atomic edit before commit.
-                    post('/orders/' + ORDER_ID + '/discount/order', { idemKey: idemKey, discountPct: pct||'', discountFixed: fixed||'', discountReason: reason }, 120000).then(function(res){
+                    post('/orders/' + ORDER_ID + '/discount/order', { idemKey: idemKey, discountPct: pct||'', discountFixed: fixed||'', discountReason: reason }, 600000).then(function(res){
                       inflight--; applying = false;
                       if (btn){ btn.disabled = false; btn.textContent = 'Apply discount'; }
                       if (res.ok && res.json && res.json.ok){
@@ -7001,11 +7001,14 @@ async function stageOrderDiscount(calcId, ctx, { pct, fixed, reason }) {
 
   // LARGE-ORDER SAFETY: one request per line timed out on #39355 (286 active lines) before commit.
   // Aliased chunks preserve Shopify's serial mutation semantics while collapsing 286 HTTP round
-  // trips to 15. Any batch error throws, so runOrderEdit abandons the calculated order atomically.
+  // trips to 29 smaller batches. Any batch error throws, so runOrderEdit abandons the calculated
+  // order atomically. Ten aliases stays below the 15s failure seen with the first 20-alias attempt.
   try {
     await addLineDiscountsBatched({
       shopifyFetch, calcId, lines: eligible,
       discount: { percentValue: effPct, description },
+      batchSize: 10,
+      fetchTimeoutMs: 60000,
     });
   } catch (err) {
     throw new OrderEditError(err.message || String(err));
