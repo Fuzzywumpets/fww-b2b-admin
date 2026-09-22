@@ -723,10 +723,10 @@ const MOCK_ORDERS = [
     totalPriceSet: { presentmentMoney: { amount: '675.00', currencyCode: 'USD' } },
     sourceName: 'web', tags: ['b2b-portal'], note: 'Partial ship OK',
     lineItems: { edges: [
-      { node: { id: 'li5', title: 'Everyday Collar', quantity: 15, variant: { id: 'v305', sku: 'EC-003-L-BK', title: 'Large / Black', selectedOptions: [{ name: 'Size', value: 'Large' }, { name: 'Color', value: 'Black' }], price: '30.00', inventoryQuantity: 12 },
+      { node: { id: 'li5', title: 'Everyday Collar', quantity: 15, currentQuantity: 15, unfulfilledQuantity: 5, variant: { id: 'v305', sku: 'EC-003-L-BK', title: 'Large / Black', selectedOptions: [{ name: 'Size', value: 'Large' }, { name: 'Color', value: 'Black' }], price: '30.00', inventoryQuantity: 12 },
           discountedUnitPriceSet: { presentmentMoney: { amount: '30.00', currencyCode: 'USD' } },
           originalUnitPriceSet:   { presentmentMoney: { amount: '30.00', currencyCode: 'USD' } } } },
-      { node: { id: 'li6', title: 'Leash Set', quantity: 5, variant: { id: 'v306', sku: 'LS-007', price: '45.00', inventoryQuantity: 3 },
+      { node: { id: 'li6', title: 'Leash Set', quantity: 5, currentQuantity: 5, unfulfilledQuantity: 5, variant: { id: 'v306', sku: 'LS-007', price: '45.00', inventoryQuantity: 3 },
           discountedUnitPriceSet: { presentmentMoney: { amount: '45.00', currencyCode: 'USD' } },
           originalUnitPriceSet:   { presentmentMoney: { amount: '45.00', currencyCode: 'USD' } } } },
     ]},
@@ -735,7 +735,8 @@ const MOCK_ORDERS = [
     totalTaxSet:           { presentmentMoney: { amount: '0.00', currencyCode: 'USD' } },
     shippingAddress: { firstName: 'Maria', lastName: 'Garcia', address1: '321 Palm Dr', address2: 'Suite 4', city: 'Miami', province: 'FL', zip: '33101', country: 'US' },
     billingAddress:  { firstName: 'Maria', lastName: 'Garcia', address1: '321 Palm Dr', address2: 'Suite 4', city: 'Miami', province: 'FL', zip: '33101', country: 'US' },
-    fulfillments: [{ status: 'SUCCESS', trackingInfo: [{ number: 'TRACK456', url: null, company: 'FedEx' }], createdAt: '2026-05-22T09:00:00Z' }],
+    fulfillments: [{ status: 'SUCCESS', trackingInfo: [{ number: 'TRACK456', url: null, company: 'FedEx' }], createdAt: '2026-05-22T09:00:00Z',
+      fulfillmentLineItems: { nodes: [{ quantity: 10, lineItem: { id: 'li5', title: 'Everyday Collar', sku: 'EC-003-L-BK' } }] } }],
     transactions: [{ id: 'tx3', status: 'SUCCESS', kind: 'SALE', gateway: 'manual', createdAt: '2026-05-21T17:00:00Z', amountSet: { presentmentMoney: { amount: '675.00', currencyCode: 'USD' } } }],
   },
   // SparkLayer wholesale order (historical — pre-portal)
@@ -2249,14 +2250,15 @@ async function getOrderDetail(numericId, { throwOnError = false } = {}) {
         note tags
         shippingAddress{firstName lastName address1 address2 city province zip country phone}
         billingAddress{firstName lastName address1 address2 city province zip country}
-        lineItems(first:250){edges{node{id title quantity currentQuantity
+        lineItems(first:250){edges{node{id title quantity currentQuantity unfulfilledQuantity
           variant{id title sku barcode selectedOptions{name value} price inventoryQuantity product{id title}}
           discountedUnitPriceSet{presentmentMoney{amount currencyCode}}
           originalUnitPriceSet{presentmentMoney{amount currencyCode}}
           discountedTotalSet{presentmentMoney{amount currencyCode}}
           discountAllocations{allocatedAmountSet{presentmentMoney{amount currencyCode}} discountApplication{targetSelection ... on ManualDiscountApplication{description}}}
         }}}
-        fulfillments{status trackingInfo{number url company} createdAt}
+        fulfillments{status trackingInfo{number url company} createdAt
+          fulfillmentLineItems(first:250){nodes{quantity lineItem{id title sku}}}}
         transactions(first:10){id status kind gateway createdAt
           amountSet{presentmentMoney{amount currencyCode}}}
       }}`, { id: shopifyOrderGid(numericId) });
@@ -2341,9 +2343,9 @@ function variantLabel(variant) {
   return t && t !== 'Default Title' ? t : '';
 }
 
-// WHAT: the large order-detail page — status timeline, editable line items, fulfillments, transactions, address, Xero/partial-invoice state, and all the modal JS (edit/discount/fulfill/backorder/invoice/cancel/ship).
-// CHANGE-GUARD: reads several SQLite stores by gid (getXeroMap, getPartialInvoices, getBackordersForOrder) — those keys must match shopifyOrderGid(numId). The edit form posts qtys[]/prices[]/removes/addCustomLines to /orders/:id/edit; serializeCustomLines() must run before submit (onclick on Save). Re-test edit/ship/cancel modals after any markup change since the inline JS selects elements by hardcoded ids.
-// INVARIANT(S): flash strings map 1:1 to alert banners — adding a server flash value needs a branch here or it renders silently; client-side ship rates JS sorts by amount and posts to <path>/ship/rates then /ship/label; line-item product links resolve via variant.product.id or the MOCK_VARIANT_PRODUCT fallback.
+// WHAT: the large order-detail page — status timeline, editable line items, fulfillments, transactions, address, Xero/partial-invoice state, and the modal JS (edit/discount/fulfill/backorder/invoice/cancel).
+// CHANGE-GUARD: reads several SQLite stores by gid (getXeroMap, getPartialInvoices, getBackordersForOrder) — those keys must match shopifyOrderGid(numId). The edit form posts qtys[]/prices[]/removes/addCustomLines to /orders/:id/edit; serializeCustomLines() must run before submit (onclick on Save). Re-test edit/fulfill/cancel modals after any markup change since the inline JS selects elements by hardcoded ids.
+// INVARIANT(S): flash strings map 1:1 to alert banners — adding a server flash value needs a branch here or it renders silently; line-item product links resolve via variant.product.id or the MOCK_VARIANT_PRODUCT fallback.
 function renderOrderDetail(session, order, flash, flashMsg) {
   const numId    = shopifyNumericId(order.id);
   // DEPENDS: both the order heading and the local-note warning link to this exact Shopify order.
@@ -2372,7 +2374,14 @@ function renderOrderDetail(session, order, flash, flashMsg) {
   const shippingInvoice = findShippingInvoice(partialInvoices);
   // Second build (Build D): read-only order-history timeline (edits + non-edit audit verbs).
   const orderHistory = getOrderHistory(`gid://shopify/Order/${numId}`);
-  const isFulfilled = ['FULFILLED','PARTIALLY_FULFILLED'].includes(order.displayFulfillmentStatus);
+  const remainingQuantity = (order.lineItems?.edges || []).reduce((sum, e) => {
+    const item = e.node || {};
+    const remaining = item.unfulfilledQuantity != null
+      ? Number(item.unfulfilledQuantity)
+      : (order.displayFulfillmentStatus === 'FULFILLED' ? 0 : Number(item.currentQuantity ?? item.quantity ?? 0));
+    return sum + Math.max(0, remaining || 0);
+  }, 0);
+  const isFulfilled = order.displayFulfillmentStatus === 'FULFILLED' || remainingQuantity === 0;
   const finStatus = (order.displayFinancialStatus || '').toLowerCase();
   const fulStatus = (order.displayFulfillmentStatus || '').toLowerCase().replace(/_/g, '-');
 
@@ -2513,6 +2522,9 @@ function renderOrderDetail(session, order, flash, flashMsg) {
           <span class="badge badge-ff-${h((f.status||'').toLowerCase())}">${h(f.status)}</span>
           <span class="text-muted">${fmtDate(f.createdAt)}</span>
           ${(f.trackingInfo || []).map(t => `<a href="${h(safeUrl(t.url))}" target="_blank" rel="noopener noreferrer" class="tracking-link">${h(t.company || '')} ${h(t.number || '')}</a>`).join('')}
+          <div style="width:100%;margin-top:5px;font-size:12px;color:var(--muted)">
+            ${(f.fulfillmentLineItems?.nodes || []).map(fl => `${h(fl.lineItem?.title || 'Item')}${fl.lineItem?.sku ? ` <span class="mono">${h(fl.lineItem.sku)}</span>` : ''} × ${Number(fl.quantity)||0}`).join(' · ') || 'Item detail unavailable'}
+          </div>
         </div>`).join('')
     : '<p class="text-muted small-text">No fulfillments yet</p>';
 
@@ -2586,8 +2598,8 @@ function renderOrderDetail(session, order, flash, flashMsg) {
     : '';
 
   // Edit mode JS (16A)
-// WHAT: inline edit-mode controller — toggles static-vs-input cells, manages custom-line add/remove, discount bar, and all the order modals; also the ship rates/label AJAX.
-// CHANGE-GUARD: every function selects DOM by hardcoded element id (edit-mode-bar, edit-save-bar, discount-modal, ship-modal, etc.) — renaming those ids in the markup silently no-ops the buttons. toggleEditMode(false) RESETS custom lines and discount inputs; keep that cleanup if you add fields.
+// WHAT: inline edit-mode controller — toggles static-vs-input cells, manages custom-line add/remove, discount bar, and the order modals.
+// CHANGE-GUARD: every function selects DOM by hardcoded element id (edit-mode-bar, edit-save-bar, discount-modal, fulfill-modal, etc.) — renaming those ids in the markup silently no-ops the buttons. toggleEditMode(false) RESETS custom lines and discount inputs; keep that cleanup if you add fields.
 // INVARIANT(S): disabled inputs are excluded from form submission (edit mode toggles .disabled), so non-edit-mode loads never POST qty/price overrides; Escape closes all modals via the keydown handler at the bottom.
   const editModeScript = `<script>
   function toggleEditMode(enable) {
@@ -2673,98 +2685,6 @@ function renderOrderDetail(session, order, flash, flashMsg) {
       if (b) { b.disabled = false; b.textContent = 'Record payment'; }
     }
   }
-  function toggleShipModal(show) {
-    const m = document.getElementById('ship-modal');
-    m.style.display = show ? 'flex' : 'none';
-    if (show) {
-      // Reset state
-      document.getElementById('ship-rates-area').style.display = 'none';
-      document.getElementById('ship-label-area').style.display = 'none';
-      document.getElementById('ship-error').style.display = 'none';
-      document.getElementById('ship-buy-btn').style.display = 'none';
-      document.getElementById('ship-get-rates-btn').style.display = 'inline-flex';
-    }
-  }
-  let _selectedRateId = null;
-// WHAT: client-side 'Get rates' — collects checked ship line items + fromId + weight and POSTs <path>/ship/rates, then renders a sorted radio list of carrier rates.
-// CHANGE-GUARD: weight defaults to 1 if blank/NaN (unit is whatever the shipping bridge expects — confirm lb vs oz before changing); rates are sorted ascending by shipping_amount.amount with 9999 as the missing-price sentinel. Auto-selects the cheapest. Re-test against the shipping bridge after field renames (rate_id, shipping_amount, carrier/service codes).
-// INVARIANT(S): _selectedRateId is set to the first/cheapest rate and updated on radio change — shipBuyLabel refuses to proceed without it.
-  async function shipGetRates() {
-    const btn = document.getElementById('ship-get-rates-btn');
-    const errEl = document.getElementById('ship-error');
-    errEl.style.display = 'none';
-    btn.disabled = true; btn.textContent = 'Fetching rates…';
-    const lis = [...document.querySelectorAll('#ship-modal input[name="ship_li[]"]:checked')].map(c => ({ id: c.value, quantity: parseInt(c.dataset.qty, 10) || 1 }));
-    const fromId = document.getElementById('ship-from').value;
-    const weight = parseFloat(document.getElementById('ship-weight').value) || 1;
-    try {
-      const r = await fetch(window.location.pathname + '/ship/rates', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ fromId, weight, lineItems: lis })
-      });
-      const j = await r.json();
-      if (!r.ok || j.error) throw new Error(j.error || 'rates failed');
-      const list = document.getElementById('ship-rates-list');
-      const rates = (j.rates || []).sort((a, b) => (a.shipping_amount?.amount || 9999) - (b.shipping_amount?.amount || 9999));
-      list.innerHTML = rates.length === 0 ? '<div class=\"text-muted\">No rates returned.</div>' :
-        rates.map(function(rt, i) {
-          var cost = (rt.shipping_amount && rt.shipping_amount.amount != null) ? rt.shipping_amount.amount.toFixed(2) : '?';
-          var days = (rt.delivery_days || rt.estimated_delivery_date) ? (rt.delivery_days ? rt.delivery_days + ' days' : '~' + rt.estimated_delivery_date) : '';
-          var checked = i === 0 ? 'checked' : '';
-          var carrier = rt.carrier_friendly_name || rt.carrier_code || '';
-          var service = rt.service_type || rt.service_code || '';
-          return '<label style=\"display:flex;align-items:center;gap:8px;padding:6px;border-bottom:1px solid #eee;font-size:13px;cursor:pointer\">' +
-            '<input type=\"radio\" name=\"ship_rate\" value=\"' + rt.rate_id + '\" ' + checked + ' onchange=\"_selectedRateId=this.value\">' +
-            '<strong style=\"flex:1\">' + service + '</strong>' +
-            '<span style=\"color:#888\">' + carrier + '</span>' +
-            '<span style=\"font-weight:600;min-width:60px;text-align:right\">$' + cost + '</span>' +
-            (days ? '<span style=\"color:#888;font-size:11px\">' + days + '</span>' : '') +
-            '</label>';
-        }).join('');
-      if (rates.length > 0) _selectedRateId = rates[0].rate_id;
-      document.getElementById('ship-rates-area').style.display = '';
-      document.getElementById('ship-buy-btn').style.display = 'inline-flex';
-      document.getElementById('ship-buy-btn').disabled = rates.length === 0;
-      btn.style.display = 'none';
-    } catch (e) {
-      errEl.textContent = 'Rates error: ' + e.message;
-      errEl.style.display = '';
-      btn.disabled = false; btn.textContent = 'Get rates';
-    }
-  }
-// WHAT: client-side 'Buy label + fulfill' — POSTs <path>/ship/label with the chosen rate_id + line items, then shows tracking + label link.
-// CHANGE-GUARD: the success copy distinguishes 'Fulfilled in Shopify' vs 'Shopify fulfill failed' purely from j.fulfillment_id presence — the server contract (tracking_number/tracking_url/label_url/carrier_code/fulfillment_id) must stay stable. Disables the button during purchase to avoid buying two labels.
-// INVARIANT(S): refuses without _selectedRateId; buying a label and fulfilling in Shopify are a single server action — the rule is fulfillment must follow the label (don't split them client-side).
-  async function shipBuyLabel() {
-    const btn = document.getElementById('ship-buy-btn');
-    const errEl = document.getElementById('ship-error');
-    errEl.style.display = 'none';
-    if (!_selectedRateId) { errEl.textContent = 'Pick a rate first'; errEl.style.display = ''; return; }
-    btn.disabled = true; btn.textContent = 'Buying label…';
-    const lis = [...document.querySelectorAll('#ship-modal input[name="ship_li[]"]:checked')].map(c => ({ id: c.value, quantity: parseInt(c.dataset.qty, 10) || 1 }));
-    try {
-      const r = await fetch(window.location.pathname + '/ship/label', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ rate_id: _selectedRateId, lineItems: lis })
-      });
-      const j = await r.json();
-      if (!r.ok || j.error) throw new Error(j.error || 'label failed');
-      const trackingEl = document.getElementById('ship-tracking-info');
-      var tUrl = j.tracking_url || '#';
-      var tNum = j.tracking_number || '(no number)';
-      var carrSeg = j.carrier_code ? ' &middot; ' + j.carrier_code : '';
-      var ffSeg = j.fulfillment_id ? ' &middot; Fulfilled in Shopify' : ' &middot; Shopify fulfill failed (see logs)';
-      trackingEl.innerHTML = 'Tracking: <a href=\"' + tUrl + '\" target=\"_blank\" rel=\"noopener\">' + tNum + '</a>' + carrSeg + ffSeg;
-      document.getElementById('ship-label-link').href = j.label_url;
-      document.getElementById('ship-label-area').style.display = '';
-      document.getElementById('ship-rates-area').style.display = 'none';
-      btn.style.display = 'none';
-    } catch (e) {
-      errEl.textContent = 'Buy label error: ' + e.message;
-      errEl.style.display = '';
-      btn.disabled = false; btn.textContent = 'Buy label + fulfill';
-    }
-  }
   document.addEventListener('keydown', e => {
     if (e.key === 'Escape') {
       document.getElementById('discount-modal').style.display = 'none';
@@ -2772,7 +2692,6 @@ function renderOrderDetail(session, order, flash, flashMsg) {
       document.getElementById('backorder-modal').style.display = 'none';
       document.getElementById('invoice-modal').style.display = 'none';
       const cm = document.getElementById('cancel-modal'); if (cm) cm.style.display = 'none';
-      const sm = document.getElementById('ship-modal'); if (sm) sm.style.display = 'none';
       const rpm = document.getElementById('record-payment-modal'); if (rpm) rpm.style.display = 'none';
     }
   });
@@ -2920,7 +2839,8 @@ function renderOrderDetail(session, order, flash, flashMsg) {
         </form>` : ''}
         ${canRecordPayment ? `<button type="button" class="btn btn-success" onclick="toggleRecordPaymentModal(true)" title="Record a manual payment (check, ACH, cash, etc.)">Record payment</button>` : ''}
         ${order.cancelledAt || order.displayFulfillmentStatus === 'FULFILLED' ? '' : `
-        <button class="btn btn-primary" onclick="toggleShipModal(true)" title="Buy a shipping label and fulfill this order">📦 Ship order</button>`}
+        <!-- DEPENDS: fww-shipping-bridge /ui parses this exact numeric order_id and opens the exact order independently of queue pagination. -->
+        <a class="btn btn-primary" href="https://shipping.fuzzyreporting.com/ui?order_id=${encodeURIComponent(numId)}" target="_blank" rel="noopener">Open in FWW Shipping ↗</a>`}
         <button id="edit-btn" class="btn btn-secondary" onclick="toggleEditMode(true)">Edit order</button>
         <button class="btn btn-secondary" onclick="toggleFulfillModal(true)">Fulfill items</button>
         <button class="btn btn-ghost" onclick="toggleDiscountModal(true)">Apply discount</button>
@@ -3818,13 +3738,14 @@ function renderOrderDetail(session, order, flash, flashMsg) {
                 ${/* CURRENT-FIELDS (2026-06-29): only CURRENTLY-active lines are fulfillable — a line removed
                       in a prior edit (currentQuantity 0) is no longer part of the order, so it's excluded from
                       the fulfill picker, and the max/value reflect currentQuantity not the frozen original. */''}
-                ${lineItems.filter(item => ((item.currentQuantity != null ? item.currentQuantity : item.quantity) || 0) > 0).map(item => {
-                  const cq = item.currentQuantity != null ? item.currentQuantity : (item.quantity || 0);
+                ${lineItems.filter(item => Number(item.unfulfilledQuantity ?? (order.displayFulfillmentStatus === 'FULFILLED' ? 0 : (item.currentQuantity ?? item.quantity ?? 0))) > 0).map(item => {
+                  const cq = Number(item.unfulfilledQuantity ?? item.currentQuantity ?? item.quantity ?? 0);
                   const bo = backorderMap.get(item.id);
                   return `<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;font-size:13px">
-                    <input type="checkbox" name="sel_${h(item.id)}" value="1" checked style="flex-shrink:0">
+                    <input type="checkbox" name="sel_${h(item.id)}" value="1" checked style="flex-shrink:0" onchange="var q=this.parentElement.querySelector('input[type=number]');q.disabled=!this.checked;q.value=this.checked?q.max:0">
                     <span style="flex:1">${h(item.title)}${bo ? ' <span class="badge badge-warning">Backorder</span>' : ''}</span>
-                    <input type="number" name="lineItems[${h(item.id)}]" value="${cq}" min="0" max="${cq}" style="width:60px">
+                    <span class="text-muted">${cq} remaining</span>
+                    <input type="number" name="lineItems[${h(item.id)}]" value="${cq}" min="1" max="${cq}" step="1" style="width:60px">
                   </div>`;
                 }).join('')}
               </div>
@@ -3932,60 +3853,6 @@ function renderOrderDetail(session, order, flash, flashMsg) {
             </form>
           </div>
         </div>` : ''}
-        ${/* Ship Order modal */''}<div id="ship-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center">
-          <div style="background:#fff;border-radius:8px;padding:24px;min-width:520px;max-width:640px;max-height:90vh;overflow-y:auto">
-            <h3 style="margin:0 0 16px;display:flex;align-items:center;gap:8px">📦 Ship order ${h(order.name)}</h3>
-            <div style="margin-bottom:14px">
-              <label style="display:block;font-size:13px;font-weight:500;margin-bottom:6px">Items to ship <span style="color:#999;font-weight:400;font-size:12px">(uncheck to split-ship later)</span></label>
-              <div style="border:1px solid #e5e5e5;border-radius:4px;padding:8px;max-height:160px;overflow-y:auto">
-                ${/* CURRENT-FIELDS (2026-06-29): ship only CURRENTLY-active lines — a removed line (currentQuantity 0)
-                      is no longer shippable, and the qty shown/posted is currentQuantity not the frozen original. */''}
-                ${(order.lineItems?.edges || []).filter(e => ((e.node.currentQuantity != null ? e.node.currentQuantity : e.node.quantity) || 0) > 0).map(e => {
-                  const cq = e.node.currentQuantity != null ? e.node.currentQuantity : (e.node.quantity || 0);
-                  return `
-                  <label style="display:flex;align-items:center;gap:8px;padding:4px 0;font-size:13px">
-                    <input type="checkbox" name="ship_li[]" value="${h(e.node.id || '')}" data-qty="${cq || 1}" checked>
-                    <span style="flex:1">${h(e.node.title || '—')} × ${cq}</span>
-                    <span class="text-muted" style="font-size:11px">${h(e.node.variant?.sku || '')}</span>
-                  </label>`;
-                }).join('')}
-              </div>
-            </div>
-            <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:14px">
-              <div>
-                <label style="display:block;font-size:13px;font-weight:500;margin-bottom:4px">Ship from</label>
-                <select id="ship-from" class="filter-select" style="width:100%">
-                  <option value="fww-hp">Fuzzywumpets — Highland Park</option>
-                  <option value="beth-hastings">Beth Hastings — Fuzzy South</option>
-                </select>
-              </div>
-              <div>
-                <label style="display:block;font-size:13px;font-weight:500;margin-bottom:4px">Package weight (lbs)</label>
-                <input type="number" id="ship-weight" value="1" min="0.1" step="0.1" class="filter-input" style="width:100%">
-              </div>
-            </div>
-            <div id="ship-rates-area" style="margin-bottom:14px;display:none">
-              <label style="display:block;font-size:13px;font-weight:500;margin-bottom:6px">Pick a rate</label>
-              <div id="ship-rates-list" style="border:1px solid #e5e5e5;border-radius:4px;padding:8px;max-height:240px;overflow-y:auto"></div>
-            </div>
-            <div id="ship-label-area" style="margin-bottom:14px;display:none">
-              <div style="background:#f1f7da;border:1px solid #9BBC0E;border-radius:6px;padding:12px;display:flex;align-items:center;gap:12px">
-                <span style="font-size:24px">✓</span>
-                <div style="flex:1">
-                  <div style="font-weight:600">Label purchased + order fulfilled</div>
-                  <div style="font-size:12px;color:#555" id="ship-tracking-info"></div>
-                </div>
-                <a id="ship-label-link" href="#" target="_blank" rel="noopener" class="btn btn-primary">Print Label PDF ↗</a>
-              </div>
-            </div>
-            <div id="ship-error" style="display:none;color:#c00;font-size:13px;margin-bottom:10px"></div>
-            <div style="display:flex;gap:8px;justify-content:flex-end">
-              <button type="button" class="btn btn-ghost" onclick="toggleShipModal(false)">Close</button>
-              <button type="button" id="ship-get-rates-btn" class="btn btn-secondary" onclick="shipGetRates()">Get rates</button>
-              <button type="button" id="ship-buy-btn" class="btn btn-primary" onclick="shipBuyLabel()" disabled style="display:none">Buy label + fulfill</button>
-            </div>
-          </div>
-        </div>
         ${/* Generate Invoice modal */''}<div id="invoice-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center">
           <div style="background:#fff;border-radius:8px;padding:24px;min-width:380px;max-width:500px">
             <h3 style="margin:0 0 16px">Generate Invoice</h3>
@@ -4083,7 +3950,7 @@ function renderOrderDetail(session, order, flash, flashMsg) {
           <div id="customer-replies-list"><p class="text-muted small-text">Loading…</p></div>
         </div>
         <div class="card">
-          <div class="card-header"><h2>Fulfillments</h2></div>
+          <div class="card-header"><h2>Fulfillments</h2><span class="text-muted small-text">${remainingQuantity} item${remainingQuantity === 1 ? '' : 's'} remaining</span></div>
           ${fulfillmentsHtml}
         </div>
       </div>
@@ -8173,135 +8040,6 @@ app.post('/orders/:id/discount', requireAuth, async (req, res) => {
   }
 });
 
-// Ship order — get rates via shipping bridge
-// WHAT: fetches live shipping rates from SHIPPING_BRIDGE_URL /rates for an order; body {fromId,weight,lineItems}; maps Shopify shippingAddress -> bridge addrToSS schema.
-// CHANGE-GUARD: weight defaults to 1 and units are hardcoded 'pound' — a mismatch with the bridge's expected unit silently mis-rates; residential:true is a deliberate B2B default; province is normalized via toStateCode().
-// INVARIANT(S): only rates with shipping_amount>0 are returned and amounts are normalized to {amount,currency:'usd'}; requires env SHIPPING_BRIDGE_URL + SHIPPING_BRIDGE_BEARER (bearer sent as Authorization header).
-app.post('/orders/:id/ship/rates', requireAuth, async (req, res) => {
-  const numId = req.params.id;
-  const { fromId = 'fww-hp', weight = 1, lineItems = [] } = req.body || {};
-  try {
-    const order = await getOrderDetail(numId);
-    if (!order) return res.status(404).json({ error: 'order not found' });
-    const ship = order.shippingAddress || {};
-    // Bridge expects: fromId (pinned id) + to (flat address obj using bridge's addrToSS schema) + package
-    const body = {
-      fromId: fromId,  // 'fww-hp' or 'beth-hastings' — bridge resolves to warehouse
-      to: {
-        name: `${ship.firstName || ''} ${ship.lastName || ''}`.trim() || order.customer?.displayName || '—',
-        phone: ship.phone || order.customer?.phone || '',
-        street1: ship.address1 || '',
-        street2: ship.address2 || '',
-        city: ship.city || '',
-        state: toStateCode(ship.province) || '',
-        postalCode: ship.zip || '',
-        country: (ship.country || 'United States') === 'United States' ? 'US' : (ship.country || '').slice(0,2),
-        residential: true,  // most B2B-portal customers ship to homes/small businesses; safe default
-      },
-      package: { weight: { value: parseFloat(weight) || 1, units: 'pound' } },
-    };
-    const r = await fetch(`${process.env.SHIPPING_BRIDGE_URL}/rates`, {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${process.env.SHIPPING_BRIDGE_BEARER}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-    const j = await r.json();
-    if (!r.ok) return res.status(r.status).json({ error: j.error || j.message || 'rates failed', detail: j });
-    const rates = j.rate_response?.rates || j.rates || [];
-    const normalized = rates.filter(rt => (typeof rt.shipping_amount === 'number' ? rt.shipping_amount : rt.shipping_amount?.amount) > 0).map(rt => ({
-      ...rt,
-      shipping_amount: typeof rt.shipping_amount === 'number'
-        ? { amount: rt.shipping_amount, currency: 'usd' }
-        : rt.shipping_amount,
-    }));
-    res.json({ rates: normalized });
-  } catch (err) {
-    console.error('ship rates error:', err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Ship order — buy label + auto-fulfill in Shopify
-// WHAT: buys a 4x6 PDF label via shipping-bridge then auto-fulfills the matched line items in Shopify with the returned tracking (USPS/UPS/FedEx mapped from carrier_code).
-// CHANGE-GUARD: fulfillment MUST follow the label (paid label with no Shopify fulfillment = silent drift); re-test the fulfillmentOrder line-item mapping and the carrier_code->company name map after any bridge or API-version change.
-// INVARIANT(S): label purchase is the source of truth — if fulfillmentCreate fails the label is already paid (logged, not refunded); only OPEN/IN_PROGRESS fulfillmentOrders are eligible; wantedQty is clamped to remainingQuantity; notifyCustomer:true here.
-app.post('/orders/:id/ship/label', requireAuth, async (req, res) => {
-  const numId = req.params.id;
-  const { rate_id, lineItems = [] } = req.body || {};
-  if (!rate_id) return res.status(400).json({ error: 'rate_id required' });
-  try {
-    // 1) Buy the label
-    const r = await fetch(`${process.env.SHIPPING_BRIDGE_URL}/label`, {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${process.env.SHIPPING_BRIDGE_BEARER}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ rate_id, label_format: 'pdf', label_layout: '4x6' }),
-    });
-    const j = await r.json();
-    if (!r.ok) return res.status(r.status).json({ error: j.error || j.message || 'label purchase failed', detail: j });
-    const label_url = j.label_download?.pdf || j.label_url || j.label_download?.href || '';
-    const tracking_number = j.tracking_number || '';
-    const carrier_code = j.carrier_code || '';
-    const tracking_url = j.tracking_url || (carrier_code === 'usps' ? `https://tools.usps.com/go/TrackConfirmAction?tLabels=${tracking_number}` : '');
-
-    auditLog(req.adminSession.email, 'ship_label_purchased', `gid://shopify/Order/${numId}`, null, { rate_id, tracking_number, carrier_code, cost: j.shipment_cost?.amount });
-
-    // 2) Auto-fulfill in Shopify with the tracking
-    let fulfillment_id = null;
-    try {
-      const orderId = `gid://shopify/Order/${numId}`;
-      const foRes = await shopifyFetch(`query($id:ID!){order(id:$id){
-        fulfillmentOrders(first:10){edges{node{
-          id status
-          lineItems(first:50){edges{node{id remainingQuantity lineItem{id title}}}}
-        }}}
-      }}`, { id: orderId });
-      const fos = foRes.data?.order?.fulfillmentOrders?.edges?.map(e => e.node) || [];
-      const liMap = {};
-      for (const fo of fos) {
-        if (fo.status !== 'OPEN' && fo.status !== 'IN_PROGRESS') continue;
-        for (const edge of fo.lineItems.edges) {
-          const foLi = edge.node;
-          const origId = foLi.lineItem?.id;
-          if (origId && foLi.remainingQuantity > 0) {
-            liMap[origId] = { foId: fo.id, foLiId: foLi.id, remaining: foLi.remainingQuantity };
-          }
-        }
-      }
-      const groupedByFo = {};
-      for (const li of lineItems) {
-        const mapping = liMap[li.id];
-        if (!mapping) continue;
-        const wantedQty = Math.min(li.quantity, mapping.remaining);
-        if (!groupedByFo[mapping.foId]) groupedByFo[mapping.foId] = [];
-        groupedByFo[mapping.foId].push({ id: mapping.foLiId, quantity: wantedQty });
-      }
-      const fulfillmentOrderInput = Object.entries(groupedByFo).map(([foId, items]) => ({ fulfillmentOrderId: foId, fulfillmentOrderLineItems: items }));
-      if (fulfillmentOrderInput.length > 0) {
-        const ffRes = await shopifyFetch(`mutation fulfill($f:FulfillmentInput!){
-          fulfillmentCreate(fulfillment:$f){fulfillment{id status} userErrors{field message}}
-        }`, { f: {
-          lineItemsByFulfillmentOrder: fulfillmentOrderInput,
-          trackingInfo: tracking_number ? { number: tracking_number, url: tracking_url, company: carrier_code === 'usps' ? 'USPS' : carrier_code === 'ups' ? 'UPS' : carrier_code === 'fedex' ? 'FedEx' : '' } : null,
-          notifyCustomer: true,
-        }});
-        const ffErrs = ffRes.data?.fulfillmentCreate?.userErrors || [];
-        if (ffErrs.length === 0) {
-          fulfillment_id = ffRes.data?.fulfillmentCreate?.fulfillment?.id;
-        } else {
-          console.error('ship label fulfill failed:', ffErrs.map(e => e.message).join(', '));
-        }
-      }
-    } catch (ffErr) {
-      console.error('ship label fulfill error:', ffErr.message);
-    }
-
-    res.json({ ok: true, label_url, tracking_number, tracking_url, carrier_code, fulfillment_id, cost: j.shipment_cost?.amount });
-  } catch (err) {
-    console.error('ship label error:', err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
-
 // Cancel order (calls Shopify orderCancel mutation)
 // WHAT: cancels an order via Shopify orderCancel; body flags restock/refund/notify are the literal string '1'; reason defaults to 'OTHER'.
 // CHANGE-GUARD: orderCancel runs async server-side (returns job{id}) — userErrors are checked but a returned job is NOT polled, so a queued-but-failed cancel still redirects success; reason must be a valid OrderCancelReason enum value.
@@ -8446,31 +8184,79 @@ app.post('/orders/:id/record-payment', requireAuth, async (req, res) => {
   }
 });
 
+// DEPENDS: the manual fulfillment route must consume every cursor page before
+// validating quantities; silently truncating either connection can fulfill the
+// wrong subset of a large order.
+async function getOpenFulfillmentOrderLines(orderId) {
+  const fulfillmentOrders = [];
+  let after = null;
+  do {
+    const result = await shopifyFetch(`query($id:ID!,$after:String){order(id:$id){
+      fulfillmentOrders(first:${LINE_PAGE_MAX},after:$after){pageInfo{hasNextPage endCursor} edges{node{
+        id status assignedLocation{location{id}}
+        lineItems(first:${LINE_PAGE_MAX}){pageInfo{hasNextPage endCursor} edges{node{id remainingQuantity lineItem{id title}}}}
+      }}}
+    }}`, { id: orderId, after });
+    const connection = result.data?.order?.fulfillmentOrders;
+    if (!connection?.edges) throw new Error('Could not load fulfillment orders');
+    fulfillmentOrders.push(...connection.edges.map(e => e.node));
+    after = connection.pageInfo?.hasNextPage ? connection.pageInfo.endCursor : null;
+  } while (after);
+
+  for (const fo of fulfillmentOrders) {
+    const edges = [...(fo.lineItems?.edges || [])];
+    let lineAfter = fo.lineItems?.pageInfo?.hasNextPage ? fo.lineItems.pageInfo.endCursor : null;
+    while (lineAfter) {
+      const result = await shopifyFetch(`query($id:ID!,$after:String){fulfillmentOrder(id:$id){
+        lineItems(first:${LINE_PAGE_MAX},after:$after){pageInfo{hasNextPage endCursor} edges{node{id remainingQuantity lineItem{id title}}}}
+      }}`, { id: fo.id, after: lineAfter });
+      const connection = result.data?.fulfillmentOrder?.lineItems;
+      if (!connection?.edges) throw new Error('Could not load fulfillment-order lines');
+      edges.push(...connection.edges);
+      lineAfter = connection.pageInfo?.hasNextPage ? connection.pageInfo.endCursor : null;
+    }
+    fo.lineItems = { edges };
+  }
+  return fulfillmentOrders.filter(fo => fo.status === 'OPEN' || fo.status === 'IN_PROGRESS');
+}
+
 // 16C: Partial fulfillment
-// WHAT: 16C partial fulfillment — body liRaw{lineItemId:qty}; real mode maps original lineItem ids to OPEN/IN_PROGRESS fulfillmentOrder line items then fulfillmentCreate with optional tracking.
-// CHANGE-GUARD: wantedQty is clamped to mapping.remaining; lines with no FO map are skipped with a warn (silent partial); fulfillBackorder() is called per requested li after success to clear backorder flags — keep that loop.
-// INVARIANT(S): throws 'No matching open fulfillment orders' if nothing maps; fulfillmentOrders query is capped first:10 / lineItems first:50 — orders exceeding those page sizes silently drop lines (see bugs[]).
+// WHAT: validates requested quantities against fresh Shopify remaining quantities, allocates exact fulfillment-order line IDs, and creates one fulfillment per location.
 app.post('/orders/:id/fulfill', requireAuth, async (req, res) => {
   const numId   = req.params.id;
   const session = req.adminSession;
   const { lineItems: liRaw, trackingCompany, trackingNumber, notifyCustomer } = req.body;
   // liRaw: { lineItemId: qty, ... } or { 'li1': '2', 'li2': '3' }
-  const lineItemsMap = Object.fromEntries(
-    Object.entries(liRaw || {}).map(([k, v]) => [k, parseInt(v, 10) || 0]).filter(([,qty]) => qty > 0)
-  );
+  const requested = Object.entries(liRaw || {}).map(([k, v]) => [k, Number(v)]);
+  if (requested.some(([, qty]) => !Number.isInteger(qty) || qty < 0)) {
+    return res.redirect(`/orders/${numId}?error=fulfillment_failed&msg=${encodeURIComponent('Quantities must be positive whole numbers.')}`);
+  }
+  const lineItemsMap = Object.fromEntries(requested.filter(([, qty]) => qty > 0));
   if (!Object.keys(lineItemsMap).length) return res.redirect(`/orders/${numId}?error=no_items_selected`);
 
   if (MOCK) {
     const order = getMockOrder(numId);
     if (!order) return res.status(404).json({ error: 'not found' });
+    const byId = new Map((order.lineItems?.edges || []).map(e => [e.node.id, e.node]));
+    for (const [lineId, qty] of Object.entries(lineItemsMap)) {
+      const item = byId.get(lineId);
+      const remaining = Number(item?.unfulfilledQuantity ?? (order.displayFulfillmentStatus === 'FULFILLED' ? 0 : (item?.currentQuantity ?? item?.quantity ?? 0)));
+      if (!item || qty > remaining) {
+        return res.redirect(`/orders/${numId}?error=fulfillment_failed&msg=${encodeURIComponent(`Stale quantity for ${lineId}: requested ${qty}, only ${Math.max(0, remaining || 0)} remains`)}`);
+      }
+    }
     const overrides = mockOrderOverrides.get(numId) || {};
     const tracking = trackingNumber ? [{ number: trackingNumber, url: null, company: trackingCompany || '' }] : [];
     const existingFulfillments = overrides.fulfillments || order.fulfillments || [];
     overrides.fulfillments = [...existingFulfillments, {
       status: 'SUCCESS', trackingInfo: tracking, createdAt: new Date().toISOString(),
-      lineItemIds: Object.keys(lineItemsMap),
+      fulfillmentLineItems: { nodes: Object.entries(lineItemsMap).map(([lineId, quantity]) => ({ quantity, lineItem: { id: lineId, title: byId.get(lineId)?.title || lineId, sku: byId.get(lineId)?.variant?.sku || '' } })) },
     }];
-    overrides.displayFulfillmentStatus = 'PARTIALLY_FULFILLED';
+    overrides.lineItems = { edges: (order.lineItems?.edges || []).map(e => ({ node: {
+      ...e.node,
+      unfulfilledQuantity: Math.max(0, Number(e.node.unfulfilledQuantity ?? e.node.currentQuantity ?? e.node.quantity ?? 0) - (lineItemsMap[e.node.id] || 0)),
+    } })) };
+    overrides.displayFulfillmentStatus = overrides.lineItems.edges.some(e => e.node.unfulfilledQuantity > 0) ? 'PARTIALLY_FULFILLED' : 'FULFILLED';
     // Mark backorders as fulfilled for matched lines
     for (const liId of Object.keys(lineItemsMap)) {
       fulfillBackorder(`gid://shopify/Order/${numId}`, liId);
@@ -8485,56 +8271,57 @@ app.post('/orders/:id/fulfill', requireAuth, async (req, res) => {
     const orderId    = `gid://shopify/Order/${numId}`;
     const trackInput = trackingNumber ? { company: trackingCompany || '', number: trackingNumber, url: null } : null;
 
-    // Step 1: fetch fulfillmentOrders for this order + their line items, map original lineItemId -> fulfillmentOrderLineItem
-    const foRes = await shopifyFetch(`query($id:ID!){order(id:$id){
-      fulfillmentOrders(first:10){edges{node{
-        id status
-        lineItems(first:50){edges{node{id remainingQuantity lineItem{id title}}}}
-      }}}
-    }}`, { id: orderId });
-    const fos = foRes.data?.order?.fulfillmentOrders?.edges?.map(e => e.node) || [];
-    // Find OPEN/IN_PROGRESS fulfillmentOrders, build map original_li_id -> { fulfillmentOrderId, foLineItemId, remaining }
+    const fos = await getOpenFulfillmentOrderLines(orderId);
     const liMap = {};
     for (const fo of fos) {
-      if (fo.status !== 'OPEN' && fo.status !== 'IN_PROGRESS') continue;
       for (const edge of fo.lineItems.edges) {
         const foLi = edge.node;
         const origId = foLi.lineItem?.id;
         if (origId && foLi.remainingQuantity > 0) {
-          liMap[origId] = { foId: fo.id, foLiId: foLi.id, remaining: foLi.remainingQuantity };
+          if (!liMap[origId]) liMap[origId] = [];
+          liMap[origId].push({ foId: fo.id, foLiId: foLi.id, remaining: Number(foLi.remainingQuantity), locationId: fo.assignedLocation?.location?.id || 'unassigned' });
         }
       }
     }
 
-    // Step 2: group requested line items by fulfillmentOrderId
-    const groupedByFo = {};
+    // Reject stale/excess requests. Never clamp: the operator must review the
+    // fresh remainder instead of silently shipping a different quantity.
+    const groupedByLocation = {};
+    const fulfilledLineIds = [];
     for (const [origLiId, qty] of Object.entries(lineItemsMap)) {
-      const mapping = liMap[origLiId];
-      if (!mapping) { console.warn('[fulfill] no FO map for', origLiId); continue; }
-      const wantedQty = Math.min(qty, mapping.remaining);
-      if (!groupedByFo[mapping.foId]) groupedByFo[mapping.foId] = [];
-      groupedByFo[mapping.foId].push({ id: mapping.foLiId, quantity: wantedQty });
+      const mappings = liMap[origLiId] || [];
+      const available = mappings.reduce((sum, m) => sum + m.remaining, 0);
+      if (available < qty) throw new Error(`Stale quantity for ${origLiId}: requested ${qty}, only ${available} remains`);
+      let left = qty;
+      for (const mapping of mappings) {
+        if (left <= 0) break;
+        const take = Math.min(left, mapping.remaining);
+        const byFo = groupedByLocation[mapping.locationId] ||= {};
+        (byFo[mapping.foId] ||= []).push({ id: mapping.foLiId, quantity: take });
+        left -= take;
+      }
+      fulfilledLineIds.push(origLiId);
     }
-    const fulfillmentOrderInput = Object.entries(groupedByFo).map(([foId, items]) => ({
-      fulfillmentOrderId: foId,
-      fulfillmentOrderLineItems: items,
-    }));
-    if (fulfillmentOrderInput.length === 0) throw new Error('No matching open fulfillment orders');
 
-    const result = await shopifyFetch(`mutation fulfill($f:FulfillmentInput!){
-      fulfillmentCreate(fulfillment:$f){fulfillment{id status} userErrors{field message}}
-    }`, { f: { lineItemsByFulfillmentOrder: fulfillmentOrderInput, trackingInfo: trackInput, notifyCustomer: !!notifyCustomer } });
-    const errs = result.data?.fulfillmentCreate?.userErrors || [];
-    if (errs.length) throw new Error(errs.map(e => e.message).join(', '));
-    // Mark any matching backorders as fulfilled
-    for (const liId of Object.keys(lineItemsMap)) {
+    if (!Object.keys(groupedByLocation).length) throw new Error('No matching open fulfillment orders');
+    for (const byFo of Object.values(groupedByLocation)) {
+      const lineItemsByFulfillmentOrder = Object.entries(byFo).map(([fulfillmentOrderId, fulfillmentOrderLineItems]) => ({ fulfillmentOrderId, fulfillmentOrderLineItems }));
+      const result = await shopifyFetch(`mutation fulfill($f:FulfillmentInput!){
+        fulfillmentCreate(fulfillment:$f){fulfillment{id status} userErrors{field message}}
+      }`, { f: { lineItemsByFulfillmentOrder, trackingInfo: trackInput, notifyCustomer: !!notifyCustomer } });
+      const errs = result.data?.fulfillmentCreate?.userErrors || [];
+      if (errs.length) throw new Error(errs.map(e => e.message).join(', '));
+    }
+    // Only explicitly fulfilled lines lose their backorder flag; skipped lines
+    // remain backordered for the next parcel.
+    for (const liId of fulfilledLineIds) {
       fulfillBackorder(orderId, liId);
     }
     auditLog(session.email, 'order_fulfill', orderId, null, { lineItems: lineItemsMap, trackingNumber });
     res.redirect(`/orders/${numId}?success=fulfilled`);
   } catch (err) {
     console.error('fulfillment error:', err.message);
-    res.redirect(`/orders/${numId}?error=fulfillment_failed`);
+    res.redirect(`/orders/${numId}?error=fulfillment_failed&msg=${encodeURIComponent(String(err.message || '').slice(0, 240))}`);
   }
 });
 
