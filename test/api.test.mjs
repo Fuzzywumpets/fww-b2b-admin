@@ -4,6 +4,7 @@
  */
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
+import { readFile } from 'node:fs/promises';
 
 const BASE = process.env.TEST_BASE || 'http://127.0.0.1:8894';
 
@@ -2794,19 +2795,71 @@ await test('POST /orders/1002/discount → applies discount and redirects', asyn
   assert.ok(res.headers.get('location')?.includes('discount_applied'), 'Should have success flash');
 });
 
-await test('POST /orders/1003/fulfill → records fulfillment and redirects', async () => {
+await test('partial order detail shows exact shipping handoff, history, and truthful remaining state', async () => {
   const cookie = await seedSession();
+  const res = await fetch(`${BASE}/orders/1004`, { headers: { Cookie: cookie } });
+  const html = await res.text();
+  assert.equal(res.status, 200);
+  assert.ok(html.includes('https://shipping.fuzzyreporting.com/ui?order_id=1004'));
+  assert.ok(!html.includes('ship-modal') && !html.includes('/ship/rates') && !html.includes('/ship/label'), 'obsolete in-Admin label workflow must not render');
+  assert.ok(html.includes('10 items remaining'));
+  assert.ok(html.includes('Everyday Collar') && html.includes('TRACK456'));
+  assert.ok(!/tl-step tl-done[^>]*>Fulfilled</.test(html), 'partial fulfillment must not complete the timeline');
+  assert.match(html, /name="lineItems\[li5\]" value="5" min="1" max="5"/);
+});
+
+await test('obsolete in-Admin shipping routes are removed after bridge handoff', async () => {
+  const cookie = await seedSession();
+  const rates = await postJson('/orders/1004/ship/rates', cookie, {});
+  const label = await postJson('/orders/1004/ship/label', cookie, { rate_id: 'old-contract' });
+  assert.equal(rates.status, 404);
+  assert.equal(label.status, 404);
+});
+
+await test('POST /orders/1004/fulfill rejects a stale/excess quantity instead of clamping', async () => {
+  const cookie = await seedSession();
+  const res = await postForm('/orders/1004/fulfill', cookie, { 'lineItems[li5]': '99' });
+  assert.ok(res.headers.get('location')?.includes('error=fulfillment_failed'));
+  assert.ok(res.headers.get('location')?.includes('Stale'));
+});
+
+await test('manual fulfillment source bounds nested query cost and rejects stuck pagination cursors', async () => {
+  const source = await readFile(new URL('../server.mjs', import.meta.url), 'utf8');
+  const helper = source.match(/async function getOpenFulfillmentOrderLines[\s\S]*?return fulfillmentOrders\.filter/iu)?.[0] || '';
+  assert.match(helper, /fulfillmentOrders\(first:10,/u, 'fulfillment-order page must be bounded');
+  assert.match(helper, /lineItems\(first:10\)/u, 'nested first-page line query must be bounded');
+  assert.doesNotMatch(helper, /fulfillmentOrders\(first:\$\{LINE_PAGE_MAX\}/u, 'nested query must not exceed Shopify cost limit');
+  assert.match(source, /if \(!next \|\| next === previous\) throw new Error/u, 'pagination must reject missing or repeated cursors');
+});
+
+await test('POST /orders/1004/fulfill → records only the selected remaining quantity', async () => {
+  const cookie = await seedSession();
+  await postForm('/orders/1004/backorder', cookie, { lineItemId: 'li5', lineItemTitle: 'Everyday Collar', quantity: '5' });
   const body = new URLSearchParams({
-    'lineItems[li4]': '5',
+    'lineItems[li5]': '2',
     trackingCompany: 'USPS',
     trackingNumber: 'TEST123',
   });
-  const res = await fetch(`${BASE}/orders/1003/fulfill`, {
+  const res = await fetch(`${BASE}/orders/1004/fulfill`, {
     method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
     body: body.toString(), redirect: 'manual',
   });
   assert.ok([301, 302].includes(res.status), 'Should redirect after fulfill');
   assert.ok(res.headers.get('location')?.includes('fulfilled'), 'Should have success flash');
+  const detail = await fetch(`${BASE}/orders/1004`, { headers: { Cookie: cookie } });
+  const html = await detail.text();
+  assert.ok(html.includes('8 items remaining'));
+  assert.ok(html.includes('Everyday Collar') && html.includes('× 2'));
+  const partialBackorders = await fetch(`${BASE}/api/orders/1004/backorders`, { headers: { Cookie: cookie } }).then(r => r.json());
+  assert.ok(partialBackorders.backorders.some(b => b.line_item_id === 'li5' && b.status === 'pending'), 'partial shipment must keep the line backordered');
+});
+
+await test('shipping the full remaining quantity clears the matching backorder', async () => {
+  const cookie = await seedSession();
+  const res = await postForm('/orders/1004/fulfill', cookie, { 'lineItems[li5]': '3' });
+  assert.ok(res.headers.get('location')?.includes('fulfilled'));
+  const backorders = await fetch(`${BASE}/api/orders/1004/backorders`, { headers: { Cookie: cookie } }).then(r => r.json());
+  assert.ok(!backorders.backorders.some(b => b.line_item_id === 'li5' && b.status === 'pending'), 'full remainder must clear the line backorder');
 });
 
 await test('POST /orders/1001/backorder → flags backorder in SQLite', async () => {
