@@ -2,8 +2,11 @@ import { chromium } from 'playwright';
 import { spawn } from 'node:child_process';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
-const base='http://127.0.0.1:8905';
-const server=spawn(process.execPath,['server.mjs'],{env:{...process.env,PORT:'8905',B2B_ADMIN_MOCK:'1'},stdio:'ignore'});
+// DEPENDS: the Brain's Jarvis text console owns 8905, so CI/operators can
+// select a collision-free port without changing this browser contract.
+const testPort=process.env.SHIPPING_UI_TEST_PORT || '8905';
+const base=`http://127.0.0.1:${testPort}`;
+const server=spawn(process.execPath,['server.mjs'],{env:{...process.env,PORT:testPort,B2B_ADMIN_MOCK:'1'},stdio:'ignore'});
 let browser;
 try {
  for(let i=0;i<60;i++){try{if((await fetch(base+'/healthz')).ok)break;}catch{} await new Promise(r=>setTimeout(r,100));}
