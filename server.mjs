@@ -55,7 +55,7 @@ import { cacheRowTotal, listRowTotalAmount, restRowCurrentTotals } from './lib/o
 import { LINE_PAGE_MAX, drainLineItems } from './lib/line-item-paging.mjs';
 import { renderLabelSheet, expandItems, TEMPLATES as LABEL_TEMPLATES, DEFAULT_FIELDS } from './labels.mjs';
 import { isInsider, resolveXeroContact, syncCustomerToXero, getXeroSyncStatus } from './lib/xero-customer-sync.mjs';
-import { parseLinePrices, applyLinePriceChanges, bulkMarkOrdersPaid, addLineDiscountsBatched } from './lib/order-money.mjs';
+import { parseLinePrices, applyLinePriceChanges, bulkMarkOrdersPaid, addLineDiscountsConcurrent } from './lib/order-money.mjs';
 import { assertNoUserErrors } from './lib/shopify-user-errors.mjs';
 import { currentShippingAmount, findShippingInvoice, parseShippingAmount, stageShippingReplacement } from './lib/order-shipping.mjs';
 import { createCreditCardInvoice } from './helcim.mjs';
@@ -3720,9 +3720,8 @@ function renderOrderDetail(session, order, flash, flashMsg) {
                     applying = true;
                     if (btn){ btn.disabled = true; btn.textContent = 'Applying…'; }
                     setDiscChip('saving'); inflight++; setPill();
-                    // DEPENDS: server-side discount staging batches large orders, but Shopify still
-                    // executes every aliased mutation field serially. #39355 has 286 active lines;
-                    // the ordinary 30s request ceiling aborted its valid atomic edit before commit.
+                    // DEPENDS: server-side discount staging uses bounded concurrent requests for
+                    // large orders. #39355 has 286 active lines, so allow the complete atomic edit.
                     post('/orders/' + ORDER_ID + '/discount/order', { idemKey: idemKey, discountPct: pct||'', discountFixed: fixed||'', discountReason: reason }, 600000).then(function(res){
                       inflight--; applying = false;
                       if (btn){ btn.disabled = false; btn.textContent = 'Apply discount'; }
@@ -6999,15 +6998,18 @@ async function stageOrderDiscount(calcId, ctx, { pct, fixed, reason }) {
     ctx.warnings.push(`a fixed $ discount is applied as ${effPct}% across ${eligible.length} lines, landing at ${fmtMoney(expectedAmt)}`);
   }
 
-  // LARGE-ORDER SAFETY: one request per line timed out on #39355 (286 active lines) before commit.
-  // Aliased chunks preserve Shopify's serial mutation semantics while collapsing 286 HTTP round
-  // trips to 29 smaller batches. Any batch error throws, so runOrderEdit abandons the calculated
-  // order atomically. Ten aliases stays below the 15s failure seen with the first 20-alias attempt.
+  // LARGE-ORDER SAFETY: Shopify executes aliased mutations serially, so both 20- and 10-alias
+  // batches timed out on #39355. Independent requests against one OPEN calculated order are run at
+  // a bounded 24-way pipeline. Full staging succeeded; earlier probe timeouts were outside the
+  // write helper, so reducing concurrency only made the edit slower.
+  // DEPENDS: runOrderEdit supplies Shopify's returned sessionId; legacy batch edits use calcId.
+  // The helper waits for all requests; any error makes runOrderEdit
+  // abandon that calculated order without committing any of its staged changes.
   try {
-    await addLineDiscountsBatched({
-      shopifyFetch, calcId, lines: eligible,
+    await addLineDiscountsConcurrent({
+      shopifyFetch, calcId: ctx.sessionId || calcId, lines: eligible,
       discount: { percentValue: effPct, description },
-      batchSize: 10,
+      concurrency: 24,
       fetchTimeoutMs: 60000,
     });
   } catch (err) {
@@ -7075,7 +7077,7 @@ async function runOrderEdit(orderId, idemKey, editedBy, action, payload, stageFn
       const beginResult = await shopifyFetch(`
         mutation begin($id:ID!){orderEditBegin(id:$id){
           calculatedOrder{ id lineItems(first:${LINE_PAGE_MAX}){ pageInfo{hasNextPage endCursor} edges{node{ ${CALC_LINE_FIELDS} }}} }
-          userErrors{field message}
+          orderEditSession{id} userErrors{field message}
         }}
       `, { id: orderId });
       const beginErrs = beginResult.data?.orderEditBegin?.userErrors || [];
@@ -7089,14 +7091,17 @@ async function runOrderEdit(orderId, idemKey, editedBy, action, payload, stageFn
       const calcItems = await drainLineItems(calcOrder.lineItems, 'calculated order',
         calcLineItemsPage(calcId, CALC_LINE_FIELDS));
 
-      const ctx = { calcOrder, calcItems, warnings: [] };
+      const ctx = { calcOrder, calcItems, sessionId: beginResult.data?.orderEditBegin?.orderEditSession?.id, warnings: [] };
+      const stageStarted = Date.now();
       await stageFn(calcId, ctx);
+      console.log(`[order-edit] STAGED action=${action} order=${orderId} elapsedMs=${Date.now() - stageStarted}`);
 
       // Commit — and ACTUALLY READ userErrors (this is the bug the user hit).
       const commitRes = await shopifyFetch(`mutation commit($id:ID!,$notify:Boolean!,$note:String){
         orderEditCommit(id:$id,notifyCustomer:$notify,staffNote:$note){
           order{id} userErrors{field message}}}`,
-        { id: calcId, notify: false, note: payload?.staffNote || null });
+        { id: calcId, notify: false, note: payload?.staffNote || null },
+        { timeoutMs: action === 'discount/order' ? 60000 : 15000 });
       const cErrs = commitRes.data?.orderEditCommit?.userErrors || [];
       if (cErrs.length) {
         // NO-OP IS NOT A FAILURE (P0 regression fix, 2026-06-29): Shopify returns
