@@ -4,6 +4,7 @@
  */
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
+import { readFile } from 'node:fs/promises';
 
 const BASE = process.env.TEST_BASE || 'http://127.0.0.1:8894';
 
@@ -2883,8 +2884,18 @@ await test('POST /orders/1004/fulfill rejects a stale/excess quantity instead of
   assert.ok(res.headers.get('location')?.includes('Stale'));
 });
 
+await test('manual fulfillment source bounds nested query cost and rejects stuck pagination cursors', async () => {
+  const source = await readFile(new URL('../server.mjs', import.meta.url), 'utf8');
+  const helper = source.match(/async function getOpenFulfillmentOrderLines[\s\S]*?return fulfillmentOrders\.filter/iu)?.[0] || '';
+  assert.match(helper, /fulfillmentOrders\(first:10,/u, 'fulfillment-order page must be bounded');
+  assert.match(helper, /lineItems\(first:10\)/u, 'nested first-page line query must be bounded');
+  assert.doesNotMatch(helper, /fulfillmentOrders\(first:\$\{LINE_PAGE_MAX\}/u, 'nested query must not exceed Shopify cost limit');
+  assert.match(source, /if \(!next \|\| next === previous\) throw new Error/u, 'pagination must reject missing or repeated cursors');
+});
+
 await test('POST /orders/1004/fulfill → records only the selected remaining quantity', async () => {
   const cookie = await seedSession();
+  await postForm('/orders/1004/backorder', cookie, { lineItemId: 'li5', lineItemTitle: 'Everyday Collar', quantity: '5' });
   const body = new URLSearchParams({
     'lineItems[li5]': '2',
     trackingCompany: 'USPS',
@@ -2900,6 +2911,16 @@ await test('POST /orders/1004/fulfill → records only the selected remaining qu
   const html = await detail.text();
   assert.ok(html.includes('8 items remaining'));
   assert.ok(html.includes('Everyday Collar') && html.includes('× 2'));
+  const partialBackorders = await fetch(`${BASE}/api/orders/1004/backorders`, { headers: { Cookie: cookie } }).then(r => r.json());
+  assert.ok(partialBackorders.backorders.some(b => b.line_item_id === 'li5' && b.status === 'pending'), 'partial shipment must keep the line backordered');
+});
+
+await test('shipping the full remaining quantity clears the matching backorder', async () => {
+  const cookie = await seedSession();
+  const res = await postForm('/orders/1004/fulfill', cookie, { 'lineItems[li5]': '3' });
+  assert.ok(res.headers.get('location')?.includes('fulfilled'));
+  const backorders = await fetch(`${BASE}/api/orders/1004/backorders`, { headers: { Cookie: cookie } }).then(r => r.json());
+  assert.ok(!backorders.backorders.some(b => b.line_item_id === 'li5' && b.status === 'pending'), 'full remainder must clear the line backorder');
 });
 
 await test('POST /orders/1001/backorder → flags backorder in SQLite', async () => {

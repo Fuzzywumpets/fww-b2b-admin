@@ -8159,25 +8159,32 @@ app.post('/orders/:id/record-payment', requireAuth, async (req, res) => {
 // DEPENDS: the manual fulfillment route must consume every cursor page before
 // validating quantities; silently truncating either connection can fulfill the
 // wrong subset of a large order.
+function nextFulfillmentCursor(pageInfo, previous, label) {
+  if (!pageInfo?.hasNextPage) return null;
+  const next = pageInfo.endCursor;
+  if (!next || next === previous) throw new Error(`${label} pagination did not advance`);
+  return next;
+}
+
 async function getOpenFulfillmentOrderLines(orderId) {
   const fulfillmentOrders = [];
   let after = null;
   do {
     const result = await shopifyFetch(`query($id:ID!,$after:String){order(id:$id){
-      fulfillmentOrders(first:${LINE_PAGE_MAX},after:$after){pageInfo{hasNextPage endCursor} edges{node{
+      fulfillmentOrders(first:10,after:$after){pageInfo{hasNextPage endCursor} edges{node{
         id status assignedLocation{location{id}}
-        lineItems(first:${LINE_PAGE_MAX}){pageInfo{hasNextPage endCursor} edges{node{id remainingQuantity lineItem{id title}}}}
+        lineItems(first:10){pageInfo{hasNextPage endCursor} edges{node{id remainingQuantity lineItem{id title}}}}
       }}}
     }}`, { id: orderId, after });
     const connection = result.data?.order?.fulfillmentOrders;
     if (!connection?.edges) throw new Error('Could not load fulfillment orders');
     fulfillmentOrders.push(...connection.edges.map(e => e.node));
-    after = connection.pageInfo?.hasNextPage ? connection.pageInfo.endCursor : null;
+    after = nextFulfillmentCursor(connection.pageInfo, after, 'Fulfillment-order');
   } while (after);
 
   for (const fo of fulfillmentOrders) {
     const edges = [...(fo.lineItems?.edges || [])];
-    let lineAfter = fo.lineItems?.pageInfo?.hasNextPage ? fo.lineItems.pageInfo.endCursor : null;
+    let lineAfter = nextFulfillmentCursor(fo.lineItems?.pageInfo, null, 'Fulfillment-order line');
     while (lineAfter) {
       const result = await shopifyFetch(`query($id:ID!,$after:String){fulfillmentOrder(id:$id){
         lineItems(first:${LINE_PAGE_MAX},after:$after){pageInfo{hasNextPage endCursor} edges{node{id remainingQuantity lineItem{id title}}}}
@@ -8185,7 +8192,7 @@ async function getOpenFulfillmentOrderLines(orderId) {
       const connection = result.data?.fulfillmentOrder?.lineItems;
       if (!connection?.edges) throw new Error('Could not load fulfillment-order lines');
       edges.push(...connection.edges);
-      lineAfter = connection.pageInfo?.hasNextPage ? connection.pageInfo.endCursor : null;
+      lineAfter = nextFulfillmentCursor(connection.pageInfo, lineAfter, 'Fulfillment-order line');
     }
     fo.lineItems = { edges };
   }
@@ -8229,9 +8236,12 @@ app.post('/orders/:id/fulfill', requireAuth, async (req, res) => {
       unfulfilledQuantity: Math.max(0, Number(e.node.unfulfilledQuantity ?? e.node.currentQuantity ?? e.node.quantity ?? 0) - (lineItemsMap[e.node.id] || 0)),
     } })) };
     overrides.displayFulfillmentStatus = overrides.lineItems.edges.some(e => e.node.unfulfilledQuantity > 0) ? 'PARTIALLY_FULFILLED' : 'FULFILLED';
-    // Mark backorders as fulfilled for matched lines
-    for (const liId of Object.keys(lineItemsMap)) {
-      fulfillBackorder(`gid://shopify/Order/${numId}`, liId);
+    // A partial parcel does not resolve the line's backorder. Clear it only
+    // when this fulfillment consumes the entire pre-shipment remainder.
+    for (const [liId, qty] of Object.entries(lineItemsMap)) {
+      const item = byId.get(liId);
+      const remaining = Number(item?.unfulfilledQuantity ?? (order.displayFulfillmentStatus === 'FULFILLED' ? 0 : (item?.currentQuantity ?? item?.quantity ?? 0)));
+      if (qty === remaining) fulfillBackorder(`gid://shopify/Order/${numId}`, liId);
     }
     mockOrderOverrides.set(numId, overrides);
     auditLog(session.email, 'order_fulfill', `gid://shopify/Order/${numId}`, null, { lineItems: lineItemsMap, trackingNumber });
@@ -8239,8 +8249,12 @@ app.post('/orders/:id/fulfill', requireAuth, async (req, res) => {
   }
 
   // Real mode: fulfillmentCreate with FulfillmentV2Input + fulfillmentOrderId lookup
+  const orderId = `gid://shopify/Order/${numId}`;
+  const committedLocations = [];
+  const committedLineQuantities = new Map();
+  const fullySelectedLineIds = new Set();
+  let failedLocation = null;
   try {
-    const orderId    = `gid://shopify/Order/${numId}`;
     const trackInput = trackingNumber ? { company: trackingCompany || '', number: trackingNumber, url: null } : null;
 
     const fos = await getOpenFulfillmentOrderLines(orderId);
@@ -8259,7 +8273,7 @@ app.post('/orders/:id/fulfill', requireAuth, async (req, res) => {
     // Reject stale/excess requests. Never clamp: the operator must review the
     // fresh remainder instead of silently shipping a different quantity.
     const groupedByLocation = {};
-    const fulfilledLineIds = [];
+    const lineQuantitiesByLocation = {};
     for (const [origLiId, qty] of Object.entries(lineItemsMap)) {
       const mappings = liMap[origLiId] || [];
       const available = mappings.reduce((sum, m) => sum + m.remaining, 0);
@@ -8270,29 +8284,53 @@ app.post('/orders/:id/fulfill', requireAuth, async (req, res) => {
         const take = Math.min(left, mapping.remaining);
         const byFo = groupedByLocation[mapping.locationId] ||= {};
         (byFo[mapping.foId] ||= []).push({ id: mapping.foLiId, quantity: take });
+        const byLine = lineQuantitiesByLocation[mapping.locationId] ||= {};
+        byLine[origLiId] = (byLine[origLiId] || 0) + take;
         left -= take;
       }
-      fulfilledLineIds.push(origLiId);
+      if (qty === available) fullySelectedLineIds.add(origLiId);
     }
 
     if (!Object.keys(groupedByLocation).length) throw new Error('No matching open fulfillment orders');
-    for (const byFo of Object.values(groupedByLocation)) {
+    // One mutation per Shopify location. If a later location fails, earlier
+    // successes are already real and must still be audited and reflected in
+    // backorder state before the operator retries the remainder.
+    // SYNC: the committedLineQuantities accounting below must match the exact
+    // lineItemsByFulfillmentOrder input sent by this loop.
+    for (const [locationId, byFo] of Object.entries(groupedByLocation)) {
+      failedLocation = locationId;
       const lineItemsByFulfillmentOrder = Object.entries(byFo).map(([fulfillmentOrderId, fulfillmentOrderLineItems]) => ({ fulfillmentOrderId, fulfillmentOrderLineItems }));
       const result = await shopifyFetch(`mutation fulfill($f:FulfillmentInput!){
         fulfillmentCreate(fulfillment:$f){fulfillment{id status} userErrors{field message}}
       }`, { f: { lineItemsByFulfillmentOrder, trackingInfo: trackInput, notifyCustomer: !!notifyCustomer } });
       const errs = result.data?.fulfillmentCreate?.userErrors || [];
       if (errs.length) throw new Error(errs.map(e => e.message).join(', '));
+      committedLocations.push(locationId);
+      for (const [lineId, qty] of Object.entries(lineQuantitiesByLocation[locationId] || {})) {
+        committedLineQuantities.set(lineId, (committedLineQuantities.get(lineId) || 0) + qty);
+      }
+      failedLocation = null;
     }
-    // Only explicitly fulfilled lines lose their backorder flag; skipped lines
-    // remain backordered for the next parcel.
-    for (const liId of fulfilledLineIds) {
-      fulfillBackorder(orderId, liId);
+    // Only a line whose entire fresh remainder committed loses its backorder
+    // flag. Skipped and partially shipped lines remain open for another parcel.
+    for (const liId of fullySelectedLineIds) {
+      if (committedLineQuantities.get(liId) === lineItemsMap[liId]) fulfillBackorder(orderId, liId);
     }
-    auditLog(session.email, 'order_fulfill', orderId, null, { lineItems: lineItemsMap, trackingNumber });
+    auditLog(session.email, 'order_fulfill', orderId, null, { lineItems: Object.fromEntries(committedLineQuantities), trackingNumber, locations: committedLocations });
     res.redirect(`/orders/${numId}?success=fulfilled`);
   } catch (err) {
     console.error('fulfillment error:', err.message);
+    if (committedLocations.length) {
+      for (const liId of fullySelectedLineIds) {
+        if (committedLineQuantities.get(liId) === lineItemsMap[liId]) fulfillBackorder(orderId, liId);
+      }
+      auditLog(session.email, 'order_fulfill', orderId, null, {
+        lineItems: Object.fromEntries(committedLineQuantities), trackingNumber,
+        locations: committedLocations, partialFailure: String(err.message || ''), failedLocation,
+      });
+      const msg = `Fulfilled ${committedLocations.length} location${committedLocations.length === 1 ? '' : 's'} before ${failedLocation || 'a later location'} failed: ${String(err.message || '')}`;
+      return res.redirect(`/orders/${numId}?error=fulfillment_failed&msg=${encodeURIComponent(msg.slice(0, 240))}`);
+    }
     res.redirect(`/orders/${numId}?error=fulfillment_failed&msg=${encodeURIComponent(String(err.message || '').slice(0, 240))}`);
   }
 });
