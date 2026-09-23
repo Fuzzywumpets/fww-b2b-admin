@@ -2221,7 +2221,8 @@ function renderOrdersList(session, data, filters) {
 
 // ── Order detail ──────────────────────────────────────────────────────────────
 // WHAT: fetches one order's full detail (customer, line items w/ variant+barcode, addresses, fulfillments, transactions) for the detail page and Xero sync.
-// CHANGE-GUARD: lineItems first:50 and transactions first:10 are HARD caps with no paging — an order with >50 lines or >10 transactions silently drops the overflow from the UI AND from createXeroInvoice's line build. Re-verify large orders invoice correctly. Returns null on any error (caller 404s).
+// CHANGE-GUARD: lineItems(first:250) is only the first transport page and is drained below;
+// transactions(first:10) remains a hard cap. Returns null on any error (caller 404s).
 // INVARIANT(S): id is built via shopifyOrderGid(numericId); the selected fields are the contract consumed by renderOrderDetail, createXeroInvoice, and the ship/fulfill flows — adding a consumer means extending this query.
 // CURRENT-FIELDS (2026-06-29): each lineItems node carries BOTH quantity (frozen original) and currentQuantity (post-edit truth; 0 = removed). The order carries BOTH subtotal/totalPriceSet (frozen) and currentSubtotal/currentTotalPriceSet (post-edit truth). Consumers that mean "what is in the order NOW" (renderOrderDetail line rows + totals, fulfill/ship/cancel, createXeroInvoice) MUST read the current* variants; the frozen ones are kept only where the ORIGINAL value is intended.
 // THROW-ON-ERROR (added for orders_cache eviction): every other caller wants the swallow-to-null
@@ -2250,7 +2251,7 @@ async function getOrderDetail(numericId, { throwOnError = false } = {}) {
         note tags
         shippingAddress{firstName lastName address1 address2 city province zip country phone}
         billingAddress{firstName lastName address1 address2 city province zip country}
-        lineItems(first:250){edges{node{id title quantity currentQuantity unfulfilledQuantity
+        lineItems(first:250){pageInfo{hasNextPage endCursor} edges{node{id title quantity currentQuantity unfulfilledQuantity
           variant{id title sku barcode selectedOptions{name value} price inventoryQuantity product{id title}}
           discountedUnitPriceSet{presentmentMoney{amount currencyCode}}
           originalUnitPriceSet{presentmentMoney{amount currencyCode}}
@@ -2262,6 +2263,29 @@ async function getOrderDetail(numericId, { throwOnError = false } = {}) {
         transactions(first:10){id status kind gateway createdAt
           amountSet{presentmentMoney{amount currencyCode}}}
       }}`, { id: shopifyOrderGid(numericId) });
+
+
+    // Pagination-completeness (2026-09-23 audit): order.lineItems(first:250) is a TRANSPORT page, not
+    // the whole order. An order with >250 lines (the #39355 class) silently dropped the overflow from
+    // every consumer below (renderOrderDetail, createXeroInvoice, ship/fulfill, cancel). Drain the rest
+    // of the connection with the shared drag-the-cursor helper and rebuild edges so ALL lines are seen.
+    if (result.data?.order) {
+      try {
+        // SYNC: this continuation projection must retain every line field selected
+        // above. In particular, partial fulfillment depends on unfulfilledQuantity.
+        const nodes = await drainLineItems(result.data.order.lineItems, 'getOrderDetail', orderLineItemsPage(result.data.order.id, `id title quantity currentQuantity unfulfilledQuantity
+          variant{id title sku barcode selectedOptions{name value} price inventoryQuantity product{id title}}
+          discountedUnitPriceSet{presentmentMoney{amount currencyCode}}
+          originalUnitPriceSet{presentmentMoney{amount currencyCode}}
+          discountedTotalSet{presentmentMoney{amount currencyCode}}
+          discountAllocations{allocatedAmountSet{presentmentMoney{amount currencyCode}} discountApplication{targetSelection ... on ManualDiscountApplication{description}}}`));
+        result.data.order.lineItems = { edges: nodes.map(node => ({ node })) };
+      } catch (err) {
+        console.error('getOrderDetail line-item pagination error:', err.message);
+        if (throwOnError) throw err;
+        return null;
+      }
+    }
     return result.data?.order || null;
   } catch (err) {
     console.error('getOrderDetail error:', err.message);
