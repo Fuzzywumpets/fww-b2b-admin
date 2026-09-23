@@ -2263,7 +2263,7 @@ async function getOrderDetail(numericId, { throwOnError = false } = {}) {
         note tags
         shippingAddress{firstName lastName address1 address2 city province zip country phone}
         billingAddress{firstName lastName address1 address2 city province zip country}
-        lineItems(first:250){edges{node{id title quantity currentQuantity
+        lineItems(first:250){pageInfo{hasNextPage endCursor} edges{node{id title quantity currentQuantity
           variant{id title sku barcode selectedOptions{name value} price inventoryQuantity product{id title}}
           discountedUnitPriceSet{presentmentMoney{amount currencyCode}}
           originalUnitPriceSet{presentmentMoney{amount currencyCode}}
@@ -2274,6 +2274,27 @@ async function getOrderDetail(numericId, { throwOnError = false } = {}) {
         transactions(first:10){id status kind gateway createdAt
           amountSet{presentmentMoney{amount currencyCode}}}
       }}`, { id: shopifyOrderGid(numericId) });
+
+
+    // Pagination-completeness (2026-09-23 audit): order.lineItems(first:250) is a TRANSPORT page, not
+    // the whole order. An order with >250 lines (the #39355 class) silently dropped the overflow from
+    // every consumer below (renderOrderDetail, createXeroInvoice, ship/fulfill, cancel). Drain the rest
+    // of the connection with the shared drag-the-cursor helper and rebuild edges so ALL lines are seen.
+    if (result.data?.order) {
+      try {
+        const nodes = await drainLineItems(result.data.order.lineItems, 'getOrderDetail', orderLineItemsPage(result.data.order.id, `id title quantity currentQuantity
+          variant{id title sku barcode selectedOptions{name value} price inventoryQuantity product{id title}}
+          discountedUnitPriceSet{presentmentMoney{amount currencyCode}}
+          originalUnitPriceSet{presentmentMoney{amount currencyCode}}
+          discountedTotalSet{presentmentMoney{amount currencyCode}}
+          discountAllocations{allocatedAmountSet{presentmentMoney{amount currencyCode}} discountApplication{targetSelection ... on ManualDiscountApplication{description}}}`));
+        result.data.order.lineItems = { edges: nodes.map(node => ({ node })) };
+      } catch (err) {
+        console.error('getOrderDetail line-item pagination error:', err.message);
+        if (throwOnError) throw err;
+        return null;
+      }
+    }
     return result.data?.order || null;
   } catch (err) {
     console.error('getOrderDetail error:', err.message);
