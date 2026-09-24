@@ -77,6 +77,32 @@ export function lineItemTrueUnit(item) {
   return lineItemTrueTotal(item) / cq;
 }
 
+// WHAT: the explicit discount allocated to the CURRENT quantity of one line.
+// WHY: invoices must show the customer's discount, not hide it by printing only net unit prices.
+// Shopify bakes EXPLICIT discounts into discountedTotalSet but leaves ALL/cart discounts outside it,
+// so summing every allocation and adding it back to lineItemTrueTotal reconstructs the honest
+// pre-discount merchandise amount across both representations.
+// DEPENDS: partial-invoice snapshots persist this as invoiceDiscountAmount because their archived
+// quantity/pricing must not depend on whatever the live Shopify order looks like when re-downloaded.
+export function lineItemInvoiceDiscount(item) {
+  const cq = lineItemCurrentQty(item);
+  if (cq <= 0) return 0;
+  if (item.invoiceDiscountAmount != null) return parseFloat(item.invoiceDiscountAmount) || 0;
+  const q = item.quantity || cq || 1;
+  const allocated = (item.discountAllocations || [])
+    .reduce((sum, allocation) => sum + liNum(allocation?.allocatedAmountSet), 0);
+  return allocated * (cq / q);
+}
+
+export function lineItemInvoiceGrossTotal(item) {
+  return lineItemTrueTotal(item) + lineItemInvoiceDiscount(item);
+}
+
+export function lineItemInvoiceGrossUnit(item) {
+  const cq = lineItemCurrentQty(item);
+  return cq > 0 ? lineItemInvoiceGrossTotal(item) / cq : 0;
+}
+
 // Shopify order edits can bake the variant into lineItem.title (for example,
 // "Luxe Limited Slip Collar - Booth — XXS / 1/2\"") while also returning the
 // same value in variant.title. Invoices render those as separate fields, so
@@ -103,7 +129,10 @@ function registerBrandFonts(doc) {
 
 // WHAT: renders a branded B2B invoice PDF (pdfkit) from a Shopify order, with optional opts overrides for partial invoices (lineItems/subtotal/shipping/total/invoiceSuffix/paymentTerms).
 // CHANGE-GUARD: line rows use fixed heights + lineBreak:false + ellipsis and an explicit y>680 page-break; long titles/skus or added columns can overlap or push the footer off-page — re-render a multi-page order and an unpaid order (PAYMENT PENDING watermark) after layout edits.
-// INVARIANT(S): unit price falls back discountedUnitPrice -> originalUnitPrice -> 0; when opts.subtotal is supplied the totals come entirely from opts (partial-invoice path) and must already be reconciled by the caller; all text is black per brand spec (lime is accent-only).
+// INVARIANT(S): undiscounted invoices show post-discount unit prices directly; invoices with allocated
+// discounts show reconstructed pre-discount rows plus one negative Discount total. When opts.subtotal
+// is supplied, partial-invoice totals come from opts and must already be reconciled by the caller;
+// all text is black per brand spec (lime is accent-only).
 export async function generateInvoicePdf(order, opts = {}) {
   return new Promise((resolve, reject) => {
     const doc = new PDFDocument({ margin: 50, size: 'LETTER', autoFirstPage: true });
@@ -230,6 +259,11 @@ export async function generateInvoicePdf(order, opts = {}) {
 
     let y = tableTop + 30;
     const lineItems = opts.lineItems ?? (order.lineItems?.edges?.map(e => e.node) || []);
+    const inferredDiscount = lineItems.reduce((sum, item) => sum + lineItemInvoiceDiscount(item), 0);
+    const discountAmount = opts.discount !== undefined
+      ? (parseFloat(opts.discount) || 0)
+      : inferredDiscount;
+    const showDiscount = discountAmount > 0.004;
     doc.font('Inter').fillColor(BLACK);
 
     for (const item of lineItems) {
@@ -237,8 +271,11 @@ export async function generateInvoicePdf(order, opts = {}) {
       // key qty/unit/total off the post-ALL-discounts current line math (shared with buildInvoiceCsv).
       const qty = lineItemCurrentQty(item);
       if (qty <= 0) continue;
-      const unitPrice = lineItemTrueUnit(item);
-      const rowTotal = lineItemTrueTotal(item);
+      // When a real allocated discount exists, show the pre-discount merchandise values here and
+      // itemize the discount once in the totals block. Otherwise the final amount is correct but the
+      // discount is invisible, which is not an acceptable customer invoice.
+      const unitPrice = showDiscount ? lineItemInvoiceGrossUnit(item) : lineItemTrueUnit(item);
+      const rowTotal = showDiscount ? lineItemInvoiceGrossTotal(item) : lineItemTrueTotal(item);
       const variantTitle = (item.variant?.title && item.variant.title !== 'Default Title') ? item.variant.title : null;
       const productTitle = invoiceItemTitle(item);
       doc.fontSize(9.5).font('Inter');
@@ -298,10 +335,19 @@ export async function generateInvoicePdf(order, opts = {}) {
     const LABEL_W = 100;
     const LABEL_X = AMT_X - LABEL_W;
 
+    const displayedSubtotal = opts.grossSubtotal !== undefined
+      ? (parseFloat(opts.grossSubtotal) || 0)
+      : sub + discountAmount;
+
     doc.fontSize(10).font('Inter').fillColor(BLACK);
     doc.text('Subtotal', LABEL_X, y, { width: LABEL_W, align: 'right', lineBreak: false });
-    doc.text(fmt(sub), AMT_X, y, { width: AMT_W, align: 'right', lineBreak: false });
+    doc.text(fmt(displayedSubtotal), AMT_X, y, { width: AMT_W, align: 'right', lineBreak: false });
     y += 16;
+    if (showDiscount) {
+      doc.text('Discount', LABEL_X, y, { width: LABEL_W, align: 'right', lineBreak: false });
+      doc.text(fmt(-discountAmount), AMT_X, y, { width: AMT_W, align: 'right', lineBreak: false });
+      y += 16;
+    }
     if (ship > 0) {
       doc.text('Shipping', LABEL_X, y, { width: LABEL_W, align: 'right', lineBreak: false });
       doc.text(fmt(ship), AMT_X, y, { width: AMT_W, align: 'right', lineBreak: false });

@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { generateInvoicePdf, invoiceItemTitle } from '../pdf.mjs';
+import {
+  generateInvoicePdf, invoiceItemTitle, lineItemInvoiceDiscount,
+  lineItemInvoiceGrossTotal, lineItemInvoiceGrossUnit,
+} from '../pdf.mjs';
 
 assert.equal(invoiceItemTitle({ title: 'Collar — SM / 1"', variant: { title: 'SM / 1"' } }), 'Collar');
 assert.equal(invoiceItemTitle({ title: 'Walking Lead - Booth — 12"', variant: { title: '12"' } }), 'Walking Lead - Booth');
@@ -13,8 +16,21 @@ assert.match(source, /sku:\s*i\.variant\?\.sku/,
   'new partial-invoice snapshots retain the SKU');
 assert.match(source, /currentLines\.get\(li\.id\)/,
   'historical snapshots recover display metadata by immutable line-item id');
+assert.match(source, /discountAmount:\s*lineItemInvoiceDiscount\(i\)/,
+  'partial-invoice snapshots retain the allocated discount');
+assert.match(source, /grossSubtotal:\s*netSubtotal \+ discountAmt/,
+  'partial-invoice re-download reconstructs the gross subtotal');
 
 const money = amount => ({ presentmentMoney: { amount: String(amount), currencyCode: 'USD' } });
+const discountedLine = {
+  quantity: 1, currentQuantity: 1,
+  discountedUnitPriceSet: money(90), discountedTotalSet: money(90), originalUnitPriceSet: money(100),
+  discountAllocations: [{ allocatedAmountSet: money(10), discountApplication: { targetSelection: 'EXPLICIT' } }],
+};
+assert.equal(lineItemInvoiceDiscount(discountedLine), 10);
+assert.equal(lineItemInvoiceGrossTotal(discountedLine), 100);
+assert.equal(lineItemInvoiceGrossUnit(discountedLine), 100);
+
 const lineItems = Array.from({ length: 30 }, (_, i) => ({
   id: `gid://shopify/LineItem/${i + 1}`,
   title: `Long descriptive wholesale product ${i + 1} — MED / 1.5"`,

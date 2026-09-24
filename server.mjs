@@ -44,7 +44,10 @@ import {
   getOrderInternalNote, setOrderInternalNote,
   getHelcimInvoiceMap, upsertHelcimInvoiceMap, setHelcimInvoiceDelivery,
 } from './db.mjs';
-import { generateInvoicePdf, lineItemTrueTotal, lineItemTrueUnit, lineItemCurrentQty } from './pdf.mjs';
+import {
+  generateInvoicePdf, lineItemTrueTotal, lineItemTrueUnit, lineItemCurrentQty,
+  lineItemInvoiceDiscount,
+} from './pdf.mjs';
 // Extracted so they can be unit-tested without booting this server (house pattern: lib/*.mjs).
 import { isTerminalEditError } from './lib/order-edit-errors.mjs';
 // DEPENDS: every money surface in this file picks its amount through these two — cacheRowTotal for a
@@ -6436,9 +6439,15 @@ app.post('/orders/:id/partial-invoice', requireAuth, async (req, res) => {
 
   // ORDER-LEVEL discount fix: the partial-invoice subtotal + the stored per-line snapshot must be net of
   // ALL discounts (incl order/cart-level). Sum the shared lineItemTrueTotal (post-ALL-discounts, current
-  // qty) and snapshot the post-discount unit + current qty so the re-download path (which reconstructs
-  // from the flat {unitPrice,quantity} shape, without discountedTotalSet/allocations) renders identically.
+  // qty) and snapshot the post-discount unit, allocated discount, and current qty so the re-download
+  // path can render the same gross subtotal / discount / net total without consulting mutable pricing.
   const subtotal = lineItems.reduce((sum, item) => sum + lineItemTrueTotal(item), 0);
+  const discountAmt = lineItems.reduce((sum, item) => sum + lineItemInvoiceDiscount(item), 0);
+  const grossSubtotal = subtotal + discountAmt;
+  const discountSummary = summarizeOrderDiscount(lineItems.map(item => ({
+    currentQuantity: lineItemCurrentQty(item),
+    discounts: normalizeAllocations(item.discountAllocations),
+  })));
   const shippingAmt = (!findShippingInvoice(priorInvoices) && shipping_handling !== 'none')
     ? currentShippingAmount(order)
     : 0;
@@ -6455,13 +6464,15 @@ app.post('/orders/:id/partial-invoice', requireAuth, async (req, res) => {
     total,
     shipping: shippingAmt,
     tax: taxAmt,
-    // SYNC: the re-download route below reconstructs these fields. Preserve
-    // identity separately so archived invoices never degrade into clipped
-    // titles and dash-only SKU columns.
+    // SYNC: the re-download route below reconstructs every field in this snapshot. Preserve
+    // identity and allocated discount separately so archived invoices never degrade into clipped
+    // titles/dash-only SKUs or hide their discount after Shopify changes later.
     lineItemsJson: JSON.stringify(lineItems
       .filter(i => lineItemCurrentQty(i) > 0)
       .map(i => ({ id: i.id, title: i.title, variantTitle: i.variant?.title || null,
-        sku: i.variant?.sku || i.sku || null, quantity: lineItemCurrentQty(i), unitPrice: lineItemTrueUnit(i) }))),
+        sku: i.variant?.sku || i.sku || null, quantity: lineItemCurrentQty(i),
+        unitPrice: lineItemTrueUnit(i), discountAmount: lineItemInvoiceDiscount(i),
+        discountReason: discountSummary.reason || null }))),
     createdBy: session.email,
   });
   auditLog(session.email, 'partial_invoice_created', orderGid, null, { invoiceId: invId, letter, type, total });
@@ -6474,6 +6485,8 @@ app.post('/orders/:id/partial-invoice', requireAuth, async (req, res) => {
       lineItems,
       invoiceSuffix: letter,
       subtotal,
+      grossSubtotal,
+      discount: discountAmt,
       shipping: shippingAmt,
       total,
     });
@@ -6524,14 +6537,19 @@ app.get('/orders/:id/partial-invoice/:letter.pdf', requireAuth, async (req, res)
       quantity: li.quantity,
       discountedUnitPriceSet: { presentmentMoney: { amount: String(li.unitPrice), currencyCode: 'USD' } },
       originalUnitPriceSet: { presentmentMoney: { amount: String(li.unitPrice), currencyCode: 'USD' } },
+      invoiceDiscountAmount: Number(li.discountAmount) || 0,
       variant: (variantTitle || sku) ? { title: variantTitle, sku } : null,
     };
   });
+  const discountAmt = lineItems.reduce((sum, item) => sum + lineItemInvoiceDiscount(item), 0);
+  const netSubtotal = inv.total - inv.shipping - inv.tax;
   try {
     const pdf = await generateInvoicePdf(order, {
       lineItems,
       invoiceSuffix: letter,
-      subtotal: inv.total - inv.shipping - inv.tax,
+      subtotal: netSubtotal,
+      grossSubtotal: netSubtotal + discountAmt,
+      discount: discountAmt,
       shipping: inv.shipping,
       total: inv.total,
     });
@@ -6647,8 +6665,9 @@ function withOrderLock(orderId, fn) {
 // DEPENDS: pdf.mjs lineItemTrueTotal/lineItemTrueUnit subtract only targetSelection 'ALL'
 // allocations because EXPLICIT (line-level) ones are already baked into
 // discountedUnitPriceSet/discountedTotalSet. Our discounts are EXPLICIT (verified live), so the
-// invoice PDF, the invoice CSV and the partial-invoice math stay correct with NO change. Do NOT
-// "fix" pdf.mjs to also subtract EXPLICIT allocations — that would double-subtract every line.
+// invoice CSV and net partial-invoice math stay correct. The PDF separately ADDS every allocation
+// back to reconstruct gross merchandise, then prints one negative Discount row; do not subtract
+// EXPLICIT allocations inside lineItemTrueTotal, which would double-subtract every line.
 const ORDER_DISCOUNT_PREFIX = 'Order discount: ';
 const isOrderDiscountDescription = (d) => String(d || '').startsWith(ORDER_DISCOUNT_PREFIX);
 const orderDiscountDescription = (reason) => `${ORDER_DISCOUNT_PREFIX}${reason}`;
