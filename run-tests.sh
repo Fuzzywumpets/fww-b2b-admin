@@ -121,6 +121,13 @@ if [ -f test/order-display-totals.test.mjs ]; then
   node test/order-display-totals.test.mjs || UNIT_FAIL=$?
 fi
 
+# Invoice rendering: archived partial invoices must retain/recover SKU and
+# variant identity, and dense tables must paginate with full readable rows.
+if [ -f test/invoice-format.test.mjs ]; then
+  echo ""
+  node test/invoice-format.test.mjs || UNIT_FAIL=$?
+fi
+
 # The #38953 lock-up: a permanently-failing line edit armed a beforeunload guard, and the Electron
 # shell cancels a prevented unload SILENTLY — every link, the back button, "Generate PDF" and Quit
 # died at once. Standalone: it spans desktop shell code (never loaded by the server) and source-level

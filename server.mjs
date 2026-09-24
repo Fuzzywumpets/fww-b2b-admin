@@ -6431,9 +6431,13 @@ app.post('/orders/:id/partial-invoice', requireAuth, async (req, res) => {
     total,
     shipping: shippingAmt,
     tax: taxAmt,
+    // SYNC: the re-download route below reconstructs these fields. Preserve
+    // identity separately so archived invoices never degrade into clipped
+    // titles and dash-only SKU columns.
     lineItemsJson: JSON.stringify(lineItems
       .filter(i => lineItemCurrentQty(i) > 0)
-      .map(i => ({ id: i.id, title: i.title, quantity: lineItemCurrentQty(i), unitPrice: lineItemTrueUnit(i) }))),
+      .map(i => ({ id: i.id, title: i.title, variantTitle: i.variant?.title || null,
+        sku: i.variant?.sku || i.sku || null, quantity: lineItemCurrentQty(i), unitPrice: lineItemTrueUnit(i) }))),
     createdBy: session.email,
   });
   auditLog(session.email, 'partial_invoice_created', orderGid, null, { invoiceId: invId, letter, type, total });
@@ -6470,6 +6474,9 @@ app.post('/orders/:id/partial-invoice', requireAuth, async (req, res) => {
 // Re-download a previously generated partial invoice
 // WHAT: re-renders a previously-created partial invoice from its stored line_items_json snapshot (matched by uppercased :letter).
 // CHANGE-GUARD: reconstructs discountedUnitPriceSet/originalUnitPriceSet from the flat snapshot {unitPrice} — keep this shape aligned with what generateInvoicePdf reads and with the JSON written in the POST route.
+// DEPENDS: historical snapshots omitted variantTitle/sku. Merge those display-only
+// fields from the current Shopify line with the same immutable line-item GID so
+// existing invoices remain readable without changing their saved qty/pricing.
 // INVARIANT(S): subtotal is derived as inv.total - inv.shipping - inv.tax (the snapshot does not store subtotal) so the three stored fields must stay self-consistent; currency hardcoded 'USD'.
 app.get('/orders/:id/partial-invoice/:letter.pdf', requireAuth, async (req, res) => {
   const numId  = req.params.id;
@@ -6482,12 +6489,20 @@ app.get('/orders/:id/partial-invoice/:letter.pdf', requireAuth, async (req, res)
   const order = await getOrderDetail(numId);
   if (!order) return res.status(404).json({ error: 'Order not found' });
 
-  const lineItems = JSON.parse(inv.line_items_json || '[]').map(li => ({
-    id: li.id, title: li.title, quantity: li.quantity,
-    discountedUnitPriceSet: { presentmentMoney: { amount: String(li.unitPrice), currencyCode: 'USD' } },
-    originalUnitPriceSet:   { presentmentMoney: { amount: String(li.unitPrice), currencyCode: 'USD' } },
-    variant: null,
-  }));
+  const currentLines = new Map((order.lineItems?.edges || []).map(edge => [edge.node.id, edge.node]));
+  const lineItems = JSON.parse(inv.line_items_json || '[]').map(li => {
+    const current = currentLines.get(li.id) || {};
+    const variantTitle = li.variantTitle || current.variant?.title || null;
+    const sku = li.sku || current.variant?.sku || current.sku || null;
+    return {
+      id: li.id,
+      title: li.title,
+      quantity: li.quantity,
+      discountedUnitPriceSet: { presentmentMoney: { amount: String(li.unitPrice), currencyCode: 'USD' } },
+      originalUnitPriceSet: { presentmentMoney: { amount: String(li.unitPrice), currencyCode: 'USD' } },
+      variant: (variantTitle || sku) ? { title: variantTitle, sku } : null,
+    };
+  });
   try {
     const pdf = await generateInvoicePdf(order, {
       lineItems,
