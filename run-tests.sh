@@ -74,6 +74,13 @@ if [ -f test/order-money.test.mjs ]; then
   node test/order-money.test.mjs || UNIT_FAIL=$?
 fi
 
+# Large-order discount staging is a pure Shopify batching contract. The mock server cannot expose
+# the timeout that occurred on live #39355 (286 lines), so exercise the generated aliases directly.
+if [ -f test/order-discount-batching.test.mjs ]; then
+  echo ""
+  node test/order-discount-batching.test.mjs || UNIT_FAIL=$?
+fi
+
 if [ -f test/helcim.test.mjs ]; then
   echo ""
   echo "── Unit: Helcim invoice client (standalone, no server) ──"
@@ -114,6 +121,13 @@ if [ -f test/order-display-totals.test.mjs ]; then
   node test/order-display-totals.test.mjs || UNIT_FAIL=$?
 fi
 
+# Invoice rendering: archived partial invoices must retain/recover SKU and
+# variant identity, and dense tables must paginate with full readable rows.
+if [ -f test/invoice-format.test.mjs ]; then
+  echo ""
+  node test/invoice-format.test.mjs || UNIT_FAIL=$?
+fi
+
 # The #38953 lock-up: a permanently-failing line edit armed a beforeunload guard, and the Electron
 # shell cancels a prevented unload SILENTLY — every link, the back button, "Generate PDF" and Quit
 # died at once. Standalone: it spans desktop shell code (never loaded by the server) and source-level
@@ -121,6 +135,12 @@ fi
 if [ -f test/order-edit-nav-deadlock.test.mjs ]; then
   echo ""
   node test/order-edit-nav-deadlock.test.mjs || UNIT_FAIL=$?
+# Pagination-completeness (2026-09-23 audit, #39355 class): getOrderDetail must drain order
+# lineItems beyond first:250 or renderOrderDetail / createXeroInvoice / ship flows under-build.
+if [ -f test/pagination-completeness.test.mjs ]; then
+  echo ""
+  node test/pagination-completeness.test.mjs || UNIT_FAIL=$?
+fi
 fi
 
 # Electron shell code — never runs inside the Express server, so the HTTP suites cannot reach it.

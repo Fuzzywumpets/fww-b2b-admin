@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { currentShippingAmount, parseShippingAmount, stageShippingReplacement } from '../lib/order-shipping.mjs';
+import { currentShippingAmount, findShippingInvoice, parseShippingAmount, stageShippingReplacement } from '../lib/order-shipping.mjs';
 
 const money = amount => ({ presentmentMoney: { amount: String(amount), currencyCode: 'USD' }, shopMoney: { amount: String(amount), currencyCode: 'USD' } });
 const line = (id, amount, stagedStatus = 'NONE') => ({ id, title: 'UPS', stagedStatus, price: money(amount) });
@@ -15,6 +15,14 @@ function fixture(lines, fail) {
   } };
 }
 const stage = f => stageShippingReplacement({ ...f, calcId: 'calc', amount: 45, title: 'UPS', expectedAmount: 125 });
+
+test('only a positive shipping snapshot reserves the once-per-order charge', () => {
+  assert.equal(findShippingInvoice([]), undefined);
+  const previous = [{ invoice_letter: 'A', shipping: 0 }, { invoice_letter: 'B', shipping: '0.00' }];
+  assert.equal(findShippingInvoice(previous), undefined);
+  const charged = { invoice_letter: 'C', shipping: 35 };
+  assert.equal(findShippingInvoice([...previous, charged, { invoice_letter: 'D', shipping: 0 }]), charged);
+});
 
 test('removed $80 is excluded from current shipping, including zero', () => {
   assert.equal(currentShippingAmount({ currentShippingPriceSet: money(45), totalShippingPriceSet: money(125) }), 45);

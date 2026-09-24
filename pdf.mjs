@@ -77,6 +77,47 @@ export function lineItemTrueUnit(item) {
   return lineItemTrueTotal(item) / cq;
 }
 
+// WHAT: the explicit discount allocated to the CURRENT quantity of one line.
+// WHY: invoices must show the customer's discount, not hide it by printing only net unit prices.
+// Shopify bakes EXPLICIT discounts into discountedTotalSet but leaves ALL/cart discounts outside it,
+// so summing every allocation and adding it back to lineItemTrueTotal reconstructs the honest
+// pre-discount merchandise amount across both representations.
+// DEPENDS: partial-invoice snapshots persist this as invoiceDiscountAmount because their archived
+// quantity/pricing must not depend on whatever the live Shopify order looks like when re-downloaded.
+export function lineItemInvoiceDiscount(item) {
+  const cq = lineItemCurrentQty(item);
+  if (cq <= 0) return 0;
+  if (item.invoiceDiscountAmount != null) return parseFloat(item.invoiceDiscountAmount) || 0;
+  const q = item.quantity || cq || 1;
+  const allocated = (item.discountAllocations || [])
+    .reduce((sum, allocation) => sum + liNum(allocation?.allocatedAmountSet), 0);
+  return allocated * (cq / q);
+}
+
+export function lineItemInvoiceGrossTotal(item) {
+  return lineItemTrueTotal(item) + lineItemInvoiceDiscount(item);
+}
+
+export function lineItemInvoiceGrossUnit(item) {
+  const cq = lineItemCurrentQty(item);
+  return cq > 0 ? lineItemInvoiceGrossTotal(item) / cq : 0;
+}
+
+// Shopify order edits can bake the variant into lineItem.title (for example,
+// "Luxe Limited Slip Collar - Booth — XXS / 1/2\"") while also returning the
+// same value in variant.title. Invoices render those as separate fields, so
+// remove only an exact trailing copy; ordinary product-name punctuation stays.
+export function invoiceItemTitle(item) {
+  const title = String(item?.title || '—').trim();
+  const variant = String(item?.variant?.title || item?.variantTitle || '').trim();
+  if (!variant || variant === 'Default Title') return title;
+  for (const separator of [' — ', ' - ']) {
+    const suffix = separator + variant;
+    if (title.endsWith(suffix)) return title.slice(0, -suffix.length).trim();
+  }
+  return title;
+}
+
 function registerBrandFonts(doc) {
   for (const [name, path] of Object.entries(FONT_PATHS)) {
     if (existsSync(path)) {
@@ -88,7 +129,10 @@ function registerBrandFonts(doc) {
 
 // WHAT: renders a branded B2B invoice PDF (pdfkit) from a Shopify order, with optional opts overrides for partial invoices (lineItems/subtotal/shipping/total/invoiceSuffix/paymentTerms).
 // CHANGE-GUARD: line rows use fixed heights + lineBreak:false + ellipsis and an explicit y>680 page-break; long titles/skus or added columns can overlap or push the footer off-page — re-render a multi-page order and an unpaid order (PAYMENT PENDING watermark) after layout edits.
-// INVARIANT(S): unit price falls back discountedUnitPrice -> originalUnitPrice -> 0; when opts.subtotal is supplied the totals come entirely from opts (partial-invoice path) and must already be reconciled by the caller; all text is black per brand spec (lime is accent-only).
+// INVARIANT(S): undiscounted invoices show post-discount unit prices directly; invoices with allocated
+// discounts show reconstructed pre-discount rows plus one negative Discount total. When opts.subtotal
+// is supplied, partial-invoice totals come from opts and must already be reconciled by the caller;
+// all text is black per brand spec (lime is accent-only).
 export async function generateInvoicePdf(order, opts = {}) {
   return new Promise((resolve, reject) => {
     const doc = new PDFDocument({ margin: 50, size: 'LETTER', autoFirstPage: true });
@@ -135,16 +179,14 @@ export async function generateInvoicePdf(order, opts = {}) {
       doc.text(order.customer.email, 400, 94, { align: 'right', width: 162 });
     }
 
-    // ─── PAYMENT PENDING watermark (only when unpaid) ──────────────
-    // lineBreak:false prevents pdfkit auto-pagination from rotated text
+    // ─── PAYMENT PENDING status (only when unpaid) ─────────────────
+    // Keep status in the header. A diagonal watermark crossed the item table
+    // and made dense wholesale invoices materially harder to read.
     const isPaid = order.displayFinancialStatus === 'PAID';
     if (!isPaid) {
-      doc.save();
-      doc.rotate(-20, { origin: [306, 280] });
-      doc.fontSize(48).font('Playfair-Bold').fillColor(BLACK).opacity(0.08)
-        .text('PAYMENT PENDING', 56, 245, { width: 500, align: 'center', lineBreak: false });
-      doc.restore();
-      doc.opacity(1);
+      doc.roundedRect(428, 112, 134, 24, 4).lineWidth(1).strokeColor(LIME).stroke();
+      doc.fontSize(8).font('Inter-Bold').fillColor(BLACK)
+        .text('PAYMENT PENDING', 436, 120, { width: 118, align: 'center', lineBreak: false });
     }
 
     // ─── Lime divider ──────────────────────────────────────────────
@@ -191,48 +233,64 @@ export async function generateInvoicePdf(order, opts = {}) {
     }
 
     // ─── Line items table ──────────────────────────────────────────
+    function drawTableHeader(top) {
+      doc.rect(50, top, 512, 22).fill('#F8F8F8');
+      doc.fontSize(8).font('Inter-Bold').fillColor(BLACK);
+      doc.text('ITEM', 56, top + 7);
+      doc.text('SKU', 276, top + 7);
+      doc.text('QTY', 385, top + 7, { width: 40, align: 'right' });
+      doc.text('UNIT PRICE', 430, top + 7, { width: 65, align: 'right' });
+      doc.text('TOTAL', 500, top + 7, { width: 62, align: 'right' });
+    }
+    function addContinuationPage(withTable = true) {
+      doc.addPage();
+      doc.rect(0, 0, 612, 6).fill(LIME);
+      doc.fontSize(9).font('Inter-Bold').fillColor(BLACK)
+        .text(`INVOICE ${invoiceName} - CONTINUED`, 50, 30, { width: 512, align: 'right', lineBreak: false });
+      if (withTable) {
+        drawTableHeader(56);
+        return 86;
+      }
+      return 70;
+    }
+
     const tableTop = 285;
-    doc.rect(50, tableTop, 512, 22).fill('#F8F8F8');
-    doc.fontSize(8).font('Inter-Bold').fillColor(BLACK);
-    doc.text('ITEM', 56, tableTop + 7);
-    doc.text('SKU', 285, tableTop + 7);
-    doc.text('QTY', 385, tableTop + 7, { width: 40, align: 'right' });
-    doc.text('UNIT PRICE', 430, tableTop + 7, { width: 65, align: 'right' });
-    doc.text('TOTAL', 500, tableTop + 7, { width: 62, align: 'right' });
+    drawTableHeader(tableTop);
 
     let y = tableTop + 30;
     const lineItems = opts.lineItems ?? (order.lineItems?.edges?.map(e => e.node) || []);
+    const inferredDiscount = lineItems.reduce((sum, item) => sum + lineItemInvoiceDiscount(item), 0);
+    const discountAmount = opts.discount !== undefined
+      ? (parseFloat(opts.discount) || 0)
+      : inferredDiscount;
+    const showDiscount = discountAmount > 0.004;
     doc.font('Inter').fillColor(BLACK);
-
-    // Truncate-with-ellipsis helper that respects column width
-    function fitText(s, maxChars) {
-      s = String(s || '—');
-      return s.length > maxChars ? s.slice(0, maxChars - 1) + '…' : s;
-    }
 
     for (const item of lineItems) {
       // ORDER-LEVEL discount + post-edit qty: skip lines removed in an edit (currentQuantity 0) and
       // key qty/unit/total off the post-ALL-discounts current line math (shared with buildInvoiceCsv).
       const qty = lineItemCurrentQty(item);
       if (qty <= 0) continue;
-      if (y > 680) {
-        doc.addPage();
-        y = 50;
-      }
-      const unitPrice = lineItemTrueUnit(item);
-      const rowTotal = lineItemTrueTotal(item);
-      // Use fixed height: 1 line per row, truncate overflow. height:14 + ellipsis prevents wrap.
+      // When a real allocated discount exists, show the pre-discount merchandise values here and
+      // itemize the discount once in the totals block. Otherwise the final amount is correct but the
+      // discount is invisible, which is not an acceptable customer invoice.
+      const unitPrice = showDiscount ? lineItemInvoiceGrossUnit(item) : lineItemTrueUnit(item);
+      const rowTotal = showDiscount ? lineItemInvoiceGrossTotal(item) : lineItemTrueTotal(item);
       const variantTitle = (item.variant?.title && item.variant.title !== 'Default Title') ? item.variant.title : null;
-      const rowH = variantTitle ? 32 : 20;
-      doc.fontSize(9.5).fillColor(BLACK);
-      doc.text(fitText(item.title, 37), 56, y, { width: 224, height: 14, lineBreak: false, ellipsis: true });
+      const productTitle = invoiceItemTitle(item);
+      doc.fontSize(9.5).font('Inter');
+      const titleH = doc.heightOfString(productTitle, { width: 210, lineGap: 1 });
+      const rowH = Math.max(20, Math.ceil(titleH) + (variantTitle ? 13 : 0) + 7);
+      if (y + rowH > 694) y = addContinuationPage(true);
+      doc.fontSize(9.5).font('Inter').fillColor(BLACK);
+      doc.text(productTitle, 56, y, { width: 210, lineGap: 1 });
       if (variantTitle) {
-        doc.fontSize(8).fillColor('#555555').text(fitText(variantTitle, 50), 56, y + 13, { width: 224, height: 12, lineBreak: false, ellipsis: true });
+        doc.fontSize(8).fillColor('#555555').text(variantTitle, 56, y + titleH + 2, { width: 210, lineBreak: false });
         doc.fontSize(9.5).fillColor(BLACK);
       }
-      // SKU: full SKUs run up to 16 chars (e.g. CRSWLK0533258XS8); 8.5pt + 90px column fits them without truncation.
+      // SKU: full SKUs run up to 16 chars (e.g. CRSWLK0533258XS8).
       doc.fontSize(8.5);
-      doc.text(fitText(item.variant?.sku, 20), 285, y, { width: 90, height: 14, lineBreak: false, ellipsis: true });
+      doc.text(String(item.variant?.sku || item.sku || '—'), 276, y, { width: 100, height: 14, lineBreak: false, ellipsis: true });
       doc.fontSize(9.5);
       doc.text(String(qty), 385, y, { width: 40, height: 14, align: 'right', lineBreak: false });
       doc.text(fmt(unitPrice), 430, y, { width: 65, height: 14, align: 'right', lineBreak: false });
@@ -243,6 +301,7 @@ export async function generateInvoicePdf(order, opts = {}) {
 
     // ─── Totals ────────────────────────────────────────────────────
     y += 12;
+    if (y > 650) y = addContinuationPage(false);
     let sub, ship, total;
     if (opts.subtotal !== undefined) {
       sub   = parseFloat(opts.subtotal) || 0;
@@ -276,10 +335,19 @@ export async function generateInvoicePdf(order, opts = {}) {
     const LABEL_W = 100;
     const LABEL_X = AMT_X - LABEL_W;
 
+    const displayedSubtotal = opts.grossSubtotal !== undefined
+      ? (parseFloat(opts.grossSubtotal) || 0)
+      : sub + discountAmount;
+
     doc.fontSize(10).font('Inter').fillColor(BLACK);
     doc.text('Subtotal', LABEL_X, y, { width: LABEL_W, align: 'right', lineBreak: false });
-    doc.text(fmt(sub), AMT_X, y, { width: AMT_W, align: 'right', lineBreak: false });
+    doc.text(fmt(displayedSubtotal), AMT_X, y, { width: AMT_W, align: 'right', lineBreak: false });
     y += 16;
+    if (showDiscount) {
+      doc.text('Discount', LABEL_X, y, { width: LABEL_W, align: 'right', lineBreak: false });
+      doc.text(fmt(-discountAmount), AMT_X, y, { width: AMT_W, align: 'right', lineBreak: false });
+      y += 16;
+    }
     if (ship > 0) {
       doc.text('Shipping', LABEL_X, y, { width: LABEL_W, align: 'right', lineBreak: false });
       doc.text(fmt(ship), AMT_X, y, { width: AMT_W, align: 'right', lineBreak: false });
