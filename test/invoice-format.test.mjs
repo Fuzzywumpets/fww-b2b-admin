@@ -18,8 +18,10 @@ assert.match(source, /currentLines\.get\(li\.id\)/,
   'historical snapshots recover display metadata by immutable line-item id');
 assert.match(source, /discountAmount:\s*lineItemInvoiceDiscount\(i\)/,
   'partial-invoice snapshots retain the allocated discount');
-assert.match(source, /grossSubtotal:\s*netSubtotal \+ discountAmt/,
-  'partial-invoice re-download reconstructs the gross subtotal');
+assert.match(source, /grossSubtotal = Math\.round\(\(snapshotNetSubtotal \+ allocatedDiscount\)/,
+  'partial-invoice re-download reconstructs gross merchandise from immutable line data');
+assert.match(source, /effectiveDiscount = Math\.round\(Math\.max\(0, grossSubtotal - invoiceNetSubtotal\)/,
+  'partial-invoice re-download reconciles a fixed-dollar discount to the stored invoice total');
 
 const money = amount => ({ presentmentMoney: { amount: String(amount), currencyCode: 'USD' } });
 const discountedLine = {

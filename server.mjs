@@ -6514,7 +6514,10 @@ app.post('/orders/:id/partial-invoice', requireAuth, async (req, res) => {
 // DEPENDS: historical snapshots omitted variantTitle/sku. Merge those display-only
 // fields from the current Shopify line with the same immutable line-item GID so
 // existing invoices remain readable without changing their saved qty/pricing.
-// INVARIANT(S): subtotal is derived as inv.total - inv.shipping - inv.tax (the snapshot does not store subtotal) so the three stored fields must stay self-consistent; currency hardcoded 'USD'.
+// INVARIANT(S): merchandise gross is reconstructed from immutable line net prices plus their original
+// allocations. The effective invoice discount is then the exact amount required to reconcile that
+// gross with the stored invoice total, so a fixed-dollar invoice correction remains visible instead
+// of being absorbed into line prices. Currency is hardcoded 'USD'.
 app.get('/orders/:id/partial-invoice/:letter.pdf', requireAuth, async (req, res) => {
   const numId  = req.params.id;
   const letter = req.params.letter.toUpperCase();
@@ -6541,15 +6544,21 @@ app.get('/orders/:id/partial-invoice/:letter.pdf', requireAuth, async (req, res)
       variant: (variantTitle || sku) ? { title: variantTitle, sku } : null,
     };
   });
-  const discountAmt = lineItems.reduce((sum, item) => sum + lineItemInvoiceDiscount(item), 0);
-  const netSubtotal = inv.total - inv.shipping - inv.tax;
+  const allocatedDiscount = lineItems.reduce((sum, item) => sum + lineItemInvoiceDiscount(item), 0);
+  const snapshotNetSubtotal = lineItems.reduce((sum, item) => sum + lineItemTrueTotal(item), 0);
+  const grossSubtotal = Math.round((snapshotNetSubtotal + allocatedDiscount) * 100) / 100;
+  const invoiceNetSubtotal = Math.round((inv.total - inv.shipping - inv.tax) * 100) / 100;
+  // DEPENDS: partial_invoices.total may intentionally override Shopify's calculated amount for the
+  // customer-facing invoice. Reconcile the Discount row to that immutable invoice total without
+  // altering the saved line prices or the gross merchandise subtotal.
+  const effectiveDiscount = Math.round(Math.max(0, grossSubtotal - invoiceNetSubtotal) * 100) / 100;
   try {
     const pdf = await generateInvoicePdf(order, {
       lineItems,
       invoiceSuffix: letter,
-      subtotal: netSubtotal,
-      grossSubtotal: netSubtotal + discountAmt,
-      discount: discountAmt,
+      subtotal: invoiceNetSubtotal,
+      grossSubtotal,
+      discount: effectiveDiscount,
       shipping: inv.shipping,
       total: inv.total,
     });
