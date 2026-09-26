@@ -141,6 +141,14 @@ if [ -f test/pagination-completeness.test.mjs ]; then
   echo ""
   node test/pagination-completeness.test.mjs || UNIT_FAIL=$?
 fi
+if [ -f test/fulfillment-order-paging.test.mjs ]; then
+  echo ""
+  node test/fulfillment-order-paging.test.mjs || UNIT_FAIL=$?
+fi
+if [ -f test/dashboard-paging.test.mjs ]; then
+  echo ""
+  node test/dashboard-paging.test.mjs || UNIT_FAIL=$?
+fi
 fi
 
 # Electron shell code — never runs inside the Express server, so the HTTP suites cannot reach it.

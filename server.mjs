@@ -54,6 +54,8 @@ import { isTerminalEditError } from './lib/order-edit-errors.mjs';
 // falls back to the frozen pre-edit amount and the surface looks correct while being wrong.
 import { cacheRowTotal, listRowTotalAmount, restRowCurrentTotals } from './lib/order-display-totals.mjs';
 import { LINE_PAGE_MAX, drainLineItems } from './lib/line-item-paging.mjs';
+import { loadOpenFulfillmentLineMap } from './lib/fulfillment-order-paging.mjs';
+import { drainDashboardOrders, drainLowStockItems, drainCustomerSpendOrders } from './lib/dashboard-paging.mjs';
 import { renderLabelSheet, expandItems, TEMPLATES as LABEL_TEMPLATES, DEFAULT_FIELDS } from './labels.mjs';
 import { isInsider, resolveXeroContact, syncCustomerToXero, getXeroSyncStatus } from './lib/xero-customer-sync.mjs';
 import { parseLinePrices, applyLinePriceChanges, bulkMarkOrdersPaid } from './lib/order-money.mjs';
@@ -1795,7 +1797,7 @@ async function shopifyFetch(query, variables = {}) {
 
 // ── Dashboard ─────────────────────────────────────────────────────────────────
 // WHAT: assembles the dashboard model — open orders, week count, top customers, low-stock B2B variants, 12-mo revenue, pending-Xero-review list.
-// CHANGE-GUARD: live path issues TWO parallel shopifyFetch calls (orders tag:b2b-portal last 90d, products published) via Promise.all; the orders query is capped at first:50 with NO pagination, so >50 recent B2B orders silently truncate the open/week counts. Re-verify counts when volume grows.
+// CHANGE-GUARD: live path issues TWO parallel drained Shopify walks (orders tag:b2b-portal last 90d, published products). A paging failure must surface as data.error — never a silent prefix count.
 // INVARIANT(S): top customers prefer the all-time cache (getTopCustomersAllTime) and only fall back to the 90-day live spend map when the cache is empty; low-stock threshold is inventoryQuantity<10 and only for variants on the B2B publication; whole function is wrapped so any error returns a safe zeroed shape with .error set.
 const DASHBOARD_CACHE_TTL_MS = 60_000;
 let dashboardCache = { data: null, ts: 0 };
@@ -1825,20 +1827,10 @@ async function getDashboardData() {
   try {
     const ninetyDaysAgo = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
     const sevenDaysAgo  = new Date(Date.now() -  7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
-    const [ordersResult, productsResult] = await Promise.all([
-      shopifyFetch(`query($q:String!){ orders(first:50,query:$q,sortKey:PROCESSED_AT,reverse:true){
-        edges{node{id name processedAt customer{id displayName email} displayFinancialStatus
-          totalPriceSet{presentmentMoney{amount currencyCode}}
-          currentTotalPriceSet{presentmentMoney{amount currencyCode}} tags}}
-        pageInfo{hasNextPage}}}`, { q: `tag:b2b-portal created_at:>${ninetyDaysAgo}` }),
-// WHAT: low-stock source query — pulls first:100 published products with publishedOnPublication(B2B_PUB_ID) and first:10 variants each.
-// CHANGE-GUARD: DOUBLE truncation risk — first:100 products AND first:10 variants/product with no paging; a catalog beyond those caps drops products/variants from the low-stock widget silently. B2B_PUB_ID is the hardcoded publication gid (199709720811) gating B2B visibility.
-// INVARIANT(S): only variants on the B2B publication count (p.publishedOnPublication guard); inventoryQuantity must be a number to be considered.
-      shopifyFetch(`query{ products(first:100,query:"published_status:published"){
-        edges{node{id title publishedOnPublication(publicationId:"${B2B_PUB_ID}")
-          variants(first:10){edges{node{sku title inventoryQuantity}}}}}}}`)
+    const [orders, lowStockAll] = await Promise.all([
+      drainDashboardOrders(shopifyFetch, `tag:b2b-portal created_at:>${ninetyDaysAgo}`),
+      drainLowStockItems(shopifyFetch, B2B_PUB_ID),
     ]);
-    const orders = ordersResult.data?.orders?.edges?.map(e => e.node) || [];
     const openStatuses = new Set(['PENDING','AUTHORIZED','PARTIALLY_PAID']);
     const openOrders = orders.filter(o => openStatuses.has(o.displayFinancialStatus));
     const weekOrders = orders.filter(o => o.processedAt >= sevenDaysAgo);
@@ -1864,16 +1856,7 @@ async function getDashboardData() {
     if (topCustomers.length === 0) {
       topCustomers = [...spend.values()].sort((a, b) => b.spend - a.spend).slice(0, 5);
     }
-    const allProducts = productsResult.data?.products?.edges?.map(e => e.node) || [];
-    const lowStockItems = [];
-    for (const p of allProducts) {
-      if (!p.publishedOnPublication) continue;
-      for (const ve of (p.variants?.edges || [])) {
-        const v = ve.node;
-        if (typeof v.inventoryQuantity === 'number' && v.inventoryQuantity < 10)
-          lowStockItems.push({ productId: p.id, productTitle: p.title, variantTitle: v.title, sku: v.sku, qty: v.inventoryQuantity });
-      }
-    }
+    const lowStockItems = lowStockAll;
     const pendingReview = getCustomersPendingXeroReview();
     let monthly = [];
     try { const rd = getReportsDataFromCache(); monthly = rd.monthly || []; } catch(e) {}
@@ -8251,24 +8234,9 @@ app.post('/orders/:id/ship/label', requireAuth, async (req, res) => {
     let fulfillment_id = null;
     try {
       const orderId = `gid://shopify/Order/${numId}`;
-      const foRes = await shopifyFetch(`query($id:ID!){order(id:$id){
-        fulfillmentOrders(first:10){edges{node{
-          id status
-          lineItems(first:50){edges{node{id remainingQuantity lineItem{id title}}}}
-        }}}
-      }}`, { id: orderId });
-      const fos = foRes.data?.order?.fulfillmentOrders?.edges?.map(e => e.node) || [];
-      const liMap = {};
-      for (const fo of fos) {
-        if (fo.status !== 'OPEN' && fo.status !== 'IN_PROGRESS') continue;
-        for (const edge of fo.lineItems.edges) {
-          const foLi = edge.node;
-          const origId = foLi.lineItem?.id;
-          if (origId && foLi.remainingQuantity > 0) {
-            liMap[origId] = { foId: fo.id, foLiId: foLi.id, remaining: foLi.remainingQuantity };
-          }
-        }
-      }
+      // Pagination-completeness: fulfillmentOrders(first:10)/lineItems(first:50) was a silent
+      // prefix. Drain both connections or fail closed before mapping selected lines.
+      const liMap = await loadOpenFulfillmentLineMap(orderId, shopifyFetch);
       const groupedByFo = {};
       for (const li of lineItems) {
         const mapping = liMap[li.id];
@@ -8451,7 +8419,7 @@ app.post('/orders/:id/record-payment', requireAuth, async (req, res) => {
 // 16C: Partial fulfillment
 // WHAT: 16C partial fulfillment — body liRaw{lineItemId:qty}; real mode maps original lineItem ids to OPEN/IN_PROGRESS fulfillmentOrder line items then fulfillmentCreate with optional tracking.
 // CHANGE-GUARD: wantedQty is clamped to mapping.remaining; lines with no FO map are skipped with a warn (silent partial); fulfillBackorder() is called per requested li after success to clear backorder flags — keep that loop.
-// INVARIANT(S): throws 'No matching open fulfillment orders' if nothing maps; fulfillmentOrders query is capped first:10 / lineItems first:50 — orders exceeding those page sizes silently drop lines (see bugs[]).
+// INVARIANT(S): throws 'No matching open fulfillment orders' if nothing maps; fulfillmentOrders and their line items are fully drained or the request fails closed.
 app.post('/orders/:id/fulfill', requireAuth, async (req, res) => {
   const numId   = req.params.id;
   const session = req.adminSession;
@@ -8487,26 +8455,8 @@ app.post('/orders/:id/fulfill', requireAuth, async (req, res) => {
     const orderId    = `gid://shopify/Order/${numId}`;
     const trackInput = trackingNumber ? { company: trackingCompany || '', number: trackingNumber, url: null } : null;
 
-    // Step 1: fetch fulfillmentOrders for this order + their line items, map original lineItemId -> fulfillmentOrderLineItem
-    const foRes = await shopifyFetch(`query($id:ID!){order(id:$id){
-      fulfillmentOrders(first:10){edges{node{
-        id status
-        lineItems(first:50){edges{node{id remainingQuantity lineItem{id title}}}}
-      }}}
-    }}`, { id: orderId });
-    const fos = foRes.data?.order?.fulfillmentOrders?.edges?.map(e => e.node) || [];
-    // Find OPEN/IN_PROGRESS fulfillmentOrders, build map original_li_id -> { fulfillmentOrderId, foLineItemId, remaining }
-    const liMap = {};
-    for (const fo of fos) {
-      if (fo.status !== 'OPEN' && fo.status !== 'IN_PROGRESS') continue;
-      for (const edge of fo.lineItems.edges) {
-        const foLi = edge.node;
-        const origId = foLi.lineItem?.id;
-        if (origId && foLi.remainingQuantity > 0) {
-          liMap[origId] = { foId: fo.id, foLiId: foLi.id, remaining: foLi.remainingQuantity };
-        }
-      }
-    }
+    // Step 1: drain fulfillmentOrders + nested line items, map original lineItemId -> fulfillmentOrderLineItem
+    const liMap = await loadOpenFulfillmentLineMap(orderId, shopifyFetch);
 
     // Step 2: group requested line items by fulfillmentOrderId
     const groupedByFo = {};
@@ -8950,7 +8900,7 @@ app.post('/api/admin/sync-now', requireAuth, async (req, res) => {
 });
 
 // WHAT: 19A/24D customer spend API; returns lifetime + date-ranged totals/orders. Tries the local orders cache first (real mode), then MOCK, then live Shopify.
-// CHANGE-GUARD: three code paths must return the SAME JSON shape {lifetimeTotal,lifetimeCount,rangeTotal,rangeCount,orders[]}; the live query caps orders at first:250 with NO pagination so a customer with >250 in-range orders is silently truncated (see bugs[]); from/to default to epoch-0 .. now+1day.
+// CHANGE-GUARD: three code paths must return the SAME JSON shape {lifetimeTotal,lifetimeCount,rangeTotal,rangeCount,orders[]}; the live path drains every customer-order page or fails closed; from/to default to epoch-0 .. now+1day.
 // INVARIANT(S): cache path requires both a cached customer AND non-empty cache stats before short-circuiting; range filter is inclusive on both ends (created_at>=from && <=to).
 app.get('/api/admin/customers/:id/spend', requireAuth, async (req, res) => {
   const numId  = req.params.id;
@@ -9018,23 +8968,10 @@ app.get('/api/admin/customers/:id/spend', requireAuth, async (req, res) => {
     const gid = shopifyCustomerGid(numId);
     const fromStr = new Date(fromTs).toISOString().split('T')[0];
     const toStr   = new Date(toTs  ).toISOString().split('T')[0];
-    const r = await shopifyFetch(`
-      query($id:ID!,$q:String!){
-        customer(id:$id){
-          amountSpent{amount currencyCode}
-          numberOfOrders
-          orders(first:250,query:$q,sortKey:PROCESSED_AT,reverse:true){
-            edges{node{
-              id name processedAt displayFinancialStatus displayFulfillmentStatus
-              totalPriceSet{presentmentMoney{amount currencyCode}}
-              currentTotalPriceSet{presentmentMoney{amount currencyCode}}
-            }}
-          }
-        }
-      }`, { id: gid, q: `processed_at:>=${fromStr} processed_at:<=${toStr}` });
-    const cust = r.data?.customer;
-    if (!cust) return res.status(404).json({ error: 'not found' });
-    const orders = cust.orders.edges.map(e => e.node);
+    const spent = await drainCustomerSpendOrders(shopifyFetch, gid, `processed_at:>=${fromStr} processed_at:<=${toStr}`);
+    if (!spent) return res.status(404).json({ error: 'not found' });
+    const cust = spent.customer;
+    const orders = spent.orders;
     // listRowTotalAmount on BOTH the sum and the rows. #33 changed only the cache branch, so the
     // answer this endpoint gave depended on whether the cache was warm — a cold cache reproduced the
     // edited-order overstatement the fix existed to remove. (Qodo #11 on PR#33.)
