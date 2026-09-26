@@ -51,5 +51,11 @@ await test('getOrderDetail fails closed when line-item paging errors and throwOn
   assert.match(region, /return null;/, 'a paging failure must not silently render a truncated order');
 });
 
+await test('dashboard and spend live paths no longer use silent first-page prefixes', () => {
+  assert.match(src, /drainDashboardOrders\(/);
+  assert.match(src, /drainLowStockItems\(/);
+  assert.match(src, /drainCustomerSpendOrders\(/);
+});
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exitCode = failed ? 1 : 0;
