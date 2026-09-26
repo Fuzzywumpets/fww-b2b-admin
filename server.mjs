@@ -54,6 +54,11 @@ import { isTerminalEditError } from './lib/order-edit-errors.mjs';
 // falls back to the frozen pre-edit amount and the surface looks correct while being wrong.
 import { cacheRowTotal, listRowTotalAmount, restRowCurrentTotals } from './lib/order-display-totals.mjs';
 import { LINE_PAGE_MAX, drainLineItems } from './lib/line-item-paging.mjs';
+// loadOpenFulfillmentLineMap is the standalone fail-closed helper. /orders/:id/fulfill stays on
+// getOpenFulfillmentOrderLines because PR #45 maps remaining qty per location and never clamps;
+// origin/main no longer has /orders/:id/ship/label (handed off to FWW Shipping).
+import { loadOpenFulfillmentLineMap } from './lib/fulfillment-order-paging.mjs';
+import { drainDashboardOrders, drainLowStockItems, drainCustomerSpendOrders } from './lib/dashboard-paging.mjs';
 import { renderLabelSheet, expandItems, TEMPLATES as LABEL_TEMPLATES, DEFAULT_FIELDS } from './labels.mjs';
 import { isInsider, resolveXeroContact, syncCustomerToXero, getXeroSyncStatus } from './lib/xero-customer-sync.mjs';
 import { parseLinePrices, applyLinePriceChanges, bulkMarkOrdersPaid } from './lib/order-money.mjs';
@@ -1826,20 +1831,10 @@ async function getDashboardData() {
   try {
     const ninetyDaysAgo = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
     const sevenDaysAgo  = new Date(Date.now() -  7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
-    const [ordersResult, productsResult] = await Promise.all([
-      shopifyFetch(`query($q:String!){ orders(first:50,query:$q,sortKey:PROCESSED_AT,reverse:true){
-        edges{node{id name processedAt customer{id displayName email} displayFinancialStatus
-          totalPriceSet{presentmentMoney{amount currencyCode}}
-          currentTotalPriceSet{presentmentMoney{amount currencyCode}} tags}}
-        pageInfo{hasNextPage}}}`, { q: `tag:b2b-portal created_at:>${ninetyDaysAgo}` }),
-// WHAT: low-stock source query — pulls first:100 published products with publishedOnPublication(B2B_PUB_ID) and first:10 variants each.
-// CHANGE-GUARD: DOUBLE truncation risk — first:100 products AND first:10 variants/product with no paging; a catalog beyond those caps drops products/variants from the low-stock widget silently. B2B_PUB_ID is the hardcoded publication gid (199709720811) gating B2B visibility.
-// INVARIANT(S): only variants on the B2B publication count (p.publishedOnPublication guard); inventoryQuantity must be a number to be considered.
-      shopifyFetch(`query{ products(first:100,query:"published_status:published"){
-        edges{node{id title publishedOnPublication(publicationId:"${B2B_PUB_ID}")
-          variants(first:10){edges{node{sku title inventoryQuantity}}}}}}}`)
+    const [orders, lowStockAll] = await Promise.all([
+      drainDashboardOrders(shopifyFetch, `tag:b2b-portal created_at:>${ninetyDaysAgo}`),
+      drainLowStockItems(shopifyFetch, B2B_PUB_ID),
     ]);
-    const orders = ordersResult.data?.orders?.edges?.map(e => e.node) || [];
     const openStatuses = new Set(['PENDING','AUTHORIZED','PARTIALLY_PAID']);
     const openOrders = orders.filter(o => openStatuses.has(o.displayFinancialStatus));
     const weekOrders = orders.filter(o => o.processedAt >= sevenDaysAgo);
@@ -1865,16 +1860,7 @@ async function getDashboardData() {
     if (topCustomers.length === 0) {
       topCustomers = [...spend.values()].sort((a, b) => b.spend - a.spend).slice(0, 5);
     }
-    const allProducts = productsResult.data?.products?.edges?.map(e => e.node) || [];
-    const lowStockItems = [];
-    for (const p of allProducts) {
-      if (!p.publishedOnPublication) continue;
-      for (const ve of (p.variants?.edges || [])) {
-        const v = ve.node;
-        if (typeof v.inventoryQuantity === 'number' && v.inventoryQuantity < 10)
-          lowStockItems.push({ productId: p.id, productTitle: p.title, variantTitle: v.title, sku: v.sku, qty: v.inventoryQuantity });
-      }
-    }
+    const lowStockItems = lowStockAll;
     const pendingReview = getCustomersPendingXeroReview();
     let monthly = [];
     try { const rd = getReportsDataFromCache(); monthly = rd.monthly || []; } catch(e) {}
@@ -2264,7 +2250,7 @@ async function getOrderDetail(numericId, { throwOnError = false } = {}) {
         note tags
         shippingAddress{firstName lastName address1 address2 city province zip country phone}
         billingAddress{firstName lastName address1 address2 city province zip country}
-        lineItems(first:250){edges{node{id title quantity currentQuantity unfulfilledQuantity
+        lineItems(first:250){pageInfo{hasNextPage endCursor} edges{node{id title quantity currentQuantity unfulfilledQuantity
           variant{id title sku barcode selectedOptions{name value} price inventoryQuantity product{id title}}
           discountedUnitPriceSet{presentmentMoney{amount currencyCode}}
           originalUnitPriceSet{presentmentMoney{amount currencyCode}}
@@ -2276,6 +2262,28 @@ async function getOrderDetail(numericId, { throwOnError = false } = {}) {
         transactions(first:10){id status kind gateway createdAt
           amountSet{presentmentMoney{amount currencyCode}}}
       }}`, { id: shopifyOrderGid(numericId) });
+
+    // Pagination-completeness (2026-09-23 audit): order.lineItems(first:250) is a TRANSPORT page, not
+    // the whole order. An order with >250 lines (the #39355 class) silently dropped the overflow from
+    // every consumer below (renderOrderDetail, createXeroInvoice, ship/fulfill, cancel). Drain the rest
+    // of the connection with the shared drag-the-cursor helper and rebuild edges so ALL lines are seen.
+    // SYNC: getOrderDetail line fields — initial selection and drainLineItems continuation must stay
+    // identical, including unfulfilledQuantity and the #45 shipping/fulfillment projections above.
+    if (result.data?.order) {
+      try {
+        const nodes = await drainLineItems(result.data.order.lineItems, 'getOrderDetail', orderLineItemsPage(result.data.order.id, `id title quantity currentQuantity unfulfilledQuantity
+          variant{id title sku barcode selectedOptions{name value} price inventoryQuantity product{id title}}
+          discountedUnitPriceSet{presentmentMoney{amount currencyCode}}
+          originalUnitPriceSet{presentmentMoney{amount currencyCode}}
+          discountedTotalSet{presentmentMoney{amount currencyCode}}
+          discountAllocations{allocatedAmountSet{presentmentMoney{amount currencyCode}} discountApplication{targetSelection ... on ManualDiscountApplication{description}}}`));
+        result.data.order.lineItems = { edges: nodes.map(node => ({ node })) };
+      } catch (err) {
+        console.error('getOrderDetail line-item pagination error:', err.message);
+        if (throwOnError) throw err;
+        return null;
+      }
+    }
     return result.data?.order || null;
   } catch (err) {
     console.error('getOrderDetail error:', err.message);
@@ -8813,23 +8821,10 @@ app.get('/api/admin/customers/:id/spend', requireAuth, async (req, res) => {
     const gid = shopifyCustomerGid(numId);
     const fromStr = new Date(fromTs).toISOString().split('T')[0];
     const toStr   = new Date(toTs  ).toISOString().split('T')[0];
-    const r = await shopifyFetch(`
-      query($id:ID!,$q:String!){
-        customer(id:$id){
-          amountSpent{amount currencyCode}
-          numberOfOrders
-          orders(first:250,query:$q,sortKey:PROCESSED_AT,reverse:true){
-            edges{node{
-              id name processedAt displayFinancialStatus displayFulfillmentStatus
-              totalPriceSet{presentmentMoney{amount currencyCode}}
-              currentTotalPriceSet{presentmentMoney{amount currencyCode}}
-            }}
-          }
-        }
-      }`, { id: gid, q: `processed_at:>=${fromStr} processed_at:<=${toStr}` });
-    const cust = r.data?.customer;
-    if (!cust) return res.status(404).json({ error: 'not found' });
-    const orders = cust.orders.edges.map(e => e.node);
+    const spent = await drainCustomerSpendOrders(shopifyFetch, gid, `processed_at:>=${fromStr} processed_at:<=${toStr}`);
+    if (!spent) return res.status(404).json({ error: 'not found' });
+    const cust = spent.customer;
+    const orders = spent.orders;
     // listRowTotalAmount on BOTH the sum and the rows. #33 changed only the cache branch, so the
     // answer this endpoint gave depended on whether the cache was warm — a cold cache reproduced the
     // edited-order overstatement the fix existed to remove. (Qodo #11 on PR#33.)

@@ -137,6 +137,21 @@ if [ -f test/order-edit-nav-deadlock.test.mjs ]; then
   node test/order-edit-nav-deadlock.test.mjs || UNIT_FAIL=$?
 fi
 
+# Pagination-completeness (2026-09-23 audit, #39355 class): getOrderDetail must drain order
+# lineItems beyond first:250 or renderOrderDetail / createXeroInvoice / ship flows under-build.
+if [ -f test/pagination-completeness.test.mjs ]; then
+  echo ""
+  node test/pagination-completeness.test.mjs || UNIT_FAIL=$?
+fi
+if [ -f test/fulfillment-order-paging.test.mjs ]; then
+  echo ""
+  node test/fulfillment-order-paging.test.mjs || UNIT_FAIL=$?
+fi
+if [ -f test/dashboard-paging.test.mjs ]; then
+  echo ""
+  node test/dashboard-paging.test.mjs || UNIT_FAIL=$?
+fi
+
 # Electron shell code — never runs inside the Express server, so the HTTP suites cannot reach it.
 # Guards the PDF-in-the-main-window trap (no back button; its X quits the whole app).
 if [ -f test/desktop-pdf-headers.test.mjs ]; then
