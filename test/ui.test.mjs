@@ -191,6 +191,21 @@ await test('/orders/1001 shows order detail with timeline and line items', async
   assert.ok(html.includes('Generate Invoice'), 'Missing Generate Invoice button');
 });
 
+await test('/orders/1001 distinguishes Shopify notes from B2B Admin-only notes', async (page, ctx) => {
+  const sid = await seedSession();
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: sid, domain: '127.0.0.1', path: '/' }]);
+  await page.goto(`${BASE}/orders/1001`);
+  await page.waitForSelector('#internal-note-card');
+  const html = await page.content();
+  assert.ok(html.includes('Shopify order note'), 'Shopify-backed note is not labeled clearly');
+  assert.ok(html.includes('syncs to Shopify'), 'Shopify-backed note is missing its sync promise');
+  assert.ok(html.includes('B2B Admin-only note'), 'Local note is not labeled as B2B Admin-only');
+  assert.ok(html.includes('stored only here · not in Shopify'), 'Local note is missing its no-sync warning');
+  assert.ok(html.includes('Shopify does not allow apps to create timeline comments after an edit'), 'Missing Shopify timeline API limitation');
+  assert.ok(html.includes('admin.shopify.com/store/parttwoenterprises/orders/1001'), 'Missing direct Shopify order link');
+  assert.ok(html.includes('Shopify timeline note for this edit (optional)'), 'Edit form does not label the supported Shopify staff-note path');
+});
+
 // Second build (Build C + D): record-payment control + order-history card on order detail.
 await test('/orders/1001 shows Record payment button and order-history card', async (page, ctx) => {
   const sid = await seedSession();
