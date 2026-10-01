@@ -105,6 +105,10 @@ if [ -f test/order-edit-user-errors.test.mjs ]; then
   node test/order-edit-user-errors.test.mjs || UNIT_FAIL=$?
 fi
 
+# Shipping replacement must abort before commit if any Shopify staging mutation fails.
+node --test test/order-shipping.test.mjs || UNIT_FAIL=$?
+node test/shipping-ui.test.mjs || UI_FAIL=$?
+
 # List truncation lives here for the same reason: the cache path is gated on `if (!MOCK)`, so the
 # HTTP suite can never reach the capped query that truncates /orders and /customers.
 if [ -f test/list-truncation.test.mjs ]; then
