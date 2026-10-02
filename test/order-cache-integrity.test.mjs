@@ -23,6 +23,9 @@ const {
   getOrderFromCache,
   getReportsDataFromCache,
   deleteOrderFromCache,
+  deleteCustomerFromCache,
+  getCustomerFromCache,
+  listCustomersFromCache,
   getOrderShopifyIdsBatch,
   default: db,
 } = await import('../db.mjs');
@@ -195,6 +198,35 @@ await test('a deleted order disappears from the /orders list (listOrdersFromCach
   assert(listOrdersFromCache({}).some(o => o.name === '#7604'), 'sanity: order shows in the list before deletion');
   deleteOrderFromCache('7604');
   assert(!listOrdersFromCache({}).some(o => o.name === '#7604'), 'the order page must stop showing an order once Shopify has deleted it');
+});
+
+// ── deleteCustomerFromCache: PRO-MOHS 2026-08-24 — a Shopify customerMerge left a ghost duplicate ──
+// in /customers because customers/delete webhooks were upserted like every other customers/* topic
+// instead of being deleted. This covers the DB-layer fix; server.mjs now special-cases the topic.
+
+await test('deleteCustomerFromCache removes the customer row', async () => {
+  upsertCustomerCache({
+    shopify_id: '9800', gid: 'gid://shopify/Customer/9800', email: 'ghost@pro-mohs.com',
+    display_name: 'Ghost Customer', tags: ['b2b'],
+  });
+  assert(getCustomerFromCache('9800'), 'sanity: customer is cached before deletion');
+  deleteCustomerFromCache('9800');
+  assertEqual(getCustomerFromCache('9800'), null, 'a merged-away/deleted customer must not remain in customers_cache');
+});
+
+await test('deleteCustomerFromCache is scoped to one customer — it must not touch a sibling row', async () => {
+  upsertCustomerCache({ shopify_id: '9801', gid: 'gid://shopify/Customer/9801', email: 'one@pro-mohs.com', display_name: 'One', tags: ['b2b'] });
+  upsertCustomerCache({ shopify_id: '9802', gid: 'gid://shopify/Customer/9802', email: 'two@pro-mohs.com', display_name: 'Two', tags: ['b2b'] });
+  deleteCustomerFromCache('9801');
+  assertEqual(getCustomerFromCache('9801'), null);
+  assert(getCustomerFromCache('9802'), 'a sibling customer must survive deleting a different customer');
+});
+
+await test('a deleted customer disappears from the /customers list (listCustomersFromCache)', async () => {
+  upsertCustomerCache({ shopify_id: '9803', gid: 'gid://shopify/Customer/9803', email: 'three@pro-mohs.com', display_name: 'Three', tags: ['b2b'] });
+  assert(listCustomersFromCache({}).some(c => c.email === 'three@pro-mohs.com'), 'sanity: customer shows in the list before deletion');
+  deleteCustomerFromCache('9803');
+  assert(!listCustomersFromCache({}).some(c => c.email === 'three@pro-mohs.com'), 'the customers page must stop showing a customer once Shopify has merged/deleted it');
 });
 
 // ── getOrderShopifyIdsBatch: the reconciliation sweep's paging primitive ────────────────────────
