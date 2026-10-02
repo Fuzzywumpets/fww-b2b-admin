@@ -56,6 +56,7 @@ import { isTerminalEditError } from './lib/order-edit-errors.mjs';
 // falls back to the frozen pre-edit amount and the surface looks correct while being wrong.
 import { cacheRowTotal, listRowTotalAmount, restRowCurrentTotals } from './lib/order-display-totals.mjs';
 import { LINE_PAGE_MAX, drainLineItems } from './lib/line-item-paging.mjs';
+import { syncRecentOrders, normalizeRestFulfillmentStatus } from './lib/orders-recent-sync.mjs';
 import { renderLabelSheet, expandItems, TEMPLATES as LABEL_TEMPLATES, DEFAULT_FIELDS } from './labels.mjs';
 import { isInsider, resolveXeroContact, syncCustomerToXero, getXeroSyncStatus } from './lib/xero-customer-sync.mjs';
 import { parseLinePrices, applyLinePriceChanges, bulkMarkOrdersPaid, addLineDiscountsConcurrent } from './lib/order-money.mjs';
@@ -12390,9 +12391,9 @@ app.post('/webhooks/shopify', (req, res) => {
           // DEPENDS: readers that lowercase for display (badge class, ~line 11640) still work — they
           // normalize on read. Keep this uppercase to match the GraphQL sync writer.
           financial_status: o.financial_status?.toUpperCase() || null,
-          fulfillment_status: o.fulfillment_status?.toUpperCase() || null,
+          fulfillment_status: normalizeRestFulfillmentStatus(o.fulfillment_status),
           display_financial_status: o.financial_status?.toUpperCase(),
-          display_fulfillment_status: o.fulfillment_status?.toUpperCase(),
+          display_fulfillment_status: normalizeRestFulfillmentStatus(o.fulfillment_status),
           total_price: parseFloat(o.total_price) || 0,
           subtotal_price: parseFloat(o.subtotal_price) || 0,
           // CURRENT-TOTALS (corrected 2026-08-28): the comment that stood here since 2026-06-29 said
@@ -12469,30 +12470,13 @@ app.post('/webhooks/shopify', (req, res) => {
 // INVARIANT(S): no-ops in MOCK or without SHOPIFY_BEARER; the 60s lookback overlap is REQUIRED so updates landing between polls aren't lost; success and error both call setSyncState so last_synced_at always advances (an error still moves the cursor, meaning a failed page is not retried — intentional best-effort).
 async function syncRecentFromShopify() {
   if (MOCK || !SHOPIFY_BEARER) return;
-  try {
-    const state = getSyncState('orders_recent');
-    const since = state?.last_synced_at
-      ? new Date(state.last_synced_at - 60000).toISOString()
-      : new Date(Date.now() - 6 * 60 * 1000).toISOString();
-    const result = await shopifyFetch(`
-      query($q:String!){
-        orders(first:50,query:$q,sortKey:UPDATED_AT,reverse:true){
-          edges{node{
-            id name processedAt updatedAt createdAt cancelledAt
-            displayFinancialStatus displayFulfillmentStatus
-            totalPriceSet{shopMoney{amount}}
-            subtotalPriceSet{shopMoney{amount}}
-            currentTotalPriceSet{shopMoney{amount}}
-            currentSubtotalPriceSet{shopMoney{amount}}
-            totalTaxSet{shopMoney{amount}}
-            customer{id email firstName lastName}
-            tags sourceName note
-          }}
-          pageInfo{hasNextPage}
-        }
-      }`, { q: `updated_at:>${since}` });
-    const edges = result.data?.orders?.edges || [];
-    for (const { node: o } of edges) {
+  // Paging/cursor logic lives in lib/orders-recent-sync.mjs (unit-tested); this only maps a node to a row.
+  // DEPENDS: the fields below must stay in step with ORDER_SYNC_FIELDS in that module.
+  await syncRecentOrders({
+    shopifyFetch,
+    getState: () => getSyncState('orders_recent'),
+    setState: (st) => setSyncState('orders_recent', st),
+    upsertNode: (o) => {
       const shopifyId = shopifyNumericId(o.id);
       const custId = o.customer?.id ? shopifyNumericId(o.customer.id) : null;
       upsertOrderCache({
@@ -12517,12 +12501,8 @@ async function syncRecentFromShopify() {
         tags: o.tags || [], source_name: o.sourceName || null, note: o.note || null,
         customer_email: o.customer?.email || null,
       });
-    }
-    setSyncState('orders_recent', { lastSyncedAt: Date.now(), totalSynced: edges.length });
-  } catch (err) {
-    console.error('[sync] polling error:', err.message);
-    setSyncState('orders_recent', { lastSyncedAt: Date.now(), lastError: err.message });
-  }
+    },
+  });
 }
 
 // WHAT: verifies a small rotating batch of cached orders still exist in Shopify (nodes(ids:) returns

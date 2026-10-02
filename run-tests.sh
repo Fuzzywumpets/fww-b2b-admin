@@ -67,6 +67,13 @@ if [ -f test/test-session-guard.test.mjs ]; then
   node test/test-session-guard.test.mjs || AUTH_FAIL=$?
 fi
 
+# Incremental orders poller (paging, cursor, error handling) + REST status normalizer. Standalone:
+# the poller sits behind `if (!MOCK)` in server.mjs, so the HTTP suite can never reach it.
+if [ -f test/orders-recent-sync.test.mjs ]; then
+  echo ""
+  node test/orders-recent-sync.test.mjs || UNIT_FAIL=$?
+fi
+
 # Money-correctness helpers (lib/order-money.mjs). Standalone because the branches under test are
 # Shopify userError branches — MOCK never calls shopifyFetch, so only an injected fake reaches them.
 if [ -f test/order-money.test.mjs ]; then
