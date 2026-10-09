@@ -1,0 +1,235 @@
+{
+  "version": "0.1.0",
+  "metadata": {
+    "repository": "fww-b2b-admin",
+    "root": "C:\\Users\\AlexLass\\projects\\commerce-b2b\\fww-b2b-admin",
+    "head": "dfcae833af17698384396626c1754c97c109add8",
+    "base": "origin/main",
+    "changed_files": [
+      "lib/orders-recent-sync.mjs",
+      "run-tests.sh",
+      "server.mjs",
+      "test/orders-recent-sync.test.mjs"
+    ],
+    "changed_symbols": [
+      "normalizeRestFulfillmentStatus",
+      "PARTIALLY_FULFILLED",
+      "SYNC_COLD_START_MS",
+      "ORDER_SYNC_FIELDS",
+      "syncRecentOrders",
+      "SYNC_OVERLAP_MS",
+      "SYNC_PAGE_LIMIT",
+      "SYNC_PAGE_SIZE",
+      "UNFULFILLED",
+      "fakeShopify",
+      "UPDATED_AT",
+      "maxUpdated",
+      "FULFILLED",
+      "INVARIANT",
+      "RESTOCKED",
+      "UNIT_FAIL",
+      "startedAt",
+      "function",
+      "DEPENDS",
+      "PARTIAL",
+      "harness",
+      "hasNext",
+      "sinceMs",
+      "NEWEST",
+      "OLDEST",
+      "cursor",
+      "orders",
+      "passed",
+      "synced",
+      "EVERY",
+      "QUERY",
+      "after",
+      "async",
+      "calls",
+      "const",
+      "names",
+      "since",
+      "slice",
+      "start",
+      "state"
+    ],
+    "status": ""
+  },
+  "packet_sha256": "836f84ad35e789606df7287610b0d41e80a761d23831ee160eb70492c40a8195",
+  "tests": [],
+  "candidate_reviews": {
+    "code": {
+      "summary": "Reviewed the new `lib/orders-recent-sync.mjs` poller, its wiring in `server.mjs`, the new standalone test, and the `run-tests.sh` addition. The paging/cursor logic is sound for the happy path, but the error path in `syncRecentOrders` writes a cursor value that is NOT the stored value it claims to preserve, and the `server.mjs` caller no longer catches the rethrown error \u2014 which changes the scheduler's `_lastSyncAt` bookkeeping and the `reconcileOrderDeletions` sequencing. I also found that the new test's `fakeShopify` cursor semantics do not match the real Shopify `endCursor` contract, so the 'page cap hit' test passes for the wrong reason and would not catch a regression in the resume logic.",
+      "findings": [
+        {
+          "title": "Error path advances the cursor instead of leaving it put, contradicting the module's own INVARIANT and the test's assertion",
+          "severity": "high",
+          "confidence": 0.9,
+          "file": "lib/orders-recent-sync.mjs",
+          "line": 78,
+          "evidence": "lib/orders-recent-sync.mjs:76-80\n```js\n  } catch (err) {\n    // Cursor stays put (sinceMs + overlap == the stored value) so the whole window is retried.\n    setState({ lastSyncedAt: sinceMs + SYNC_OVERLAP_MS, lastError: err.message });\n    throw err;\n  }\n```\nThe comment asserts `sinceMs + SYNC_OVERLAP_MS == the stored value`. That is only true when `state.last_synced_at` was truthy, because `sinceMs` is derived at line 51-53:\n```js\n  const sinceMs = state?.last_synced_at\n    ? state.last_synced_at - SYNC_OVERLAP_MS\n    : startedAt - SYNC_COLD_START_MS;\n```\nOn the cold-start branch (`state.last_synced_at` falsy/0/undefined) `sinceMs = startedAt - SYNC_COLD_START_MS`, so the catch writes `lastSyncedAt = startedAt - SYNC_COLD_START_MS + SYNC_OVERLAP_MS` = `startedAt - 5min`, i.e. it ADVANCES the cursor from 'never synced' to '5 minutes ago' on a failed first run. The test at test/orders-recent-sync.test.mjs:59-69 only exercises the warm branch (`harness({ last_synced_at: base - 5000 })`) and asserts `h.state.last_synced_at === base - 5000`, so the cold-start error path is untested and the invariant is violated exactly where it matters most (first run after deploy/restart, when the poller has the largest window to cover).",
+          "impact": "On a cold start (fresh DB, wiped sync_state, or first boot after deploy) a single transient shopify-bridge error writes a cursor 5 minutes in the past. The next successful run then only re-covers `updated_at:> (startedAt - 5min - 60s)`, permanently skipping every order updated between the intended 6-minute cold-start window and that point. Those orders stay stale in orders_cache (the exact class of bug this module was written to fix), and because the cursor has moved forward there is no retry that recovers them.",
+          "verification": "Add a test that calls `syncRecentOrders` with `getState: () => ({})` (or `{ last_synced_at: 0 }`) and a `shopifyFetch` that throws on the first call, then assert `h.state.last_synced_at` is unchanged (i.e. still falsy/0). Run `node test/orders-recent-sync.test.mjs` \u2014 the new assertion fails against the current code, proving the cursor advanced."
+        },
+        {
+          "title": "server.mjs caller no longer catches the rethrown error, so a sync failure now skips reconcileOrderDeletions and leaves _lastSyncAt stale",
+          "severity": "medium",
+          "confidence": 0.85,
+          "file": "server.mjs",
+          "line": 12458,
+          "evidence": "server.mjs:12454-12460\n```js\n  setInterval(async () => {\n    if (!dashboardActive()) return;            // quiet when nobody is looking\n    if (_syncing || (Date.now() - _lastSyncAt) < FRESH_TARGET_MS) return;\n    _syncing = true;\n    try { await syncRecentFromShopify(); await reconcileOrderDeletions(); _lastSyncAt = Date.now(); }\n    catch {} finally { _syncing = false; }\n  }, 60 * 1000);\n```\nBefore this change `syncRecentFromShopify` swallowed its own errors (the removed `catch (err) { console.error(...); setSyncState(...) }` block), so `reconcileOrderDeletions()` always ran and `_lastSyncAt` always advanced. The new `syncRecentOrders` rethrows (lib/orders-recent-sync.mjs:79), and the caller's `catch {}` is empty, so on any poller error the `await reconcileOrderDeletions()` on the same line is skipped and `_lastSyncAt` is NOT updated. The module header explicitly states the rethrow is intentional ('rethrown so callers/\"Sync now\" see the failure'), but the only caller in this diff is the scheduler, whose catch discards it.",
+          "impact": "Two coupled regressions on every transient Shopify error: (1) deleted-order reconciliation is starved \u2014 it only runs in the same gated tick, so a run of failures means deleted orders are never evicted from orders_cache; (2) because `_lastSyncAt` is not advanced, the next 60s tick immediately retries (the `(Date.now() - _lastSyncAt) < FRESH_TARGET_MS` guard no longer throttles), turning a bridge outage into a tight retry loop against the Shopify API rather than the intended ~3-minute cadence.",
+          "verification": "In a non-MOCK boot with a `shopifyFetch` stubbed to throw, observe that `reconcileOrderDeletions` is never invoked and that the interval fires again on the next 60s tick instead of waiting FRESH_TARGET_MS. Alternatively, unit-test the scheduler body by extracting it: assert `_lastSyncAt` advances and `reconcileOrderDeletions` is called even when `syncRecentFromShopify` rejects."
+        },
+        {
+          "title": "Test fakeShopify uses a numeric offset as endCursor, so the 'page cap hit' test does not exercise the real resume contract",
+          "severity": "medium",
+          "confidence": 0.8,
+          "file": "test/orders-recent-sync.test.mjs",
+          "line": 21,
+          "evidence": "test/orders-recent-sync.test.mjs:14-22\n```js\n  const fn = async (_q, { q, first, after }) => {\n    calls.push({ q, first, after });\n    const since = Date.parse(q.replace('updated_at:>', ''));\n    const rows = orders.filter(o => Date.parse(o.updatedAt) > since).sort((a, b) => Date.parse(a.updatedAt) - Date.parse(b.updatedAt));\n    const start = after ? Number(after) : 0;\n    const slice = rows.slice(start, start + first);\n    const end = start + slice.length;\n    return { data: { orders: { edges: slice.map(node => ({ node })), pageInfo: { hasNextPage: end < rows.length, endCursor: String(end) } } } };\n  };\n```\nThe fake treats `after` as an integer index into the freshly-filtered `rows` array and returns `endCursor: String(end)`. Real Shopify returns an opaque base64 cursor that is only meaningful against the SAME query/filter set. The production code (lib/orders-recent-sync.mjs:74) passes `conn.pageInfo.endCursor` straight back as `after`, and the resume test at test/orders-recent-sync.test.mjs:46-57 relies on the fake's index semantics to make the second run pick up at row 50. Because the fake re-filters by `updated_at:>since` on every call and the cursor is an index into that filtered list, the test cannot detect a real-world failure mode: if the resume window's `since` changes between runs (which it does \u2014 the cursor is set to `orders[49].updatedAt` at line 83, so the next run's `since` is `orders[49].updatedAt - 60s`), the filtered `rows` array is a DIFFERENT set than the one the cursor was minted against, and a real opaque cursor would be invalid or would skip/duplicate rows.",
+          "impact": "The test gives false confidence that the capped-resume path is correct. The real risk it fails to cover: after a capped run the cursor is set to the newest stored `updatedAt` (line 83), so the next run's `since` is that timestamp minus the 60s overlap. Any order whose `updatedAt` falls inside that 60s overlap window is re-fetched (fine), but the resume relies on Shopify's `after` cursor being valid for a query whose `updated_at:>` bound has moved. If Shopify rejects or mis-handles a cursor minted under a different filter, the second run throws 'orders unavailable while polling' or silently restarts from page 0, and the test would still pass because the fake ignores cursor validity entirely.",
+          "verification": "Change the fake to mint an opaque cursor (e.g. base64 of the last row's `updatedAt`) and to reject an `after` that was not minted against the current `since` bound; re-run `node test/orders-recent-sync.test.mjs`. The 'page cap hit' test should then fail, demonstrating that the current test does not validate the real cursor contract."
+        }
+      ]
+    },
+    "tests": {
+      "summary": "Reviewed the new lib/orders-recent-sync.mjs poller, its server.mjs integration, the REST fulfillment normalizer, and the accompanying unit test. The paging/cursor/error logic is well covered by the new suite. I found one concrete defect in the changed behavior: the error path in syncRecentOrders writes a cursor value that is not the stored value it claims to preserve, so the documented 'cursor stays put' invariant is false and the retry window silently shifts forward by the overlap on every failure. I also found that the normalizer's contract is only half-applied at the webhook call site (display_* fields), which is a real but lower-severity inconsistency. No other findings met the bar.",
+      "findings": [
+        {
+          "title": "Error path advances the cursor by SYNC_OVERLAP_MS instead of leaving it unchanged",
+          "severity": "medium",
+          "confidence": 0.85,
+          "file": "lib/orders-recent-sync.mjs",
+          "line": 78,
+          "evidence": "Line 51-53: `sinceMs = state.last_synced_at - SYNC_OVERLAP_MS`. Line 78 (catch): `setState({ lastSyncedAt: sinceMs + SYNC_OVERLAP_MS, lastError: err.message })`. The comment on line 77 asserts 'Cursor stays put (sinceMs + overlap == the stored value)'. That equality only holds when `state.last_synced_at` was truthy. On a cold start (`state?.last_synced_at` falsy) `sinceMs = startedAt - SYNC_COLD_START_MS`, so the catch writes `startedAt - SYNC_COLD_START_MS + SYNC_OVERLAP_MS` = `startedAt - 5min`, i.e. it writes a brand-new cursor where none existed. Even on the warm path the arithmetic is only correct because the same constant is added and subtracted; the code is fragile and the invariant is stated as an identity that the cold-start branch violates.",
+          "impact": "On the first-ever poll (or any poll where sync_state has no row / last_synced_at is null) a transient Shopify/bridge error now persists a cursor of `startedAt - 5min` instead of leaving the state empty. The next run then uses `sinceMs = (startedAt - 5min) - 60s`, so the retry window is anchored to the failed run's start time rather than the intended 6-minute cold-start lookback. If the failure repeats, each attempt re-anchors the window to a later `startedAt`, so the effective lookback shrinks toward the 60s overlap and orders updated during the outage window can be skipped once a later run finally succeeds. The unit test at test/orders-recent-sync.test.mjs:59-69 only exercises the warm path (harness seeded with `last_synced_at: base - 5000`), so this branch is untested.",
+          "verification": "Add a test that calls syncRecentOrders with `getState: () => null` (or `{}`), a shopifyFetch that throws on the first call, and asserts that after the throw the recorded write's `lastSyncedAt` equals the pre-call state (i.e. no cursor is persisted / the state is unchanged). Concretely: `const h = harness(null); try { await syncRecentOrders({ shopifyFetch: async () => { throw new Error('x'); }, getState: h.getState, setState: h.setState, upsertNode: h.upsertNode, now: () => 1_000_000 }); } catch {} eq(h.writes.at(-1).lastSyncedAt, undefined)` \u2014 this fails against the current line 78, which writes `1_000_000 - 360_000 + 60_000`."
+        },
+        {
+          "title": "normalizeRestFulfillmentStatus applied to fulfillment_status but the display_* pair is left inconsistent for the empty-string case",
+          "severity": "low",
+          "confidence": 0.6,
+          "file": "server.mjs",
+          "line": 12391,
+          "evidence": "The change replaces both `fulfillment_status` and `display_fulfillment_status` with `normalizeRestFulfillmentStatus(o.fulfillment_status)` (server.mjs:12391 and 12393). The normalizer (lib/orders-recent-sync.mjs:93-96) maps `null`/`''` to `'UNFULFILLED'`. The sibling financial fields on the same object are NOT normalized the same way: `financial_status: o.financial_status?.toUpperCase() || null` and `display_financial_status: o.financial_status?.toUpperCase()` (server.mjs:12390, 12392) still yield `null`/`undefined` for a missing financial status. So a webhook payload with no fulfillment status now writes `'UNFULFILLED'` into both fulfillment columns while the financial columns stay null \u2014 the two status families no longer share a null-handling convention in the same row.",
+          "impact": "Readers that treat a null status as 'unknown / not yet synced' (e.g. the badge-class lowercasing noted at server.mjs:12292 and the status-bucket filters in db.mjs) will now see a definite 'UNFULFILLED' for orders whose fulfillment status was simply absent from the payload, which is indistinguishable from a genuinely unfulfilled order. This is the intended behavior for the fulfillment column per the module comment, but the asymmetry with the financial column means the same webhook row can carry a concrete fulfillment status and a null financial status, which is a state the readers were not written against.",
+          "verification": "Add a unit assertion that a webhook payload with `fulfillment_status: ''` and `financial_status: ''` produces a row where `fulfillment_status === 'UNFULFILLED'` and `financial_status === null`, then confirm the Orders-list status filter (db.mjs listOrdersFromCache) renders that row under the expected bucket. If the intended contract is that both families normalize identically, the test should assert `financial_status === 'UNFULFILLED'`-equivalent handling and will fail against the current server.mjs:12390."
+        }
+      ]
+    }
+  },
+  "result": {
+    "verdict": "clean",
+    "summary": "The new oldest-first poller preserves its retry window on both warm and cold-start failures, and cross-run resume is timestamp-based rather than Shopify-cursor-based. The candidate impacts are contradicted by the control flow in lib/orders-recent-sync.mjs and server.mjs.",
+    "findings": [],
+    "rejected": [
+      {
+        "title": "Error path advances the cursor instead of leaving it put, contradicting the module's own INVARIANT and the test's assertion",
+        "reason": "On a cold start the catch does write lastSyncedAt = startedAt - 5min, but the next run subtracts SYNC_OVERLAP_MS again, so the query bound is exactly the original sinceMs (T1 - 6min), not a later bound. A repeated failure then takes the warm path, where sinceMs + overlap equals the stored cursor, so the window does not re-anchor or shrink. No order is skipped."
+      },
+      {
+        "title": "Error path advances the cursor by SYNC_OVERLAP_MS instead of leaving it unchanged",
+        "reason": "Same arithmetic as the other error-path claim. Warm-path sinceMs is stored cursor minus overlap, so the catch write restores that cursor. Cold-start writes a cursor whose next lower bound is the original 6-minute lookback. The claimed shrinking retry window is not what the next getState/setState cycle does."
+      },
+      {
+        "title": "server.mjs caller no longer catches the rethrown error, so a sync failure now skips reconcileOrderDeletions and leaves _lastSyncAt stale",
+        "reason": "The empty scheduler catch is real, but the impact is not. reconcileOrderDeletions also needs Shopify and already swallows its own errors; a failed sync only delays it until the next successful tick. _lastSyncAt not moving does not create an unbounded loop: the interval is 60s and _syncing is cleared in finally, and the Shopify cursor itself is still preserved inside syncRecentOrders."
+      },
+      {
+        "title": "Test fakeShopify uses a numeric offset as endCursor, so the 'page cap hit' test does not exercise the real resume contract",
+        "reason": "Production never reuses endCursor across runs. after starts null on every syncRecentOrders call; resume is the updatedAt timestamp written at lib/orders-recent-sync.mjs:83 and re-read as the updated_at:> bound. Within one run the filter is constant, so the fake's index cursor matches the only cursor contract this code uses."
+      },
+      {
+        "title": "normalizeRestFulfillmentStatus applied to fulfillment_status but the display_* pair is left inconsistent for the empty-string case",
+        "reason": "The cited server.mjs:12391 lines are the GraphQL upsert, which still stores displayFulfillmentStatus and does not call the normalizer. The webhook change intentionally maps REST null/empty fulfillment_status to UNFULFILLED, and financial_status null handling is a separate pre-existing contract. The packet does not show a reader broken by that difference."
+      }
+    ]
+  },
+  "receipts": [
+    {
+      "requested_model": "deepseek/deepseek-v4.1-flash",
+      "served_model": "deepseek/deepseek-v4.1-flash",
+      "id": "gen-1790971794-BDfQaJ77tKEt2kojh9IL",
+      "usage": {
+        "prompt_tokens": 66162,
+        "completion_tokens": 2193,
+        "total_tokens": 68355,
+        "cost": 0.01018374,
+        "is_byok": false,
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "cache_write_tokens": 0,
+          "audio_tokens": 0,
+          "video_tokens": 0
+        },
+        "cost_details": {
+          "upstream_inference_cost": 0.01018374,
+          "upstream_inference_prompt_cost": 0.00926268,
+          "upstream_inference_completions_cost": 0.00092106
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 0,
+          "image_tokens": 0,
+          "audio_tokens": 0
+        }
+      }
+    },
+    {
+      "requested_model": "deepseek/deepseek-v4.1-flash",
+      "served_model": "deepseek/deepseek-v4.1-flash",
+      "id": "gen-1790971794-DuXT5NZ4MXnYEV7UQoKj",
+      "usage": {
+        "prompt_tokens": 66146,
+        "completion_tokens": 1401,
+        "total_tokens": 67547,
+        "cost": 0.00984886,
+        "is_byok": false,
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "cache_write_tokens": 0,
+          "audio_tokens": 0,
+          "video_tokens": 0
+        },
+        "cost_details": {
+          "upstream_inference_cost": 0.00984886,
+          "upstream_inference_prompt_cost": 0.00926044,
+          "upstream_inference_completions_cost": 0.00058842
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 0,
+          "image_tokens": 0,
+          "audio_tokens": 0
+        }
+      }
+    },
+    {
+      "requested_model": "x-ai/grok-4.7",
+      "served_model": "x-ai/grok-4.7",
+      "id": "gen-1790971833-8F5rV13QPX9CjKJcJrFq",
+      "usage": {
+        "prompt_tokens": 73892,
+        "completion_tokens": 21380,
+        "total_tokens": 95272,
+        "cost": 0.274336,
+        "is_byok": false,
+        "prompt_tokens_details": {
+          "cached_tokens": 1152,
+          "cache_write_tokens": 0,
+          "audio_tokens": 0,
+          "video_tokens": 0
+        },
+        "cost_details": {
+          "upstream_inference_cost": 0.274336,
+          "upstream_inference_prompt_cost": 0.146056,
+          "upstream_inference_completions_cost": 0.12828
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 20745,
+          "image_tokens": 0,
+          "audio_tokens": 0
+        }
+      }
+    }
+  ]
+}
