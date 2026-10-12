@@ -126,6 +126,17 @@ await test('order-create payload: default address sent verbatim WITH company + p
   assert.equal(billingAddress.address1, '670 Highway 69');
 });
 
+await test('order-create payload: an edited province/country is NOT replaced by the saved address (DeepReview #1)', () => {
+  const base = { firstName: 'Lorraine', lastName: 'Rainwater', address1: '670 Highway 69', city: 'Haysville', zip: '28904' };
+  assert.ok(sameStreetAddress({ ...base, province: 'NC', country: 'US' }, DEFAULT_ADDR));
+  assert.ok(sameStreetAddress({ ...base, province: 'north carolina', country: 'United States' }, DEFAULT_ADDR));
+  assert.ok(!sameStreetAddress({ ...base, province: 'TX', country: 'US' }, DEFAULT_ADDR));
+  assert.ok(!sameStreetAddress({ ...base, province: 'NC', country: 'CA' }, DEFAULT_ADDR));
+  const { shippingAddress } = buildOrderAddresses({ submitted: { ...base, province: 'TX', country: 'US' }, submittedCompany: CO, defaultAddress: DEFAULT_ADDR, company: CO });
+  assert.equal(shippingAddress.province, 'TX'); assert.equal(shippingAddress.provinceCode, undefined);
+  assert.equal(shippingAddress.company, CO);
+});
+
 await test('order-create payload: legacy form (no ship_company field) still carries the company', () => {
   const submitted = { firstName: 'Lorraine', lastName: 'Rainwater', address1: '670 Highway 69', city: 'Haysville', zip: '28904' };
   const { shippingAddress, billingAddress } = buildOrderAddresses({ submitted, submittedCompany: undefined, defaultAddress: DEFAULT_ADDR, company: CO });
