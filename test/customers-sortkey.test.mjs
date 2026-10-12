@@ -38,6 +38,11 @@ await test('getCustomersData picks RELEVANCE when searching, else ID, and sorts 
   assert.match(src, /customers: sortCustomers\(edges\.map\(e => e\.node\), filters\.sort\)/);
 });
 
+await test('live path flags perPageSortOnly and the ★ badge honours it', () => {
+  assert.match(src, /perPageSortOnly: true,/);
+  assert.match(src, /const isTop = !data\.perPageSortOnly && /);
+});
+
 await test('/customers/export.csv sorts collected rows by lifetime spend', () => {
   assert.match(src, /return sortCustomers\(all, 'lifetime_spend_desc'\);/);
 });

@@ -4209,6 +4209,8 @@ async function getCustomersData(filters) {
     const edges = result.data?.customers?.edges || [];
     return {
       customers: sortCustomers(edges.map(e => e.node), filters.sort),
+      // DEPENDS: renderCustomersList suppresses the ★ top-10 badge when set — a per-page sort is not a global rank.
+      perPageSortOnly: true,
       hasNextPage: result.data?.customers?.pageInfo?.hasNextPage || false,
       endCursor:   result.data?.customers?.pageInfo?.endCursor   || null,
       total:       edges.length,
@@ -4237,7 +4239,7 @@ function tagChip(t, { linked = false } = {}) {
 }
 
 // WHAT: HTML for the /customers table — segment chips, search/tag/sort filter bar, rows with star badges for top-10-by-spend, and a 'Next 50' cursor link.
-// CHANGE-GUARD: the ★ top-customer badge is index-based (idx < TOP_CUSTOMER_THRESHOLD) and ONLY valid when sort is lifetime_spend_desc — if you change the default sort or page size, the star logic silently mislabels. Re-test that 'Next 50' preserves q/segment/tag/sort params plus after cursor.
+// CHANGE-GUARD: the ★ top-customer badge is index-based (idx < TOP_CUSTOMER_THRESHOLD) and ONLY valid when sort is lifetime_spend_desc AND the list is globally ranked (suppressed when data.perPageSortOnly — the live Shopify fallback) — if you change the default sort or page size, the star logic silently mislabels. Re-test that 'Next 50' preserves q/segment/tag/sort params plus after cursor.
 // INVARIANT(S): colspan=7 on the empty row must match the 7 <th> columns; pagination uses endCursor (opaque Shopify cursor), never an offset.
 function renderCustomersList(session, data, filters) {
   const { customers, hasNextPage, endCursor, error, truncated } = data;
@@ -4253,7 +4255,7 @@ function renderCustomersList(session, data, filters) {
     const visibleTags = (c.tags || []).slice(0, 3);
     const moreTags    = (c.tags || []).length - visibleTags.length;
     const tagBadges   = visibleTags.map(t => tagChip(t, { linked: true })).join('') + (moreTags > 0 ? `<span class="tag-chip tag-chip-more" title="${h((c.tags||[]).join(', '))}">+${moreTags}</span>` : '');
-    const isTop = (filters.sort || 'lifetime_spend_desc') === 'lifetime_spend_desc' && idx < TOP_CUSTOMER_THRESHOLD;
+    const isTop = !data.perPageSortOnly && (filters.sort || 'lifetime_spend_desc') === 'lifetime_spend_desc' && idx < TOP_CUSTOMER_THRESHOLD;
     const starBadge = isTop ? `<span class="top-customer-star" title="Top customer by lifetime spend">★</span>` : '';
     return `<tr>
       <td><a href="/customers/${h(numId)}" class="link-strong">${h(c.displayName)}</a>${starBadge}<br><small>${h(c.email)}</small></td>
