@@ -235,6 +235,16 @@ await test('GET /orders/new province select covers US + Canada (Ontario regressi
   assert.ok(html.includes('<option value="IL">'), 'Missing Illinois (IL) option');
 });
 
+// COMPANY-NAME (#39848, 2026-10-12): the manual order form must carry the business name so
+// orderCreate gets a company on shipping + billing (payload itself: test/order-company.test.mjs).
+await test('GET /orders/new?customer=102 prefills the Company field from the default address', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/orders/new?customer=102`, { headers: { Cookie: cookie } });
+  const html = await res.text();
+  assert.ok(html.includes('name="ship_company"'), 'Missing ship_company field on the order form');
+  assert.ok(html.includes('Happy Paws Boutique LLC'), 'Prefill JSON should carry defaultAddress.company');
+});
+
 await test('GET /orders/1001 returns order detail', async () => {
   const cookie = await seedSession();
   const res = await fetch(`${BASE}/orders/1001`, { headers: { Cookie: cookie } });

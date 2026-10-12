@@ -64,6 +64,7 @@ import { drainDashboardOrders, drainLowStockItems, drainCustomerSpendOrders } fr
 import { renderLabelSheet, expandItems, TEMPLATES as LABEL_TEMPLATES, DEFAULT_FIELDS } from './labels.mjs';
 import { isInsider, resolveXeroContact, syncCustomerToXero, getXeroSyncStatus } from './lib/xero-customer-sync.mjs';
 import { parseLinePrices, applyLinePriceChanges, bulkMarkOrdersPaid } from './lib/order-money.mjs';
+import { resolveOrderCompany, buildOrderAddresses } from './lib/order-company.mjs';
 import { assertNoUserErrors } from './lib/shopify-user-errors.mjs';
 import { createCreditCardInvoice } from './helcim.mjs';
 import { buildHelcimInvoicePayload, HelcimInvoiceValidationError } from './lib/helcim-invoice-payload.mjs';
@@ -967,7 +968,8 @@ const MOCK_CUSTOMERS = [
     tags: ['b2b', 'b2b-tier:silver'],
     amountSpent: { amount: '2890.00', currencyCode: 'USD' },
     numberOfOrders: 15,
-    defaultAddress: { id: 'addr2', firstName: 'Jane', lastName: 'Smith', address1: '456 Park Ave', city: 'Seattle', province: 'WA', zip: '98101', country: 'US' },
+    // SYNC: company matches MOCK_ORDERS #1002 customer.company — the manual-order company/billing test keys on it.
+    defaultAddress: { id: 'addr2', company: 'Happy Paws Boutique LLC', firstName: 'Jane', lastName: 'Smith', address1: '456 Park Ave', city: 'Seattle', province: 'WA', zip: '98101', country: 'US' },
     addresses: [{ id: 'addr2', firstName: 'Jane', lastName: 'Smith', address1: '456 Park Ave', city: 'Seattle', province: 'WA', zip: '98101', country: 'US' }],
     metafields: { edges: [
       { node: { id: 'mf2', namespace: 'b2b', key: 'dropship_enabled', value: 'true', type: 'boolean' } },
@@ -2301,17 +2303,23 @@ async function getOrderDetail(numericId, { throwOnError = false } = {}) {
       }
     }
     const order = result.data?.order || null;
-    // COMPANY-NAME (2026-09-08): Shopify keeps a wholesale account's business name on the
-    // customer's DEFAULT ADDRESS (`defaultAddress.company`), not on the Customer node — displayName
-    // is the person ("Emily Stoddard"), the company is "Canine Sports Dog Training". Order #39028-A
-    // invoiced and rendered under the person's name because this query never asked for it. Flatten
-    // it onto customer.company so consumers read one field regardless of source.
+    // COMPANY-NAME (2026-09-08, precedence 2026-10-12): Shopify keeps a wholesale account's
+    // business name on MailingAddress.company only (B2B Companies is not used) — displayName is the
+    // person ("Lorraine Rainwater"), the business is "Mountain Valley Country Store". Invoices
+    // #39028-A and #39848-A printed the person because nothing here asked for a company. Resolve it
+    // once (order billing → order shipping → customer default address → most recent prior
+    // order/draft → customers_cache; never an arbitrary address-book entry) and flatten it onto
+    // customer.company so every consumer reads one field.
     // DEPENDS: pdf.mjs generateInvoicePdf BILL TO reads customer.company (and shipping/billingAddress
     // .company, selected above); renderOrderDetail's header + Customer card read it via
     // orderCustomerNames(). MOCK_ORDERS carries `company` on customer directly — keep the shape equal.
     if (order?.customer) {
-      const co = (order.customer.defaultAddress?.company || '').trim();
-      order.customer.company = co || null;
+      const { company, source } = await resolveOrderCompany(order, {
+        shopifyFetch,
+        getCacheCompany: (numId) => getCustomerFromCache(numId)?.company || null,
+      });
+      order.customer.company = company;
+      order.customer.companySource = source;
     }
     return order;
   } catch (err) {
@@ -4304,7 +4312,7 @@ async function getCustomerDetail(numericId) {
         id email displayName phone tags numberOfOrders
         amountSpent{amount currencyCode}
         addresses(first:5){id firstName lastName address1 city province zip country}
-        defaultAddress{id firstName lastName address1 address2 city province provinceCode zip country phone}
+        defaultAddress{id company firstName lastName address1 address2 city province provinceCode zip country phone}
         metafields(first:20,namespace:"b2b"){edges{node{id namespace key value type}}}
       }}`, { id: shopifyCustomerGid(numericId) });
     return result.data?.customer || null;
@@ -5110,6 +5118,9 @@ function renderNewOrderForm(session, prefillCustomer) {
           <div class="card">
             <div class="card-header"><h2>Shipping Address</h2></div>
             <div id="default-addr-msg" class="text-muted small-text" style="margin-bottom:0.5rem">Select a customer to auto-fill.</div>
+            ${/* SYNC: ship_company — submitNewOrder reads req.body.ship_company (buildOrderAddresses);
+                 fillShipAddr prefills it from defaultAddress.company. Clear it for a dropship to a consumer. */''}
+            <div class="form-row"><label for="ship-company">Company</label><input type="text" name="ship_company" class="input" id="ship-company" placeholder="Business name (clear for dropship)"></div>
             <div class="form-row"><label>First Name</label><input type="text" name="ship_first" class="input" id="ship-first"></div>
             <div class="form-row"><label>Last Name</label><input type="text" name="ship_last" class="input" id="ship-last"></div>
             <div class="form-row"><label>Address 1</label><input type="text" name="ship_addr1" class="input" id="ship-addr1"></div>
@@ -5161,6 +5172,7 @@ function renderNewOrderForm(session, prefillCustomer) {
       // ?customer= prefill path (above) and the search-and-select path (below). Null/undefined = no-op.
       function fillShipAddr(a){
         if(!a) return;
+        document.getElementById('ship-company').value=a.company||'';
         document.getElementById('ship-first').value=a.firstName||'';
         document.getElementById('ship-last').value=a.lastName||'';
         document.getElementById('ship-addr1').value=a.address1||'';
@@ -5229,6 +5241,7 @@ function renderNewOrderForm(session, prefillCustomer) {
       window.removeItem = function(i){ lineItems.splice(i,1); renderLineItems(); updateTotals(); };
       window.clearCustomer = function(){
         selectedCustomer=null; customerIdHidden.value='';
+        document.getElementById('ship-company').value=''; // never carry one account's business onto the next
         document.getElementById('customer-selected').hidden=true;
         document.getElementById('customer-search').hidden=false;
         updateSubmitBtn();
@@ -5472,12 +5485,43 @@ async function submitNewOrder(req, session) {
   const shipCostNum = shipCostRaw === '' ? 0 : parseFloat(shipCostRaw);
   if (!Number.isFinite(shipCostNum) || shipCostNum < 0) return { error: 'Invalid shipping cost.' };
 
-  const shippingAddress = {
+  const submittedAddress = {
     firstName: ship_first || '', lastName: ship_last || '',
     address1: ship_addr1 || '', address2: ship_addr2 || '',
     city: ship_city || '', province: ship_province || '',
     zip: ship_zip || '', country: ship_country || 'US',
   };
+
+  // COMPANY-NAME (2026-10-12, order #39848): the form used to send a shipping address with no
+  // company/phone and no billing address. Shopify saved that as a NEW company-less address, made it
+  // the customer's default, and the invoice printed the person instead of the business. Read the
+  // customer's saved default address server-side (never trust the client for it), resolve the
+  // wholesale company, and send both addresses with it. See lib/order-company.mjs.
+  let priorDefault = null;
+  let company = null;
+  if (MOCK) {
+    const mc = MOCK_CUSTOMERS.find(c => c.id === shopifyCustomerGid(customer_id));
+    priorDefault = mc?.defaultAddress || null;
+    company = (priorDefault?.company || '').trim() || null;
+  } else {
+    try {
+      const cr = await shopifyFetch(`query($id:ID!){ customer(id:$id){ id
+        defaultAddress{id company firstName lastName address1 address2 city province provinceCode zip country countryCodeV2 phone} } }`,
+        { id: shopifyCustomerGid(customer_id) });
+      priorDefault = cr.data?.customer?.defaultAddress || null;
+      ({ company } = await resolveOrderCompany(
+        { id: null, customer: { id: shopifyCustomerGid(customer_id), defaultAddress: priorDefault } },
+        { shopifyFetch, getCacheCompany: (numId) => getCustomerFromCache(numId)?.company || null }));
+    } catch (err) {
+      // Non-fatal: fall back to the submitted address alone rather than refuse the order.
+      console.error(`[order-create] customer address lookup failed (continuing without company): ${err.message}`);
+    }
+  }
+  // DEPENDS: renderNewOrderForm posts `ship_company` (absent from older cached forms → undefined →
+  // resolved company is used).
+  const { shippingAddress, billingAddress } = buildOrderAddresses({
+    submitted: submittedAddress, submittedCompany: req.body.ship_company, defaultAddress: priorDefault, company,
+  });
 
   const orderNote = [note || '', po_number ? `PO: ${po_number}` : ''].filter(Boolean).join('\n');
   // Notify-customer checkbox: unchecked → field absent; checked → 'on'. Default (absent) = do NOT
@@ -5485,7 +5529,7 @@ async function submitNewOrder(req, session) {
   const sendReceipt = notify_customer === 'on' || notify_customer === 'true' || notify_customer === true;
 
   if (MOCK) {
-    auditLog(session.email, 'create_order', `mock-customer-${customer_id}`, null, { customer_id, lineItemsParsed, shippingAddress, shippingCost: ship_cost || null, sendReceipt });
+    auditLog(session.email, 'create_order', `mock-customer-${customer_id}`, null, { customer_id, lineItemsParsed, shippingAddress, billingAddress, shippingCost: ship_cost || null, sendReceipt });
     return { orderId: 'MOCK-9999', orderName: '#MOCK-9999', ok: true };
   }
 
@@ -5512,6 +5556,7 @@ async function submitNewOrder(req, session) {
         return line;
       }),
       shippingAddress,
+      billingAddress,
       // Shipping cost → orderCreate shippingLines[] (PLURAL; priceSet: MoneyBagInput{shopMoney{...}}).
       // Verified live that shippingLines is retained when a shippable line exists (requiresShipping above).
       // [XERO-DISABLED] When Xero writes are re-enabled, createXeroInvoice must also add this shipping
@@ -5556,7 +5601,27 @@ async function submitNewOrder(req, session) {
       return { error: 'Order was not created (Shopify returned no order). Nothing was charged.' };
     }
     const numId = shopifyNumericId(order.id);
-    auditLog(session.email, 'create_order', order.id, null, { customer_id, lineItemCount: lineItemsParsed.length, sendReceipt });
+    auditLog(session.email, 'create_order', order.id, null, { customer_id, lineItemCount: lineItemsParsed.length, sendReceipt, company: billingAddress.company || null });
+
+    // DEFAULT-ADDRESS GUARD (#39848): orderCreate may save a non-matching shipping address (e.g. a
+    // dropship to a consumer) into the customer's address book AND promote it to default — which
+    // silently changes the company every later order/invoice resolves. Put the prior default back.
+    // Non-fatal: the order exists; a failure here is logged, never surfaced as an order failure.
+    if (priorDefault?.id) {
+      try {
+        const after = await shopifyFetch(`query($id:ID!){ customer(id:$id){ defaultAddress{id} } }`, { id: gidCustomer });
+        const nowId = after.data?.customer?.defaultAddress?.id || null;
+        if (nowId && nowId !== priorDefault.id) {
+          const ur = await shopifyFetch(`mutation($c:ID!,$a:ID!){ customerUpdateDefaultAddress(customerId:$c,addressId:$a){ userErrors{field message} } }`,
+            { c: gidCustomer, a: priorDefault.id });
+          const uue = ur.data?.customerUpdateDefaultAddress?.userErrors || [];
+          if (uue.length) console.error(`[order-create] default-address restore FAILED order=${order.name}: ${uue.map(e => e.message).join('; ')}`);
+          else console.log(`[order-create] restored default address for customer=${customer_id} after order=${order.name}`);
+        }
+      } catch (err) {
+        console.error(`[order-create] default-address guard error order=${order.name}: ${err.message}`);
+      }
+    }
     console.log(`[order-create] OK order=${order?.name || numId} id=${numId} customer=${customer_id} lines=${lineItemsParsed.length} ship_cost=${ship_cost || 0} notify=${sendReceipt}`);
 
     // Phase 18: push to Xero as Authorised ACCREC invoice (fire-and-forget; queue on failure)
@@ -8890,7 +8955,7 @@ app.get('/api/customers/search', requireAuth, async (req, res) => {
     : await (async () => {
         try {
           const r = await shopifyFetch(`query($q:String!){ customers(first:10,query:$q){
-            edges{node{id displayName email defaultAddress{firstName lastName address1 address2 city province provinceCode zip country} metafields(first:25,namespace:"b2b"){edges{node{key value}}}}}}}`,
+            edges{node{id displayName email defaultAddress{company firstName lastName address1 address2 city province provinceCode zip country} metafields(first:25,namespace:"b2b"){edges{node{key value}}}}}}}`,
             { q: `tag:b2b ${q}` });
           return r.data?.customers?.edges?.map(e => e.node) || [];
         } catch { return []; }
