@@ -578,10 +578,10 @@ query($q: String!, $first: Int!, $after: String) {
 }
 ```
 
-### Customer list query (b2b-tagged, sorted by amountSpent)
+### Customer list query (b2b-tagged; sorted by amountSpent in-process — AMOUNT_SPENT is not a valid CustomerSortKeys value)
 ```graphql
 query($q: String!, $first: Int!, $after: String) {
-  customers(first: $first, query: $q, after: $after, sortKey: AMOUNT_SPENT, reverse: true) {
+  customers(first: $first, query: $q, after: $after, sortKey: RELEVANCE)  # RELEVANCE when searching, else ID {
     edges {
       cursor
       node {
