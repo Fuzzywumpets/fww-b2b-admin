@@ -154,6 +154,7 @@ async function backfillCustomers() {
         `query($q:String!,$first:Int!,$after:String){
           customers(first:$first,after:$after,query:$q,sortKey:UPDATED_AT,reverse:true){
             edges{node{
+              # SYNC: CUSTOMER_SYNC_FIELDS in lib/customer-cache-sync.mjs reads the same fields for the live webhook/poller.
               id email firstName lastName displayName createdAt updatedAt
               numberOfOrders amountSpent{amount currencyCode}
               tags
