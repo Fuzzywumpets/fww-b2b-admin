@@ -27,9 +27,11 @@ Phase 19A (customer lifetime spend) and Phase 20 (priority customer onboarding).
 
 ## Query Used to Generate This List
 
+> Note (2026-10-12): `AMOUNT_SPENT` is **not** a valid `CustomerSortKeys` value (valid: CREATED_AT, ID, LOCATION, NAME, RELEVANCE, UPDATED_AT) — Shopify rejects it. Fetch with `sortKey: ID` and sort by `amountSpent.amount` desc client-side.
+
 ```graphql
 query {
-  customers(first: 20, sortKey: AMOUNT_SPENT, reverse: true, query: "") {
+  customers(first: 250, sortKey: ID, query: "") {
     edges {
       node {
         id displayName email numberOfOrders
