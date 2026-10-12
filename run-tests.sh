@@ -157,6 +157,13 @@ if [ -f test/pagination-completeness.test.mjs ]; then
 fi
 fi
 
+# Wholesale company on invoices/order pages + manual order-create addresses (#39848-A). Standalone:
+# getOrderDetail and submitNewOrder both short-circuit under MOCK before the resolver/builder run.
+if [ -f test/order-company.test.mjs ]; then
+  echo ""
+  node test/order-company.test.mjs || UNIT_FAIL=$?
+fi
+
 # Electron shell code — never runs inside the Express server, so the HTTP suites cannot reach it.
 # Guards the PDF-in-the-main-window trap (no back button; its X quits the whole app).
 if [ -f test/desktop-pdf-headers.test.mjs ]; then
