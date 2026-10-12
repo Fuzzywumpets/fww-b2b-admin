@@ -74,6 +74,13 @@ if [ -f test/orders-recent-sync.test.mjs ]; then
   node test/orders-recent-sync.test.mjs || UNIT_FAIL=$?
 fi
 
+# Customer cache refresh (customers/* webhook re-read + "Sync now" customer sync). Standalone: both
+# are skipped under MOCK (no Shopify), so the HTTP suite can never reach them.
+if [ -f test/customer-cache-sync.test.mjs ]; then
+  echo ""
+  B2B_ADMIN_MOCK=1 node test/customer-cache-sync.test.mjs || UNIT_FAIL=$?
+fi
+
 # Money-correctness helpers (lib/order-money.mjs). Standalone because the branches under test are
 # Shopify userError branches — MOCK never calls shopifyFetch, so only an injected fake reaches them.
 if [ -f test/order-money.test.mjs ]; then

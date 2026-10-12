@@ -57,6 +57,7 @@ import { isTerminalEditError } from './lib/order-edit-errors.mjs';
 import { cacheRowTotal, listRowTotalAmount, restRowCurrentTotals } from './lib/order-display-totals.mjs';
 import { LINE_PAGE_MAX, drainLineItems } from './lib/line-item-paging.mjs';
 import { syncRecentOrders, normalizeRestFulfillmentStatus } from './lib/orders-recent-sync.mjs';
+import { refreshCustomerFromShopify, syncRecentCustomers } from './lib/customer-cache-sync.mjs';
 import { renderLabelSheet, expandItems, TEMPLATES as LABEL_TEMPLATES, DEFAULT_FIELDS } from './labels.mjs';
 import { isInsider, resolveXeroContact, syncCustomerToXero, getXeroSyncStatus } from './lib/xero-customer-sync.mjs';
 import { parseLinePrices, applyLinePriceChanges, bulkMarkOrdersPaid, addLineDiscountsConcurrent } from './lib/order-money.mjs';
@@ -8834,7 +8835,8 @@ app.post('/api/admin/sync-now', requireAuth, async (req, res) => {
     if (typeof syncRecentFromShopify === 'function') {
       await syncRecentFromShopify();
     }
-    res.json({ ok: true, syncedAt: Date.now() });
+    const customers = await syncRecentCustomersFromShopify();
+    res.json({ ok: true, syncedAt: Date.now(), customers });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -12333,7 +12335,7 @@ app.get('/customers/:id/activity', requireAuth, async (req, res) => {
 // but the app-level express.json runs first (registration order), so req.body was already a parsed
 // object and the HMAC was computed over Buffer.from(JSON.stringify(...)) → it never matched Shopify's
 // signature and ALL real webhooks were rejected. A missing signature now fails closed; compare is timing-safe.
-// INVARIANT(S): cache upserts run in setImmediate AFTER the 200 is sent, and their errors are swallowed (console.error only) — a 200 does NOT mean the row persisted; topic prefixes 'customers/', 'orders/', 'products/(create|update)' route the upsert; money fields use shop_money/total_*; tags are normalized from array-or-CSV; every dispatch is auditLog'd webhook:<topic>.
+// INVARIANT(S): cache upserts run in setImmediate AFTER the 200 is sent, and their errors are swallowed (console.error only) — a 200 does NOT mean the row persisted; topic prefixes 'customers/', 'orders/', 'products/(create|update)' route the upsert ('customers/' is trigger-only: the row is re-read over GraphQL, never built from the payload); money fields use shop_money/total_*; tags are normalized from array-or-CSV; every dispatch is auditLog'd webhook:<topic>.
 app.post('/webhooks/shopify', (req, res) => {
   const rawBody = req.rawBody || (Buffer.isBuffer(req.body) ? req.body : Buffer.from(JSON.stringify(req.body || {})));
   const sig = req.headers['x-shopify-hmac-sha256'];
@@ -12354,22 +12356,16 @@ app.post('/webhooks/shopify', (req, res) => {
   setImmediate(() => {
     try {
       if (topic.startsWith('customers/')) {
-        const c = payload;
-        const shopifyId = String(c.id);
-        const tags = Array.isArray(c.tags) ? c.tags : (c.tags || '').split(',').map(s => s.trim()).filter(Boolean);
-        upsertCustomerCache({
-          shopify_id: shopifyId,
-          gid: `gid://shopify/Customer/${shopifyId}`,
-          email: c.email, first_name: c.first_name, last_name: c.last_name,
-          display_name: c.first_name && c.last_name ? `${c.first_name} ${c.last_name}` : (c.email || shopifyId),
-          company: c.default_address?.company || null,
-          tags,
-          amount_spent_total: parseFloat(c.total_spent) || 0,
-          orders_count: c.orders_count || 0,
-          default_address_json: c.default_address || null,
-          created_at: c.created_at ? new Date(c.created_at).getTime() : null,
-          updated_at: c.updated_at ? new Date(c.updated_at).getTime() : null,
-        });
+        // TRIGGER-ONLY (2026-10-12): the REST payload for this app/API version omits tags,
+        // total_spent and orders_count, and upserting from it demoted B2B customers to is_b2b=0 /
+        // $0 on every update. Re-read the customer over GraphQL and write only that; a failed read
+        // writes nothing (the next "Sync now"/poll picks the change up). customers/delete is not
+        // subscribed and would read back 'missing', which leaves the row alone.
+        // DEPENDS: lib/customer-cache-sync.mjs owns the row mapping and the B2B-scoping rule.
+        if (MOCK) console.log(`[webhook] ${topic} ${payload.id}: MOCK, Shopify refresh skipped`);
+        else refreshCustomerFromShopify(payload.id, customerCacheDeps())
+          .then(r => { if (r !== 'upserted') console.log(`[webhook] ${topic} ${payload.id}: ${r}`); })
+          .catch(err => console.error(`[webhook] ${topic} ${payload.id} refresh failed:`, err.message));
       } else if (topic.startsWith('orders/')) {
         const o = payload;
         const shopifyId = String(o.id);
@@ -12505,6 +12501,26 @@ async function syncRecentFromShopify() {
   });
 }
 
+// WHAT: dependencies shared by the customers/* webhook refresh and the incremental customer sync.
+// INVARIANT(S): isCached lets an already-cached customer be updated (and demoted) even once the b2b
+// tag is gone, while non-B2B customers are never added — customers_cache stays B2B-scoped.
+function customerCacheDeps() {
+  return { shopifyFetch, upsert: upsertCustomerCache, isCached: (id) => !!getCustomerFromCache(id) };
+}
+
+// WHAT: pulls customers updated since the last run into customers_cache (b2b tag added/removed,
+// spend/order counts, address/company) — the backstop for a missed customers/* webhook.
+// INVARIANT(S): no-op in MOCK or without SHOPIFY_BEARER; cursor lives in sync_state 'customers_recent'
+// (distinct from the backfill's rows); errors are rethrown so "Sync now" reports them.
+async function syncRecentCustomersFromShopify() {
+  if (MOCK || !SHOPIFY_BEARER) return null;
+  return syncRecentCustomers({
+    ...customerCacheDeps(),
+    getState: () => getSyncState('customers_recent'),
+    setState: (st) => setSyncState('customers_recent', st),
+  });
+}
+
 // WHAT: verifies a small rotating batch of cached orders still exist in Shopify (nodes(ids:) returns
 // a null entry for a deleted id) and evicts any that don't from orders_cache.
 // CHANGE-GUARD: syncRecentFromShopify (above) can only ADD/UPDATE — Shopify's orders() search
@@ -12554,7 +12570,12 @@ if (!MOCK) {
     if (!dashboardActive()) return;            // quiet when nobody is looking
     if (_syncing || (Date.now() - _lastSyncAt) < FRESH_TARGET_MS) return;
     _syncing = true;
-    try { await syncRecentFromShopify(); await reconcileOrderDeletions(); _lastSyncAt = Date.now(); }
+    try {
+      await syncRecentFromShopify();
+      // Own try: a customers failure must not starve the order-deletion reconcile below.
+      try { await syncRecentCustomersFromShopify(); } catch (err) { console.error('[poll] customer sync failed:', err.message); }
+      await reconcileOrderDeletions(); _lastSyncAt = Date.now();
+    }
     catch {} finally { _syncing = false; }
   }, 60 * 1000);
   // Daily GC for expired impersonation nonces
