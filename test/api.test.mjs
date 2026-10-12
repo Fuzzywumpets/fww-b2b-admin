@@ -65,6 +65,90 @@ await test('GET /login?error= shows error message', async () => {
   assert.ok(html.includes('Test error message'));
 });
 
+// ── Electron shell: sign in through the SYSTEM browser (lib/desktop-handoff.mjs) ──────────────────
+// MOCK has no Google, so /auth/login?desktop_challenge= goes straight to the "return to the app" page;
+// the callback's real-Google half is the same renderDesktopHandoff()/issue() pair. The point here is the
+// contract the shell relies on: the browser gets a one-time code and NO session; only the exchange —
+// with the right verifier — yields a session cookie.
+function desktopAttempt() {
+  const verifier = crypto.randomBytes(32).toString('base64url');
+  const challenge = crypto.createHash('sha256').update(verifier).digest('base64url');
+  return { verifier, challenge };
+}
+async function desktopLogin(challenge) {
+  const res = await fetch(`${BASE}/auth/login?desktop_challenge=${challenge}`, { redirect: 'manual' });
+  const html = await res.text();
+  const m = html.match(/fww-b2b-admin:\/\/auth\?code=([a-f0-9]{64})/);
+  return { res, html, code: m ? m[1] : null };
+}
+function exchange(body) {
+  return fetch(`${BASE}/auth/desktop/exchange`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  });
+}
+
+await test('desktop sign-in: browser receives a one-time code and NO session cookie', async () => {
+  const { challenge } = desktopAttempt();
+  const { res, html, code } = await desktopLogin(challenge);
+  assert.equal(res.status, 200);
+  assert.ok(code, 'page must carry the fww-b2b-admin:// handoff link');
+  assert.ok(html.includes('http-equiv="refresh"'), 'must auto-launch the app');
+  assert.equal(extractSid(res.headers.get('set-cookie')), null, 'the system browser must not get a session');
+  assert.ok(!html.includes('alex@fuzzywumpets.com'), 'identity must never appear in the handoff page');
+});
+
+await test('desktop sign-in: exchange with the right verifier sets a working session cookie', async () => {
+  const { verifier, challenge } = desktopAttempt();
+  const { code } = await desktopLogin(challenge);
+  const res = await exchange({ code, verifier });
+  assert.equal(res.status, 200);
+  const sid = extractSid(res.headers.get('set-cookie'));
+  assert.ok(sid, 'exchange must set the session cookie');
+  assert.match(res.headers.get('set-cookie'), /HttpOnly/);
+  const home = await fetch(`${BASE}/`, { headers: { Cookie: `b2b_admin_sid=${sid}` }, redirect: 'manual' });
+  assert.equal(home.status, 200, 'the minted session must authenticate');
+});
+
+await test('desktop sign-in: a code cannot be replayed', async () => {
+  const { verifier, challenge } = desktopAttempt();
+  const { code } = await desktopLogin(challenge);
+  assert.equal((await exchange({ code, verifier })).status, 200);
+  const again = await exchange({ code, verifier });
+  assert.equal(again.status, 401);
+  assert.equal(extractSid(again.headers.get('set-cookie')), null);
+});
+
+await test('desktop sign-in: a stolen code with the wrong verifier is refused AND burned', async () => {
+  const { verifier, challenge } = desktopAttempt();
+  const { code } = await desktopLogin(challenge);
+  const bad = await exchange({ code, verifier: desktopAttempt().verifier });
+  assert.equal(bad.status, 401);
+  assert.equal(extractSid(bad.headers.get('set-cookie')), null);
+  assert.equal((await exchange({ code, verifier })).status, 401, 'the legitimate verifier must not work after a failed guess');
+});
+
+await test('desktop sign-in: junk exchange bodies are a plain 401', async () => {
+  for (const body of [{}, { code: 'x' }, { code: 'a'.repeat(64) }, { code: 'a'.repeat(64), verifier: 'short' }, { code: 5, verifier: 5 }]) {
+    const res = await exchange(body);
+    assert.equal(res.status, 401, JSON.stringify(body));
+  }
+  const noBody = await fetch(`${BASE}/auth/desktop/exchange`, { method: 'POST' });
+  assert.equal(noBody.status, 401);
+});
+
+await test('desktop sign-in: a malformed challenge is rejected up front', async () => {
+  for (const c of ['x', 'a'.repeat(42), 'a'.repeat(44), '<script>']) {
+    const res = await fetch(`${BASE}/auth/login?desktop_challenge=${encodeURIComponent(c)}`, { redirect: 'manual' });
+    assert.equal(res.status, 400, c);
+  }
+});
+
+await test('ordinary browser sign-in is unchanged (no challenge -> session + redirect)', async () => {
+  const res = await fetch(`${BASE}/auth/login`, { redirect: 'manual' });
+  assert.equal(res.status, 302);
+  assert.ok(extractSid(res.headers.get('set-cookie')), 'a plain login still mints a session');
+});
+
 await test('GET /__test__/session seeds session and returns JSON + cookie', async () => {
   const res = await fetch(`${BASE}/__test__/session?email=alex@fuzzywumpets.com`);
   assert.equal(res.status, 200);

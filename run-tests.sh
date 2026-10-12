@@ -166,6 +166,14 @@ if [ -f test/desktop-pdf-headers.test.mjs ]; then
   node test/desktop-pdf-headers.test.mjs || UNIT_FAIL=$?
 fi
 
+# System-browser sign-in for the Electron shell: one-time-code store + the shell's URL gates. Standalone
+# because the real Google callback is behind `if (!MOCK)` and the shell is Electron; the HTTP half of the
+# flow is exercised in api.test.mjs against the mock server.
+if [ -f test/desktop-system-login.test.mjs ]; then
+  echo ""
+  node test/desktop-system-login.test.mjs || UNIT_FAIL=$?
+fi
+
 # Packaging allowlist. v1.0.3 shipped unlaunchable because main.js required a module that
 # build.files never packaged — the build, the tests and the publish all succeeded. This is the
 # source-level half of that guard; tools/verify-package.js checks the built artifact in CI.

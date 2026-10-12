@@ -69,6 +69,14 @@ address or a bare domain with a leading `@`. Live value: `@fuzzywumpets.com,erin
 `isAllowedAdminEmail()`; it compares the substring after the LAST `@` for equality (never
 endsWith/includes — see `test/admin-allowlist.test.mjs` for the four bypasses that defeats).
 
+The Electron shell signs in through the **system browser**, not its own window (its cookie jar is
+private, so Google never recognised the user there). `/auth/login?desktop_challenge=…` runs the normal
+OAuth + allowlist, then the callback parks the verified user behind a one-time code and redirects to
+`fww-b2b-admin://auth?code=…`; the shell redeems it at `POST /auth/desktop/exchange` with a PKCE-style
+verifier and gets its session cookie. Same Google redirect URI as before — nothing to change in the
+Google console. Pending codes are in memory, so this assumes a single node process
+(`lib/desktop-handoff.mjs`).
+
 **portal (customers):** Shopify Customer Account OAuth. `/auth/callback` rejects anyone whose
 Shopify customer record lacks the **`b2b` tag**, *before* any admin check runs. No member of staff
 is a tagged B2B customer, so the portal's `/admin/*` pages are unreachable by staff. Real example:

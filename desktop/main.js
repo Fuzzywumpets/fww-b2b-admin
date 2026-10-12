@@ -9,6 +9,7 @@ const Store = require('electron-store').default || require('electron-store');
 const path = require('path');
 const { pdfAttachmentHeaders } = require('./lib/pdf-headers');
 const { unloadPromptOptions, shouldAllowUnload } = require('./lib/unload-prompt');
+const desktopAuth = require('./lib/desktop-auth');
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -36,6 +37,18 @@ const PDF_ORIGINS = new Set([
   'https://b2badmin.fuzzywumpets.com',
   'https://b2badmin.fuzzyreporting.com',
 ]);
+
+// Origins that serve the admin site itself. Used to recognise the site's own "Sign in with Google" link.
+// SYNC: same two hosts as PDF_ORIGINS above — a new admin hostname must be added to both.
+const ADMIN_ORIGINS = new Set([
+  'https://b2badmin.fuzzywumpets.com',
+  'https://b2badmin.fuzzyreporting.com',
+]);
+
+// Cookie name the server uses for the admin session; checked after a desktop sign-in to confirm the app's
+// own session actually received it.
+// SYNC: COOKIE_NAME in server.mjs.
+const SESSION_COOKIE_NAME = 'b2b_admin_sid';
 
 // WHAT: Returns the URL's origin only if it parses AND is https, else null.
 // INVARIANT(S): never throws on a malformed URL; a non-https scheme (file:, data:,
@@ -67,6 +80,68 @@ let mainWindow = null;
 let tray       = null;
 let quitting   = false;
 let pdfWindows = [];
+// The in-flight system-browser sign-in ({ verifier, challenge, expiresAt }), or null. In memory only: the
+// verifier must never touch disk, and an app restart mid-login just means clicking "Sign in" again.
+let pendingLogin = null;
+
+// ─── Sign-in through the system browser ───────────────────────────────────────────
+//
+// WHY: Google sign-in used to run inside this window, whose cookie jar is private to the app — it never saw
+//   the user's Google session, saved password or passkey, so the password was re-asked on every login.
+//   Now "Sign in with Google" opens the DEFAULT BROWSER (already signed in to Google); when it finishes the
+//   server redirects to fww-b2b-admin://auth?code=…, the OS hands that to this app, and the code is traded
+//   for a session cookie in THIS window's session. Server half + the full flow: lib/desktop-handoff.mjs.
+
+// WHAT: starts a sign-in — remembers a fresh verifier and opens the system browser at the login URL.
+function startSystemBrowserLogin() {
+  pendingLogin = desktopAuth.newLoginAttempt();
+  shell.openExternal(desktopAuth.systemBrowserLoginUrl(ADMIN_URL, pendingLogin.challenge));
+}
+
+function showSignInError(detail) {
+  dialog.showMessageBox(mainWindow ?? undefined, {
+    type: 'error', title: APP_NAME, buttons: ['OK'],
+    message: 'Sign-in did not complete.',
+    detail,
+  }).catch(() => {});
+}
+
+// WHAT: handles a fww-b2b-admin:// URL delivered by the OS — trades its one-time code for a session cookie in the
+//   app's own session, then reloads the admin site signed in.
+// CHANGE-GUARD: the URL comes from outside this process (any web page can link to a custom scheme), so it is
+//   validated by parseAuthCallbackUrl() first and junk is IGNORED SILENTLY — no dialog a web page could
+//   trigger at will. pendingLogin is cleared before the network call: a code is single-use, and a retry
+//   needs a fresh browser round trip anyway.
+// DEPENDS: POST /auth/desktop/exchange in server.mjs ({code, verifier} → 200 + Set-Cookie).
+async function handleAuthUrl(url) {
+  const code = desktopAuth.parseAuthCallbackUrl(url);
+  if (!code) return;
+  if (mainWindow) { if (mainWindow.isMinimized()) mainWindow.restore(); mainWindow.show(); mainWindow.focus(); }
+
+  const attempt = pendingLogin;
+  pendingLogin = null;
+  if (!attempt || attempt.expiresAt < Date.now()) {
+    showSignInError('That sign-in link has expired or was not started from this app. Click "Sign in with Google" again.');
+    return;
+  }
+
+  try {
+    const ses = session.fromPartition('persist:b2badmin');
+    const res = await ses.fetch(new URL('/auth/desktop/exchange', ADMIN_URL).toString(), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code, verifier: attempt.verifier }),
+      credentials: 'include',
+    });
+    if (!res.ok) throw new Error(`the server refused the sign-in code (HTTP ${res.status})`);
+    // Fail loudly rather than reload into a login page that looks like nothing happened.
+    const stored = await ses.cookies.get({ url: ADMIN_URL, name: SESSION_COOKIE_NAME });
+    if (!stored.length) throw new Error('the session cookie was not stored');
+    mainWindow?.loadURL(ADMIN_URL);
+  } catch (e) {
+    showSignInError(`${e?.message || e}\n\nClick "Sign in with Google" to try again.`);
+  }
+}
 
 // ─── PDF / document windows ─────────────────────────────────────────────────────
 //
@@ -161,6 +236,13 @@ function setupDownloadHandling() {
 // ─── App lifecycle ────────────────────────────────────────────────────────────
 
 app.whenReady().then(() => {
+  // Registers fww-b2b-admin:// with the OS so the browser can hand the sign-in code back (see above). Runs
+  // every launch; in dev (`electron .`) the registration must name the script or it launches bare Electron.
+  if (process.defaultApp) {
+    if (process.argv.length >= 2) app.setAsDefaultProtocolClient(desktopAuth.PROTOCOL, process.execPath, [path.resolve(process.argv[1])]);
+  } else {
+    app.setAsDefaultProtocolClient(desktopAuth.PROTOCOL);
+  }
   nativeTheme.themeSource = 'dark';
   buildAppMenu();
   // DEPENDS: must run BEFORE createMainWindow() — the handler has to be attached to the partition
@@ -169,9 +251,16 @@ app.whenReady().then(() => {
   createMainWindow();
   createTray();
   setupAutoUpdater();
+  // Cold start via the sign-in link (app wasn't running): no pending attempt, so this just reports expiry.
+  const launchUrl = desktopAuth.findProtocolUrl(process.argv);
+  if (launchUrl) handleAuthUrl(launchUrl);
 });
 
-app.on('second-instance', () => {
+// On Windows the OS delivers a fww-b2b-admin:// link by launching a SECOND instance with the URL in argv; the
+// single-instance lock above forwards that argv here.
+app.on('second-instance', (_event, argv) => {
+  const authUrl = desktopAuth.findProtocolUrl(argv);
+  if (authUrl) { handleAuthUrl(authUrl); return; }
   if (mainWindow) {
     if (mainWindow.isMinimized()) mainWindow.restore();
     mainWindow.focus();
@@ -287,6 +376,8 @@ function createMainWindow() {
 
   // Let the Google OAuth popup open in-app; send everything else to the browser.
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    // The site's own sign-in link goes to the system browser (see startSystemBrowserLogin), never a popup.
+    if (desktopAuth.isAdminLoginUrl(url, ADMIN_ORIGINS)) { startSystemBrowserLogin(); return { action: 'deny' }; }
     // Invoice / packing-label PDFs -> dedicated in-app window (shares the authed
     // session); never a chromeless popup or the signed-out system browser.
     if (isAdminPdfUrl(url)) { openPdfWindow(url); return { action: 'deny' }; }
@@ -302,6 +393,13 @@ function createMainWindow() {
   // SYNC: mirrors the PDF branch in setWindowOpenHandler above — both entry points must
   //   apply the SAME origin check, or one becomes a way around the other.
   mainWindow.webContents.on('will-navigate', (event, url) => {
+    // "Sign in with Google" — divert to the system browser instead of loading Google in this window.
+    // SYNC: mirrors the login branch in setWindowOpenHandler above (same predicate, same action).
+    if (desktopAuth.isAdminLoginUrl(url, ADMIN_ORIGINS)) {
+      event.preventDefault();
+      startSystemBrowserLogin();
+      return;
+    }
     if (isAdminPdfUrl(url)) {
       event.preventDefault();
       openPdfWindow(url);

@@ -48,6 +48,7 @@ import {
 import { generateInvoicePdf, lineItemTrueTotal, lineItemTrueUnit, lineItemCurrentQty } from './pdf.mjs';
 // Extracted so they can be unit-tested without booting this server (house pattern: lib/*.mjs).
 import { isTerminalEditError } from './lib/order-edit-errors.mjs';
+import { createHandoffStore, isValidChallenge, desktopRedirectUrl } from './lib/desktop-handoff.mjs';
 // DEPENDS: every money surface in this file picks its amount through these two — cacheRowTotal for a
 // raw orders_cache row, listRowTotalAmount for a Shopify/GraphQL-shaped one. A query that feeds one
 // of them MUST also select currentTotalPriceSet (or carry current_total), or the accessor silently
@@ -1752,6 +1753,36 @@ function renderLogin(error) {
     <p class="login-note">Access restricted to authorized Fuzzywumpets admin emails.</p>
   </div>
 </body></html>`;
+}
+
+// WHAT: one-time-code store for the Electron shell's system-browser sign-in (see lib/desktop-handoff.mjs).
+// DEPENDS: shared by /auth/login (MOCK branch), /auth/google/callback and /auth/desktop/exchange — all three
+//   must see the SAME instance, so it is a module-level singleton, not created per request.
+const desktopHandoffs = createHandoffStore();
+
+// WHAT: the page shown in the system browser once Google sign-in has succeeded for a desktop login — it
+//   hands the one-time code to the Electron shell via the registered fww-b2b-admin:// scheme.
+// CHANGE-GUARD: carries ONLY the opaque code (hex, so safe to drop into an attribute unescaped — it is
+//   still passed through h() anyway). Never put the email/session id in this URL. The meta refresh fires
+//   the handoff automatically; the visible link is the fallback for browsers that block a scripted
+//   protocol launch without a click.
+function renderDesktopHandoff(code) {
+  const url = desktopRedirectUrl(code);
+  return `<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="refresh" content="0;url=${h(url)}">
+  <title>Signed in — FWW Admin</title>${gfonts()}<link rel="stylesheet" href="/admin.css">
+</head>
+<body class="login-body">
+  <div class="login-card">
+    <div class="login-logo"><span class="logo-fw">FW</span><span class="logo-admin">admin</span></div>
+    <p style="margin-top:1.5rem">You're signed in. Returning to the FWW B2B Admin app…</p>
+    <a href="${h(url)}" class="btn-google" style="margin-top:1.25rem">Open FWW B2B Admin</a>
+    <p style="margin-top:1.25rem;font-size:13px;color:#6b7280">You can close this tab once the app has opened.</p>
+  </div>
+</body>
+</html>`;
 }
 
 function renderUnauthorized(email) {
@@ -5727,15 +5758,36 @@ app.get('/__test__/session', (req, res) => {
 // WHAT: Start Google OAuth — sets an oauth_state CSRF cookie (HttpOnly, SameSite=Lax, 5min) then redirects to Google's consent screen; in MOCK it just mints a session and redirects to /.
 // CHANGE-GUARD: state cookie and the state query param sent to Google MUST be the same value verified in the callback; scope 'openid email profile' and prompt 'select_account' are deliberate. redirect_uri must equal REDIRECT_URI registered in the Google console.
 // INVARIANT(S): MOCK shortcut must never run in prod (no allowlist check there).
+// DESKTOP: ?desktop_challenge=<43-char base64url sha256> marks this as the Electron shell's system-browser
+//   sign-in. It is remembered in an oauth_desktop cookie (same lifetime/flags as oauth_state) so the
+//   callback — a separate request, arriving from Google — knows to hand the result to the app instead of
+//   setting a browser session. A request WITHOUT the param actively clears any stale oauth_desktop cookie,
+//   so an abandoned desktop attempt can't hijack a later ordinary browser login within the 5-minute window.
+// DEPENDS: desktop/main.js opens this URL via shell.openExternal; the param name and the challenge format
+//   must match desktop/lib/desktop-auth.js (challengeFor) and lib/desktop-handoff.mjs (isValidChallenge).
 app.get('/auth/login', (req, res) => {
+  const rawChallenge = req.query.desktop_challenge;
+  const desktopChallenge = rawChallenge === undefined ? null : rawChallenge;
+  if (desktopChallenge !== null && !isValidChallenge(desktopChallenge)) {
+    return res.status(400).send('Invalid desktop sign-in request. Please retry from the app.');
+  }
   if (MOCK) {
+    if (desktopChallenge) {
+      const code = desktopHandoffs.issue({ email: 'alex@fuzzywumpets.com', name: 'Alex (Mock)', picture: '', challenge: desktopChallenge });
+      return res.send(renderDesktopHandoff(code));
+    }
     const sid = crypto.randomBytes(32).toString('hex');
     createSession(sid, 'alex@fuzzywumpets.com', 'Alex (Mock)', '');
     res.setHeader('Set-Cookie', sessionCookie(sid));
     return res.redirect('/');
   }
   const state = crypto.randomBytes(16).toString('hex');
-  res.setHeader('Set-Cookie', `oauth_state=${state}; Path=/; HttpOnly; SameSite=Lax; Max-Age=300`);
+  res.setHeader('Set-Cookie', [
+    `oauth_state=${state}; Path=/; HttpOnly; SameSite=Lax; Max-Age=300`,
+    desktopChallenge
+      ? `oauth_desktop=${desktopChallenge}; Path=/; HttpOnly; SameSite=Lax; Max-Age=300`
+      : 'oauth_desktop=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0',
+  ]);
   const params = new URLSearchParams({
     client_id: GOOGLE_CLIENT_ID, redirect_uri: REDIRECT_URI,
     response_type: 'code', scope: 'openid email profile',
@@ -5778,14 +5830,43 @@ app.get('/auth/google/callback', async (req, res) => {
     //   CHANGE-GUARD. Do not reintroduce an inline equality test here; that is what this replaced.
     if (!isAllowedAdminEmail(user.email))
       return res.status(403).send(renderUnauthorized(user.email));
+    // DESKTOP: a login started from the Electron shell (oauth_desktop cookie, set by /auth/login) must NOT
+    //   mint a session here — the cookie would land in the system browser's jar, not the app's. Park the
+    //   verified user behind a one-time code instead; the session is created (and audited) when the app
+    //   redeems it at /auth/desktop/exchange. Both gates above (email_verified, allowlist) have already run.
+    const desktopChallenge = getCookie(req, 'oauth_desktop');
+    if (desktopChallenge && isValidChallenge(desktopChallenge)) {
+      const code = desktopHandoffs.issue({ email: user.email, name: user.name, picture: user.picture, challenge: desktopChallenge });
+      res.setHeader('Set-Cookie', ['oauth_state=; Path=/; HttpOnly; Max-Age=0', 'oauth_desktop=; Path=/; HttpOnly; Max-Age=0']);
+      return res.send(renderDesktopHandoff(code));
+    }
     const sid = crypto.randomBytes(32).toString('hex');
     createSession(sid, user.email, user.name || user.email, user.picture || '');
     auditLog(user.email, 'login', null, null, { ip: req.ip });
-    res.setHeader('Set-Cookie', ['oauth_state=; Path=/; HttpOnly; Max-Age=0', sessionCookie(sid)]);
+    res.setHeader('Set-Cookie', ['oauth_state=; Path=/; HttpOnly; Max-Age=0', 'oauth_desktop=; Path=/; HttpOnly; Max-Age=0', sessionCookie(sid)]);
     res.redirect('/');
   } catch (err) {
     res.redirect(`/login?error=${encodeURIComponent('Authentication error: ' + err.message)}`);
   }
+});
+
+// WHAT: the Electron shell redeems the one-time code from a system-browser sign-in. On success it creates the
+//   session and sets the session cookie IN THE SHELL'S OWN cookie jar (the response goes to the app, not the browser).
+// CHANGE-GUARD: JSON POST (not GET) so the verifier never lands in a URL/log and a cross-site page can't trigger it
+//   (a cross-origin JSON POST needs a preflight we don't answer). Every failure is the same opaque 401 — never say
+//   whether the code existed. redeem() burns the code on the first attempt, right or wrong.
+// DEPENDS: desktop/main.js posts {code, verifier} here and treats a 200 + Set-Cookie as "signed in"; the audit row
+//   mirrors the ordinary callback's 'login' entry so desktop and browser logins are indistinguishable in reports
+//   except for the `via` field.
+app.post('/auth/desktop/exchange', (req, res) => {
+  const { code, verifier } = req.body || {};
+  const user = desktopHandoffs.redeem(code, verifier);
+  if (!user) return res.status(401).json({ error: 'invalid or expired sign-in code' });
+  const sid = crypto.randomBytes(32).toString('hex');
+  createSession(sid, user.email, user.name || user.email, user.picture || '');
+  auditLog(user.email, 'login', null, null, { ip: req.ip, via: 'desktop' });
+  res.setHeader('Set-Cookie', sessionCookie(sid));
+  res.json({ ok: true });
 });
 
 // WHAT: Destroy the server-side session (deleteSession) + audit-log the logout, then expire the cookie and redirect to /login.

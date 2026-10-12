@@ -14,10 +14,14 @@ internal Fuzzywumpets B2B admin dashboard. Built to mirror `fww-shipping-desktop
 
 - Opens the B2B Admin dashboard in its own window with a green **B2B** app icon
   (desktop + Start-menu shortcut, system-tray icon).
-- **Authentication:** same as FWW Shipping — the window uses a persistent session
-  partition (`persist:b2badmin`), so the **Sign in with Google** flow runs once and
-  the session survives restarts. Google OAuth popups (`accounts.google.com`) open
-  in-app; all other links open in your default browser.
+- **Authentication:** **Sign in with Google** opens your *default browser*, where you're
+  already signed in to Google (saved password, passkey and password manager all work).
+  When it finishes, the browser hands a one-time code back to the app through the
+  `fww-b2b-admin://` link, and the app trades it for a session cookie in its own
+  persistent partition (`persist:b2badmin`), so the login survives restarts. Flow and
+  security notes: `lib/desktop-handoff.mjs` (server) and `desktop/lib/desktop-auth.js`
+  (shell). The scheme is registered with Windows each time the app launches. Other
+  links open in your default browser.
 - **Auto-update on open:** on every launch it checks GitHub Releases, downloads any
   new version in the background, and offers to restart (and installs on quit
   regardless). Powered by `electron-updater`.
