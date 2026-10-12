@@ -145,6 +145,15 @@ await test('sync pages past one page and resumes from the newest stored row when
   for (let i = 0; i < 7; i++) eq(getCustomerFromCache(String(7200 + i)).is_b2b, 1);
 });
 
+await test('a capped run whose rows carry no parseable updatedAt does not jump the cursor to now', async () => {
+  const last = Date.parse('2026-10-12T17:30:00Z');
+  const h = stateHarness(last);
+  const f = async () => ({ data: { customers: { edges: [{ node: node(7300, { updatedAt: null }) }], pageInfo: { hasNextPage: true, endCursor: '1' } } } });
+  const res = await syncRecentCustomers({ ...deps(f), getState: h.getState, setState: h.setState, now: () => last + 3600_000, pageLimit: 1 });
+  eq(res.truncated, true);
+  eq(h.state.last_synced_at, last);
+});
+
 await test('sync error leaves the cursor in place and rethrows', async () => {
   const last = Date.parse('2026-10-12T18:00:00Z');
   const h = stateHarness(last);
