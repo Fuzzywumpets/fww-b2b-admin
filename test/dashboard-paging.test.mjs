@@ -64,6 +64,10 @@ await test('low-stock variant paging fails closed on a repeated cursor or a page
   await assert.rejects(() => drainLowStockItems(noInfo, 'gid://shopify/Publication/1'), /without pageInfo/);
 });
 
+await test('dashboard order walk fails closed on a page without pageInfo (DeepReview 2026-10-14)', async () => {
+  await assert.rejects(() => drainDashboardOrders(async () => ({ data: { orders: { edges: [] } } }), 'q'), /without pageInfo/);
+});
+
 await test('customer spend keeps lifetime fields from page 1 and all range orders', async () => {
   const shopifyFetch = async (_q, vars) => {
     if (!vars.after) {
