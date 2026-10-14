@@ -14,6 +14,7 @@
  *   --all-vendors                           Products: include non-FWW vendors
  */
 import { createRequire } from 'node:module';
+import { drainLineItems } from '../lib/line-item-paging.mjs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
@@ -69,6 +70,23 @@ async function gql(query, variables = {}) {
   const json = await res.json();
   if (json.errors?.length) throw new Error(json.errors[0].message);
   return json.data;
+}
+
+// Completes an inline nested connection (orders.lineItems, products.variants) whose first page overflowed.
+// Pagination sweep 2026-10-14: the backfill used to persist only the first N children of each parent,
+// so orders with >50 lines (the biggest B2B orders) landed in order_line_items_cache short.
+// SYNC: `fields` must equal the field list of the nested selection in the caller's query.
+async function completeNested(parents, key, parentField, fields, label) {
+  for (const parent of parents) {
+    const conn = parent?.[key];
+    if (!conn || (conn.pageInfo && !conn.pageInfo.hasNextPage)) continue; // missing pageInfo -> drainLineItems throws
+    const nodes = await drainLineItems(conn, `${label} ${parent.id}`, (after) =>
+      gql(`query($id:ID!,$after:String){node(id:$id){... on ${parentField}{${key}(first:250,after:$after){
+        pageInfo{hasNextPage endCursor} edges{node{ ${fields} }} }}}}`, { id: parent.id, after })
+        .then(d => d?.node?.[key]));
+    parent[key] = { edges: nodes.map(node => ({ node })) };
+  }
+  return parents;
 }
 
 // ── Cursor-based paginator ────────────────────────────────────────────────────
@@ -270,7 +288,7 @@ async function backfillOrders() {
               shippingAddress{address1 address2 city province country zip}
               billingAddress{address1 address2 city province country zip}
               fulfillments{id status trackingInfo{number url}}
-              lineItems(first:50){edges{node{
+              lineItems(first:50){pageInfo{hasNextPage endCursor} edges{node{
                 id title variantTitle sku quantity taxable vendor
                 variant{id}
                 product{id}
@@ -284,6 +302,12 @@ async function backfillOrders() {
         }`,
         { q: sinceQ, first, after: cursor }
       );
+      await completeNested(data.orders?.edges?.map(e => e.node) || [], 'lineItems', 'Order', `id title variantTitle sku quantity taxable vendor
+                variant{id}
+                product{id}
+                originalUnitPriceSet{presentmentMoney{amount}}
+                totalDiscountSet{presentmentMoney{amount}}
+                discountAllocations{allocatedAmountSet{presentmentMoney{amount}}}`, 'backfill orders');
       return data.orders;
     },
     transformFn: (node) => {
@@ -338,7 +362,8 @@ async function backfillProducts() {
           products(first:$first,after:$after,query:$q,sortKey:UPDATED_AT,reverse:true){
             edges{node{
               id handle title vendor productType status tags createdAt updatedAt
-              variants(first:20){edges{node{id sku title inventoryQuantity price}}}
+              variants(first:20){pageInfo{hasNextPage endCursor} edges{node{id sku title inventoryQuantity price}}}
+              # BOUNDED: cache keeps the first 3 images (thumbnails) by design
               images(first:3){edges{node{id url altText}}}
             }}
             pageInfo{hasNextPage endCursor}
@@ -346,6 +371,7 @@ async function backfillProducts() {
         }`,
         { q, first, after: cursor }
       );
+      await completeNested(data.products?.edges?.map(e => e.node) || [], 'variants', 'Product', 'id sku title inventoryQuantity price', 'backfill products');
       return data.products;
     },
     transformFn: transformProduct,

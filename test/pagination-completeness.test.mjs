@@ -24,6 +24,7 @@ console.log('\n\u2500\u2500 Unit: order-detail line-item pagination completeness
 const src = await readFile(new URL('../server.mjs', import.meta.url), 'utf8');
 
 // The initial projection in getOrderDetail must carry pageInfo so the walker can advance.
+// BOUNDED: test title text only; no query is issued here
 await test('getOrderDetail lineItems(first:250) requests pageInfo { hasNextPage endCursor }', () => {
   const m = src.match(/getOrderDetail[\s\S]*?lineItems\(first:250\)\{pageInfo\{hasNextPage endCursor\}/);
   assert.ok(m, 'the order-detail query must request pageInfo on the lineItems connection');
@@ -49,6 +50,12 @@ await test('getOrderDetail fails closed when line-item paging errors and throwOn
   const region = src.slice(src.indexOf('Pagination-completeness'), src.indexOf('return result.data?.order || null;'));
   assert.match(region, /if \(throwOnError\) throw err;/, 'a paging failure must propagate when throwOnError is set');
   assert.match(region, /return null;/, 'a paging failure must not silently render a truncated order');
+});
+
+await test('dashboard and spend live paths no longer use silent first-page prefixes', () => {
+  assert.match(src, /drainDashboardOrders\(/);
+  assert.match(src, /drainLowStockItems\(/);
+  assert.match(src, /drainCustomerSpendOrders\(/);
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);

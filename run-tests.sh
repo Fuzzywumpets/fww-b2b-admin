@@ -149,12 +149,6 @@ fi
 if [ -f test/order-edit-nav-deadlock.test.mjs ]; then
   echo ""
   node test/order-edit-nav-deadlock.test.mjs || UNIT_FAIL=$?
-# Pagination-completeness (2026-09-23 audit, #39355 class): getOrderDetail must drain order
-# lineItems beyond first:250 or renderOrderDetail / createXeroInvoice / ship flows under-build.
-if [ -f test/pagination-completeness.test.mjs ]; then
-  echo ""
-  node test/pagination-completeness.test.mjs || UNIT_FAIL=$?
-fi
 fi
 
 # Wholesale company on invoices/order pages + manual order-create addresses (#39848-A). Standalone:
@@ -162,6 +156,30 @@ fi
 if [ -f test/order-company.test.mjs ]; then
   echo ""
   node test/order-company.test.mjs || UNIT_FAIL=$?
+fi
+
+# Pagination-completeness (2026-09-23 audit, #39355 class): getOrderDetail must drain order
+# lineItems beyond first:250 or renderOrderDetail / createXeroInvoice / ship flows under-build.
+if [ -f test/pagination-completeness.test.mjs ]; then
+  echo ""
+  node test/pagination-completeness.test.mjs || UNIT_FAIL=$?
+fi
+
+if [ -f test/paginate-connection.test.mjs ]; then
+  echo ""
+  node test/paginate-connection.test.mjs || UNIT_FAIL=$?
+fi
+
+# Pagination guard (vendored from ~/.claude/scripts/pagination_guard.py): any new unbounded list fetch fails the suite.
+if [ -f scripts/pagination_guard.py ]; then
+  echo ""
+  # DeepReview 2026-10-14: choose the interpreter, then run the guard ONCE so its exit status is never masked.
+  PY=$(command -v python3 || command -v python || true)
+  if [ -z "$PY" ]; then echo "pagination_guard: no python interpreter"; UNIT_FAIL=1; else "$PY" scripts/pagination_guard.py . || UNIT_FAIL=$?; fi
+fi
+if [ -f test/dashboard-paging.test.mjs ]; then
+  echo ""
+  node test/dashboard-paging.test.mjs || UNIT_FAIL=$?
 fi
 
 # Electron shell code — never runs inside the Express server, so the HTTP suites cannot reach it.

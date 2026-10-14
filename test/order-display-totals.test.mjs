@@ -216,13 +216,15 @@ await test('renderCustomerDetail converts the GID before querying', () => {
 // pre-edit amount. Absent field and unedited order are indistinguishable to the accessor, so this
 // can only be caught here.
 
-await test('every orders query feeding a money surface selects currentTotalPriceSet', () => {
-  const flat = serverSrc.replace(/\s+/g, ' ');
+await test('every orders query feeding a money surface selects currentTotalPriceSet', async () => {
+  // The dashboard + spend queries moved into lib/dashboard-paging.mjs (pagination sweep), so scan both files.
+  const dashSrc = await readFile(new URL('../lib/dashboard-paging.mjs', import.meta.url), 'utf8');
+  const flat = (serverSrc + ' ' + dashSrc).replace(/\s+/g, ' ');
   // Each entry: a distinct orders(...) query whose rows reach a rendered/summed amount.
   const feeds = [
-    ['dashboard open orders + 90d spend', 'orders(first:50,query:$q,sortKey:PROCESSED_AT'],
+    ['dashboard open orders + 90d spend', 'orders(first:${DASHBOARD_ORDER_PAGE},query:$q,after:$after,sortKey:PROCESSED_AT'],
     ['customer Recent Orders',            'orders(first:10,query:$q,sortKey:PROCESSED_AT'],
-    ['customer spend API',                'orders(first:250,query:$q,sortKey:PROCESSED_AT'],
+    ['customer spend API',                'orders(first:${DASHBOARD_ORDER_PAGE},query:$q,after:$after,sortKey:PROCESSED_AT'],
   ];
   for (const [label, marker] of feeds) {
     const at = flat.indexOf(marker);

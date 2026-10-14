@@ -56,8 +56,10 @@ import { isTerminalEditError } from './lib/order-edit-errors.mjs';
 // falls back to the frozen pre-edit amount and the surface looks correct while being wrong.
 import { cacheRowTotal, listRowTotalAmount, restRowCurrentTotals } from './lib/order-display-totals.mjs';
 import { LINE_PAGE_MAX, drainLineItems } from './lib/line-item-paging.mjs';
+import { paginateConnection, drainRemaining } from './lib/paginate-connection.mjs';
 import { syncRecentOrders, normalizeRestFulfillmentStatus } from './lib/orders-recent-sync.mjs';
 import { refreshCustomerFromShopify, syncRecentCustomers } from './lib/customer-cache-sync.mjs';
+import { drainDashboardOrders, drainLowStockItems, drainCustomerSpendOrders } from './lib/dashboard-paging.mjs';
 import { renderLabelSheet, expandItems, TEMPLATES as LABEL_TEMPLATES, DEFAULT_FIELDS } from './labels.mjs';
 import { isInsider, resolveXeroContact, syncCustomerToXero, getXeroSyncStatus } from './lib/xero-customer-sync.mjs';
 import { parseLinePrices, applyLinePriceChanges, bulkMarkOrdersPaid, addLineDiscountsConcurrent } from './lib/order-money.mjs';
@@ -1823,20 +1825,10 @@ async function getDashboardData() {
   try {
     const ninetyDaysAgo = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
     const sevenDaysAgo  = new Date(Date.now() -  7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
-    const [ordersResult, productsResult] = await Promise.all([
-      shopifyFetch(`query($q:String!){ orders(first:50,query:$q,sortKey:PROCESSED_AT,reverse:true){
-        edges{node{id name processedAt customer{id displayName email} displayFinancialStatus
-          totalPriceSet{presentmentMoney{amount currencyCode}}
-          currentTotalPriceSet{presentmentMoney{amount currencyCode}} tags}}
-        pageInfo{hasNextPage}}}`, { q: `tag:b2b-portal created_at:>${ninetyDaysAgo}` }),
-// WHAT: low-stock source query — pulls first:100 published products with publishedOnPublication(B2B_PUB_ID) and first:10 variants each.
-// CHANGE-GUARD: DOUBLE truncation risk — first:100 products AND first:10 variants/product with no paging; a catalog beyond those caps drops products/variants from the low-stock widget silently. B2B_PUB_ID is the hardcoded publication gid (199709720811) gating B2B visibility.
-// INVARIANT(S): only variants on the B2B publication count (p.publishedOnPublication guard); inventoryQuantity must be a number to be considered.
-      shopifyFetch(`query{ products(first:100,query:"published_status:published"){
-        edges{node{id title publishedOnPublication(publicationId:"${B2B_PUB_ID}")
-          variants(first:10){edges{node{sku title inventoryQuantity}}}}}}}`)
+    const [orders, lowStockAll] = await Promise.all([
+      drainDashboardOrders(shopifyFetch, `tag:b2b-portal created_at:>${ninetyDaysAgo}`),
+      drainLowStockItems(shopifyFetch, B2B_PUB_ID),
     ]);
-    const orders = ordersResult.data?.orders?.edges?.map(e => e.node) || [];
     const openStatuses = new Set(['PENDING','AUTHORIZED','PARTIALLY_PAID']);
     const openOrders = orders.filter(o => openStatuses.has(o.displayFinancialStatus));
     const weekOrders = orders.filter(o => o.processedAt >= sevenDaysAgo);
@@ -1862,16 +1854,7 @@ async function getDashboardData() {
     if (topCustomers.length === 0) {
       topCustomers = [...spend.values()].sort((a, b) => b.spend - a.spend).slice(0, 5);
     }
-    const allProducts = productsResult.data?.products?.edges?.map(e => e.node) || [];
-    const lowStockItems = [];
-    for (const p of allProducts) {
-      if (!p.publishedOnPublication) continue;
-      for (const ve of (p.variants?.edges || [])) {
-        const v = ve.node;
-        if (typeof v.inventoryQuantity === 'number' && v.inventoryQuantity < 10)
-          lowStockItems.push({ productId: p.id, productTitle: p.title, variantTitle: v.title, sku: v.sku, qty: v.inventoryQuantity });
-      }
-    }
+    const lowStockItems = lowStockAll;
     const pendingReview = getCustomersPendingXeroReview();
     let monthly = [];
     try { const rd = getReportsDataFromCache(); monthly = rd.monthly || []; } catch(e) {}
@@ -2080,6 +2063,7 @@ async function getOrdersData(filters) {
             currentSubtotalPriceSet{presentmentMoney{amount currencyCode}}
             currentTotalPriceSet{presentmentMoney{amount currencyCode}}
             sourceName note tags
+            # BOUNDED: orders-list row preview shows the first 3 lines only; the full order is on the detail page
             lineItems(first:3){edges{node{title quantity currentQuantity variant{sku}}}}
           }}
           pageInfo{hasNextPage endCursor}
@@ -2232,7 +2216,7 @@ function renderOrdersList(session, data, filters) {
 // ── Order detail ──────────────────────────────────────────────────────────────
 // WHAT: fetches one order's full detail (customer, line items w/ variant+barcode, addresses, fulfillments, transactions) for the detail page and Xero sync.
 // CHANGE-GUARD: lineItems(first:250) is only the first transport page and is drained below;
-// transactions(first:10) remains a hard cap. Returns null on any error (caller 404s).
+// transactions is requested without a first: cap (a plain list on Order, so all transactions return); fulfillmentLineItems and nested overflow are drained below. Returns null on any error (caller 404s).
 // INVARIANT(S): id is built via shopifyOrderGid(numericId); the selected fields are the contract consumed by renderOrderDetail, createXeroInvoice, and the ship/fulfill flows — adding a consumer means extending this query.
 // CURRENT-FIELDS (2026-06-29): each lineItems node carries BOTH quantity (frozen original) and currentQuantity (post-edit truth; 0 = removed). The order carries BOTH subtotal/totalPriceSet (frozen) and currentSubtotal/currentTotalPriceSet (post-edit truth). Consumers that mean "what is in the order NOW" (renderOrderDetail line rows + totals, fulfill/ship/cancel, createXeroInvoice) MUST read the current* variants; the frozen ones are kept only where the ORIGINAL value is intended.
 // THROW-ON-ERROR (added for orders_cache eviction): every other caller wants the swallow-to-null
@@ -2265,6 +2249,7 @@ async function getOrderDetail(numericId, { throwOnError = false } = {}) {
         totalShippingPriceSet{presentmentMoney{amount currencyCode}}
         currentShippingPriceSet{presentmentMoney{amount currencyCode}}
         currencyCode presentmentCurrencyCode
+        # BOUNDED: an order has a handful of shipping lines; 100 is far above any real count
         shippingLines(first:100){nodes{id title}}
         totalTaxSet{presentmentMoney{amount currencyCode}}
         totalOutstandingSet{presentmentMoney{amount currencyCode}}
@@ -2279,13 +2264,24 @@ async function getOrderDetail(numericId, { throwOnError = false } = {}) {
           discountedTotalSet{presentmentMoney{amount currencyCode}}
           discountAllocations{allocatedAmountSet{presentmentMoney{amount currencyCode}} discountApplication{targetSelection ... on ManualDiscountApplication{description}}}
         }}}
-        fulfillments{status trackingInfo{number url company} createdAt
-          fulfillmentLineItems(first:250){nodes{quantity lineItem{id title sku}}}}
-        transactions(first:10){id status kind gateway createdAt
+        fulfillments{id status trackingInfo{number url company} createdAt
+          fulfillmentLineItems(first:250){pageInfo{hasNextPage endCursor} nodes{quantity lineItem{id title sku}}}}
+        transactions{id status kind gateway createdAt
           amountSet{presentmentMoney{amount currencyCode}}}
       }}`, { id: shopifyOrderGid(numericId) });
 
 
+    // 2026-10-14 sweep: a fulfillment can itself carry >250 lines (ship-everything on a #39355-class
+    // order). Complete any fulfillmentLineItems overflow before anything renders a partial shipment.
+    for (const f of (result.data?.order?.fulfillments || [])) {
+      if (f?.fulfillmentLineItems?.pageInfo?.hasNextPage) {
+        const nodes = await drainRemaining(f.fulfillmentLineItems, `fulfillment ${f.id} lines`, (after) =>
+          shopifyFetch(`query($id:ID!,$after:String){node(id:$id){... on Fulfillment{fulfillmentLineItems(first:250,after:$after){
+            pageInfo{hasNextPage endCursor} nodes{quantity lineItem{id title sku}} }}}}`, { id: f.id, after })
+            .then(r => r.data?.node?.fulfillmentLineItems));
+        f.fulfillmentLineItems = { nodes };
+      }
+    }
     // Pagination-completeness (2026-09-23 audit): order.lineItems(first:250) is a TRANSPORT page, not
     // the whole order. An order with >250 lines (the #39355 class) silently dropped the overflow from
     // every consumer below (renderOrderDetail, createXeroInvoice, ship/fulfill, cancel). Drain the rest
@@ -4193,6 +4189,7 @@ async function getCustomersData(filters) {
             id displayName email phone tags numberOfOrders
             amountSpent{amount currencyCode}
             defaultAddress{city province country}
+            # BOUNDED: fixed small key set in the b2b metafield namespace
             metafields(first:5,namespace:"b2b"){edges{node{key value}}}
           }}
           pageInfo{hasNextPage endCursor}
@@ -4345,8 +4342,9 @@ async function getCustomerDetail(numericId) {
       query($id:ID!){ customer(id:$id){
         id email displayName phone tags numberOfOrders
         amountSpent{amount currencyCode}
-        addresses(first:5){id firstName lastName address1 city province zip country}
+        addresses{id firstName lastName address1 city province zip country}
         defaultAddress{id company firstName lastName address1 address2 city province provinceCode zip country phone}
+        # BOUNDED: fixed small key set in the b2b metafield namespace
         metafields(first:20,namespace:"b2b"){edges{node{id namespace key value type}}}
       }}`, { id: shopifyCustomerGid(numericId) });
     return result.data?.customer || null;
@@ -4394,6 +4392,7 @@ async function getCustomerRecentOrders(customerId) {
   }
   try {
     const result = await shopifyFetch(`
+      # BOUNDED: customer page shows the 10 most recent orders by design (labelled Recent Orders)
       query($q:String!){ orders(first:10,query:$q,sortKey:PROCESSED_AT,reverse:true){
         edges{node{id name processedAt displayFinancialStatus displayFulfillmentStatus
           totalPriceSet{presentmentMoney{amount currencyCode}}
@@ -4461,6 +4460,7 @@ async function getB2bConfig(numericId) {
   try {
     const result = await shopifyFetch(`
       query($id:ID!){customer(id:$id){
+        # BOUNDED: fixed small key set in the b2b metafield namespace
         metafields(first:20,namespace:"b2b"){edges{node{id key value type}}}
       }}`, { id: shopifyCustomerGid(numericId) });
     const mfs = result.data?.customer?.metafields?.edges?.map(e => e.node) || [];
@@ -6826,6 +6826,37 @@ const orderLineItemsPage = (orderId, fields) => (after) =>
     pageInfo{hasNextPage endCursor} edges{node{ ${fields} }} }}}`, { id: orderId, after })
     .then(r => r.data?.order?.lineItems);
 
+// One cursor-addressed page of Product.variants (continuation for products with more variants than the
+// first-page cap). `fields` MUST equal the field list the caller's first page selected.
+// DEPENDS: lib/paginate-connection.mjs drainRemaining; callers: getCatalogData, getProductDetail,
+// getProductsForLabels, getProductsForExport (each requests variants{pageInfo{hasNextPage endCursor}}).
+const productVariantsPage = (productId, fields) => (after) =>
+  shopifyFetch(`query($id:ID!,$after:String){node(id:$id){... on Product{variants(first:${LINE_PAGE_MAX},after:$after){
+    pageInfo{hasNextPage endCursor} edges{node{ ${fields} }} }}}}`, { id: productId, after })
+    .then(r => r.data?.node?.variants);
+
+// Completes any product whose first variants page overflowed; throws rather than leave a prefix.
+async function completeProductVariants(products, fields, label) {
+  for (const p of products) {
+    if (p?.variants?.pageInfo?.hasNextPage) {
+      const nodes = await drainRemaining(p.variants, `${label} ${p.id} variants`, productVariantsPage(p.id, fields));
+      p.variants = { edges: nodes.map(node => ({ node })) };
+    }
+  }
+  return products;
+}
+
+// Order lineItems overflow for an order that arrived inline in a list query.
+async function completeOrderLineItems(orders, fields, label) {
+  for (const o of orders) {
+    if (o?.lineItems?.pageInfo?.hasNextPage) {
+      const nodes = await drainLineItems(o.lineItems, `${label} ${o.id}`, orderLineItemsPage(o.id, fields));
+      o.lineItems = { edges: nodes.map(node => ({ node })) };
+    }
+  }
+  return orders;
+}
+
 const calcLineItemsPage = (calcId, fields) => (after) =>
   shopifyFetch(`query($id:ID!,$after:String){node(id:$id){ ... on CalculatedOrder {
     lineItems(first:${LINE_PAGE_MAX},after:$after){ pageInfo{hasNextPage endCursor} edges{node{ ${fields} }} } } }}`,
@@ -9003,23 +9034,10 @@ app.get('/api/admin/customers/:id/spend', requireAuth, async (req, res) => {
     const gid = shopifyCustomerGid(numId);
     const fromStr = new Date(fromTs).toISOString().split('T')[0];
     const toStr   = new Date(toTs  ).toISOString().split('T')[0];
-    const r = await shopifyFetch(`
-      query($id:ID!,$q:String!){
-        customer(id:$id){
-          amountSpent{amount currencyCode}
-          numberOfOrders
-          orders(first:250,query:$q,sortKey:PROCESSED_AT,reverse:true){
-            edges{node{
-              id name processedAt displayFinancialStatus displayFulfillmentStatus
-              totalPriceSet{presentmentMoney{amount currencyCode}}
-              currentTotalPriceSet{presentmentMoney{amount currencyCode}}
-            }}
-          }
-        }
-      }`, { id: gid, q: `processed_at:>=${fromStr} processed_at:<=${toStr}` });
-    const cust = r.data?.customer;
-    if (!cust) return res.status(404).json({ error: 'not found' });
-    const orders = cust.orders.edges.map(e => e.node);
+    const spent = await drainCustomerSpendOrders(shopifyFetch, gid, `processed_at:>=${fromStr} processed_at:<=${toStr}`);
+    if (!spent) return res.status(404).json({ error: 'not found' });
+    const cust = spent.customer;
+    const orders = spent.orders;
     // listRowTotalAmount on BOTH the sum and the rows. #33 changed only the cache branch, so the
     // answer this endpoint gave depended on whether the cache was warm — a cold cache reproduced the
     // edited-order overstatement the fix existed to remove. (Qodo #11 on PR#33.)
@@ -9054,6 +9072,7 @@ app.get('/api/customers/search', requireAuth, async (req, res) => {
     ? MOCK_CUSTOMERS.filter(c => c.displayName.toLowerCase().includes(q) || c.email.toLowerCase().includes(q))
     : await (async () => {
         try {
+          // BOUNDED: customer search typeahead, top 10 matches by design
           const r = await shopifyFetch(`query($q:String!){ customers(first:10,query:$q){
             edges{node{id displayName email defaultAddress{company firstName lastName address1 address2 city province provinceCode zip country} metafields(first:25,namespace:"b2b"){edges{node{key value}}}}}}}`,
             { q: `tag:b2b ${q}` });
@@ -9130,6 +9149,7 @@ app.get('/api/products/search', requireAuth, async (req, res) => {
         )
     : await (async () => {
         try {
+          // BOUNDED: product search typeahead, top 10 matches; variants capped by PRODUCT_VARIANT_CAP and flagged via variantsTruncated
           const r = await shopifyFetch(`query($q:String!){ products(first:10,query:$q){
             edges{node{id title variants(first:${PRODUCT_VARIANT_CAP}){edges{node{id title sku price inventoryQuantity selectedOptions{name value}}}}}}}}`,
             { q });
@@ -9240,7 +9260,7 @@ function renderSparkline(values, opts = {}) {
 // ── Catalog ───────────────────────────────────────────────────────────────────
 
 // WHAT: Phase 25B/F — loads catalog products; vendor defaults to 'Fuzzywumpets' (pass vendor='all' to bypass), with status (active/draft/archived/all), style, stock (low/out), and b2b-publication filters.
-// CHANGE-GUARD: real mode fetches ONLY the first 50 products in ONE page then filters in-memory — style/stock/b2b filters therefore operate on at most 50 rows and totals are page-local, NOT catalog-wide (the `page` param is unused); statusCounts is null in real mode (only computed in MOCK). See bugs[] before trusting counts.
+// CHANGE-GUARD: real mode walks EVERY products page via paginateConnection (pagination sweep 2026-10-14; was page 1 = 50 rows) and throws past 40 pages rather than show a prefix; variants overflow (>15) is completed per product. statusCounts is null in real mode (only computed in MOCK).
 // INVARIANT(S): publishedOnB2B is derived from publishedOnPublication(B2B_PUB_ID); on error returns an empty product set with the error string rather than throwing.
 async function getCatalogData({ vendor, style, stock, b2b, status = 'active', page = 1 }) {
   // Phase 25B/F: default to Fuzzywumpets vendor; use vendor='all' to bypass
@@ -9273,29 +9293,36 @@ async function getCatalogData({ vendor, style, stock, b2b, status = 'active', pa
     const qParts = [];
     if (effectiveVendor) qParts.push(`vendor:"${effectiveVendor}"`);
     if (status !== 'all') qParts.push(`status:${status}`);
-    const result = await shopifyFetch(`
+    // 2026-10-14 sweep: walk EVERY page (was page 1 only = first 50 products, with style/stock/b2b
+    // filters and the "N products" header silently page-local). Fail closed past 40 pages (2000 products).
+    const CATALOG_VARIANT_FIELDS = 'sku title inventoryQuantity';
+    const catalogNodes = await paginateConnection(async (after) => {
+      const result = await shopifyFetch(`
       query($q:String!,$after:String){
         products(first:50,query:$q,after:$after,sortKey:TITLE){
           edges{node{
             id title handle vendor tags status
             publishedOnPublication(publicationId:"${B2B_PUB_ID}")
-            variants(first:15){edges{node{sku title inventoryQuantity}}}
+            variants(first:15){pageInfo{hasNextPage endCursor} edges{node{ ${CATALOG_VARIANT_FIELDS} }}}
           }}
           pageInfo{hasNextPage endCursor}
         }
-      }`, { q: qParts.join(' '), after: null });
-    let prods = (result.data?.products?.edges || []).map(e => ({
-      ...e.node,
-      publishedOnB2B: e.node.publishedOnPublication,
+      }`, { q: qParts.join(' '), after });
+      return result.data?.products;
+    }, 'catalog products');
+    await completeProductVariants(catalogNodes, CATALOG_VARIANT_FIELDS, 'catalog');
+    let prods = catalogNodes.map(n => ({
+      ...n,
+      publishedOnB2B: n.publishedOnPublication,
     }));
     if (style)       prods = prods.filter(p => (p.tags||[]).includes(`Style_${style}`));
     if (b2b === '1') prods = prods.filter(p => p.publishedOnB2B);
     if (b2b === '0') prods = prods.filter(p => !p.publishedOnB2B);
     if (stock === 'low')  prods = prods.filter(p => { const t=(p.variants?.edges||[]).reduce((s,e)=>s+(e.node.inventoryQuantity||0),0); return t>0&&t<10; });
     if (stock === 'out')  prods = prods.filter(p => { const t=(p.variants?.edges||[]).reduce((s,e)=>s+(e.node.inventoryQuantity||0),0); return t===0; });
-    const allVendors = [...new Set(result.data?.products?.edges?.map(e => e.node.vendor).filter(Boolean) || [])];
-    const allStyles  = [...new Set((result.data?.products?.edges||[]).flatMap(e => (e.node.tags||[]).filter(t=>t.startsWith('Style_')).map(t=>t.slice(6))))];
-    return { products: prods, vendors: allVendors, styles: allStyles, total: prods.length, hasNextPage: result.data?.products?.pageInfo?.hasNextPage, statusCounts: null, effectiveVendor };
+    const allVendors = [...new Set(catalogNodes.map(n => n.vendor).filter(Boolean))];
+    const allStyles  = [...new Set(catalogNodes.flatMap(n => (n.tags||[]).filter(t=>t.startsWith('Style_')).map(t=>t.slice(6))))];
+    return { products: prods, vendors: allVendors, styles: allStyles, total: prods.length, hasNextPage: false, statusCounts: null, effectiveVendor };
   } catch (err) {
     console.error('getCatalogData error:', err.message);
     return { products: [], vendors: [], styles: [], total: 0, hasNextPage: false, error: err.message, statusCounts: null, effectiveVendor };
@@ -9559,8 +9586,9 @@ async function getProductDetail(numericId) {
       query($id:ID!){product(id:$id){
         id title handle vendor productType status tags
         featuredImage{url altText}
+        # BOUNDED: image thumbnails on the detail page, top 10 by design
         images(first:10){edges{node{url altText}}}
-        variants(first:50){edges{node{
+        variants(first:50){pageInfo{hasNextPage endCursor} edges{node{
           id title sku barcode price compareAtPrice inventoryQuantity
           inventoryItem{tracked}
         }}}
@@ -9568,8 +9596,12 @@ async function getProductDetail(numericId) {
       }}`, { id: `gid://shopify/Product/${numericId}` });
     const p = result.data?.product;
     if (!p) return null;
+    // SYNC: field list equals the variants selection above (pagination sweep 2026-10-14).
+    await completeProductVariants([p], `id title sku barcode price compareAtPrice inventoryQuantity
+          inventoryItem{tracked}`, 'product detail');
     // Fetch recent orders containing this product
     const ordersResult = await shopifyFetch(`
+      # BOUNDED: product detail shows the 10 most recent related orders by design
       query($q:String!){orders(first:10,query:$q,sortKey:PROCESSED_AT,reverse:true){
         edges{node{id name processedAt
           customer{id displayName email}
@@ -9761,7 +9793,7 @@ async function getReportsData() {
     const allOrders = [];
     let after = null;
     let pageCount = 0;
-    while (pageCount < 10) {
+    while (pageCount < 40) {
       const result = await shopifyFetch(`
         query($q:String!,$first:Int!,$after:String){
           orders(first:$first,query:$q,after:$after,sortKey:PROCESSED_AT,reverse:true){
@@ -9769,7 +9801,7 @@ async function getReportsData() {
               id processedAt
               customer{id displayName email}
               totalPriceSet{presentmentMoney{amount}}
-              lineItems(first:50){edges{node{
+              lineItems(first:50){pageInfo{hasNextPage endCursor} edges{node{
                 title quantity
                 variant{sku}
                 discountedUnitPriceSet{presentmentMoney{amount}}
@@ -9779,10 +9811,15 @@ async function getReportsData() {
           }
         }`, { q: `tag:b2b-portal created_at:>${cutoff}`, first: 250, after });
       const edges = result.data?.orders?.edges || [];
+      // SYNC: field list equals the nested lineItems selection above (orders with >50 lines are completed).
+      await completeOrderLineItems(edges.map(e => e.node), 'title quantity variant{sku} discountedUnitPriceSet{presentmentMoney{amount}}', 'analytics');
       allOrders.push(...edges.map(e => e.node));
       if (!result.data?.orders?.pageInfo?.hasNextPage) break;
       after = result.data?.orders?.pageInfo?.endCursor;
+      if (!after) throw new Error('analytics orders hasNextPage without endCursor');
       pageCount++;
+      // Fail closed: 12-month analytics must never be built from a silently capped prefix.
+      if (pageCount >= 40) throw new Error('analytics orders did not paginate to completion after 40 pages');
     }
 
     // Aggregate monthly
@@ -10285,9 +10322,10 @@ async function getProductsForLabels(ids) {
   const result = await shopifyFetch(`
     query($ids:[ID!]!){nodes(ids:$ids){... on Product{
       id handle title vendor productType tags barcode
-      variants(first:30){edges{node{id title sku price compareAtPrice barcode inventoryQuantity}}}
+      variants(first:30){pageInfo{hasNextPage endCursor} edges{node{id title sku price compareAtPrice barcode inventoryQuantity}}}
     }}}`, { ids: gids });
-  return (result.data?.nodes || []).filter(Boolean);
+  // SYNC: the field list below equals the variants selection above; products with >30 variants are completed.
+  return completeProductVariants((result.data?.nodes || []).filter(Boolean), 'id title sku price compareAtPrice barcode inventoryQuantity', 'labels');
 }
 
 // WHAT: loads one order's line items (barcode, title, variantTitle, sku, price, qty) for the 'From an Order' labels tab.
@@ -10316,14 +10354,16 @@ async function getOrderForLabels(numericId) {
   }
   const result = await shopifyFetch(`
     query($id:ID!){order(id:$id){
-      name
-      lineItems(first:50){edges{node{
+      id name
+      lineItems(first:${LINE_PAGE_MAX}){pageInfo{hasNextPage endCursor} edges{node{
         title quantity currentQuantity
         variant{id sku price barcode displayName}
       }}}
     }}`, { id: `gid://shopify/Order/${numericId}` });
   const o = result.data?.order;
   if (!o) return null;
+  // SYNC: field list equals the lineItems selection above (orders with >250 lines are completed).
+  await completeOrderLineItems([o], 'title quantity currentQuantity variant{id sku price barcode displayName}', 'labels order');
   return {
     order: o,
     items: o.lineItems.edges
@@ -10581,14 +10621,17 @@ async function getProductsForExport(ids) {
       query($ids:[ID!]!){nodes(ids:$ids){... on Product{
         id handle title vendor productType tags
         featuredImage{url altText}
+        # BOUNDED: image URLs in the export, top 30 by design
         images(first:30){edges{node{url altText}}}
-        variants(first:50){edges{node{
+        variants(first:50){pageInfo{hasNextPage endCursor} edges{node{
           id title sku barcode price compareAtPrice inventoryQuantity inventoryPolicy
           createdAt updatedAt
         }}}
         createdAt updatedAt
       }}}`, { ids: gids.slice(i, i + 250) });
-    out.push(...(result.data?.nodes || []).filter(Boolean));
+    // SYNC: field list equals the variants selection above.
+    out.push(...await completeProductVariants((result.data?.nodes || []).filter(Boolean), `id title sku barcode price compareAtPrice inventoryQuantity inventoryPolicy
+          createdAt updatedAt`, 'export'));
   }
   return out;
 }
