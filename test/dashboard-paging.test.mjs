@@ -68,6 +68,14 @@ await test('dashboard order walk fails closed on a page without pageInfo (DeepRe
   await assert.rejects(() => drainDashboardOrders(async () => ({ data: { orders: { edges: [] } } }), 'q'), /without pageInfo/);
 });
 
+await test('customer spend: a customer missing on a later page throws, not 404 (DeepReview 2026-10-14)', async () => {
+  const f = async (_q, vars) => (!vars.after
+    ? { data: { customer: { amountSpent: { amount: '1', currencyCode: 'USD' }, numberOfOrders: 2,
+        orders: { pageInfo: { hasNextPage: true, endCursor: 'c2' }, edges: [{ node: { id: 'o1' } }] } } } }
+    : { data: {} });
+  await assert.rejects(() => drainCustomerSpendOrders(f, 'gid://shopify/Customer/1', 'q'), /later page/);
+});
+
 await test('customer spend keeps lifetime fields from page 1 and all range orders', async () => {
   const shopifyFetch = async (_q, vars) => {
     if (!vars.after) {

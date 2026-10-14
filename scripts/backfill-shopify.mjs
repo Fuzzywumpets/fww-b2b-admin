@@ -79,7 +79,7 @@ async function gql(query, variables = {}) {
 async function completeNested(parents, key, parentField, fields, label) {
   for (const parent of parents) {
     const conn = parent?.[key];
-    if (!conn?.pageInfo?.hasNextPage) continue;
+    if (!conn || (conn.pageInfo && !conn.pageInfo.hasNextPage)) continue; // missing pageInfo -> drainLineItems throws
     const nodes = await drainLineItems(conn, `${label} ${parent.id}`, (after) =>
       gql(`query($id:ID!,$after:String){node(id:$id){... on ${parentField}{${key}(first:250,after:$after){
         pageInfo{hasNextPage endCursor} edges{node{ ${fields} }} }}}}`, { id: parent.id, after })

@@ -27,7 +27,7 @@ const LINE_FIELDS = `id sku title variantTitle quantity
               taxable`;
 async function completeOrderLines(orderNodes) {
   for (const o of orderNodes) {
-    if (!o?.lineItems?.pageInfo?.hasNextPage) continue;
+    if (!o?.lineItems || (o.lineItems.pageInfo && !o.lineItems.pageInfo.hasNextPage)) continue; // missing pageInfo -> drainLineItems throws
     const nodes = await drainLineItems(o.lineItems, `per-customer backfill ${o.id}`, async (after) => {
       const r = await fetch(BRIDGE, {
         method: 'POST',

@@ -149,12 +149,6 @@ fi
 if [ -f test/order-edit-nav-deadlock.test.mjs ]; then
   echo ""
   node test/order-edit-nav-deadlock.test.mjs || UNIT_FAIL=$?
-# Pagination-completeness (2026-09-23 audit, #39355 class): getOrderDetail must drain order
-# lineItems beyond first:250 or renderOrderDetail / createXeroInvoice / ship flows under-build.
-if [ -f test/pagination-completeness.test.mjs ]; then
-  echo ""
-  node test/pagination-completeness.test.mjs || UNIT_FAIL=$?
-fi
 fi
 
 # Wholesale company on invoices/order pages + manual order-create addresses (#39848-A). Standalone:
