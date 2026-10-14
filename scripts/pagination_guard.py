@@ -200,8 +200,8 @@ PAGEINFO_REQ_RE = re.compile(r"pageInfo\s*\{[^{}]*hasNextPage")
 PAGEINFO_READ_RE = re.compile(
     r"\.hasNextPage|\[\s*[\"']hasNextPage[\"']\s*\]|get\(\s*[\"']hasNextPage|"
     r"\.endCursor|\[\s*[\"']endCursor[\"']\s*\]|get\(\s*[\"']endCursor|"
-    r"hasNextPage\s*[:,]\s*(has|next|more|hn)|hasNextPage\s*\}\s*=")
-HELPER_CALL_RE = re.compile(r"(?i)\w*(paginat|drain|walk_?pages|all_?pages|each_?page|iter_?pages|"
+    r"hasNextPage\s*[:,]\s*(has|next|more|hn)|\bhasNextPage\s*\}\s*=")
+HELPER_CALL_RE = re.compile(r"(?i)\b\w*(paginat|drain|walk_?pages|all_?pages|each_?page|iter_?pages|"
                             r"fetch_?all|page_?through|follow_?pages|hydrate)\w*\s*\(")
 
 
@@ -247,8 +247,10 @@ def main(argv):
                 text = fh.read()
         except OSError:
             continue
-        if "first" not in text and "last" not in text and "limit" not in text.lower() \
-                and "page" not in text.lower() and "maxresults" not in text.lower():
+        low = text.lower()
+        # cheap prefilter; SYNC: must cover every token CONN_RE / REST_LIMIT_RE can match
+        if not any(t in low for t in ("first", "last", "limit", "page", "maxresults", "max_results",
+                                       "$top", "per_page", "perpage")):
             continue
         for x in scan_text(rel, text):
             findings.append(x)
