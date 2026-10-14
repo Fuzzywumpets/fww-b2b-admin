@@ -52,6 +52,18 @@ await test('low-stock drains a variant on the second page and ignores unpublishe
   assert.deepEqual(items.map((i) => i.sku), ['A', 'B']);
 });
 
+await test('low-stock variant paging fails closed on a repeated cursor or a page without pageInfo (DeepReview 2026-10-14)', async () => {
+  const products = { data: { products: { pageInfo: { hasNextPage: false, endCursor: null }, edges: [
+    { node: { id: 'p1', title: 'Shown', publishedOnPublication: true, variants: { pageInfo: { hasNextPage: true, endCursor: 'v2' }, edges: [{ node: { sku: 'A', title: 'A', inventoryQuantity: 2 } }] } } },
+  ] } } };
+  const loop = async (q) => (q.includes('products(first:') ? products
+    : { data: { product: { variants: { pageInfo: { hasNextPage: true, endCursor: 'v2' }, edges: [{ node: { sku: 'B', title: 'B', inventoryQuantity: 1 } }] } } } });
+  await assert.rejects(() => drainLowStockItems(loop, 'gid://shopify/Publication/1'), /cursor repeated/);
+  const noInfo = async (q) => (q.includes('products(first:') ? products
+    : { data: { product: { variants: { edges: [{ node: { sku: 'B', title: 'B', inventoryQuantity: 1 } }] } } } });
+  await assert.rejects(() => drainLowStockItems(noInfo, 'gid://shopify/Publication/1'), /without pageInfo/);
+});
+
 await test('customer spend keeps lifetime fields from page 1 and all range orders', async () => {
   const shopifyFetch = async (_q, vars) => {
     if (!vars.after) {

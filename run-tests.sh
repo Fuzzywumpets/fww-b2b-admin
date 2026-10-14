@@ -179,7 +179,9 @@ fi
 # Pagination guard (vendored from ~/.claude/scripts/pagination_guard.py): any new unbounded list fetch fails the suite.
 if [ -f scripts/pagination_guard.py ]; then
   echo ""
-  { command -v python3 >/dev/null 2>&1 && python3 scripts/pagination_guard.py .; } || { command -v python3 >/dev/null 2>&1 || python scripts/pagination_guard.py .; } || UNIT_FAIL=$?
+  # DeepReview 2026-10-14: choose the interpreter, then run the guard ONCE so its exit status is never masked.
+  PY=$(command -v python3 || command -v python || true)
+  if [ -z "$PY" ]; then echo "pagination_guard: no python interpreter"; UNIT_FAIL=1; else "$PY" scripts/pagination_guard.py . || UNIT_FAIL=$?; fi
 fi
 if [ -f test/dashboard-paging.test.mjs ]; then
   echo ""
