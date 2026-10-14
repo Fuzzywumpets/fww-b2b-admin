@@ -82,9 +82,9 @@ await test('plain-list fields (transactions, customer addresses) no longer carry
   assert.doesNotMatch(src, /addresses\(first:5\)/);
 });
 
-console.log(`\n${passed} passed, ${failed} failed`);
-process.exitCode = failed ? 1 : 0;
-
 await test('drainLineItems fails closed on a first page without pageInfo (DeepReview 2026-10-14)', async () => {
   await assert.rejects(() => drainLineItems({ edges: [{ node: 1 }] }, 't', async () => null), /without pageInfo/);
 });
+
+console.log(`\n${passed} passed, ${failed} failed`);
+process.exitCode = failed ? 1 : 0;

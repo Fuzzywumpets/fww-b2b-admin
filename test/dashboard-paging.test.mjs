@@ -76,6 +76,13 @@ await test('customer spend: a customer missing on a later page throws, not 404 (
   await assert.rejects(() => drainCustomerSpendOrders(f, 'gid://shopify/Customer/1', 'q'), /later page/);
 });
 
+await test('low-stock: first-page variants without pageInfo fail closed (DeepReview 2026-10-14)', async () => {
+  const f = async () => ({ data: { products: { pageInfo: { hasNextPage: false, endCursor: null }, edges: [
+    { node: { id: 'p1', title: 'Shown', publishedOnPublication: true, variants: { edges: [{ node: { sku: 'A', title: 'A', inventoryQuantity: 1 } }] } } },
+  ] } } });
+  await assert.rejects(() => drainLowStockItems(f, 'gid://shopify/Publication/1'), /without pageInfo/);
+});
+
 await test('customer spend keeps lifetime fields from page 1 and all range orders', async () => {
   const shopifyFetch = async (_q, vars) => {
     if (!vars.after) {
