@@ -62,7 +62,7 @@ REST_FOLLOW_RE = re.compile(
     r"page_info|pageInfo|[Ll]ink\b|rel=\"?next|next_?[Pp]age|nextPageToken|pageToken|"
     r"next_?[Cc]ursor|cursor|offset|starting_after|continuation|\bpage\s*[=:+]|"
     r"page\s*\+=|skip|has_more|hasMore|truncated|list_complete|@odata\.nextLink|"
-    r"total_pages|totalPages|\bnext\b")
+    r"total_pages|totalPages|[\"']next[\"']|\.next\b(?!\s*\()|\bnext_?(?:url|link|page|cursor|token)\b")
 
 
 def load_ignores(root):
