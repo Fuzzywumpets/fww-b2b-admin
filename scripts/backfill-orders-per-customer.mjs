@@ -14,6 +14,35 @@ const {
 const BEARER = process.env.SHOPIFY_BRIDGE_BEARER;
 const BRIDGE = 'https://shopify-bridge.alex-037.workers.dev/api/graphql';
 
+// Pagination sweep 2026-10-14: lineItems(first:50) used to be persisted as the whole order. Orders
+// with more lines now have the overflow drained (or the script throws; never a silent prefix).
+// SYNC: LINE_FIELDS must equal the lineItems selection in fetchOrdersForCustomer's query.
+import { drainLineItems } from '../lib/line-item-paging.mjs';
+const LINE_FIELDS = `id sku title variantTitle quantity
+              vendor
+              originalUnitPriceSet{shopMoney{amount}}
+              totalDiscountSet{shopMoney{amount}}
+              discountAllocations{allocatedAmountSet{shopMoney{amount}}}
+              variant{id product{id}}
+              taxable`;
+async function completeOrderLines(orderNodes) {
+  for (const o of orderNodes) {
+    if (!o?.lineItems?.pageInfo?.hasNextPage) continue;
+    const nodes = await drainLineItems(o.lineItems, `per-customer backfill ${o.id}`, async (after) => {
+      const r = await fetch(BRIDGE, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${BEARER}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query: `query($id:ID!,$after:String){order(id:$id){lineItems(first:250,after:$after){
+          pageInfo{hasNextPage endCursor} edges{node{ ${LINE_FIELDS} }} }}}`, variables: { id: o.id, after } })
+      });
+      const j = await r.json();
+      if (j.errors?.length) throw new Error(j.errors[0].message);
+      return j.data?.order?.lineItems;
+    });
+    o.lineItems = { edges: nodes.map(node => ({ node })) };
+  }
+}
+
 // WHAT: per-customer order backfill — paginates a single customer's orders (50/page, up to 50 line items each) and upserts orders + line items into the local cache.
 // CHANGE-GUARD: uses shopMoney amounts (matching the live poller, NOT the bulk backfill's presentmentMoney) — keep consistent with whichever writer is authoritative; lineItems(first:50) silently truncates orders with >50 lines.
 // INVARIANT(S): iterates only customers where listCustomersFromCache segment:'b2b'; total is per-customer; on a GraphQL error it returns the partial count and moves on (best-effort, not transactional).
@@ -37,7 +66,7 @@ async function fetchOrdersForCustomer(customerGid) {
             customer{id email phone}
             shippingAddress{firstName lastName company address1 address2 city province zip country phone}
             billingAddress{firstName lastName company address1 address2 city province zip country phone}
-            lineItems(first:50){edges{node{
+            lineItems(first:50){pageInfo{hasNextPage endCursor} edges{node{
               id sku title variantTitle quantity
               vendor
               originalUnitPriceSet{shopMoney{amount}}
@@ -63,6 +92,7 @@ async function fetchOrdersForCustomer(customerGid) {
     }
     const orders = json.data?.customer?.orders;
     if (!orders) return total;
+    await completeOrderLines(orders.edges.map(e => e.node));
     for (const edge of orders.edges) {
       const o = edge.node;
       const shopifyId = o.id.split('/').pop();

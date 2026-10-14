@@ -24,6 +24,7 @@ console.log('\n\u2500\u2500 Unit: order-detail line-item pagination completeness
 const src = await readFile(new URL('../server.mjs', import.meta.url), 'utf8');
 
 // The initial projection in getOrderDetail must carry pageInfo so the walker can advance.
+// BOUNDED: test title text only; no query is issued here
 await test('getOrderDetail lineItems(first:250) requests pageInfo { hasNextPage endCursor }', () => {
   const m = src.match(/getOrderDetail[\s\S]*?lineItems\(first:250\)\{pageInfo\{hasNextPage endCursor\}/);
   assert.ok(m, 'the order-detail query must request pageInfo on the lineItems connection');

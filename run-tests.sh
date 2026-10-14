@@ -171,6 +171,16 @@ if [ -f test/pagination-completeness.test.mjs ]; then
   node test/pagination-completeness.test.mjs || UNIT_FAIL=$?
 fi
 
+if [ -f test/paginate-connection.test.mjs ]; then
+  echo ""
+  node test/paginate-connection.test.mjs || UNIT_FAIL=$?
+fi
+
+# Pagination guard (vendored from ~/.claude/scripts/pagination_guard.py): any new unbounded list fetch fails the suite.
+if [ -f scripts/pagination_guard.py ]; then
+  echo ""
+  { command -v python3 >/dev/null 2>&1 && python3 scripts/pagination_guard.py .; } || { command -v python3 >/dev/null 2>&1 || python scripts/pagination_guard.py .; } || UNIT_FAIL=$?
+fi
 if [ -f test/dashboard-paging.test.mjs ]; then
   echo ""
   node test/dashboard-paging.test.mjs || UNIT_FAIL=$?
