@@ -114,6 +114,11 @@ node test/shipping-ui.test.mjs || UI_FAIL=$?
 
 # List truncation lives here for the same reason: the cache path is gated on `if (!MOCK)`, so the
 # HTTP suite can never reach the capped query that truncates /orders and /customers.
+# customers cache search must match company — cache path, unreachable under MOCK HTTP.
+if [ -f test/customers-search-company.test.mjs ]; then
+  echo ""
+  B2B_ADMIN_MOCK=1 node test/customers-search-company.test.mjs || UNIT_FAIL=$?
+fi
 if [ -f test/list-truncation.test.mjs ]; then
   echo ""
   B2B_ADMIN_MOCK=1 node test/list-truncation.test.mjs || UNIT_FAIL=$?

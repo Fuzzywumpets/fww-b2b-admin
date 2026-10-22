@@ -1157,9 +1157,11 @@ export function listCustomersFromCache(filters = {}) {
   else if (filters.segment === 'has_orders') where.push('orders_count > 0');
   else if (filters.segment === 'no_orders') where.push('orders_count = 0');
   if (filters.q) {
-    where.push('(LOWER(display_name) LIKE ? OR LOWER(email) LIKE ?)');
+    // DEPENDS: the row mapping below shows `company` as the displayName, so search must match it
+    // too — otherwise a customer listed as "Champ Dog" is unfindable by the name on screen.
+    where.push("(LOWER(display_name) LIKE ? OR LOWER(email) LIKE ? OR LOWER(COALESCE(company,'')) LIKE ?)");
     const q = '%' + filters.q.toLowerCase() + '%';
-    params.push(q, q);
+    params.push(q, q, q);
   }
   if (filters.tag) {
     where.push('tags LIKE ?');
