@@ -12,7 +12,8 @@ const {
 } = db;
 
 const BEARER = process.env.SHOPIFY_BRIDGE_BEARER;
-const BRIDGE = 'https://shopify-bridge.alex-037.workers.dev/api/graphql';
+// Same resolution as server.mjs (lib/test-env.mjs): prod unless the test copy overrides it.
+const BRIDGE = process.env.B2B_ADMIN_SHOPIFY_BRIDGE_URL || 'https://shopify-bridge.alex-037.workers.dev/api/graphql';
 
 // WHAT: per-customer order backfill — paginates a single customer's orders (50/page, up to 50 line items each) and upserts orders + line items into the local cache.
 // CHANGE-GUARD: uses shopMoney amounts (matching the live poller, NOT the bulk backfill's presentmentMoney) — keep consistent with whichever writer is authoritative; lineItems(first:50) silently truncates orders with >50 lines.

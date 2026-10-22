@@ -6,7 +6,7 @@
 import { writeFileSync } from 'node:fs';
 import { getIntrospectionQuery } from 'graphql';
 
-const res = await fetch('https://shopify-bridge.alex-037.workers.dev/api/graphql', {
+const res = await fetch(process.env.B2B_ADMIN_SHOPIFY_BRIDGE_URL || 'https://shopify-bridge.alex-037.workers.dev/api/graphql', {
   method: 'POST',
   headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.SHOPIFY_BRIDGE_BEARER}` },
   body: JSON.stringify({ query: getIntrospectionQuery({ descriptions: false }) }),

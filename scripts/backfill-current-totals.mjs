@@ -22,7 +22,8 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DB_PATH = path.join(__dirname, '..', 'data', 'admin.db');
 const DRY = process.argv.includes('--dry');
 
-const BRIDGE_URL = 'https://shopify-bridge.alex-037.workers.dev/api/graphql';
+// Same resolution as server.mjs (lib/test-env.mjs): prod unless the test copy overrides it.
+const BRIDGE_URL = process.env.B2B_ADMIN_SHOPIFY_BRIDGE_URL || 'https://shopify-bridge.alex-037.workers.dev/api/graphql';
 const BEARER = process.env.SHOPIFY_BRIDGE_BEARER || '';
 if (!BEARER) { console.error('Missing SHOPIFY_BRIDGE_BEARER (run via: doppler run --)'); process.exit(1); }
 

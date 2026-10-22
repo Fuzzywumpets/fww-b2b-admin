@@ -138,6 +138,11 @@ if [ -f test/shopify-schema.test.mjs ]; then
   echo ""
   node test/shopify-schema.test.mjs || UNIT_FAIL=$?
 fi
+# Test-environment isolation guard — runs at module load, outside MOCK.
+if [ -f test/test-env.test.mjs ]; then
+  echo ""
+  node test/test-env.test.mjs || UNIT_FAIL=$?
+fi
 if [ -f test/list-truncation.test.mjs ]; then
   echo ""
   B2B_ADMIN_MOCK=1 node test/list-truncation.test.mjs || UNIT_FAIL=$?
