@@ -126,6 +126,11 @@ if [ -f test/customers-search-company.test.mjs ]; then
   echo ""
   B2B_ADMIN_MOCK=1 node test/customers-search-company.test.mjs || UNIT_FAIL=$?
 fi
+# metafieldsDelete payload fields — live Shopify path, unreachable under MOCK.
+if [ -f test/metafields-delete-payload.test.mjs ]; then
+  echo ""
+  node test/metafields-delete-payload.test.mjs || UNIT_FAIL=$?
+fi
 if [ -f test/list-truncation.test.mjs ]; then
   echo ""
   B2B_ADMIN_MOCK=1 node test/list-truncation.test.mjs || UNIT_FAIL=$?
