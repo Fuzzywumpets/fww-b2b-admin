@@ -4531,7 +4531,7 @@ async function applyB2bConfigUpdate(numericId, body) {
   }
   if (delKeys.length) {
     const delInputs = delKeys.map(k => ({ ownerId: gid, namespace: 'b2b', key: k }));
-    await shopifyFetch(`mutation metafieldsDelete($m:[MetafieldIdentifierInput!]!){ metafieldsDelete(metafields:$m){ deletedMetafieldIds userErrors{field message} } }`, { m: delInputs });
+    await shopifyFetch(`mutation metafieldsDelete($m:[MetafieldIdentifierInput!]!){ metafieldsDelete(metafields:$m){ deletedMetafields{ownerId namespace key} userErrors{field message} } }`, { m: delInputs });
   }
 }
 
