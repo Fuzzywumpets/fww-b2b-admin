@@ -4097,7 +4097,21 @@ function renderOrderDetail(session, order, flash, flashMsg) {
 // ── Customers list ────────────────────────────────────────────────────────────
 // WHAT: Build the /customers list — cache-first (Phase 24D local cache via listCustomersFromCache), falling back to a live Shopify customers() GraphQL query when cache empty or MOCK.
 // CHANGE-GUARD: re-test all three paths (cache hit, MOCK, live Shopify); if cache returns 0 rows it MUST fall through to live, not show an empty list. Verify _fromCache/_syncedAt flags still set so the 'Sync now' button + sync badge render.
-// INVARIANT(S): live query is sortKey:AMOUNT_SPENT reverse:true (descending lifetime spend) and capped at first:50 — pagination is cursor-based via filters.after; segment->Shopify query-string mapping (b2b->tag:b2b, sparklayer->tag:sparklayer*, has_orders->orders_count:>0) must match the MOCK in-memory filter semantics.
+// INVARIANT(S): live query uses sortKey RELEVANCE when filters.q is set, else ID (AMOUNT_SPENT is NOT a valid CustomerSortKeys value — Shopify rejects the whole query), capped at first:50, then the returned page is sorted in-process by sortCustomers(filters.sort) — so live ordering is per-page only, not global across cursors — pagination is cursor-based via filters.after; segment->Shopify query-string mapping (b2b->tag:b2b, sparklayer->tag:sparklayer*, has_orders->orders_count:>0) must match the MOCK in-memory filter semantics.
+// WHAT: In-place sort of a customer array by the /customers ?sort param (default lifetime_spend_desc).
+// DEPENDS: getCustomersData (MOCK + live paths) and /customers/export.csv; renderCustomersList's ★ top-10 badge assumes lifetime_spend_desc order.
+function sortCustomers(customers, sort) {
+  sort = sort || 'lifetime_spend_desc';
+  if (sort === 'lifetime_spend_desc') {
+    customers.sort((a, b) => parseFloat(b.amountSpent?.amount || 0) - parseFloat(a.amountSpent?.amount || 0));
+  } else if (sort === 'name_asc') {
+    customers.sort((a, b) => (a.displayName || '').localeCompare(b.displayName || ''));
+  } else if (sort === 'orders_desc') {
+    customers.sort((a, b) => (b.numberOfOrders || 0) - (a.numberOfOrders || 0));
+  }
+  return customers;
+}
+
 async function getCustomersData(filters) {
   // Phase 24D: try local cache first (populated by backfill); fall back to live Shopify
   if (!MOCK) {
@@ -4134,14 +4148,7 @@ async function getCustomersData(filters) {
       customers = customers.filter(c => (c.tags||[]).includes(filters.tag));
     }
     // Sort: default = lifetime spend desc (Phase 20)
-    const sort = filters.sort || 'lifetime_spend_desc';
-    if (sort === 'lifetime_spend_desc') {
-      customers.sort((a, b) => parseFloat(b.amountSpent?.amount || 0) - parseFloat(a.amountSpent?.amount || 0));
-    } else if (sort === 'name_asc') {
-      customers.sort((a, b) => a.displayName.localeCompare(b.displayName));
-    } else if (sort === 'orders_desc') {
-      customers.sort((a, b) => (b.numberOfOrders || 0) - (a.numberOfOrders || 0));
-    }
+    sortCustomers(customers, filters.sort);
     return { customers, hasNextPage: false, total: customers.length };
   }
   try {
@@ -4152,9 +4159,13 @@ async function getCustomersData(filters) {
     if (filters.segment === 'no_orders')  qParts.push('orders_count:0');
     if (filters.q) qParts.push(filters.q);
     if (filters.tag && !filters.segment)  qParts.push(`tag:${filters.tag}`);
+    // Valid CustomerSortKeys: CREATED_AT, ID, LOCATION, NAME, RELEVANCE, UPDATED_AT — there is no
+    // AMOUNT_SPENT key, so spend ordering happens in-process below. That ordering is per-page only:
+    // the top spender on page 2 is not guaranteed to rank below page 1's lowest.
+    const sortKey = filters.q ? 'RELEVANCE' : 'ID';
     const result = await shopifyFetch(`
-      query($q:String!,$first:Int!,$after:String){
-        customers(first:$first,query:$q,after:$after,sortKey:AMOUNT_SPENT,reverse:true){
+      query($q:String!,$first:Int!,$after:String,$sortKey:CustomerSortKeys!){
+        customers(first:$first,query:$q,after:$after,sortKey:$sortKey){
           edges{cursor node{
             id displayName email phone tags numberOfOrders
             amountSpent{amount currencyCode}
@@ -4163,10 +4174,12 @@ async function getCustomersData(filters) {
           }}
           pageInfo{hasNextPage endCursor}
         }
-      }`, { q: qParts.join(' '), first: 50, after: filters.after || null });
+      }`, { q: qParts.join(' '), first: 50, after: filters.after || null, sortKey });
     const edges = result.data?.customers?.edges || [];
     return {
-      customers: edges.map(e => e.node),
+      customers: sortCustomers(edges.map(e => e.node), filters.sort),
+      // DEPENDS: renderCustomersList suppresses the ★ top-10 badge when set — a per-page sort is not a global rank.
+      perPageSortOnly: true,
       hasNextPage: result.data?.customers?.pageInfo?.hasNextPage || false,
       endCursor:   result.data?.customers?.pageInfo?.endCursor   || null,
       total:       edges.length,
@@ -4195,7 +4208,7 @@ function tagChip(t, { linked = false } = {}) {
 }
 
 // WHAT: HTML for the /customers table — segment chips, search/tag/sort filter bar, rows with star badges for top-10-by-spend, and a 'Next 50' cursor link.
-// CHANGE-GUARD: the ★ top-customer badge is index-based (idx < TOP_CUSTOMER_THRESHOLD) and ONLY valid when sort is lifetime_spend_desc — if you change the default sort or page size, the star logic silently mislabels. Re-test that 'Next 50' preserves q/segment/tag/sort params plus after cursor.
+// CHANGE-GUARD: the ★ top-customer badge is index-based (idx < TOP_CUSTOMER_THRESHOLD) and ONLY valid when sort is lifetime_spend_desc AND the list is globally ranked (suppressed when data.perPageSortOnly — the live Shopify fallback) — if you change the default sort or page size, the star logic silently mislabels. Re-test that 'Next 50' preserves q/segment/tag/sort params plus after cursor.
 // INVARIANT(S): colspan=7 on the empty row must match the 7 <th> columns; pagination uses endCursor (opaque Shopify cursor), never an offset.
 function renderCustomersList(session, data, filters) {
   const { customers, hasNextPage, endCursor, error, truncated } = data;
@@ -4211,7 +4224,7 @@ function renderCustomersList(session, data, filters) {
     const visibleTags = (c.tags || []).slice(0, 3);
     const moreTags    = (c.tags || []).length - visibleTags.length;
     const tagBadges   = visibleTags.map(t => tagChip(t, { linked: true })).join('') + (moreTags > 0 ? `<span class="tag-chip tag-chip-more" title="${h((c.tags||[]).join(', '))}">+${moreTags}</span>` : '');
-    const isTop = (filters.sort || 'lifetime_spend_desc') === 'lifetime_spend_desc' && idx < TOP_CUSTOMER_THRESHOLD;
+    const isTop = !data.perPageSortOnly && (filters.sort || 'lifetime_spend_desc') === 'lifetime_spend_desc' && idx < TOP_CUSTOMER_THRESHOLD;
     const starBadge = isTop ? `<span class="top-customer-star" title="Top customer by lifetime spend">★</span>` : '';
     return `<tr>
       <td><a href="/customers/${h(numId)}" class="link-strong">${h(c.displayName)}</a>${starBadge}<br><small>${h(c.email)}</small></td>
@@ -8647,7 +8660,7 @@ app.post('/tax-exempt/:id/reject', requireAuth, async (req, res) => {
 });
 
 // Phase 4: Customers CSV export
-// WHAT: Phase 4 — streams a CSV of all tag:b2b customers sorted by AMOUNT_SPENT desc, paginating Shopify customers in pages of 250.
+// WHAT: Phase 4 — streams a CSV of all tag:b2b customers sorted by lifetime spend desc (sorted in-process after collecting all pages — Shopify has no AMOUNT_SPENT sort key), paginating Shopify customers in pages of 250.
 // CHANGE-GUARD: pagination loop is hard-capped at 10 pages (max 2500 customers) — beyond that the export SILENTLY truncates with no warning (see bugs[]); response is streamed via res.write so headers are committed before the loop (cannot switch to an error status mid-stream).
 // INVARIANT(S): column order is fixed by the header csvLine; tags joined with '|'; ids reduced via shopifyNumericId.
 app.get('/customers/export.csv', requireAuth, async (req, res) => {
@@ -8662,14 +8675,14 @@ app.get('/customers/export.csv', requireAuth, async (req, res) => {
         let after = null;
         for (let page = 0; page < 10; page++) {
           const result = await shopifyFetch(
-            `query($q:String!,$first:Int!,$after:String){customers(first:$first,query:$q,after:$after,sortKey:AMOUNT_SPENT,reverse:true){edges{cursor node{id displayName email phone tags amountSpent{amount} numberOfOrders defaultAddress{city province country}}}pageInfo{hasNextPage endCursor}}}`,
+            `query($q:String!,$first:Int!,$after:String){customers(first:$first,query:$q,after:$after,sortKey:ID){edges{cursor node{id displayName email phone tags amountSpent{amount} numberOfOrders defaultAddress{city province country}}}pageInfo{hasNextPage endCursor}}}`,
             { q: 'tag:b2b', first: 250, after });
           const edges = result.data?.customers?.edges || [];
           all.push(...edges.map(e => e.node));
           if (!result.data?.customers?.pageInfo?.hasNextPage) break;
           after = result.data.customers.pageInfo.endCursor;
         }
-        return all;
+        return sortCustomers(all, 'lifetime_spend_desc');
       })();
   for (const c of customers) {
     const addr = c.defaultAddress || {};

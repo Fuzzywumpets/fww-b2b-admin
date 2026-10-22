@@ -157,6 +157,11 @@ if [ -f test/pagination-completeness.test.mjs ]; then
   echo ""
   node test/pagination-completeness.test.mjs || UNIT_FAIL=$?
 fi
+# customers() sortKey validity — live Shopify path, unreachable under MOCK.
+if [ -f test/customers-sortkey.test.mjs ]; then
+  echo ""
+  node test/customers-sortkey.test.mjs || UNIT_FAIL=$?
+fi
 if [ -f test/fulfillment-order-paging.test.mjs ]; then
   echo ""
   node test/fulfillment-order-paging.test.mjs || UNIT_FAIL=$?
