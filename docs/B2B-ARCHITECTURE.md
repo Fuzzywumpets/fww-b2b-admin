@@ -64,7 +64,7 @@ The lead page reflects this: Invite is the primary button, Convert is a ghost bu
 
 **b2badmin (staff):** Google OAuth. Admitted only if `email_verified` AND the address matches
 `B2B_ADMIN_ALLOWED_EMAILS`, which lives in **Doppler**, not `.env`. An entry is either a whole
-address or a bare domain with a leading `@`. Live value: `@fuzzywumpets.com,erin.m.karson@gmail.com`
+address or a bare domain with a leading `@`. Live value: `@fuzzywumpets.com,<staff Gmail (see Doppler B2B_ADMIN_ALLOWED_EMAILS)>`
 — so every Workspace account has full access with no list to maintain. Matching is
 `isAllowedAdminEmail()`; it compares the substring after the LAST `@` for equality (never
 endsWith/includes — see `test/admin-allowlist.test.mjs` for the four bypasses that defeats).
