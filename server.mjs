@@ -8271,14 +8271,16 @@ app.post('/orders/:id/cancel', requireAuth, async (req, res) => {
   try {
     const orderId = `gid://shopify/Order/${numId}`;
     const result = await shopifyFetch(`
-      mutation cancel($id:ID!,$reason:OrderCancelReason!,$refund:Boolean!,$restock:Boolean!,$notify:Boolean!,$staffNote:String){
-        orderCancel(orderId:$id, reason:$reason, refund:$refund, restock:$restock, notifyCustomer:$notify, staffNote:$staffNote){
+      mutation cancel($id:ID!,$reason:OrderCancelReason!,$refundMethod:OrderCancelRefundMethodInput,$restock:Boolean!,$notify:Boolean!,$staffNote:String){
+        orderCancel(orderId:$id, reason:$reason, refundMethod:$refundMethod, restock:$restock, notifyCustomer:$notify, staffNote:$staffNote){
           job{id} userErrors{field message}
         }
       }`, {
       id: orderId,
       reason,
-      refund,
+      // The Boolean `refund` argument no longer exists on orderCancel; the same checkbox now maps to
+      // refundMethod, explicitly false when unchecked so "no refund" is never left to a default.
+      refundMethod: { originalPaymentMethodsRefund: refund },
       restock,
       notify,
       staffNote: `Canceled via FWW admin by ${session.email}`,
@@ -10334,7 +10336,7 @@ async function getProductsForLabels(ids) {
   const gids = ids.map(id => `gid://shopify/Product/${id}`);
   const result = await shopifyFetch(`
     query($ids:[ID!]!){nodes(ids:$ids){... on Product{
-      id handle title vendor productType tags barcode
+      id handle title vendor productType tags
       variants(first:30){pageInfo{hasNextPage endCursor} edges{node{id title sku price compareAtPrice barcode inventoryQuantity}}}
     }}}`, { ids: gids });
   // SYNC: the field list below equals the variants selection above; products with >30 variants are completed.

@@ -124,6 +124,13 @@ if [ -f test/metafields-delete-payload.test.mjs ]; then
   echo ""
   node test/metafields-delete-payload.test.mjs || UNIT_FAIL=$?
 fi
+# Every Shopify GraphQL document validates against the real Admin schema snapshot.
+# MOCK never sends a query to Shopify, so this is the only check on field/enum/argument names.
+# Refresh the snapshot: doppler run -- node scripts/snapshot-shopify-schema.mjs
+if [ -f test/shopify-schema.test.mjs ]; then
+  echo ""
+  node test/shopify-schema.test.mjs || UNIT_FAIL=$?
+fi
 if [ -f test/list-truncation.test.mjs ]; then
   echo ""
   B2B_ADMIN_MOCK=1 node test/list-truncation.test.mjs || UNIT_FAIL=$?

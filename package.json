@@ -19,6 +19,7 @@
     "pdfkit": "^0.18.0"
   },
   "devDependencies": {
+    "graphql": "^16.14.2",
     "playwright": "^1.60.0"
   }
 }
