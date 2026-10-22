@@ -32,7 +32,8 @@ const {
 } = await import(dbPath);
 
 const BEARER = process.env.SHOPIFY_BRIDGE_BEARER || '';
-const BRIDGE = 'https://shopify-bridge.alex-037.workers.dev/api/graphql';
+// Same resolution as server.mjs (lib/test-env.mjs): prod unless the test copy overrides it.
+const BRIDGE = process.env.B2B_ADMIN_SHOPIFY_BRIDGE_URL || 'https://shopify-bridge.alex-037.workers.dev/api/graphql';
 const FWW_VENDOR = 'Fuzzywumpets';
 
 if (!BEARER) {

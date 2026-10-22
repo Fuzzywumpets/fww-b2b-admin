@@ -67,6 +67,7 @@ import { parseLinePrices, applyLinePriceChanges, bulkMarkOrdersPaid } from './li
 import { resolveOrderCompany, buildOrderAddresses } from './lib/order-company.mjs';
 import { assertNoUserErrors } from './lib/shopify-user-errors.mjs';
 import { createCreditCardInvoice } from './helcim.mjs';
+import { resolveServiceConfig, assertTestEnvIsolated } from './lib/test-env.mjs';
 import { buildHelcimInvoicePayload, HelcimInvoiceValidationError } from './lib/helcim-invoice-payload.mjs';
 import { buildHelcimInvoiceMessage } from './lib/helcim-invoice-message.mjs';
 // SYNC: same module db.mjs uses for the SQL LIMIT — the banner/footer copy and the query page size
@@ -95,10 +96,20 @@ const REDIRECT_URI         = MOCK
   ? `http://127.0.0.1:${PORT}/auth/google/callback`
   : 'https://b2badmin.fuzzywumpets.com/auth/google/callback';
 const COOKIE_NAME = 'b2b_admin_sid';
-const B2B_PUB_ID  = 'gid://shopify/Publication/199709720811';
+// Outside-service URLs resolve through lib/test-env.mjs: production defaults unless the isolated test
+// copy (B2B_ADMIN_TEST_ENV=1) overrides them, and that copy refuses to start if any still point at prod.
+const SERVICE_CFG = resolveServiceConfig();
+// Explicit exit, not a bare throw: fww-logsink's installGlobalHandlers() swallows uncaught exceptions,
+// so a thrown startup error would leave the process exiting 0 with nothing on stderr.
+try { assertTestEnvIsolated(SERVICE_CFG); }
+catch (e) { console.error(e.message); process.exit(1); }
+const TEST_ENV = SERVICE_CFG.testEnv;
+// The B2B sales-channel publication is store-specific; the dev store has its own id.
+const B2B_PUB_ID  = process.env.B2B_ADMIN_B2B_PUBLICATION_ID || 'gid://shopify/Publication/199709720811';
 const PORTAL_INTERNAL_TOKEN = process.env.B2B_PORTAL_INTERNAL_TOKEN || '';
-const PORTAL_INTERNAL_URL   = process.env.B2B_PORTAL_INTERNAL_URL || 'http://127.0.0.1:8793';
-const XERO_BRIDGE_URL       = 'https://fww-xero-bridge.alex-037.workers.dev/xero';
+const PORTAL_INTERNAL_URL   = SERVICE_CFG.portalInternalUrl;
+const XERO_BRIDGE_URL       = SERVICE_CFG.xeroBridgeUrl;
+const SHOPIFY_BRIDGE_URL    = SERVICE_CFG.shopifyBridgeUrl;
 const XERO_BEARER           = process.env.XERO_BRIDGE_BEARER || '';
 // ─────────────────────────────────────────────────────────────────────────────
 // [XERO-DISABLED] TEMPORARY XERO WRITE KILL-SWITCH — added 2026-07-14 by request.
@@ -1607,7 +1618,7 @@ function layout({ title, session, activePath = '/', content, extraHead = '' }) {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>${h(title)} — FWW Admin</title>
+  <title>${TEST_ENV ? "[TEST] " : ""}${h(title)} — FWW Admin</title>
   <link rel="manifest" href="/manifest.json">
   <link rel="icon" href="/favicon.ico" sizes="192x192" type="image/png">
   <meta name="theme-color" content="#9BBC0E">
@@ -1616,6 +1627,8 @@ function layout({ title, session, activePath = '/', content, extraHead = '' }) {
   ${extraHead}
 </head>
 <body>
+  ${TEST_ENV ? `<!-- DEPENDS: Gauntlet test-copy runs require #test-env-banner to be visible before any click. -->
+  <div id="test-env-banner" role="status" style="background:#b91c1c;color:#fff;text-align:center;font:600 13px/1.4 system-ui,sans-serif;padding:6px 12px;letter-spacing:.04em">TEST ENVIRONMENT — Shopify dev store, not production</div>` : ''}
   <header class="admin-header">
     <div class="header-inner">
       <a href="/" class="header-logo">
@@ -1791,10 +1804,10 @@ function renderComingSoon(session, label, activePath) {
 // CHANGE-GUARD: if the bridge URL, bearer env name, or error-shape handling changes, every order/customer/product/catalog feature breaks at once; re-test one read and one mutation.
 // INVARIANT(S): throws on res.!ok and on json.errors[] so callers can try/catch; callers must inspect per-mutation userErrors separately (this only catches transport/top-level errors, NOT mutation userErrors).
 // WHAT: single choke-point for all live Shopify GraphQL via the shopify-bridge worker with Bearer SHOPIFY_BRIDGE_BEARER.
-// CHANGE-GUARD: hardcoded worker URL (shopify-bridge.alex-037.workers.dev/api/graphql) — if the bridge host or bearer env name changes, EVERY order/customer/product/catalog read+mutation breaks at once; re-test one read and one mutation.
+// CHANGE-GUARD: worker URL is SHOPIFY_BRIDGE_URL (prod default in lib/test-env.mjs) — if the bridge host or bearer env name changes, EVERY order/customer/product/catalog read+mutation breaks at once; re-test one read and one mutation.
 // INVARIANT(S): throws on !res.ok and on json.errors[] (transport/top-level), but does NOT inspect per-mutation userErrors — callers running mutations must check userErrors themselves; bearer is empty-string default so a missing env yields 401s from the bridge, not a local throw.
 async function shopifyFetch(query, variables = {}) {
-  const res = await fetch('https://shopify-bridge.alex-037.workers.dev/api/graphql', {
+  const res = await fetch(SHOPIFY_BRIDGE_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${SHOPIFY_BEARER}` },
     body: JSON.stringify({ query, variables }),
@@ -9989,6 +10002,11 @@ app.post('/settings/allowlist/add', requireAuth, (req, res) => {
   }
   if (MOCK) {
     return res.redirect(`/settings?flash=ok&msg=${encodeURIComponent(`${email} added (mock mode — not persisted).`)}`);
+  }
+  // `doppler secrets set` resolves the config from the working directory, which is the PRODUCTION
+  // config — a test copy must never rewrite the live staff allowlist.
+  if (TEST_ENV) {
+    return res.redirect(`/settings?flash=err&msg=${encodeURIComponent('Allowlist changes are disabled in the test environment.')}`);
   }
   try {
     const current = (process.env.B2B_ADMIN_ALLOWED_EMAILS || '').split(',').map(s => s.trim()).filter(Boolean);
