@@ -3,6 +3,11 @@
   --lime-dark: #7a9a0b;
   --blue: #2086BA;
   --blue-light: #D9E8FF;
+  /* Text links. --blue (#2086BA) is only ~4.0:1 on white / 3.9:1 on gray-50, under WCAG 1.4.3's 4.5:1 for 12-14px
+     text, so Gauntlet's text probe treated order/customer links as not visible. #1D6F99 is 5.55:1 on white, 5.31:1
+     on gray-50. --blue stays for borders/focus rings (non-text, 3:1).
+     DEPENDS: server.mjs inline `var(--link,#2086ba)` (Edit shipping address summary) reads this token. */
+  --link: #1D6F99;
   --black: #000000;
   --white: #FFFFFF;
   --gray-50: #F9FAFB;
@@ -258,7 +263,7 @@ body {
 
 .widget-link {
   font-size: 0.8125rem;
-  color: var(--blue);
+  color: var(--link);
   text-decoration: none;
 }
 
@@ -307,7 +312,7 @@ body {
 .mini-table tr:hover td { background: var(--gray-50); }
 
 .mini-table a {
-  color: var(--blue);
+  color: var(--link);
   text-decoration: none;
   font-weight: 500;
 }
@@ -605,7 +610,7 @@ body {
 .data-table tr:last-child td { border-bottom: none; }
 .data-table tbody tr:hover td { background: var(--gray-50); }
 
-.data-table a { color: var(--blue); text-decoration: none; font-weight: 500; }
+.data-table a { color: var(--link); text-decoration: none; font-weight: 500; }
 .data-table a:hover { text-decoration: underline; }
 .data-table small { color: var(--gray-400); font-size: 0.75rem; display: block; }
 
@@ -614,7 +619,7 @@ body {
 .small-text { font-size: 0.8125rem; }
 .order-link { font-weight: 600; }
 .table-action { color: var(--gray-400); font-size: 0.8125rem; white-space: nowrap; }
-.table-action:hover { color: var(--blue); }
+.table-action:hover { color: var(--link); }
 
 /* ── Pagination ── */
 .pagination {
@@ -646,7 +651,7 @@ body {
   color: var(--gray-500);
   text-decoration: none;
 }
-.breadcrumb:hover { color: var(--blue); text-decoration: underline; }
+.breadcrumb:hover { color: var(--link); text-decoration: underline; }
 
 /* ── Detail header ── */
 .detail-header {
@@ -832,7 +837,7 @@ body {
   font-size: 0.875rem;
 }
 .tracking-link {
-  color: var(--blue);
+  color: var(--link);
   text-decoration: none;
   font-size: 0.8125rem;
 }
@@ -869,7 +874,7 @@ body {
 
 /* ── Link strong ── */
 .link-strong { color: var(--gray-900); font-weight: 600; text-decoration: none; }
-.link-strong:hover { color: var(--blue); text-decoration: underline; }
+.link-strong:hover { color: var(--link); text-decoration: underline; }
 
 /* ── Autocomplete dropdown ── */
 .autocomplete-dropdown {

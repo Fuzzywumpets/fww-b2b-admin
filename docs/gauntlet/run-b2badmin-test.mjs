@@ -1,6 +1,7 @@
 // WHAT: runs the confirmed Gauntlet scope (b2badmin-test.app-scope.json) HEADED against the isolated TEST copy of
 // b2badmin, reached through an SSH tunnel (default http://localhost:18796 -> fww-vps-1 127.0.0.1:8796).
 //   GAUNTLET_DIR=C:/Users/AlexLass/Documents/Codex/Gauntlet node docs/gauntlet/run-b2badmin-test.mjs [baseUrl]
+// Off Windows (e.g. fww-brain under xvfb-run) Gauntlet finds no Chrome/Edge, so pass GAUNTLET_BROWSER_PATH=<chromium>.
 // Reset the store first: scripts/seed-test-store.mjs (customers keep their ids; seeded order NAMES are stable).
 // CHANGE-GUARD: one desktop viewport on purpose. Gauntlet repeats every workflow per viewport, and Reset / Cancel
 // can only succeed once per seed, so a second viewport would fail on state the first one already changed.
@@ -21,6 +22,7 @@ const { report, reportPath } = await runAppAssessment({
   config: {
     url: `${base}/__test__/session?email=alex@fuzzywumpets.com`,
     mode: 'headed',
+    ...(process.env.GAUNTLET_BROWSER_PATH ? { browserPath: process.env.GAUNTLET_BROWSER_PATH } : {}),
     viewports: [{ name: 'desktop', width: 1366, height: 900 }],
   },
   manifest,
