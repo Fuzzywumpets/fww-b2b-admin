@@ -138,6 +138,13 @@ if [ -f test/shopify-schema.test.mjs ]; then
   echo ""
   node test/shopify-schema.test.mjs || UNIT_FAIL=$?
 fi
+
+# Seed/reset script for the dev store: its prod-refusal guards. Standalone — it never touches the app server.
+if [ -f test/seed-test-store.test.mjs ]; then
+  echo ""
+  node test/seed-test-store.test.mjs || UNIT_FAIL=$?
+fi
+
 # Test-environment isolation guard — runs at module load, outside MOCK.
 if [ -f test/test-env.test.mjs ]; then
   echo ""
