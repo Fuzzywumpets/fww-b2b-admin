@@ -1628,6 +1628,8 @@ function layout({ title, session, activePath = '/', content, extraHead = '' }) {
 </head>
 <body>
   ${TEST_ENV ? `<!-- DEPENDS: Gauntlet test-copy runs require #test-env-banner to be visible before any click. -->
+  <style>/* TEST copy only: Gauntlet verifies painted text only in generic font families, and refuses the Inter
+     webfont, so text assertions could never pass. Production keeps Inter. */ body,button,input,select,textarea{font-family:system-ui,sans-serif!important}</style>
   <div id="test-env-banner" role="status" style="background:#b91c1c;color:#fff;text-align:center;font:600 13px/1.4 system-ui,sans-serif;padding:6px 12px;letter-spacing:.04em">TEST ENVIRONMENT — Shopify dev store, not production</div>` : ''}
   <header class="admin-header">
     <div class="header-inner">

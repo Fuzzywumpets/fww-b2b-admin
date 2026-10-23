@@ -351,14 +351,14 @@
         },
         {
           "action": "assert_visible_text",
-          "text": "Casey Champ",
+          "text": "Champ Dog",
           "requirementIds": [
             "REQ-CUSTOMER-SEARCH"
           ]
         },
         {
           "action": "assert_visible_text_absent",
-          "text": "Blake Blank",
+          "text": "Blank Kennels",
           "requirementIds": [
             "REQ-CUSTOMER-SEARCH"
           ]
