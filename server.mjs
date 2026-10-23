@@ -10227,10 +10227,23 @@ const MOCK_LABEL_PRODUCTS = MOCK_PRODUCTS;
 // WHAT: loads product+variant data (barcode, sku, price, inventory) for label generation, by id list or full catalog in MOCK.
 // CHANGE-GUARD: variants are fetched first:30 — products with >30 variants silently lose the overflow on labels; the Shopify `nodes(ids:)` query expects gid://shopify/Product/<id> form built here from numeric ids.
 // INVARIANT(S): result is filtered through Boolean to drop null nodes (deleted/inaccessible products); the returned shape (p.variants.edges[].node) must match what /labels and handleLabelsPdf consume.
-async function getProductsForLabels(ids) {
+async function getProductsForLabels(ids, searchText = '') {
   if (MOCK) {
     if (ids && ids.length) return MOCK_LABEL_PRODUCTS.filter(p => ids.includes(shopifyNumericId(p.id)));
     return MOCK_LABEL_PRODUCTS;
+  }
+  // No id list = the 'From Products' search tab. It used to fall through to ids.map and 500 on every live search.
+  // CHANGE-GUARD: capped at first:50 matches (Shopify default search on the sanitised text); the /labels route still
+  // applies its own title/handle filter on top, so a broader Shopify match never widens what is shown.
+  // SYNC: product node shape here must match the ids-path query below (both feed /labels and handleLabelsPdf).
+  if (!ids || !ids.length) {
+    const term = String(searchText || '').replace(/[^\p{L}\p{N} _-]/gu, ' ').trim();
+    const found = await shopifyFetch(`
+      query($q:String){products(first:50, query:$q){nodes{
+        id handle title vendor productType tags
+        variants(first:30){edges{node{id title sku price compareAtPrice barcode inventoryQuantity}}}
+      }}}`, { q: term || null });
+    return (found.data?.products?.nodes || []).filter(Boolean);
   }
   const gids = ids.map(id => `gid://shopify/Product/${id}`);
   const result = await shopifyFetch(`
@@ -10435,7 +10448,7 @@ app.get('/labels', requireAuth, async (req, res) => {
 
   if (source === 'products') {
     const q = queryQ.toLowerCase();
-    const rawProducts = await getProductsForLabels(null);
+    const rawProducts = await getProductsForLabels(null, queryQ);
     const filtered = q
       ? rawProducts.filter(p => p.title.toLowerCase().includes(q) || (p.handle || '').includes(q))
       : rawProducts;
