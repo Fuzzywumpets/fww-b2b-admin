@@ -1046,7 +1046,7 @@ body {
   font-size: 0.875rem;
   font-family: inherit;
 }
-.form-input:focus { outline: 2px solid var(--lime); border-color: var(--lime); }
+.form-input:focus { outline: 2px solid var(--blue); border-color: var(--blue); } /* --blue, not --lime: lime is ~2:1 on white, below the 3:1 non-text focus-indicator floor */
 .allowlist {
   list-style: none;
   padding: 0;

@@ -1794,6 +1794,23 @@ await test('POST /customers/:id/b2b-config form saves override and redirects', a
   assert.ok(res.headers.get('location')?.includes('b2b_settings_saved') || res.headers.get('location')?.includes('b2b_config_saved'), 'Should redirect with success param');
 });
 
+await test('POST /customers/:id/b2b-config Reset button (duplicate discount_pct) clears the override', async () => {
+  const cookie = await seedSession();
+  await fetch(`${BASE}/api/admin/customers/106/b2b-config`, {
+    method: 'PUT', headers: { Cookie: cookie, 'Content-Type': 'application/json' }, body: JSON.stringify({ discount_pct: 55 }),
+  });
+  // Browser form post when the Reset submitter is used: the field's own input value, then the button's blank value.
+  const res = await fetch(`${BASE}/customers/106/b2b-config`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: 'discount_pct=55&discount_pct=',
+    redirect: 'manual',
+  });
+  assert.equal(res.status, 302);
+  const cfg = await (await fetch(`${BASE}/api/admin/customers/106/b2b-config`, { headers: { Cookie: cookie } })).json();
+  assert.equal(cfg.overrides.discount_pct, null, 'Reset must clear the override, not re-save the old value');
+});
+
 await test('GET /customers/:id shows B2B Customer Settings section', async () => {
   const cookie = await seedSession();
   const res = await fetch(`${BASE}/customers/101`, { headers: { Cookie: cookie } });

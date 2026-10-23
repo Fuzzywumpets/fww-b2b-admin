@@ -1630,7 +1630,7 @@ function layout({ title, session, activePath = '/', content, extraHead = '' }) {
   ${TEST_ENV ? `<!-- DEPENDS: Gauntlet test-copy runs require #test-env-banner to be visible before any click. -->
   <!-- SYNC: z-index:2000 must stay above the fixed modal overlays (cancel-modal, record-payment-modal use z-index:1000); Gauntlet re-checks this marker is painted and unoccluded before allowlisted destructive steps made while a modal is open. -->
   <style>/* TEST copy only: Gauntlet verifies painted text only in generic font families, and refuses the Inter
-     webfont, so text assertions could never pass. Production keeps Inter. */ body,button,input,select,textarea{font-family:system-ui,sans-serif!important}</style>
+     webfont, so text assertions could never pass. Production keeps Inter. */ body,button,input,select,textarea{font-family:system-ui,sans-serif!important} .badge{text-transform:none!important;letter-spacing:normal!important}</style>
   <div id="test-env-banner" role="status" style="position:relative;z-index:2000;background:#b91c1c;color:#fff;text-align:center;font:600 13px/1.4 system-ui,sans-serif;padding:6px 12px;letter-spacing:.04em">TEST ENVIRONMENT — Shopify dev store, not production</div>` : ''}
   <header class="admin-header">
     <div class="header-inner">
@@ -8835,8 +8835,17 @@ app.post('/customers/:id/dropship', requireAuth, async (req, res) => {
 app.post('/customers/:id/b2b-config', requireAuth, async (req, res) => {
   const numId = req.params.id;
   // Checkboxes: if absent from form body, checkbox was unchecked → explicitly set false
+  // WHAT: a per-field Reset/Clear submit button shares its name with the field's own <input>, so the browser
+  // posts BOTH values (discount_pct=55&discount_pct=) and urlencoded{extended} parses them to an array. The
+  // submitter follows its input in tree order, so the LAST value is the operator's intent; without this
+  // parseInt(['55','']) read 55 and Reset silently re-saved the old override.
+  // DEPENDS: the Reset/Clear buttons rendered in the B2B settings form (name=<field> value="") sit AFTER their input.
+  const lastValue = (v) => (Array.isArray(v) ? v[v.length - 1] : v);
   const body = {
     ...req.body,
+    discount_pct:        lastValue(req.body.discount_pct),
+    dropship_margin_pct: lastValue(req.body.dropship_margin_pct),
+    catalog_access_tags: lastValue(req.body.catalog_access_tags),
     dropship_enabled:       'dropship_enabled'       in req.body ? req.body.dropship_enabled       : 'false',
     allow_order_on_invoice: 'allow_order_on_invoice' in req.body ? req.body.allow_order_on_invoice : 'false',
   };
