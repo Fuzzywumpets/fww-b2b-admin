@@ -19,7 +19,7 @@ const root = new URL('../', import.meta.url);
 const schemaFile = JSON.parse(readFileSync(new URL('test/fixtures/shopify-admin-schema.json', root), 'utf8'));
 const schema = buildClientSchema(schemaFile.data);
 
-const files = ['server.mjs', 'db.mjs',
+const files = ['server.mjs', 'db.mjs', 'scripts/seed-test-store.mjs',
   ...(existsSync(new URL('lib/', root)) ? readdirSync(new URL('lib/', root)).filter(f => f.endsWith('.mjs')).map(f => 'lib/' + f) : [])];
 
 // Finds string literals that START a GraphQL document (`query…`, `mutation…`, or a backtick `{…`) and
