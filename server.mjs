@@ -1628,9 +1628,10 @@ function layout({ title, session, activePath = '/', content, extraHead = '' }) {
 </head>
 <body>
   ${TEST_ENV ? `<!-- DEPENDS: Gauntlet test-copy runs require #test-env-banner to be visible before any click. -->
+  <!-- SYNC: z-index:2000 must stay above the fixed modal overlays (cancel-modal, record-payment-modal use z-index:1000); Gauntlet re-checks this marker is painted and unoccluded before allowlisted destructive steps made while a modal is open. -->
   <style>/* TEST copy only: Gauntlet verifies painted text only in generic font families, and refuses the Inter
      webfont, so text assertions could never pass. Production keeps Inter. */ body,button,input,select,textarea{font-family:system-ui,sans-serif!important}</style>
-  <div id="test-env-banner" role="status" style="background:#b91c1c;color:#fff;text-align:center;font:600 13px/1.4 system-ui,sans-serif;padding:6px 12px;letter-spacing:.04em">TEST ENVIRONMENT — Shopify dev store, not production</div>` : ''}
+  <div id="test-env-banner" role="status" style="position:relative;z-index:2000;background:#b91c1c;color:#fff;text-align:center;font:600 13px/1.4 system-ui,sans-serif;padding:6px 12px;letter-spacing:.04em">TEST ENVIRONMENT — Shopify dev store, not production</div>` : ''}
   <header class="admin-header">
     <div class="header-inner">
       <a href="/" class="header-logo">
