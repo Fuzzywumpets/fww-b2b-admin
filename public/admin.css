@@ -11,6 +11,9 @@
   --gray-300: #D1D5DB;
   --gray-400: #9CA3AF;
   --gray-500: #6B7280;
+  /* Form-control borders must reach 3:1 against white / gray-50 (WCAG 1.4.11 non-text contrast); gray-300 was
+     ~1.5:1, which also made Gauntlet treat every field as not visibly painted. gray-500 is ~4.8:1. */
+  --control-border: var(--gray-500);
   --gray-700: #374151;
   --gray-900: #111827;
   --red: #DC2626;
@@ -527,7 +530,7 @@ body {
   flex: 1;
   min-width: 160px;
   padding: 0.4rem 0.625rem;
-  border: 1px solid var(--gray-300);
+  border: 1px solid var(--control-border);
   border-radius: var(--radius);
   font-size: 0.875rem;
   font-family: inherit;
@@ -541,7 +544,7 @@ body {
 
 .filter-select {
   padding: 0.4rem 0.625rem;
-  border: 1px solid var(--gray-300);
+  border: 1px solid var(--control-border);
   border-radius: var(--radius);
   font-size: 0.875rem;
   font-family: inherit;
@@ -759,7 +762,7 @@ body {
 .textarea {
   width: 100%;
   padding: 0.5rem 0.625rem;
-  border: 1px solid var(--gray-300);
+  border: 1px solid var(--control-border);
   border-radius: var(--radius);
   font-size: 0.875rem;
   font-family: inherit;
@@ -771,7 +774,7 @@ body {
 .input {
   width: 100%;
   padding: 0.4rem 0.625rem;
-  border: 1px solid var(--gray-300);
+  border: 1px solid var(--control-border);
   border-radius: var(--radius);
   font-size: 0.875rem;
   font-family: inherit;
@@ -1033,7 +1036,7 @@ body {
 .form-row label { font-size: 0.85rem; font-weight: 500; color: var(--gray-700); }
 .form-input {
   padding: 0.375rem 0.625rem;
-  border: 1px solid var(--gray-300);
+  border: 1px solid var(--control-border);
   border-radius: var(--radius);
   font-size: 0.875rem;
   font-family: inherit;

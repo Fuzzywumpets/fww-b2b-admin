@@ -2135,7 +2135,7 @@ function renderOrdersList(session, data, filters) {
     const srcColor = ORDER_SOURCE_COLORS[src] || 'muted';
     return `<tr>
       <td class="col-check"><input type="checkbox" name="ids" value="${h(numId)}" aria-label="Select order ${h(o.name)}"></td>
-      <td><a href="/orders/${h(numId)}" class="order-link">${h(o.name)}</a></td>
+      <td><!-- DEPENDS: docs/gauntlet/b2badmin-test.app-scope.json reaches seeded orders by a[data-order-name="…"] (ids change per reset). --><a href="/orders/${h(numId)}" class="order-link" data-order-name="${h(o.name)}">${h(o.name)}</a></td>
       <td>${o.customer ? `<a href="/customers/${shopifyNumericId(o.customer.id)}">${h(o.customer.displayName)}</a><br><small>${h(o.customer.email)}</small>` : '—'}</td>
       <td class="text-muted">${fmtDate(o.processedAt)}</td>
       <td class="text-muted small-text">${h(lineItemSummary)}</td>
