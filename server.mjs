@@ -10225,7 +10225,7 @@ app.get('/audit', requireAuth, (req, res) => {
 const MOCK_LABEL_PRODUCTS = MOCK_PRODUCTS;
 
 // WHAT: loads product+variant data (barcode, sku, price, inventory) for label generation, by id list or full catalog in MOCK.
-// CHANGE-GUARD: variants are fetched first:30 — products with >30 variants silently lose the overflow on labels; the Shopify `nodes(ids:)` query expects gid://shopify/Product/<id> form built here from numeric ids.
+// CHANGE-GUARD: variants are fetched first:30 — products with >30 variants silently lose the overflow on labels; null/empty ids = first 100 products by title (the From Products tab); the Shopify `nodes(ids:)` query expects gid://shopify/Product/<id> form built here from numeric ids.
 // INVARIANT(S): result is filtered through Boolean to drop null nodes (deleted/inaccessible products); the returned shape (p.variants.edges[].node) must match what /labels and handleLabelsPdf consume.
 async function getProductsForLabels(ids, searchText = '') {
   if (MOCK) {
@@ -10256,7 +10256,7 @@ async function getProductsForLabels(ids, searchText = '') {
 
 // WHAT: loads one order's line items (barcode, title, variantTitle, sku, price, qty) for the 'From an Order' labels tab.
 // CHANGE-GUARD: lineItems are fetched first:50 — orders with >50 line items truncate silently; barcode comes from variant.barcode and is later validated as /^\d{12,13}$/ in renderLabelsPage, so non-UPC barcodes are dropped downstream.
-// INVARIANT(S): returns null when the order doesn't exist (caller shows 'Order not found'); MOCK path reads MOCK_ORDERS and mirrors the live shape exactly.
+// INVARIANT(S): returns null when the order doesn't exist (caller shows 'Order not found'); MOCK path reads MOCK_ORDERS and mirrors the live shape exactly. Live accepts an order number (#1001/1001, <=9 digits) or a numeric id.
 async function getOrderForLabels(numericId) {
   if (MOCK) {
     const o = MOCK_ORDERS.find(o => shopifyNumericId(o.id) === numericId);
@@ -10277,6 +10277,15 @@ async function getOrderForLabels(numericId) {
         qty:          e.node.currentQuantity != null ? e.node.currentQuantity : e.node.quantity,
       };
     })};
+  }
+  // The input's placeholder says "Order # (e.g. 1001)", so staff type the order NUMBER; a Shopify
+  // numeric id is 13+ digits. Resolve "#1001"/"1001" by name first.
+  const typed = String(numericId).trim();
+  if (/^#?\d{1,9}$/.test(typed)) {
+    const byName = await shopifyFetch(`query($q:String!){orders(first:1,query:$q){nodes{id}}}`, { q: `name:#${typed.replace('#', '')}` });
+    const gid = byName.data?.orders?.nodes?.[0]?.id;
+    if (!gid) return null;
+    numericId = gid.replace('gid://shopify/Order/', '');
   }
   const result = await shopifyFetch(`
     query($id:ID!){order(id:$id){
