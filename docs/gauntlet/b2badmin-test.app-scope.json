@@ -350,8 +350,8 @@
           "key": "Enter"
         },
         {
-          "action": "assert_visible_text",
-          "text": "Champ Dog",
+          "action": "assert_visible",
+          "selector": "main a[href=\"/customers/9609759097028\"]",
           "requirementIds": [
             "REQ-CUSTOMER-SEARCH"
           ]
