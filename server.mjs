@@ -8579,6 +8579,9 @@ app.get('/api/orders/:id/visible-notes', requireAuth, (req, res) => {
 app.get('/api/orders/:id/customer-messages', requireAuth, async (req, res) => {
   const shopifyId = `gid://shopify/Order/${req.params.id}`;
   if (MOCK) return res.json({ threads: [], customerEmail: null, mock: true });
+  // DEPENDS: lib/test-env.mjs - the TEST copy deliberately has no B2B_PORTAL_INTERNAL_TOKEN, so the order page's
+  // load-time fetch must degrade to an empty panel (like MOCK) instead of a 500 that breaks the render.
+  if (TEST_ENV && !PORTAL_INTERNAL_TOKEN) return res.json({ threads: [], customerEmail: null, testEnv: true });
   const result = await callPortalInternal('POST', '/__internal__/customer-messages', { orderId: shopifyId });
   if (!result.ok) return res.status(500).json({ error: result.error || 'failed' });
   res.json({ threads: result.threads || [], customerEmail: result.customerEmail || null });
@@ -8595,6 +8598,8 @@ app.get('/api/orders/:id/customer-messages', requireAuth, async (req, res) => {
 //   the portal-internal contract (B2B_PORTAL_INTERNAL_TOKEN) being set — else callPortalInternal returns ok:false.
 app.get('/api/orders/:id/conversations/:slug/messages', requireAuth, async (req, res) => {
   if (MOCK) return res.json({ ok: true, messages: [], mock: true });
+  // SYNC: customer-messages guard above - same TEST-copy no-token degrade.
+  if (TEST_ENV && !PORTAL_INTERNAL_TOKEN) return res.json({ ok: true, messages: [], testEnv: true });
   const slug = encodeURIComponent(req.params.slug);
   const result = await callPortalInternal('GET', `/__internal__/conversations/${slug}/messages`, null);
   if (!result.ok) return res.status(500).json({ ok: false, error: result.error || 'failed' });
