@@ -10363,7 +10363,7 @@ function renderLabelsPage(session, { source, orderData, productItems, flash, sav
     const rows = allItems.map((item, idx) => {
       const hasBarcode = item.barcode && /^\d{12,13}$/.test(String(item.barcode));
       return `<tr class="${hasBarcode ? '' : 'row-muted'}">
-        <td><label class="check-hit"><input type="checkbox" name="sel" value="${idx}"${hasBarcode ? ' checked' : ' disabled'} class="item-sel"></label></td>
+        <td><label class="check-hit"><input type="checkbox" name="sel" value="${idx}"${hasBarcode ? ' checked' : ' disabled'} class="item-sel" aria-label="Print labels for ${h(item.title)}${item.variantTitle ? ' – ' + h(item.variantTitle) : ''}"></label></td>
         <td>${h(item.title)}</td>
         <td class="text-sm text-muted">${h(item.variantTitle || '')}</td>
         <td class="mono text-sm">${hasBarcode ? h(item.barcode) : '<span class="text-muted">—</span>'}</td>
@@ -10628,7 +10628,7 @@ function renderExportsCsv(session, { products, selectedIds, columns, flash }) {
     const numId = shopifyNumericId(p.id);
     const selected = selectedIds.includes(numId);
     return `<tr>
-      <td><label class="check-hit"><input type="checkbox" name="ids" value="${numId}"${selected ? ' checked' : ''} class="item-sel"></label></td>
+      <td><label class="check-hit"><input type="checkbox" name="ids" value="${numId}"${selected ? ' checked' : ''} class="item-sel" aria-label="Select product ${h(p.title)}"></label></td>
       <td>${h(p.title)}</td>
       <td class="text-sm text-muted">${h(p.vendor || '')}</td>
       <td class="text-sm">${p.variants.edges.length} variant${p.variants.edges.length !== 1 ? 's' : ''}</td>
@@ -10680,7 +10680,7 @@ function renderExportsImages(session, { products, selectedIds, mode, flash }) {
     const selected = selectedIds.includes(numId);
     const imgCount = mode === 'gallery' ? (p.images?.edges?.length || 1) : 1;
     return `<tr>
-      <td><label class="check-hit"><input type="checkbox" name="ids" value="${numId}"${selected ? ' checked' : ''} class="item-sel"></label></td>
+      <td><label class="check-hit"><input type="checkbox" name="ids" value="${numId}"${selected ? ' checked' : ''} class="item-sel" aria-label="Select product ${h(p.title)}"></label></td>
       <td>${h(p.title)}</td>
       <td class="text-sm text-muted">${h(p.vendor || '')}</td>
       <td class="text-sm" id="img-count-${numId}">${imgCount} image${imgCount !== 1 ? 's' : ''}</td>
