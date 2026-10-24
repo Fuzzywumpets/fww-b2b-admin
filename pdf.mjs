@@ -1,3 +1,4 @@
+import { currentShippingAmount } from './lib/order-shipping.mjs';
 import PDFDocument from 'pdfkit';
 import { readFileSync, existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -256,7 +257,7 @@ export async function generateInvoicePdf(order, opts = {}) {
       const curSub = order.currentSubtotalPriceSet?.presentmentMoney?.amount;
       const curTot = order.currentTotalPriceSet?.presentmentMoney?.amount;
       sub   = parseFloat(curSub ?? order.subtotalPriceSet?.presentmentMoney?.amount ?? 0) || 0;
-      ship  = parseFloat(order.totalShippingPriceSet?.presentmentMoney?.amount || 0);
+      ship  = currentShippingAmount(order);
       total = parseFloat(curTot ?? order.totalPriceSet?.presentmentMoney?.amount ?? 0) || 0;
     }
 
