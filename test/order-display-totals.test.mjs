@@ -148,6 +148,7 @@ await test('the hydrated list row carries BOTH price sets so readers can choose'
 
 const serverSrc = await readFile(new URL('../server.mjs', import.meta.url), 'utf8');
 const dbSrc     = await readFile(new URL('../db.mjs', import.meta.url), 'utf8');
+const pagingSrc = await readFile(new URL('../lib/dashboard-paging.mjs', import.meta.url), 'utf8');
 
 await test('no rendered money reads the raw frozen total_price', () => {
   const offenders = serverSrc.split('\n')
@@ -217,17 +218,22 @@ await test('renderCustomerDetail converts the GID before querying', () => {
 // can only be caught here.
 
 await test('every orders query feeding a money surface selects currentTotalPriceSet', () => {
-  const flat = serverSrc.replace(/\s+/g, ' ');
-  // Each entry: a distinct orders(...) query whose rows reach a rendered/summed amount.
+  // The dashboard and customer-spend walks moved into lib/dashboard-paging.mjs (c8a4c5a, fail-closed
+  // pagination), so each feed names the source it lives in. A marker that is not found fails loudly
+  // rather than passing vacuously.
+  // DEPENDS: the function names in lib/dashboard-paging.mjs and the Recent Orders query text in
+  // server.mjs. Moving a query again means updating its [source, marker] here.
+  const sources = { server: serverSrc, paging: pagingSrc };
   const feeds = [
-    ['dashboard open orders + 90d spend', 'orders(first:50,query:$q,sortKey:PROCESSED_AT'],
-    ['customer Recent Orders',            'orders(first:10,query:$q,sortKey:PROCESSED_AT'],
-    ['customer spend API',                'orders(first:250,query:$q,sortKey:PROCESSED_AT'],
+    ['dashboard open orders + 90d spend', 'paging', 'export async function drainDashboardOrders('],
+    ['customer Recent Orders',            'server', 'orders(first:10,query:$q,sortKey:PROCESSED_AT'],
+    ['customer spend API',                'paging', 'export async function drainCustomerSpendOrders('],
   ];
-  for (const [label, marker] of feeds) {
+  for (const [label, source, marker] of feeds) {
+    const flat = sources[source].replace(/\s+/g, ' ');
     const at = flat.indexOf(marker);
     assert.notEqual(at, -1, `could not find the ${label} query — did it move?`);
-    const body = flat.slice(at, at + 500);
+    const body = flat.slice(at, at + 700);
     assert.ok(body.includes('currentTotalPriceSet'),
       `${label}: selects only the FROZEN total, so listRowTotalAmount silently falls back to it`);
   }
