@@ -73,5 +73,35 @@ merge the only known install was Alex's PC.)
 
 ## Install
 
-Download the latest `FWW B2B Admin Setup x.y.z.exe` from the
-[Releases page](https://github.com/Fuzzywumpets/fww-b2b-admin/releases) and run it.
+- **Shared PC (several Windows accounts, e.g. the shipping PC):** run `tools/provision-all-users.ps1`
+  once, elevated (see *Install for every Windows user* below); every account then gets the app at its
+  next sign-in.
+- **Single account:** download the latest `FWW-B2B-Admin-Setup-x.y.z.exe` from the
+  [Releases page](https://github.com/Fuzzywumpets/fww-b2b-admin/releases) and run it (no admin needed).
+
+### Install for every Windows user (per-user app, admin-free updates)
+
+The installer is **per-user only** (`nsis.oneClick: true`, `nsis.perMachine: false`): each Windows account
+gets its own copy in `%LOCALAPPDATA%\Programs\fww-b2b-admin-desktop`, and `electron-updater` updates it
+silently with **no admin prompt**. (Up to 1.0.5 the installer was an assisted wizard that offered "all
+users"; picking it installed to `C:\Program Files\FWW B2B Admin`, whose updates need administrator rights,
+so non-admin accounts such as the shipping staff got a UAC prompt they could not approve and never updated.)
+
+A per-user installer only installs for whoever runs it, so each shared PC needs a **one-time admin setup**
+that makes Windows install the app for every account automatically:
+
+```powershell
+# Elevated PowerShell in desktop/, once per PC (after a >= 1.0.6 release is published):
+powershell -ExecutionPolicy Bypass -File .\tools\provision-all-users.ps1     # add -WhatIf to preview
+```
+
+It downloads the latest release installer (SHA-512-verified against `latest.yml`; refuses anything older
+than the first per-user-only build), stages it read-only in `%ProgramData%\FWW B2B Admin`, removes the old
+machine-wide install, and registers **Windows Active Setup** so every account — existing and future — gets
+the app silently at its next sign-in (accounts that already have it are skipped). Each account's Google
+sign-in session lives in its own `%APPDATA%` and is not touched.
+
+**Do not flip `nsis.oneClick` back to `false` or `nsis.perMachine` to `true`**: either one makes a
+machine-wide (admin-only-updates) install possible again. Because `package.json` cannot carry a `DEPENDS:`
+comment, this section plus `test/install-model.test.js` (`npm test`) are the dependency marker
+(SYNC: install-model, with `tools/provision-all-users.ps1`).
