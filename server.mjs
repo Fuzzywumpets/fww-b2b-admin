@@ -5100,7 +5100,7 @@ function renderNewOrderForm(session, prefillCustomer) {
           <div class="card">
             <div class="card-header"><h2>Customer</h2></div>
             <div style="position:relative">
-              <input type="text" id="customer-search" class="input" placeholder="Search customer by name or email…" autocomplete="off">
+              <input type="text" id="customer-search" class="input" aria-label="Search customer by name or email" placeholder="Search customer by name or email…" autocomplete="off">
               <div id="customer-results" class="autocomplete-dropdown" hidden></div>
             </div>
             <div id="customer-selected" class="selected-item" hidden></div>
@@ -5108,7 +5108,7 @@ function renderNewOrderForm(session, prefillCustomer) {
           <div class="card" style="margin-top:1rem">
             <div class="card-header"><h2>Line Items</h2></div>
             <div style="position:relative;margin-bottom:0.75rem">
-              <div style="display:flex;gap:8px;align-items:center"><input type="text" id="product-search" class="input" placeholder="Search product by title or SKU…" autocomplete="off" style="flex:1"><button type="button" class="btn btn-secondary btn-sm" onclick="toggleCustomItemForm()">+ Custom item</button></div>
+              <div style="display:flex;gap:8px;align-items:center"><input type="text" id="product-search" class="input" aria-label="Search product by title or SKU" placeholder="Search product by title or SKU…" autocomplete="off" style="flex:1"><button type="button" class="btn btn-secondary btn-sm" onclick="toggleCustomItemForm()">+ Custom item</button></div>
               <div id="product-results" class="autocomplete-dropdown" hidden></div>
               <div id="custom-item-form" hidden style="margin-top:8px;padding:10px;border:1px solid var(--border,#e5e7eb);border-radius:6px;background:var(--gray-50,#f9fafb)">
                 <div style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap">
@@ -5153,18 +5153,18 @@ function renderNewOrderForm(session, prefillCustomer) {
             ${/* SYNC: ship_company — submitNewOrder reads req.body.ship_company (buildOrderAddresses);
                  fillShipAddr prefills it from defaultAddress.company. Clear it for a dropship to a consumer. */''}
             <div class="form-row"><label for="ship-company">Company</label><input type="text" name="ship_company" class="input" id="ship-company" placeholder="Business name (clear for dropship)"></div>
-            <div class="form-row"><label>First Name</label><input type="text" name="ship_first" class="input" id="ship-first"></div>
-            <div class="form-row"><label>Last Name</label><input type="text" name="ship_last" class="input" id="ship-last"></div>
-            <div class="form-row"><label>Address 1</label><input type="text" name="ship_addr1" class="input" id="ship-addr1"></div>
-            <div class="form-row"><label>Address 2</label><input type="text" name="ship_addr2" class="input" id="ship-addr2"></div>
-            <div class="form-row"><label>City</label><input type="text" name="ship_city" class="input" id="ship-city"></div>
+            <div class="form-row"><label for="ship-first">First Name</label><input type="text" name="ship_first" class="input" id="ship-first"></div>
+            <div class="form-row"><label for="ship-last">Last Name</label><input type="text" name="ship_last" class="input" id="ship-last"></div>
+            <div class="form-row"><label for="ship-addr1">Address 1</label><input type="text" name="ship_addr1" class="input" id="ship-addr1"></div>
+            <div class="form-row"><label for="ship-addr2">Address 2</label><input type="text" name="ship_addr2" class="input" id="ship-addr2"></div>
+            <div class="form-row"><label for="ship-city">City</label><input type="text" name="ship_city" class="input" id="ship-city"></div>
             ${/* CANADA MATTERS: several wholesale accounts are Ontario (howlers.ca, etc). A US-only
                  list made fillShipAddr fall back to blank for them and shipped a province-less
                  address. Keep both countries here, and see fillShipAddr — unknown codes are injected
                  rather than dropped. */''}
-            <div class="form-row"><label>Province/State</label><select name="ship_province" class="input" id="ship-province"><option value="">—</option><optgroup label="United States">${['AL','AK','AZ','AR','CA','CO','CT','DE','DC','FL','GA','HI','ID','IL','IN','IA','KS','KY','LA','ME','MD','MA','MI','MN','MS','MO','MT','NE','NV','NH','NJ','NM','NY','NC','ND','OH','OK','OR','PA','RI','SC','SD','TN','TX','UT','VT','VA','WA','WV','WI','WY'].map(s=>`<option value="${s}">${s}</option>`).join('')}</optgroup><optgroup label="Canada">${['AB','BC','MB','NB','NL','NS','NT','NU','ON','PE','QC','SK','YT'].map(s=>`<option value="${s}">${s}</option>`).join('')}</optgroup></select></div>
-            <div class="form-row"><label>ZIP</label><input type="text" name="ship_zip" class="input" id="ship-zip"></div>
-            <div class="form-row"><label>Country</label><input type="text" name="ship_country" class="input" id="ship-country" value="US"></div>
+            <div class="form-row"><label for="ship-province">Province/State</label><select name="ship_province" class="input" id="ship-province"><option value="">—</option><optgroup label="United States">${['AL','AK','AZ','AR','CA','CO','CT','DE','DC','FL','GA','HI','ID','IL','IN','IA','KS','KY','LA','ME','MD','MA','MI','MN','MS','MO','MT','NE','NV','NH','NJ','NM','NY','NC','ND','OH','OK','OR','PA','RI','SC','SD','TN','TX','UT','VT','VA','WA','WV','WI','WY'].map(s=>`<option value="${s}">${s}</option>`).join('')}</optgroup><optgroup label="Canada">${['AB','BC','MB','NB','NL','NS','NT','NU','ON','PE','QC','SK','YT'].map(s=>`<option value="${s}">${s}</option>`).join('')}</optgroup></select></div>
+            <div class="form-row"><label for="ship-zip">ZIP</label><input type="text" name="ship_zip" class="input" id="ship-zip"></div>
+            <div class="form-row"><label for="ship-country">Country</label><input type="text" name="ship_country" class="input" id="ship-country" value="US"></div>
           </div>
           <div class="card" style="margin-top:1rem">
             <div class="card-header"><h2>Submit</h2></div>
@@ -11297,7 +11297,7 @@ function renderLeadDetail(session, { lead, notes, history, flash, existingInvite
                 ${['general','call','email','meeting'].map(t => `<option value="${t}">${h(t)}</option>`).join('')}
               </select>
             </div>
-            <textarea name="body" class="textarea" rows="3" placeholder="Note about this lead…" required></textarea>
+            <textarea name="body" class="textarea" rows="3" aria-label="Note about this lead" placeholder="Note about this lead…" required></textarea>
             <div style="margin-top:0.5rem"><button type="submit" class="btn btn-secondary btn-sm">Add Note</button></div>
           </form>
         </div>
@@ -11326,7 +11326,7 @@ function renderLeadDetail(session, { lead, notes, history, flash, existingInvite
         <div class="card">
           <div class="card-header"><h2>Follow-up</h2></div>
           <form method="POST" action="/leads/${lead.id}/followup" style="display:flex;gap:0.5rem;align-items:center">
-            <input type="date" name="next_followup_due" value="${h(lead.next_followup_due||'')}" class="input input-sm" style="flex:1">
+            <input type="date" name="next_followup_due" value="${h(lead.next_followup_due||'')}" class="input input-sm" style="flex:1" aria-label="Next follow-up date">
             <button type="submit" class="btn btn-secondary btn-sm">Save</button>
           </form>
           ${lead.next_followup_due && lead.next_followup_due < localDateStr()
@@ -11359,18 +11359,18 @@ function renderLeadEdit(session, { lead, flash }) {
     <div class="card" style="max-width:640px">
       <form method="POST" action="/leads/${lead.id}/edit">
         <div class="settings-grid">
-          <label>Email *</label>
-          <input type="email" name="email" value="${h(lead.email||'')}" required class="input">
-          <label>Business name</label>
-          <input type="text" name="business_name" value="${h(lead.business_name||'')}" class="input">
-          <label>Contact name</label>
-          <input type="text" name="contact_name" value="${h(lead.contact_name||'')}" class="input">
-          <label>Phone</label>
-          <input type="tel" name="phone" value="${h(lead.phone||'')}" class="input">
-          <label>Website</label>
-          <input type="url" name="website" value="${h(lead.website||'')}" class="input" placeholder="https://…">
-          <label>Business type</label>
-          <select name="business_type" class="input">
+          <label for="lead-edit-email">Email *</label>
+          <input id="lead-edit-email" type="email" name="email" value="${h(lead.email||'')}" required class="input">
+          <label for="lead-edit-business_name">Business name</label>
+          <input id="lead-edit-business_name" type="text" name="business_name" value="${h(lead.business_name||'')}" class="input">
+          <label for="lead-edit-contact_name">Contact name</label>
+          <input id="lead-edit-contact_name" type="text" name="contact_name" value="${h(lead.contact_name||'')}" class="input">
+          <label for="lead-edit-phone">Phone</label>
+          <input id="lead-edit-phone" type="tel" name="phone" value="${h(lead.phone||'')}" class="input">
+          <label for="lead-edit-website">Website</label>
+          <input id="lead-edit-website" type="url" name="website" value="${h(lead.website||'')}" class="input" placeholder="https://…">
+          <label for="lead-edit-business_type">Business type</label>
+          <select name="business_type" id="lead-edit-business_type" class="input">
             <option value="">— select —</option>
             ${LEAD_BUSINESS_TYPES.map(t =>
               `<option value="${t}"${lead.business_type===t?' selected':''}>${h(t)}</option>`
@@ -11384,30 +11384,30 @@ function renderLeadEdit(session, { lead, flash }) {
         <h2 style="margin-top:1.5rem;font-size:0.95rem">Address</h2>
         <p class="text-muted small-text" style="margin:0 0 0.5rem">A street address with no city/state/zip yet is fine — it will show as incomplete until filled in.</p>
         <div class="settings-grid">
-          <label>Address line 1</label>
-          <input type="text" name="address1" value="${h(lead.address1||'')}" class="input">
-          <label>Address line 2</label>
-          <input type="text" name="address2" value="${h(lead.address2||'')}" class="input">
-          <label>City</label>
-          <input type="text" name="city" value="${h(lead.city||'')}" class="input">
-          <label>State / province</label>
-          <input type="text" name="state" value="${h(lead.state||'')}" class="input" placeholder="2-letter code" maxlength="2" autocapitalize="characters">
-          <label>Postal code</label>
-          <input type="text" name="postal_code" value="${h(lead.postal_code||'')}" class="input">
-          <label>Country</label>
-          <select name="country_code" class="input">${countryOptions(lead.country_code)}</select>
+          <label for="lead-edit-address1">Address line 1</label>
+          <input id="lead-edit-address1" type="text" name="address1" value="${h(lead.address1||'')}" class="input">
+          <label for="lead-edit-address2">Address line 2</label>
+          <input id="lead-edit-address2" type="text" name="address2" value="${h(lead.address2||'')}" class="input">
+          <label for="lead-edit-city">City</label>
+          <input id="lead-edit-city" type="text" name="city" value="${h(lead.city||'')}" class="input">
+          <label for="lead-edit-state">State / province</label>
+          <input id="lead-edit-state" type="text" name="state" value="${h(lead.state||'')}" class="input" placeholder="2-letter code" maxlength="2" autocapitalize="characters">
+          <label for="lead-edit-postal_code">Postal code</label>
+          <input id="lead-edit-postal_code" type="text" name="postal_code" value="${h(lead.postal_code||'')}" class="input">
+          <label for="lead-edit-country_code">Country</label>
+          <select name="country_code" id="lead-edit-country_code" class="input">${countryOptions(lead.country_code)}</select>
         </div>
 
         <h2 style="margin-top:1.5rem;font-size:0.95rem">Tax</h2>
         <p class="text-muted small-text" style="margin:0 0 0.5rem">Two different IDs — the state resale number and the federal EIN. Some applications label the FEIN as a "Resale Tax ID" by mistake; check the number's shape before filing it.</p>
         <div class="settings-grid">
-          <label>Resale tax ID</label>
-          <input type="text" name="sales_tax_id" value="${h(lead.sales_tax_id||'')}" class="input">
-          <label>Tax-registration state</label>
-          <input type="text" name="sales_tax_state" value="${h(lead.sales_tax_state||'')}" class="input"
+          <label for="lead-edit-sales_tax_id">Resale tax ID</label>
+          <input id="lead-edit-sales_tax_id" type="text" name="sales_tax_id" value="${h(lead.sales_tax_id||'')}" class="input">
+          <label for="lead-edit-sales_tax_state">Tax-registration state</label>
+          <input id="lead-edit-sales_tax_state" type="text" name="sales_tax_state" value="${h(lead.sales_tax_state||'')}" class="input"
                  placeholder="Not asked on the application — add if you know it" maxlength="2" autocapitalize="characters">
-          <label>FEIN</label>
-          <input type="text" name="fein" value="${h(lead.fein||'')}" class="input" placeholder="12-3456789">
+          <label for="lead-edit-fein">FEIN</label>
+          <input id="lead-edit-fein" type="text" name="fein" value="${h(lead.fein||'')}" class="input" placeholder="12-3456789">
         </div>
 
         <div style="margin-top:1.25rem;display:flex;gap:0.75rem">
@@ -11835,8 +11835,8 @@ function renderXeroSettings(session, flash) {
   const flashHtml  = flash ? `<div class="alert ${flash.ok ? 'alert-success' : 'alert-error'}" style="margin-bottom:1rem">${h(flash.msg)}</div>` : '';
   const field = (key, label, help = '') => `
     <div class="settings-field">
-      <label class="settings-label">${h(label)}</label>
-      <input type="text" name="${key}" value="${h(accountMap[key])}" class="filter-input" style="width:160px">
+      <label class="settings-label" for="xero-${key}">${h(label)}</label>
+      <input type="text" id="xero-${key}" name="${key}" value="${h(accountMap[key])}" class="filter-input" style="width:160px">
       ${help ? `<span class="text-muted" style="font-size:12px;margin-left:8px">${h(help)}</span>` : ''}
     </div>`;
   const pendingCount = getXeroPendingCount();
