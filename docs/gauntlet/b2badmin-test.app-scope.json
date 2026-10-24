@@ -625,6 +625,15 @@
           "requirementIds": [
             "REQ-CUSTOMER-SEARCH"
           ]
+        },
+        {
+          "action": "assert_count",
+          "selector": "main a.link-strong[href^=\"/customers/\"]",
+          "operator": "eq",
+          "expected": 1,
+          "requirementIds": [
+            "REQ-CUSTOMER-SEARCH"
+          ]
         }
       ]
     },
@@ -798,7 +807,7 @@
     },
     {
       "id": "nav-dashboard",
-      "title": "Header logo opens the dashboard",
+      "title": "Nav opens the dashboard",
       "startPath": "/orders",
       "requirementIds": [
         "REQ-ROUTE-DASHBOARD"
@@ -806,7 +815,7 @@
       "steps": [
         {
           "action": "click",
-          "selector": "header a.header-logo"
+          "selector": ".header-nav a[href=\"/\"]"
         },
         {
           "action": "assert_url",
@@ -965,6 +974,13 @@
         "REQ-ROUTE-ORDER-INVOICE"
       ],
       "steps": [
+        {
+          "action": "assert_visible",
+          "selector": "main a[href=\"/orders/{{order:S-PENDING}}/invoice\"]",
+          "requirementIds": [
+            "REQ-ROUTE-ORDER-INVOICE"
+          ]
+        },
         {
           "action": "click",
           "selector": "main a[href=\"/orders/{{order:S-PENDING}}/invoice\"]"
@@ -1404,7 +1420,9 @@
       "form[action$=\"/cancel\"] input[name=\"notify\"]",
       "#edit-save-btn",
       "form[action$=\"/internal-note\"] button[type=\"submit\"]",
-      "#dropship_enabled"
+      "#dropship_enabled",
+      "main a[href=\"/exports/csv\"]",
+      "main a[href=\"/exports/images\"]"
     ],
     "disposableEnvironmentMarker": "#test-env-banner"
   }
