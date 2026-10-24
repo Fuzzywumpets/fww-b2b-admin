@@ -2556,12 +2556,12 @@ function renderOrderDetail(session, order, flash, flashMsg) {
              SYNC: three places enforce this same floor and must move together — this min=, the
              change handler in wireExisting(), and POST /orders/:id/line/qty. min= is only advisory
              while typing, so it is the weakest of the three and never the only one. */''}
-        <input type="number" name="qtys[${h(item.id)}]" value="${currentQty}" min="1" data-last="${currentQty}" class="edit-qty-input" style="display:none;width:60px">
-        <button type="button" class="btn btn-ghost btn-xs edit-remove-btn" style="display:none;margin-left:4px" onclick="markRemove('${h(item.id)}',this)">✕</button>
+        <input type="number" name="qtys[${h(item.id)}]" value="${currentQty}" min="1" data-last="${currentQty}" class="edit-qty-input" style="display:none;width:60px" aria-label="Quantity for ${h(item.title)}">
+        <button type="button" class="btn btn-ghost btn-xs edit-remove-btn" style="display:none;margin-left:8px" onclick="markRemove('${h(item.id)}',this)" aria-label="Remove ${h(item.title)}">✕</button>
       </td>
       <td class="text-right">
         <span class="edit-price-static">${fmtMoney(unitPrice)}</span>
-        <input type="number" step="0.01" min="0" name="prices[${h(item.id)}]" value="${unitPrice.toFixed(2)}" class="edit-price-input" data-retail="${parseFloat(item.originalUnitPriceSet?.presentmentMoney?.amount ?? unitPrice).toFixed(2)}" style="display:none;width:72px">
+        <input type="number" step="0.01" min="0" name="prices[${h(item.id)}]" value="${unitPrice.toFixed(2)}" class="edit-price-input" aria-label="Unit price for ${h(item.title)}" data-retail="${parseFloat(item.originalUnitPriceSet?.presentmentMoney?.amount ?? unitPrice).toFixed(2)}" style="display:none;width:72px">
       </td>
       <td class="text-right">${fmtMoney(rowTotal)}</td>
     </tr>`;
@@ -2959,7 +2959,7 @@ function renderOrderDetail(session, order, flash, flashMsg) {
           <div id="edit-add-bar" style="display:none;padding:8px 0">
             <div style="display:flex;gap:8px;align-items:flex-start;flex-wrap:wrap">
               <div style="position:relative;flex:1;min-width:260px">
-                <input type="text" id="edit-product-search" class="filter-input" placeholder="Add product — search name or SKU…" autocomplete="off" style="width:100%">
+                <input type="text" id="edit-product-search" class="filter-input" aria-label="Add product: search name or SKU" placeholder="Add product — search name or SKU…" autocomplete="off" style="width:100%">
                 <div id="edit-product-results" style="display:none;position:absolute;z-index:60;left:0;right:0;top:100%;background:#fff;border:1px solid var(--border);border-radius:4px;max-height:260px;overflow-y:auto;box-shadow:0 4px 12px rgba(0,0,0,0.12)"></div>
               </div>
               <button type="button" class="btn btn-ghost btn-sm" onclick="addCustomLineRow()" title="Add a one-off (non-catalog) line item to this order">+ Add custom line</button>
@@ -2980,14 +2980,14 @@ function renderOrderDetail(session, order, flash, flashMsg) {
                 <span style="color:var(--muted)">$</span>
                 <input type="number" name="discountFixed" placeholder="0.00" min="0" step="0.01" class="filter-input" style="width:80px" oninput="if(this.value)this.form.discountPct.value=''">
               </label>
-              <input type="text" name="discountReason" placeholder="Reason (required for discount)" class="filter-input" style="width:220px">
+              <input type="text" name="discountReason" aria-label="Discount reason" placeholder="Reason (required for discount)" class="filter-input" style="width:220px">
               <button type="button" id="discount-apply-btn" class="btn btn-primary btn-sm" title="Apply this discount to the order">Apply discount</button>
               <button type="button" id="discount-remove-btn" class="btn btn-ghost btn-sm" title="Clear the order discount entirely" style="display:${orderDiscount.amount > 0 ? '' : 'none'}">Remove discount</button>
               <span id="discount-chip" class="row-save-chip" data-state="idle" style="font-size:11px;vertical-align:middle"></span>
             </div>
           </div>
           <div id="edit-save-bar" style="display:none;padding:12px 0;border-top:1px solid var(--border);margin-top:8px">
-            <input type="text" name="staffNote" placeholder="Staff note (optional)" class="filter-input" style="width:60%;margin-right:8px">
+            <input type="text" name="staffNote" aria-label="Staff note" placeholder="Staff note (optional)" class="filter-input" style="width:60%;margin-right:8px">
             <button type="submit" id="edit-save-btn" class="btn btn-primary" onclick="serializeCustomLines()">Save changes</button>
             <button type="button" class="btn btn-ghost" onclick="toggleEditMode(false)" style="margin-left:4px">Cancel</button>
           </div>
@@ -4799,7 +4799,7 @@ function renderCustomerDetail(session, customer, recentOrders, notes, _dropshipC
 
         <!-- Task 43: Portal Activity Timeline -->
         <div class="card" id="activity-card">
-          <div class="card-header" style="cursor:pointer" onclick="loadActivity()">
+          <div class="card-header" style="cursor:pointer" role="button" tabindex="0" onclick="loadActivity()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();loadActivity();}">
             <h2>Portal Activity</h2>
             <span id="activity-header-action" class="btn btn-ghost btn-sm" style="pointer-events:none">Load</span>
           </div>
@@ -10367,7 +10367,7 @@ function renderLabelsPage(session, { source, orderData, productItems, flash, sav
         <td>${h(item.title)}</td>
         <td class="text-sm text-muted">${h(item.variantTitle || '')}</td>
         <td class="mono text-sm">${hasBarcode ? h(item.barcode) : '<span class="text-muted">—</span>'}</td>
-        <td><input type="number" name="item_qty_${idx}" value="${item.qty || 1}" min="1" max="999" style="width:60px" class="form-input form-input-sm"></td>
+        <td><input type="number" name="item_qty_${idx}" value="${item.qty || 1}" min="1" max="999" style="width:60px" class="form-input form-input-sm" aria-label="Label count for ${h(item.title)}${item.variantTitle ? ' – ' + h(item.variantTitle) : ''}"></td>
         <td class="text-sm">${item.price ? '$' + h(String(item.price)) : '—'}</td>
       </tr>
       <input type="hidden" name="item_barcode_${idx}" value="${h(item.barcode || '')}">
@@ -10417,7 +10417,7 @@ function renderLabelsPage(session, { source, orderData, productItems, flash, sav
     <div>
       <form method="GET" action="/labels" id="product-search-form" style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap;margin-bottom:0.75rem">
         <input type="hidden" name="source" value="products">
-        <input type="text" name="q" placeholder="Search products..." class="form-input search-input" style="width:240px" value="${h(queryQ)}">
+        <input type="text" name="q" aria-label="Search products" placeholder="Search products..." class="form-input search-input" style="width:240px" value="${h(queryQ)}">
         <button type="submit" class="btn btn-secondary">Search</button>
       </form>
       ${productItemsSection}
@@ -12290,7 +12290,7 @@ app.get('/customers/:id/activity', requireAuth, async (req, res) => {
     <div class="quick-lookup-box">
       <strong style="font-size:0.9rem">Quick lookup: did customer place an order on…</strong>
       <div style="display:flex;gap:0.5rem;align-items:center;margin-top:0.5rem">
-        <input type="date" id="lookup-date" class="input input-sm" value="${ymd(daysAgo(1))}">
+        <input type="date" id="lookup-date" class="input input-sm" aria-label="Lookup date" value="${ymd(daysAgo(1))}">
         <button class="btn btn-secondary btn-sm" id="lookup-btn">Check</button>
       </div>
       <div id="lookup-result" class="quick-lookup-result"></div>
@@ -12308,13 +12308,13 @@ app.get('/customers/:id/activity', requireAuth, async (req, res) => {
           ${datePresets.map(p => `<option value="${h(p.from)}|${h(p.to)}"${p.from === fromParam && p.to === toParam ? ' selected' : ''}>${h(p.label)}</option>`).join('')}
           <option value=""${!datePresets.some(p => p.from === fromParam && p.to === toParam) ? ' selected' : ''}>Custom</option>
         </select>
-        <input type="date" name="from" class="input input-sm" value="${h(fromParam)}" style="width:130px">
+        <input type="date" name="from" class="input input-sm" aria-label="From date" value="${h(fromParam)}" style="width:130px">
         <span style="font-size:0.85rem;color:#666">to</span>
-        <input type="date" name="to"   class="input input-sm" value="${h(toParam)}"   style="width:130px">
-        <select name="type" class="input input-sm" onchange="this.form.submit()">
+        <input type="date" name="to"   class="input input-sm" aria-label="To date" value="${h(toParam)}"   style="width:130px">
+        <select name="type" class="input input-sm" aria-label="Event type" onchange="this.form.submit()">
           ${typeOptions.map(t => `<option${t === typeParam ? ' selected' : ''}>${t}</option>`).join('')}
         </select>
-        <input type="text" name="q" class="input input-sm" placeholder="Search path…" value="${h(qParam)}" style="width:160px">
+        <input type="text" name="q" class="input input-sm" aria-label="Search path" placeholder="Search path…" value="${h(qParam)}" style="width:160px">
         <button type="submit" class="btn btn-secondary btn-sm">Filter</button>
         <a href="/customers/${h(numId)}/activity" class="btn btn-ghost btn-sm">Reset</a>
       </form>
