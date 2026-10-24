@@ -1,22 +1,34 @@
 {
   "schema": "gauntlet.app-scope.v4",
   "name": "b2badmin TEST copy — mutating workflows",
-  "purpose": "Click and save the b2badmin staff forms (B2B settings save/clear/reset/toggle, customer search, order cancel with refund on/off, labels, order edit, internal note) against the isolated TEST copy and its Shopify dev store, so Shopify-side errors that MOCK hides surface before production.",
+  "purpose": "Click and save the b2badmin staff forms (B2B settings save/clear/reset/toggle, customer search, order cancel with refund on/off, labels, order edit, internal note) against the isolated TEST copy and its Shopify dev store, so Shopify-side errors that MOCK hides surface before production; and reach every declared HTML route with one click from where staff would start.",
   "purposeConfirmed": true,
   "scopeConfirmed": true,
   "expectedRequirementIds": [
     "REQ-ROUTE-DASHBOARD",
     "REQ-ROUTE-CUSTOMERS",
-    "REQ-ROUTE-CUSTOMER-CHAMP",
-    "REQ-ROUTE-CUSTOMER-FILLED",
+    "REQ-ROUTE-CUSTOMER-DETAIL",
+    "REQ-ROUTE-CUSTOMER-ACTIVITY",
     "REQ-ROUTE-ORDERS",
+    "REQ-ROUTE-ORDER-DETAIL",
+    "REQ-ROUTE-ORDER-INVOICE",
+    "REQ-ROUTE-ORDER-NEW",
     "REQ-ROUTE-CATALOG",
+    "REQ-ROUTE-PRODUCT",
     "REQ-ROUTE-LABELS",
     "REQ-ROUTE-SETTINGS",
+    "REQ-ROUTE-XERO-SETTINGS",
+    "REQ-ROUTE-ACCOUNTING",
     "REQ-ROUTE-LEADS",
+    "REQ-ROUTE-LEAD-DETAIL",
+    "REQ-ROUTE-LEAD-EDIT",
+    "REQ-ROUTE-LEAD-NEW",
     "REQ-ROUTE-BACKORDERS",
     "REQ-ROUTE-REPORTS",
     "REQ-ROUTE-TAX-EXEMPT",
+    "REQ-ROUTE-EXPORTS",
+    "REQ-ROUTE-EXPORTS-CSV",
+    "REQ-ROUTE-EXPORTS-IMAGES",
     "REQ-B2B-SAVE",
     "REQ-B2B-CLEAR",
     "REQ-B2B-RESET",
@@ -38,11 +50,11 @@
       "proofTarget": "ui_transition"
     },
     {
-      "requirementId": "REQ-ROUTE-CUSTOMER-CHAMP",
+      "requirementId": "REQ-ROUTE-CUSTOMER-DETAIL",
       "proofTarget": "ui_transition"
     },
     {
-      "requirementId": "REQ-ROUTE-CUSTOMER-FILLED",
+      "requirementId": "REQ-ROUTE-CUSTOMER-ACTIVITY",
       "proofTarget": "ui_transition"
     },
     {
@@ -50,7 +62,23 @@
       "proofTarget": "ui_transition"
     },
     {
+      "requirementId": "REQ-ROUTE-ORDER-DETAIL",
+      "proofTarget": "ui_transition"
+    },
+    {
+      "requirementId": "REQ-ROUTE-ORDER-INVOICE",
+      "proofTarget": "ui_transition"
+    },
+    {
+      "requirementId": "REQ-ROUTE-ORDER-NEW",
+      "proofTarget": "ui_transition"
+    },
+    {
       "requirementId": "REQ-ROUTE-CATALOG",
+      "proofTarget": "ui_transition"
+    },
+    {
+      "requirementId": "REQ-ROUTE-PRODUCT",
       "proofTarget": "ui_transition"
     },
     {
@@ -62,7 +90,27 @@
       "proofTarget": "ui_transition"
     },
     {
+      "requirementId": "REQ-ROUTE-XERO-SETTINGS",
+      "proofTarget": "ui_transition"
+    },
+    {
+      "requirementId": "REQ-ROUTE-ACCOUNTING",
+      "proofTarget": "ui_transition"
+    },
+    {
       "requirementId": "REQ-ROUTE-LEADS",
+      "proofTarget": "ui_transition"
+    },
+    {
+      "requirementId": "REQ-ROUTE-LEAD-DETAIL",
+      "proofTarget": "ui_transition"
+    },
+    {
+      "requirementId": "REQ-ROUTE-LEAD-EDIT",
+      "proofTarget": "ui_transition"
+    },
+    {
+      "requirementId": "REQ-ROUTE-LEAD-NEW",
       "proofTarget": "ui_transition"
     },
     {
@@ -75,6 +123,18 @@
     },
     {
       "requirementId": "REQ-ROUTE-TAX-EXEMPT",
+      "proofTarget": "ui_transition"
+    },
+    {
+      "requirementId": "REQ-ROUTE-EXPORTS",
+      "proofTarget": "ui_transition"
+    },
+    {
+      "requirementId": "REQ-ROUTE-EXPORTS-CSV",
+      "proofTarget": "ui_transition"
+    },
+    {
+      "requirementId": "REQ-ROUTE-EXPORTS-IMAGES",
       "proofTarget": "ui_transition"
     },
     {
@@ -137,14 +197,56 @@
       "id": "customer-champ",
       "path": "/customers/9609759097028",
       "requirementIds": [
-        "REQ-ROUTE-CUSTOMER-CHAMP"
+        "REQ-ROUTE-CUSTOMER-DETAIL"
+      ]
+    },
+    {
+      "id": "activity-champ",
+      "path": "/customers/9609759097028/activity",
+      "requirementIds": [
+        "REQ-ROUTE-CUSTOMER-ACTIVITY"
+      ]
+    },
+    {
+      "id": "customer-nocompany",
+      "path": "/customers/9609759129796",
+      "requirementIds": [
+        "REQ-ROUTE-CUSTOMER-DETAIL"
+      ]
+    },
+    {
+      "id": "activity-nocompany",
+      "path": "/customers/9609759129796/activity",
+      "requirementIds": [
+        "REQ-ROUTE-CUSTOMER-ACTIVITY"
       ]
     },
     {
       "id": "customer-filled",
       "path": "/customers/9609759162564",
       "requirementIds": [
-        "REQ-ROUTE-CUSTOMER-FILLED"
+        "REQ-ROUTE-CUSTOMER-DETAIL"
+      ]
+    },
+    {
+      "id": "activity-filled",
+      "path": "/customers/9609759162564/activity",
+      "requirementIds": [
+        "REQ-ROUTE-CUSTOMER-ACTIVITY"
+      ]
+    },
+    {
+      "id": "customer-blank",
+      "path": "/customers/9609759195332",
+      "requirementIds": [
+        "REQ-ROUTE-CUSTOMER-DETAIL"
+      ]
+    },
+    {
+      "id": "activity-blank",
+      "path": "/customers/9609759195332/activity",
+      "requirementIds": [
+        "REQ-ROUTE-CUSTOMER-ACTIVITY"
       ]
     },
     {
@@ -155,10 +257,87 @@
       ]
     },
     {
+      "id": "order-new",
+      "path": "/orders/new",
+      "requirementIds": [
+        "REQ-ROUTE-ORDER-NEW"
+      ]
+    },
+    {
+      "id": "order-s-refund",
+      "path": "/orders/{{order:S-REFUND}}",
+      "requirementIds": [
+        "REQ-ROUTE-ORDER-DETAIL"
+      ]
+    },
+    {
+      "id": "invoice-s-refund",
+      "path": "/orders/{{order:S-REFUND}}/invoice",
+      "requirementIds": [
+        "REQ-ROUTE-ORDER-INVOICE"
+      ]
+    },
+    {
+      "id": "order-s-norefund",
+      "path": "/orders/{{order:S-NOREFUND}}",
+      "requirementIds": [
+        "REQ-ROUTE-ORDER-DETAIL"
+      ]
+    },
+    {
+      "id": "invoice-s-norefund",
+      "path": "/orders/{{order:S-NOREFUND}}/invoice",
+      "requirementIds": [
+        "REQ-ROUTE-ORDER-INVOICE"
+      ]
+    },
+    {
+      "id": "order-s-pending",
+      "path": "/orders/{{order:S-PENDING}}",
+      "requirementIds": [
+        "REQ-ROUTE-ORDER-DETAIL"
+      ]
+    },
+    {
+      "id": "invoice-s-pending",
+      "path": "/orders/{{order:S-PENDING}}/invoice",
+      "requirementIds": [
+        "REQ-ROUTE-ORDER-INVOICE"
+      ]
+    },
+    {
+      "id": "order-s-edit",
+      "path": "/orders/{{order:S-EDIT}}",
+      "requirementIds": [
+        "REQ-ROUTE-ORDER-DETAIL"
+      ]
+    },
+    {
+      "id": "invoice-s-edit",
+      "path": "/orders/{{order:S-EDIT}}/invoice",
+      "requirementIds": [
+        "REQ-ROUTE-ORDER-INVOICE"
+      ]
+    },
+    {
       "id": "catalog",
       "path": "/catalog",
       "requirementIds": [
         "REQ-ROUTE-CATALOG"
+      ]
+    },
+    {
+      "id": "product-bear",
+      "path": "/products/8837100994756",
+      "requirementIds": [
+        "REQ-ROUTE-PRODUCT"
+      ]
+    },
+    {
+      "id": "product-rope",
+      "path": "/products/8837101093060",
+      "requirementIds": [
+        "REQ-ROUTE-PRODUCT"
       ]
     },
     {
@@ -176,10 +355,73 @@
       ]
     },
     {
+      "id": "settings-xero",
+      "path": "/settings/xero",
+      "requirementIds": [
+        "REQ-ROUTE-XERO-SETTINGS"
+      ]
+    },
+    {
+      "id": "accounting",
+      "path": "/accounting",
+      "requirementIds": [
+        "REQ-ROUTE-ACCOUNTING"
+      ]
+    },
+    {
       "id": "leads",
       "path": "/leads",
       "requirementIds": [
         "REQ-ROUTE-LEADS"
+      ]
+    },
+    {
+      "id": "lead-new",
+      "path": "/leads/new",
+      "requirementIds": [
+        "REQ-ROUTE-LEAD-NEW"
+      ]
+    },
+    {
+      "id": "lead-1",
+      "path": "/leads/1",
+      "requirementIds": [
+        "REQ-ROUTE-LEAD-DETAIL"
+      ]
+    },
+    {
+      "id": "lead-1-edit",
+      "path": "/leads/1/edit",
+      "requirementIds": [
+        "REQ-ROUTE-LEAD-EDIT"
+      ]
+    },
+    {
+      "id": "lead-2",
+      "path": "/leads/2",
+      "requirementIds": [
+        "REQ-ROUTE-LEAD-DETAIL"
+      ]
+    },
+    {
+      "id": "lead-2-edit",
+      "path": "/leads/2/edit",
+      "requirementIds": [
+        "REQ-ROUTE-LEAD-EDIT"
+      ]
+    },
+    {
+      "id": "lead-3",
+      "path": "/leads/3",
+      "requirementIds": [
+        "REQ-ROUTE-LEAD-DETAIL"
+      ]
+    },
+    {
+      "id": "lead-3-edit",
+      "path": "/leads/3/edit",
+      "requirementIds": [
+        "REQ-ROUTE-LEAD-EDIT"
       ]
     },
     {
@@ -201,6 +443,27 @@
       "path": "/tax-exempt",
       "requirementIds": [
         "REQ-ROUTE-TAX-EXEMPT"
+      ]
+    },
+    {
+      "id": "exports",
+      "path": "/exports",
+      "requirementIds": [
+        "REQ-ROUTE-EXPORTS"
+      ]
+    },
+    {
+      "id": "exports-csv",
+      "path": "/exports/csv",
+      "requirementIds": [
+        "REQ-ROUTE-EXPORTS-CSV"
+      ]
+    },
+    {
+      "id": "exports-images",
+      "path": "/exports/images",
+      "requirementIds": [
+        "REQ-ROUTE-EXPORTS-IMAGES"
       ]
     }
   ],
@@ -362,21 +625,26 @@
           "requirementIds": [
             "REQ-CUSTOMER-SEARCH"
           ]
+        },
+        {
+          "action": "assert_count",
+          "selector": "main a.link-strong[href^=\"/customers/\"]",
+          "operator": "eq",
+          "expected": 1,
+          "requirementIds": [
+            "REQ-CUSTOMER-SEARCH"
+          ]
         }
       ]
     },
     {
       "id": "cancel-refund",
       "title": "Cancel #S-REFUND with refund ON",
-      "startPath": "/orders",
+      "startPath": "/orders/{{order:S-REFUND}}",
       "requirementIds": [
         "REQ-CANCEL-REFUND"
       ],
       "steps": [
-        {
-          "action": "click",
-          "selector": "a[data-order-name=\"#S-REFUND\"]"
-        },
         {
           "action": "click",
           "selector": "button[onclick=\"toggleCancelModal(true)\"]"
@@ -407,15 +675,11 @@
     {
       "id": "cancel-norefund",
       "title": "Cancel #S-NOREFUND with refund OFF",
-      "startPath": "/orders",
+      "startPath": "/orders/{{order:S-NOREFUND}}",
       "requirementIds": [
         "REQ-CANCEL-NOREFUND"
       ],
       "steps": [
-        {
-          "action": "click",
-          "selector": "a[data-order-name=\"#S-NOREFUND\"]"
-        },
         {
           "action": "click",
           "selector": "button[onclick=\"toggleCancelModal(true)\"]"
@@ -484,15 +748,11 @@
     {
       "id": "order-edit",
       "title": "Order edit: change a line quantity and save",
-      "startPath": "/orders",
+      "startPath": "/orders/{{order:S-EDIT}}",
       "requirementIds": [
         "REQ-ORDER-EDIT"
       ],
       "steps": [
-        {
-          "action": "click",
-          "selector": "a[data-order-name=\"#S-EDIT\"]"
-        },
         {
           "action": "click",
           "selector": "#edit-btn"
@@ -505,6 +765,13 @@
         {
           "action": "click",
           "selector": "#edit-form input[name=\"staffNote\"]"
+        },
+        {
+          "action": "wait_for_control_state",
+          "selector": "#edit-save-btn",
+          "state": "enabled",
+          "expected": true,
+          "timeoutMs": 10000
         },
         {
           "action": "click",
@@ -522,15 +789,11 @@
     {
       "id": "internal-note",
       "title": "Order internal note: save",
-      "startPath": "/orders",
+      "startPath": "/orders/{{order:S-PENDING}}",
       "requirementIds": [
         "REQ-INTERNAL-NOTE"
       ],
       "steps": [
-        {
-          "action": "click",
-          "selector": "a[data-order-name=\"#S-PENDING\"]"
-        },
         {
           "action": "fill",
           "selector": "form[action$=\"/internal-note\"] textarea",
@@ -548,11 +811,606 @@
           ]
         }
       ]
+    },
+    {
+      "id": "nav-dashboard",
+      "title": "Nav opens the dashboard",
+      "startPath": "/orders",
+      "requirementIds": [
+        "REQ-ROUTE-DASHBOARD"
+      ],
+      "steps": [
+        {
+          "action": "click",
+          "selector": ".header-nav a[href=\"/\"]"
+        },
+        {
+          "action": "assert_url",
+          "path": "/",
+          "requirementIds": [
+            "REQ-ROUTE-DASHBOARD"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "nav-customers",
+      "title": "Nav opens Customers",
+      "startPath": "/",
+      "requirementIds": [
+        "REQ-ROUTE-CUSTOMERS"
+      ],
+      "steps": [
+        {
+          "action": "click",
+          "selector": ".header-nav a[href=\"/customers\"]"
+        },
+        {
+          "action": "assert_url",
+          "path": "/customers",
+          "requirementIds": [
+            "REQ-ROUTE-CUSTOMERS"
+          ]
+        },
+        {
+          "action": "assert_visible",
+          "selector": "input[aria-label=\"Search customers\"]",
+          "requirementIds": [
+            "REQ-ROUTE-CUSTOMERS"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "nav-customer-detail",
+      "title": "Customer list row opens the customer",
+      "startPath": "/customers",
+      "requirementIds": [
+        "REQ-ROUTE-CUSTOMER-DETAIL"
+      ],
+      "steps": [
+        {
+          "action": "click",
+          "selector": "main a.link-strong[href=\"/customers/9609759162564\"]"
+        },
+        {
+          "action": "assert_url",
+          "path": "/customers/9609759162564",
+          "requirementIds": [
+            "REQ-ROUTE-CUSTOMER-DETAIL"
+          ]
+        },
+        {
+          "action": "assert_visible",
+          "selector": "#b2b-settings-form",
+          "requirementIds": [
+            "REQ-ROUTE-CUSTOMER-DETAIL"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "nav-customer-activity",
+      "title": "Customer page opens its activity log",
+      "startPath": "/customers/9609759162564",
+      "requirementIds": [
+        "REQ-ROUTE-CUSTOMER-ACTIVITY"
+      ],
+      "steps": [
+        {
+          "action": "click",
+          "selector": "main a.btn[href=\"/customers/9609759162564/activity\"]"
+        },
+        {
+          "action": "assert_url",
+          "path": "/customers/9609759162564/activity",
+          "requirementIds": [
+            "REQ-ROUTE-CUSTOMER-ACTIVITY"
+          ]
+        },
+        {
+          "action": "assert_visible",
+          "selector": "#lookup-date",
+          "requirementIds": [
+            "REQ-ROUTE-CUSTOMER-ACTIVITY"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "nav-orders",
+      "title": "Nav opens Orders",
+      "startPath": "/",
+      "requirementIds": [
+        "REQ-ROUTE-ORDERS"
+      ],
+      "steps": [
+        {
+          "action": "click",
+          "selector": ".header-nav a[href=\"/orders\"]"
+        },
+        {
+          "action": "assert_url",
+          "path": "/orders",
+          "requirementIds": [
+            "REQ-ROUTE-ORDERS"
+          ]
+        },
+        {
+          "action": "assert_visible",
+          "selector": "input[aria-label=\"Select all orders\"]",
+          "requirementIds": [
+            "REQ-ROUTE-ORDERS"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "nav-order-detail",
+      "title": "Order list row opens the order",
+      "startPath": "/orders",
+      "requirementIds": [
+        "REQ-ROUTE-ORDER-DETAIL"
+      ],
+      "steps": [
+        {
+          "action": "click",
+          "selector": "a[data-order-name=\"#S-PENDING\"]"
+        },
+        {
+          "action": "assert_url",
+          "path": "/orders/{{order:S-PENDING}}",
+          "requirementIds": [
+            "REQ-ROUTE-ORDER-DETAIL"
+          ]
+        },
+        {
+          "action": "assert_visible",
+          "selector": "#edit-btn",
+          "requirementIds": [
+            "REQ-ROUTE-ORDER-DETAIL"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "nav-order-invoice",
+      "title": "Customer recent-orders invoice link opens the invoice",
+      "startPath": "/customers/9609759162564",
+      "requirementIds": [
+        "REQ-ROUTE-ORDER-INVOICE"
+      ],
+      "steps": [
+        {
+          "action": "wait_for_control_state",
+          "selector": "main a[href=\"/orders/{{order:S-PENDING}}/invoice\"]",
+          "state": "visible",
+          "expected": true,
+          "timeoutMs": 8000
+        },
+        {
+          "action": "click",
+          "selector": "main a[href=\"/orders/{{order:S-PENDING}}/invoice\"]"
+        },
+        {
+          "action": "assert_url",
+          "path": "/orders/{{order:S-PENDING}}/invoice",
+          "requirementIds": [
+            "REQ-ROUTE-ORDER-INVOICE"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "nav-order-new",
+      "title": "Orders \"+ New Order\" opens the order form",
+      "startPath": "/orders",
+      "requirementIds": [
+        "REQ-ROUTE-ORDER-NEW"
+      ],
+      "steps": [
+        {
+          "action": "click",
+          "selector": "main a[href=\"/orders/new\"]"
+        },
+        {
+          "action": "assert_url",
+          "path": "/orders/new",
+          "requirementIds": [
+            "REQ-ROUTE-ORDER-NEW"
+          ]
+        },
+        {
+          "action": "assert_visible",
+          "selector": "#order-form",
+          "requirementIds": [
+            "REQ-ROUTE-ORDER-NEW"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "nav-catalog",
+      "title": "Nav opens Catalog",
+      "startPath": "/",
+      "requirementIds": [
+        "REQ-ROUTE-CATALOG"
+      ],
+      "steps": [
+        {
+          "action": "click",
+          "selector": ".header-nav a[href=\"/catalog\"]"
+        },
+        {
+          "action": "assert_url",
+          "path": "/catalog",
+          "requirementIds": [
+            "REQ-ROUTE-CATALOG"
+          ]
+        },
+        {
+          "action": "assert_visible",
+          "selector": "select[name=\"vendor\"]",
+          "requirementIds": [
+            "REQ-ROUTE-CATALOG"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "nav-product",
+      "title": "Order line item opens the product",
+      "startPath": "/orders/{{order:S-PENDING}}",
+      "requirementIds": [
+        "REQ-ROUTE-PRODUCT"
+      ],
+      "steps": [
+        {
+          "action": "click",
+          "selector": "main a.link[href=\"/products/8837101093060\"]"
+        },
+        {
+          "action": "assert_url",
+          "path": "/products/8837101093060",
+          "requirementIds": [
+            "REQ-ROUTE-PRODUCT"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "nav-labels",
+      "title": "Nav opens Labels",
+      "startPath": "/",
+      "requirementIds": [
+        "REQ-ROUTE-LABELS"
+      ],
+      "steps": [
+        {
+          "action": "click",
+          "selector": ".header-nav a[href=\"/labels\"]"
+        },
+        {
+          "action": "assert_url",
+          "path": "/labels",
+          "requirementIds": [
+            "REQ-ROUTE-LABELS"
+          ]
+        },
+        {
+          "action": "assert_visible",
+          "selector": "button[data-tab=\"from-products\"]",
+          "requirementIds": [
+            "REQ-ROUTE-LABELS"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "nav-settings",
+      "title": "Nav opens Settings",
+      "startPath": "/",
+      "requirementIds": [
+        "REQ-ROUTE-SETTINGS"
+      ],
+      "steps": [
+        {
+          "action": "click",
+          "selector": ".header-nav a[href=\"/settings\"]"
+        },
+        {
+          "action": "assert_url",
+          "path": "/settings",
+          "requirementIds": [
+            "REQ-ROUTE-SETTINGS"
+          ]
+        },
+        {
+          "action": "assert_visible",
+          "selector": "#settings-b2b-discount",
+          "requirementIds": [
+            "REQ-ROUTE-SETTINGS"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "nav-xero-settings",
+      "title": "Accounting opens Xero settings",
+      "startPath": "/accounting",
+      "requirementIds": [
+        "REQ-ROUTE-XERO-SETTINGS"
+      ],
+      "steps": [
+        {
+          "action": "click",
+          "selector": "main a[href=\"/settings/xero\"]"
+        },
+        {
+          "action": "assert_url",
+          "path": "/settings/xero",
+          "requirementIds": [
+            "REQ-ROUTE-XERO-SETTINGS"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "nav-accounting",
+      "title": "Nav opens Accounting",
+      "startPath": "/",
+      "requirementIds": [
+        "REQ-ROUTE-ACCOUNTING"
+      ],
+      "steps": [
+        {
+          "action": "click",
+          "selector": ".header-nav a[href=\"/accounting\"]"
+        },
+        {
+          "action": "assert_url",
+          "path": "/accounting",
+          "requirementIds": [
+            "REQ-ROUTE-ACCOUNTING"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "nav-leads",
+      "title": "Nav opens Leads",
+      "startPath": "/",
+      "requirementIds": [
+        "REQ-ROUTE-LEADS"
+      ],
+      "steps": [
+        {
+          "action": "click",
+          "selector": ".header-nav a[href=\"/leads\"]"
+        },
+        {
+          "action": "assert_url",
+          "path": "/leads",
+          "requirementIds": [
+            "REQ-ROUTE-LEADS"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "nav-lead-detail",
+      "title": "Lead list row opens the lead",
+      "startPath": "/leads",
+      "requirementIds": [
+        "REQ-ROUTE-LEAD-DETAIL"
+      ],
+      "steps": [
+        {
+          "action": "click",
+          "selector": "main a.link-strong[href=\"/leads/1\"]"
+        },
+        {
+          "action": "assert_url",
+          "path": "/leads/1",
+          "requirementIds": [
+            "REQ-ROUTE-LEAD-DETAIL"
+          ]
+        },
+        {
+          "action": "assert_visible",
+          "selector": "#timeline",
+          "requirementIds": [
+            "REQ-ROUTE-LEAD-DETAIL"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "nav-lead-edit",
+      "title": "Lead page opens its edit form",
+      "startPath": "/leads/1",
+      "requirementIds": [
+        "REQ-ROUTE-LEAD-EDIT"
+      ],
+      "steps": [
+        {
+          "action": "click",
+          "selector": "main a[href=\"/leads/1/edit\"]"
+        },
+        {
+          "action": "assert_url",
+          "path": "/leads/1/edit",
+          "requirementIds": [
+            "REQ-ROUTE-LEAD-EDIT"
+          ]
+        },
+        {
+          "action": "assert_visible",
+          "selector": "form[action=\"/leads/1/edit\"]",
+          "requirementIds": [
+            "REQ-ROUTE-LEAD-EDIT"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "nav-lead-new",
+      "title": "Leads \"new\" opens the new-lead form",
+      "startPath": "/leads",
+      "requirementIds": [
+        "REQ-ROUTE-LEAD-NEW"
+      ],
+      "steps": [
+        {
+          "action": "click",
+          "selector": "main a[href=\"/leads/new\"]"
+        },
+        {
+          "action": "assert_url",
+          "path": "/leads/new",
+          "requirementIds": [
+            "REQ-ROUTE-LEAD-NEW"
+          ]
+        },
+        {
+          "action": "assert_visible",
+          "selector": "#lead-email",
+          "requirementIds": [
+            "REQ-ROUTE-LEAD-NEW"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "nav-backorders",
+      "title": "Nav opens Backorders",
+      "startPath": "/",
+      "requirementIds": [
+        "REQ-ROUTE-BACKORDERS"
+      ],
+      "steps": [
+        {
+          "action": "click",
+          "selector": ".header-nav a[href=\"/backorders\"]"
+        },
+        {
+          "action": "assert_url",
+          "path": "/backorders",
+          "requirementIds": [
+            "REQ-ROUTE-BACKORDERS"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "nav-reports",
+      "title": "Nav opens Reports",
+      "startPath": "/",
+      "requirementIds": [
+        "REQ-ROUTE-REPORTS"
+      ],
+      "steps": [
+        {
+          "action": "click",
+          "selector": ".header-nav a[href=\"/reports\"]"
+        },
+        {
+          "action": "assert_url",
+          "path": "/reports",
+          "requirementIds": [
+            "REQ-ROUTE-REPORTS"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "nav-tax-exempt",
+      "title": "Nav opens Tax Exempt",
+      "startPath": "/",
+      "requirementIds": [
+        "REQ-ROUTE-TAX-EXEMPT"
+      ],
+      "steps": [
+        {
+          "action": "click",
+          "selector": ".header-nav a[href=\"/tax-exempt\"]"
+        },
+        {
+          "action": "assert_url",
+          "path": "/tax-exempt",
+          "requirementIds": [
+            "REQ-ROUTE-TAX-EXEMPT"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "nav-exports",
+      "title": "Nav opens Exports",
+      "startPath": "/",
+      "requirementIds": [
+        "REQ-ROUTE-EXPORTS"
+      ],
+      "steps": [
+        {
+          "action": "click",
+          "selector": ".header-nav a[href=\"/exports\"]"
+        },
+        {
+          "action": "assert_url",
+          "path": "/exports",
+          "requirementIds": [
+            "REQ-ROUTE-EXPORTS"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "nav-exports-csv",
+      "title": "Exports opens the CSV builder",
+      "startPath": "/exports",
+      "requirementIds": [
+        "REQ-ROUTE-EXPORTS-CSV"
+      ],
+      "steps": [
+        {
+          "action": "click",
+          "selector": "main a[href=\"/exports/csv\"]"
+        },
+        {
+          "action": "assert_url",
+          "path": "/exports/csv",
+          "requirementIds": [
+            "REQ-ROUTE-EXPORTS-CSV"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "nav-exports-images",
+      "title": "Exports opens the image export",
+      "startPath": "/exports",
+      "requirementIds": [
+        "REQ-ROUTE-EXPORTS-IMAGES"
+      ],
+      "steps": [
+        {
+          "action": "click",
+          "selector": "main a[href=\"/exports/images\"]"
+        },
+        {
+          "action": "assert_url",
+          "path": "/exports/images",
+          "requirementIds": [
+            "REQ-ROUTE-EXPORTS-IMAGES"
+          ]
+        }
+      ]
     }
   ],
   "semanticObligations": [],
   "discovery": {
-    "maxRoutes": 12
+    "maxRoutes": 25
   },
   "auth": {
     "mode": "auto",
@@ -569,9 +1427,9 @@
       "form[action$=\"/cancel\"] input[name=\"notify\"]",
       "#edit-save-btn",
       "form[action$=\"/internal-note\"] button[type=\"submit\"]",
-      "a[data-order-name=\"#S-REFUND\"]",
-      "a[data-order-name=\"#S-NOREFUND\"]",
-      "#dropship_enabled"
+      "#dropship_enabled",
+      "main a[href=\"/exports/csv\"]",
+      "main a[href=\"/exports/images\"]"
     ],
     "disposableEnvironmentMarker": "#test-env-banner"
   }
