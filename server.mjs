@@ -1655,8 +1655,8 @@ function layout({ title, session, activePath = '/', content, extraHead = '' }) {
       </details>
       <div class="header-user">
         <span class="user-email">${h(session?.email || '')}</span>
-        <!-- A button, not <a href="/login">: the href never signed anyone out (GET /login just bounces a live session
-             to /), so without the click handler below it was a link that lied. -->
+        <!-- A button, not a link to the login page: that href never signed anyone out (GET /login just bounces a live
+             session to /), so without the click handler below it was a link that lied. -->
         <button type="button" id="signout-link" class="btn-signout">Sign out</button>
       </div>
     </div>
@@ -9825,7 +9825,7 @@ function renderReports(session, data) {
     <div class="report-section">
       <div class="report-section-header">
         <h2>Monthly Revenue (last 12 months)</h2>
-        <a href="/reports/csv/monthly" class="btn btn-ghost btn-sm">↓ CSV</a>
+        <a href="/reports/csv/monthly" download class="btn btn-ghost btn-sm">↓ CSV</a>
       </div>
       <div class="chart-container">${chart}</div>
       <table class="data-table data-table-sm">
@@ -9844,7 +9844,7 @@ function renderReports(session, data) {
     <div class="report-section">
       <div class="report-section-header">
         <h2>Sales by Customer (top ${customers?.length||0})</h2>
-        <a href="/reports/csv/customers" class="btn btn-ghost btn-sm">↓ CSV</a>
+        <a href="/reports/csv/customers" download class="btn btn-ghost btn-sm">↓ CSV</a>
       </div>
       <table class="data-table data-table-sm">
         <thead><tr><th>#</th><th>Customer</th><th>Revenue</th><th>Orders</th><th>AOV</th><th>Trend</th></tr></thead>
@@ -9855,7 +9855,7 @@ function renderReports(session, data) {
     <div class="report-section">
       <div class="report-section-header">
         <h2>Sales by Product (top ${products?.length||0})</h2>
-        <a href="/reports/csv/products" class="btn btn-ghost btn-sm">↓ CSV</a>
+        <a href="/reports/csv/products" download class="btn btn-ghost btn-sm">↓ CSV</a>
       </div>
       <table class="data-table data-table-sm">
         <thead><tr><th>#</th><th>Product</th><th>SKU</th><th>Revenue</th><th>Units</th><th>Avg Price</th></tr></thead>
@@ -11233,8 +11233,12 @@ function renderLeadDetail(session, { lead, notes, history, flash, existingInvite
             ${appRow('Products of interest', application && application.products)}
             ${application && application.submittedAt ? `<div class="kv-row"><span>Submitted</span><strong class="text-muted">${fmtDate(new Date(application.submittedAt).toISOString())}</strong></div>` : ''}
             <div class="kv-row"><span>Sales tax exemption</span><strong>${
+              // DEPENDS: GET /leads/:id/tax-doc answers 503 without PORTAL_INTERNAL_TOKEN (the TEST copy has none), so
+              // only link it when the proxy can actually fetch the PDF.
               application && application.hasTaxExemptDoc
-                ? `<a href="/leads/${lead.id}/tax-doc" target="_blank" rel="noopener noreferrer" class="link">View document →</a>`
+                ? (PORTAL_INTERNAL_TOKEN
+                  ? `<a href="/leads/${lead.id}/tax-doc" target="_blank" rel="noopener noreferrer" class="link">View document →</a>`
+                  : '<span class="text-muted">Provided (portal link not configured here)</span>')
                 : '<span class="text-muted">Not provided</span>'
             }</strong></div>
           </div>
