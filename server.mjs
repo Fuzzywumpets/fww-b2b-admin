@@ -1655,7 +1655,9 @@ function layout({ title, session, activePath = '/', content, extraHead = '' }) {
       </details>
       <div class="header-user">
         <span class="user-email">${h(session?.email || '')}</span>
-        <a href="/login" id="signout-link" class="btn-signout" role="button">Sign out</a>
+        <!-- A button, not <a href="/login">: the href never signed anyone out (GET /login just bounces a live session
+             to /), so without the click handler below it was a link that lied. -->
+        <button type="button" id="signout-link" class="btn-signout">Sign out</button>
       </div>
     </div>
   </header>
@@ -1947,7 +1949,7 @@ function renderDashboard(session, data) {
   const lowStockTable = data.lowStockItems?.length > 0
     ? `<table class="mini-table"><thead><tr><th>Product / Variant</th><th>SKU</th><th>Qty</th></tr></thead><tbody>
       ${data.lowStockItems.map(item => `<tr class="${item.qty===0?'row-critical':item.qty<=3?'row-warning':''}">
-        <td><a href="/catalog/${shopifyNumericId(item.productId)}">${h(item.productTitle)}</a>
+        <td><a href="/products/${shopifyNumericId(item.productId)}">${h(item.productTitle)}</a>
           ${item.variantTitle && item.variantTitle !== 'Default Title' ? `<small>${h(item.variantTitle)}</small>` : ''}</td>
         <td class="mono">${h(item.sku||'—')}</td>
         <td class="${item.qty===0?'qty-zero':item.qty<=3?'qty-critical':'qty-low'}">${item.qty}</td>
@@ -9331,7 +9333,7 @@ function renderCatalog(session, data, filters) {
     const rowClass = pStatus === 'archived' ? ' class="row-archived"' : '';
     return `<tr data-id="${h(numId)}"${rowClass}>
       <td><label class="check-hit"><input type="checkbox" name="ids" value="${h(numId)}" class="row-check" onchange="updateBulkBar()" aria-label="Select product ${h(p.title)}"></label></td>
-      <td><a href="/catalog/${h(numId)}" class="link-primary">${h(p.title)}</a>${statusBadge}</td>
+      <td><a href="/products/${h(numId)}" class="link-primary">${h(p.title)}</a>${statusBadge}</td>
       <td class="text-muted">${h(p.vendor||'—')}</td>
       <td>${style ? `<span class="tag-chip">${h(style)}</span>` : '—'}</td>
       <td class="mono text-sm">${variants.map(e => h(e.node.sku||'—')).join('<br>')}</td>
@@ -9404,7 +9406,8 @@ app.get('/catalog', requireAuth, async (req, res) => {
 });
 
 // WHAT: legacy alias — 301-style redirect from /catalog/:id to the canonical /products/:id detail page.
-// INVARIANT(S): keep this redirect so old catalog links and the row-action hrefs (/catalog/<id>) still resolve.
+// INVARIANT(S): keep this redirect so old bookmarks to /catalog/<id> still resolve. In-app links (catalog rows,
+// dashboard low-stock) point straight at /products/<id>: a redirect hop is a failed route for Gauntlet's sweep.
 app.get('/catalog/:id', requireAuth, async (req, res) => {
   res.redirect(`/products/${req.params.id}`);
 });
