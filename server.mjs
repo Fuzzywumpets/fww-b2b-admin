@@ -2140,7 +2140,7 @@ function renderOrdersList(session, data, filters) {
     const srcLabel = ORDER_SOURCE_LABELS[src] || src;
     const srcColor = ORDER_SOURCE_COLORS[src] || 'muted';
     return `<tr>
-      <td class="col-check"><input type="checkbox" name="ids" value="${h(numId)}" aria-label="Select order ${h(o.name)}"></td>
+      <td class="col-check"><label class="check-hit"><input type="checkbox" name="ids" value="${h(numId)}" aria-label="Select order ${h(o.name)}"></label></td>
       <td><!-- DEPENDS: docs/gauntlet/b2badmin-test.app-scope.json reaches seeded orders by a[data-order-name="…"] (ids change per reset). --><a href="/orders/${h(numId)}" class="order-link" data-order-name="${h(o.name)}">${h(o.name)}</a></td>
       <td>${o.customer ? `<a href="/customers/${shopifyNumericId(o.customer.id)}">${h(o.customer.displayName)}</a><br><small>${h(o.customer.email)}</small>` : '—'}</td>
       <td class="text-muted">${fmtDate(o.processedAt)}</td>
@@ -2214,7 +2214,7 @@ function renderOrdersList(session, data, filters) {
       <div class="table-wrap">
         <table class="data-table">
           <thead><tr>
-            <th class="col-check"><input type="checkbox" id="select-all" aria-label="Select all orders"></th>
+            <th class="col-check"><label class="check-hit"><input type="checkbox" id="select-all" aria-label="Select all orders"></label></th>
             <th>Order</th><th>Customer</th><th>Date</th><th>Items</th>
             <th class="text-right">Amount</th><th>Payment</th><th>Fulfillment</th><th></th>
           </tr></thead>
@@ -9330,7 +9330,7 @@ function renderCatalog(session, data, filters) {
         : '';
     const rowClass = pStatus === 'archived' ? ' class="row-archived"' : '';
     return `<tr data-id="${h(numId)}"${rowClass}>
-      <td><input type="checkbox" name="ids" value="${h(numId)}" class="row-check" onchange="updateBulkBar()" aria-label="Select product ${h(p.title)}"></td>
+      <td><label class="check-hit"><input type="checkbox" name="ids" value="${h(numId)}" class="row-check" onchange="updateBulkBar()" aria-label="Select product ${h(p.title)}"></label></td>
       <td><a href="/catalog/${h(numId)}" class="link-primary">${h(p.title)}</a>${statusBadge}</td>
       <td class="text-muted">${h(p.vendor||'—')}</td>
       <td>${style ? `<span class="tag-chip">${h(style)}</span>` : '—'}</td>
@@ -9350,7 +9350,7 @@ function renderCatalog(session, data, filters) {
     <div class="table-wrap">
     <table class="data-table" id="catalog-table">
       <thead><tr>
-        <th style="width:32px"><input type="checkbox" id="select-all" onchange="selectAll(this)" aria-label="Select all products"></th>
+        <th style="width:32px"><label class="check-hit"><input type="checkbox" id="select-all" onchange="selectAll(this)" aria-label="Select all products"></label></th>
         <th>Product</th><th>Vendor</th><th>Style</th><th>SKUs</th>
         <th title="Total inventory across variants">Qty</th>
         <th>B2B Status</th><th>Actions</th>
@@ -10363,7 +10363,7 @@ function renderLabelsPage(session, { source, orderData, productItems, flash, sav
     const rows = allItems.map((item, idx) => {
       const hasBarcode = item.barcode && /^\d{12,13}$/.test(String(item.barcode));
       return `<tr class="${hasBarcode ? '' : 'row-muted'}">
-        <td><input type="checkbox" name="sel" value="${idx}"${hasBarcode ? ' checked' : ' disabled'} class="item-sel"></td>
+        <td><label class="check-hit"><input type="checkbox" name="sel" value="${idx}"${hasBarcode ? ' checked' : ' disabled'} class="item-sel" aria-label="Print labels for ${h(item.title)}${item.variantTitle ? ' – ' + h(item.variantTitle) : ''}"></label></td>
         <td>${h(item.title)}</td>
         <td class="text-sm text-muted">${h(item.variantTitle || '')}</td>
         <td class="mono text-sm">${hasBarcode ? h(item.barcode) : '<span class="text-muted">—</span>'}</td>
@@ -10628,7 +10628,7 @@ function renderExportsCsv(session, { products, selectedIds, columns, flash }) {
     const numId = shopifyNumericId(p.id);
     const selected = selectedIds.includes(numId);
     return `<tr>
-      <td><input type="checkbox" name="ids" value="${numId}"${selected ? ' checked' : ''} class="item-sel"></td>
+      <td><label class="check-hit"><input type="checkbox" name="ids" value="${numId}"${selected ? ' checked' : ''} class="item-sel" aria-label="Select product ${h(p.title)}"></label></td>
       <td>${h(p.title)}</td>
       <td class="text-sm text-muted">${h(p.vendor || '')}</td>
       <td class="text-sm">${p.variants.edges.length} variant${p.variants.edges.length !== 1 ? 's' : ''}</td>
@@ -10680,7 +10680,7 @@ function renderExportsImages(session, { products, selectedIds, mode, flash }) {
     const selected = selectedIds.includes(numId);
     const imgCount = mode === 'gallery' ? (p.images?.edges?.length || 1) : 1;
     return `<tr>
-      <td><input type="checkbox" name="ids" value="${numId}"${selected ? ' checked' : ''} class="item-sel"></td>
+      <td><label class="check-hit"><input type="checkbox" name="ids" value="${numId}"${selected ? ' checked' : ''} class="item-sel" aria-label="Select product ${h(p.title)}"></label></td>
       <td>${h(p.title)}</td>
       <td class="text-sm text-muted">${h(p.vendor || '')}</td>
       <td class="text-sm" id="img-count-${numId}">${imgCount} image${imgCount !== 1 ? 's' : ''}</td>
@@ -12298,7 +12298,7 @@ app.get('/customers/:id/activity', requireAuth, async (req, res) => {
 
     <!-- Filters -->
     <div class="filter-bar" style="margin-bottom:1rem">
-      <form method="GET" style="display:flex;gap:0.5rem;flex-wrap:wrap;align-items:center">
+      <form method="GET" style="display:flex;gap:0.625rem;flex-wrap:wrap;align-items:center">
         <!-- DEPENDS: this preset picker must NOT carry the from name — the date input below already owns it,
              and two controls sharing it made every manual submit send from=[preset]&from=[date],
              which Express's qs parser turns into an array and the date filter then matches nothing.
