@@ -1,0 +1,578 @@
+{
+  "schema": "gauntlet.app-scope.v4",
+  "name": "b2badmin TEST copy — mutating workflows",
+  "purpose": "Click and save the b2badmin staff forms (B2B settings save/clear/reset/toggle, customer search, order cancel with refund on/off, labels, order edit, internal note) against the isolated TEST copy and its Shopify dev store, so Shopify-side errors that MOCK hides surface before production.",
+  "purposeConfirmed": true,
+  "scopeConfirmed": true,
+  "expectedRequirementIds": [
+    "REQ-ROUTE-DASHBOARD",
+    "REQ-ROUTE-CUSTOMERS",
+    "REQ-ROUTE-CUSTOMER-CHAMP",
+    "REQ-ROUTE-CUSTOMER-FILLED",
+    "REQ-ROUTE-ORDERS",
+    "REQ-ROUTE-CATALOG",
+    "REQ-ROUTE-LABELS",
+    "REQ-ROUTE-SETTINGS",
+    "REQ-ROUTE-LEADS",
+    "REQ-ROUTE-BACKORDERS",
+    "REQ-ROUTE-REPORTS",
+    "REQ-ROUTE-TAX-EXEMPT",
+    "REQ-B2B-SAVE",
+    "REQ-B2B-CLEAR",
+    "REQ-B2B-RESET",
+    "REQ-B2B-TOGGLE",
+    "REQ-CUSTOMER-SEARCH",
+    "REQ-CANCEL-REFUND",
+    "REQ-CANCEL-NOREFUND",
+    "REQ-LABELS",
+    "REQ-ORDER-EDIT",
+    "REQ-INTERNAL-NOTE"
+  ],
+  "requirementProofTargets": [
+    {
+      "requirementId": "REQ-ROUTE-DASHBOARD",
+      "proofTarget": "ui_transition"
+    },
+    {
+      "requirementId": "REQ-ROUTE-CUSTOMERS",
+      "proofTarget": "ui_transition"
+    },
+    {
+      "requirementId": "REQ-ROUTE-CUSTOMER-CHAMP",
+      "proofTarget": "ui_transition"
+    },
+    {
+      "requirementId": "REQ-ROUTE-CUSTOMER-FILLED",
+      "proofTarget": "ui_transition"
+    },
+    {
+      "requirementId": "REQ-ROUTE-ORDERS",
+      "proofTarget": "ui_transition"
+    },
+    {
+      "requirementId": "REQ-ROUTE-CATALOG",
+      "proofTarget": "ui_transition"
+    },
+    {
+      "requirementId": "REQ-ROUTE-LABELS",
+      "proofTarget": "ui_transition"
+    },
+    {
+      "requirementId": "REQ-ROUTE-SETTINGS",
+      "proofTarget": "ui_transition"
+    },
+    {
+      "requirementId": "REQ-ROUTE-LEADS",
+      "proofTarget": "ui_transition"
+    },
+    {
+      "requirementId": "REQ-ROUTE-BACKORDERS",
+      "proofTarget": "ui_transition"
+    },
+    {
+      "requirementId": "REQ-ROUTE-REPORTS",
+      "proofTarget": "ui_transition"
+    },
+    {
+      "requirementId": "REQ-ROUTE-TAX-EXEMPT",
+      "proofTarget": "ui_transition"
+    },
+    {
+      "requirementId": "REQ-B2B-SAVE",
+      "proofTarget": "ui_transition"
+    },
+    {
+      "requirementId": "REQ-B2B-CLEAR",
+      "proofTarget": "ui_transition"
+    },
+    {
+      "requirementId": "REQ-B2B-RESET",
+      "proofTarget": "ui_transition"
+    },
+    {
+      "requirementId": "REQ-B2B-TOGGLE",
+      "proofTarget": "ui_transition"
+    },
+    {
+      "requirementId": "REQ-CUSTOMER-SEARCH",
+      "proofTarget": "ui_transition"
+    },
+    {
+      "requirementId": "REQ-CANCEL-REFUND",
+      "proofTarget": "ui_transition"
+    },
+    {
+      "requirementId": "REQ-CANCEL-NOREFUND",
+      "proofTarget": "ui_transition"
+    },
+    {
+      "requirementId": "REQ-LABELS",
+      "proofTarget": "ui_transition"
+    },
+    {
+      "requirementId": "REQ-ORDER-EDIT",
+      "proofTarget": "ui_transition"
+    },
+    {
+      "requirementId": "REQ-INTERNAL-NOTE",
+      "proofTarget": "ui_transition"
+    }
+  ],
+  "routes": [
+    {
+      "id": "dashboard",
+      "path": "/",
+      "requirementIds": [
+        "REQ-ROUTE-DASHBOARD"
+      ]
+    },
+    {
+      "id": "customers",
+      "path": "/customers",
+      "requirementIds": [
+        "REQ-ROUTE-CUSTOMERS"
+      ]
+    },
+    {
+      "id": "customer-champ",
+      "path": "/customers/9609759097028",
+      "requirementIds": [
+        "REQ-ROUTE-CUSTOMER-CHAMP"
+      ]
+    },
+    {
+      "id": "customer-filled",
+      "path": "/customers/9609759162564",
+      "requirementIds": [
+        "REQ-ROUTE-CUSTOMER-FILLED"
+      ]
+    },
+    {
+      "id": "orders",
+      "path": "/orders",
+      "requirementIds": [
+        "REQ-ROUTE-ORDERS"
+      ]
+    },
+    {
+      "id": "catalog",
+      "path": "/catalog",
+      "requirementIds": [
+        "REQ-ROUTE-CATALOG"
+      ]
+    },
+    {
+      "id": "labels",
+      "path": "/labels",
+      "requirementIds": [
+        "REQ-ROUTE-LABELS"
+      ]
+    },
+    {
+      "id": "settings",
+      "path": "/settings",
+      "requirementIds": [
+        "REQ-ROUTE-SETTINGS"
+      ]
+    },
+    {
+      "id": "leads",
+      "path": "/leads",
+      "requirementIds": [
+        "REQ-ROUTE-LEADS"
+      ]
+    },
+    {
+      "id": "backorders",
+      "path": "/backorders",
+      "requirementIds": [
+        "REQ-ROUTE-BACKORDERS"
+      ]
+    },
+    {
+      "id": "reports",
+      "path": "/reports",
+      "requirementIds": [
+        "REQ-ROUTE-REPORTS"
+      ]
+    },
+    {
+      "id": "tax-exempt",
+      "path": "/tax-exempt",
+      "requirementIds": [
+        "REQ-ROUTE-TAX-EXEMPT"
+      ]
+    }
+  ],
+  "workflows": [
+    {
+      "id": "b2b-save",
+      "title": "B2B settings: change discount and save",
+      "startPath": "/customers/9609759162564",
+      "requirementIds": [
+        "REQ-B2B-SAVE"
+      ],
+      "steps": [
+        {
+          "action": "fill",
+          "selector": "#discount_pct",
+          "value": "42"
+        },
+        {
+          "action": "click",
+          "selector": "#b2b-settings-form button.btn-primary"
+        },
+        {
+          "action": "assert_visible_text",
+          "text": "B2B customer settings saved.",
+          "requirementIds": [
+            "REQ-B2B-SAVE"
+          ]
+        },
+        {
+          "action": "assert_persisted",
+          "selector": "#discount_pct",
+          "state": "value",
+          "expected": "42",
+          "after": "reload",
+          "requirementIds": [
+            "REQ-B2B-SAVE"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "b2b-clear-margin",
+      "title": "B2B settings: blank the drop-ship margin and save (metafieldsDelete path)",
+      "startPath": "/customers/9609759097028",
+      "requirementIds": [
+        "REQ-B2B-CLEAR"
+      ],
+      "steps": [
+        {
+          "action": "fill",
+          "selector": "#dropship_margin_pct",
+          "value": ""
+        },
+        {
+          "action": "click",
+          "selector": "#b2b-settings-form button.btn-primary"
+        },
+        {
+          "action": "assert_visible_text",
+          "text": "B2B customer settings saved.",
+          "requirementIds": [
+            "REQ-B2B-CLEAR"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "b2b-reset",
+      "title": "B2B settings: Reset the discount override",
+      "startPath": "/customers/9609759097028",
+      "requirementIds": [
+        "REQ-B2B-RESET"
+      ],
+      "steps": [
+        {
+          "action": "click",
+          "selector": "#b2b-settings-form button[name=\"discount_pct\"]"
+        },
+        {
+          "action": "assert_visible_text",
+          "text": "B2B customer settings saved.",
+          "requirementIds": [
+            "REQ-B2B-RESET"
+          ]
+        },
+        {
+          "action": "assert_visible_text_absent",
+          "text": "override: 55%",
+          "requirementIds": [
+            "REQ-B2B-RESET"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "b2b-toggle",
+      "title": "B2B settings: toggle drop-ship on and save",
+      "startPath": "/customers/9609759195332",
+      "requirementIds": [
+        "REQ-B2B-TOGGLE"
+      ],
+      "steps": [
+        {
+          "action": "check",
+          "selector": "#dropship_enabled",
+          "checked": true
+        },
+        {
+          "action": "click",
+          "selector": "#b2b-settings-form button.btn-primary"
+        },
+        {
+          "action": "assert_visible_text",
+          "text": "B2B customer settings saved.",
+          "requirementIds": [
+            "REQ-B2B-TOGGLE"
+          ]
+        },
+        {
+          "action": "assert_persisted",
+          "selector": "#dropship_enabled",
+          "state": "checked",
+          "expected": true,
+          "after": "reload",
+          "requirementIds": [
+            "REQ-B2B-TOGGLE"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "customer-search",
+      "title": "Customer search matches the company name",
+      "startPath": "/customers",
+      "requirementIds": [
+        "REQ-CUSTOMER-SEARCH"
+      ],
+      "steps": [
+        {
+          "action": "fill",
+          "selector": "input[aria-label=\"Search customers\"]",
+          "value": "dog"
+        },
+        {
+          "action": "press",
+          "selector": "input[aria-label=\"Search customers\"]",
+          "key": "Enter"
+        },
+        {
+          "action": "assert_visible",
+          "selector": "main a.link-strong[href=\"/customers/9609759097028\"]",
+          "requirementIds": [
+            "REQ-CUSTOMER-SEARCH"
+          ]
+        },
+        {
+          "action": "assert_visible_text_absent",
+          "text": "Blank Kennels",
+          "requirementIds": [
+            "REQ-CUSTOMER-SEARCH"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "cancel-refund",
+      "title": "Cancel #S-REFUND with refund ON",
+      "startPath": "/orders",
+      "requirementIds": [
+        "REQ-CANCEL-REFUND"
+      ],
+      "steps": [
+        {
+          "action": "click",
+          "selector": "a[data-order-name=\"#S-REFUND\"]"
+        },
+        {
+          "action": "click",
+          "selector": "button[onclick=\"toggleCancelModal(true)\"]"
+        },
+        {
+          "action": "check",
+          "selector": "form[action$=\"/cancel\"] input[name=\"notify\"]",
+          "checked": false
+        },
+        {
+          "action": "check",
+          "selector": "form[action$=\"/cancel\"] input[name=\"refund\"]",
+          "checked": true
+        },
+        {
+          "action": "click",
+          "selector": "form[action$=\"/cancel\"] button[type=\"submit\"]"
+        },
+        {
+          "action": "assert_visible_text",
+          "text": "Order canceled.",
+          "requirementIds": [
+            "REQ-CANCEL-REFUND"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "cancel-norefund",
+      "title": "Cancel #S-NOREFUND with refund OFF",
+      "startPath": "/orders",
+      "requirementIds": [
+        "REQ-CANCEL-NOREFUND"
+      ],
+      "steps": [
+        {
+          "action": "click",
+          "selector": "a[data-order-name=\"#S-NOREFUND\"]"
+        },
+        {
+          "action": "click",
+          "selector": "button[onclick=\"toggleCancelModal(true)\"]"
+        },
+        {
+          "action": "check",
+          "selector": "form[action$=\"/cancel\"] input[name=\"notify\"]",
+          "checked": false
+        },
+        {
+          "action": "check",
+          "selector": "form[action$=\"/cancel\"] input[name=\"refund\"]",
+          "checked": false
+        },
+        {
+          "action": "click",
+          "selector": "form[action$=\"/cancel\"] button[type=\"submit\"]"
+        },
+        {
+          "action": "assert_visible_text",
+          "text": "Order canceled.",
+          "requirementIds": [
+            "REQ-CANCEL-NOREFUND"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "labels-products",
+      "title": "Labels: search products and list barcodes",
+      "startPath": "/labels",
+      "requirementIds": [
+        "REQ-LABELS"
+      ],
+      "steps": [
+        {
+          "action": "click",
+          "selector": "button[data-tab=\"from-products\"]"
+        },
+        {
+          "action": "fill",
+          "selector": "input[placeholder=\"Search products...\"]",
+          "value": "rope"
+        },
+        {
+          "action": "press",
+          "selector": "input[placeholder=\"Search products...\"]",
+          "key": "Enter"
+        },
+        {
+          "action": "assert_visible_text",
+          "text": "036000291452",
+          "requirementIds": [
+            "REQ-LABELS"
+          ]
+        },
+        {
+          "action": "assert_visible_text_absent",
+          "text": "Seed Plush Bear",
+          "requirementIds": [
+            "REQ-LABELS"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "order-edit",
+      "title": "Order edit: change a line quantity and save",
+      "startPath": "/orders",
+      "requirementIds": [
+        "REQ-ORDER-EDIT"
+      ],
+      "steps": [
+        {
+          "action": "click",
+          "selector": "a[data-order-name=\"#S-EDIT\"]"
+        },
+        {
+          "action": "click",
+          "selector": "#edit-btn"
+        },
+        {
+          "action": "fill",
+          "selector": "#edit-form tbody tr:first-child input[name^=\"qtys[\"]",
+          "value": "5"
+        },
+        {
+          "action": "click",
+          "selector": "#edit-form input[name=\"staffNote\"]"
+        },
+        {
+          "action": "click",
+          "selector": "#edit-save-btn"
+        },
+        {
+          "action": "assert_visible_text",
+          "text": "Order updated.",
+          "requirementIds": [
+            "REQ-ORDER-EDIT"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "internal-note",
+      "title": "Order internal note: save",
+      "startPath": "/orders",
+      "requirementIds": [
+        "REQ-INTERNAL-NOTE"
+      ],
+      "steps": [
+        {
+          "action": "click",
+          "selector": "a[data-order-name=\"#S-PENDING\"]"
+        },
+        {
+          "action": "fill",
+          "selector": "form[action$=\"/internal-note\"] textarea",
+          "value": "Gauntlet internal note"
+        },
+        {
+          "action": "click",
+          "selector": "form[action$=\"/internal-note\"] button[type=\"submit\"]"
+        },
+        {
+          "action": "assert_visible_text",
+          "text": "Note saved.",
+          "requirementIds": [
+            "REQ-INTERNAL-NOTE"
+          ]
+        }
+      ]
+    }
+  ],
+  "semanticObligations": [],
+  "discovery": {
+    "maxRoutes": 12
+  },
+  "auth": {
+    "mode": "auto",
+    "timeoutMs": 60000
+  },
+  "interactionPolicy": {
+    "allowClicks": true,
+    "disposableEnvironmentConfirmed": true,
+    "destructiveSelectorAllowlist": [
+      "#b2b-settings-form button.btn-primary",
+      "#b2b-settings-form button[name=\"discount_pct\"]",
+      "form[action$=\"/cancel\"] button[type=\"submit\"]",
+      "form[action$=\"/cancel\"] input[name=\"refund\"]",
+      "form[action$=\"/cancel\"] input[name=\"notify\"]",
+      "#edit-save-btn",
+      "form[action$=\"/internal-note\"] button[type=\"submit\"]",
+      "a[data-order-name=\"#S-REFUND\"]",
+      "a[data-order-name=\"#S-NOREFUND\"]",
+      "#dropship_enabled"
+    ],
+    "disposableEnvironmentMarker": "#test-env-banner"
+  }
+}

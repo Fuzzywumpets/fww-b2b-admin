@@ -1628,7 +1628,13 @@ function layout({ title, session, activePath = '/', content, extraHead = '' }) {
 </head>
 <body>
   ${TEST_ENV ? `<!-- DEPENDS: Gauntlet test-copy runs require #test-env-banner to be visible before any click. -->
-  <div id="test-env-banner" role="status" style="background:#b91c1c;color:#fff;text-align:center;font:600 13px/1.4 system-ui,sans-serif;padding:6px 12px;letter-spacing:.04em">TEST ENVIRONMENT — Shopify dev store, not production</div>` : ''}
+  <!-- SYNC: z-index:2000 must stay above the fixed modal overlays (cancel-modal, record-payment-modal use z-index:1000); Gauntlet re-checks this marker is painted and unoccluded before allowlisted destructive steps made while a modal is open. -->
+  <style>/* TEST copy only: Gauntlet verifies painted text only in generic font families, and refuses the Inter
+     webfont, so text assertions could never pass. Production keeps Inter.
+     Also TEST only: .badge text-transform (uppercase text is unverifiable) and an 8px control radius - Gauntlet's
+     hit-test sampler wrongly reports a 6px-radius input invisible when its bottom edge lands on a fractional pixel
+     (offline-reproduced: ~30% of vertical offsets), which blocks fill/click on otherwise visible inputs. */ body,button,input,select,textarea{font-family:system-ui,sans-serif!important} .badge{text-transform:none!important;letter-spacing:normal!important} .input,.filter-input,.form-input{border-radius:8px!important}</style>
+  <div id="test-env-banner" role="status" style="position:relative;z-index:2000;background:#b91c1c;color:#fff;text-align:center;font:600 13px/1.4 system-ui,sans-serif;padding:6px 12px;letter-spacing:.04em">TEST ENVIRONMENT — Shopify dev store, not production</div>` : ''}
   <header class="admin-header">
     <div class="header-inner">
       <a href="/" class="header-logo">
@@ -2135,7 +2141,7 @@ function renderOrdersList(session, data, filters) {
     const srcColor = ORDER_SOURCE_COLORS[src] || 'muted';
     return `<tr>
       <td class="col-check"><input type="checkbox" name="ids" value="${h(numId)}" aria-label="Select order ${h(o.name)}"></td>
-      <td><a href="/orders/${h(numId)}" class="order-link">${h(o.name)}</a></td>
+      <td><!-- DEPENDS: docs/gauntlet/b2badmin-test.app-scope.json reaches seeded orders by a[data-order-name="…"] (ids change per reset). --><a href="/orders/${h(numId)}" class="order-link" data-order-name="${h(o.name)}">${h(o.name)}</a></td>
       <td>${o.customer ? `<a href="/customers/${shopifyNumericId(o.customer.id)}">${h(o.customer.displayName)}</a><br><small>${h(o.customer.email)}</small>` : '—'}</td>
       <td class="text-muted">${fmtDate(o.processedAt)}</td>
       <td class="text-muted small-text">${h(lineItemSummary)}</td>
@@ -8577,6 +8583,9 @@ app.get('/api/orders/:id/visible-notes', requireAuth, (req, res) => {
 app.get('/api/orders/:id/customer-messages', requireAuth, async (req, res) => {
   const shopifyId = `gid://shopify/Order/${req.params.id}`;
   if (MOCK) return res.json({ threads: [], customerEmail: null, mock: true });
+  // DEPENDS: lib/test-env.mjs - the TEST copy deliberately has no B2B_PORTAL_INTERNAL_TOKEN, so the order page's
+  // load-time fetch must degrade to an empty panel (like MOCK) instead of a 500 that breaks the render.
+  if (TEST_ENV && !PORTAL_INTERNAL_TOKEN) return res.json({ threads: [], customerEmail: null, testEnv: true });
   const result = await callPortalInternal('POST', '/__internal__/customer-messages', { orderId: shopifyId });
   if (!result.ok) return res.status(500).json({ error: result.error || 'failed' });
   res.json({ threads: result.threads || [], customerEmail: result.customerEmail || null });
@@ -8593,6 +8602,8 @@ app.get('/api/orders/:id/customer-messages', requireAuth, async (req, res) => {
 //   the portal-internal contract (B2B_PORTAL_INTERNAL_TOKEN) being set — else callPortalInternal returns ok:false.
 app.get('/api/orders/:id/conversations/:slug/messages', requireAuth, async (req, res) => {
   if (MOCK) return res.json({ ok: true, messages: [], mock: true });
+  // SYNC: customer-messages guard above - same TEST-copy no-token degrade.
+  if (TEST_ENV && !PORTAL_INTERNAL_TOKEN) return res.json({ ok: true, messages: [], testEnv: true });
   const slug = encodeURIComponent(req.params.slug);
   const result = await callPortalInternal('GET', `/__internal__/conversations/${slug}/messages`, null);
   if (!result.ok) return res.status(500).json({ ok: false, error: result.error || 'failed' });
@@ -8827,8 +8838,17 @@ app.post('/customers/:id/dropship', requireAuth, async (req, res) => {
 app.post('/customers/:id/b2b-config', requireAuth, async (req, res) => {
   const numId = req.params.id;
   // Checkboxes: if absent from form body, checkbox was unchecked → explicitly set false
+  // WHAT: a per-field Reset/Clear submit button shares its name with the field's own <input>, so the browser
+  // posts BOTH values (discount_pct=55&discount_pct=) and urlencoded{extended} parses them to an array. The
+  // submitter follows its input in tree order, so the LAST value is the operator's intent; without this
+  // parseInt(['55','']) read 55 and Reset silently re-saved the old override.
+  // DEPENDS: the Reset/Clear buttons rendered in the B2B settings form (name=<field> value="") sit AFTER their input.
+  const lastValue = (v) => (Array.isArray(v) ? v[v.length - 1] : v);
   const body = {
     ...req.body,
+    discount_pct:        lastValue(req.body.discount_pct),
+    dropship_margin_pct: lastValue(req.body.dropship_margin_pct),
+    catalog_access_tags: lastValue(req.body.catalog_access_tags),
     dropship_enabled:       'dropship_enabled'       in req.body ? req.body.dropship_enabled       : 'false',
     allow_order_on_invoice: 'allow_order_on_invoice' in req.body ? req.body.allow_order_on_invoice : 'false',
   };
@@ -10210,20 +10230,23 @@ const MOCK_LABEL_PRODUCTS = MOCK_PRODUCTS;
 // WHAT: loads product+variant data (barcode, sku, price, inventory) for label generation, by id list or full catalog in MOCK.
 // CHANGE-GUARD: variants are fetched first:30 — products with >30 variants silently lose the overflow on labels; null/empty ids = first 100 products by title (the From Products tab); the Shopify `nodes(ids:)` query expects gid://shopify/Product/<id> form built here from numeric ids.
 // INVARIANT(S): result is filtered through Boolean to drop null nodes (deleted/inaccessible products); the returned shape (p.variants.edges[].node) must match what /labels and handleLabelsPdf consume.
-async function getProductsForLabels(ids) {
+async function getProductsForLabels(ids, searchText = '') {
   if (MOCK) {
     if (ids && ids.length) return MOCK_LABEL_PRODUCTS.filter(p => ids.includes(shopifyNumericId(p.id)));
     return MOCK_LABEL_PRODUCTS;
   }
-  // The "From Products" tab passes null (whole catalog). Live used to call null.map and 500 every
-  // time — MOCK returned early so no test saw it (found seeding the dev store, 2026-10-22).
+  // No id list = the 'From Products' search tab. It used to fall through to ids.map and 500 on every live search.
+  // CHANGE-GUARD: capped at first:50 matches (Shopify default search on the sanitised text); the /labels route still
+  // applies its own title/handle filter on top, so a broader Shopify match never widens what is shown.
+  // SYNC: product node shape here must match the ids-path query below (both feed /labels and handleLabelsPdf).
   if (!ids || !ids.length) {
-    const all = await shopifyFetch(`
-      query{products(first:100,sortKey:TITLE){nodes{
+    const term = String(searchText || '').replace(/[^\p{L}\p{N} _-]/gu, ' ').trim();
+    const found = await shopifyFetch(`
+      query($q:String){products(first:50, query:$q){nodes{
         id handle title vendor productType tags
         variants(first:30){edges{node{id title sku price compareAtPrice barcode inventoryQuantity}}}
-      }}}`);
-    return all.data?.products?.nodes || [];
+      }}}`, { q: term || null });
+    return (found.data?.products?.nodes || []).filter(Boolean);
   }
   const gids = ids.map(id => `gid://shopify/Product/${id}`);
   const result = await shopifyFetch(`
@@ -10437,7 +10460,7 @@ app.get('/labels', requireAuth, async (req, res) => {
 
   if (source === 'products') {
     const q = queryQ.toLowerCase();
-    const rawProducts = await getProductsForLabels(null);
+    const rawProducts = await getProductsForLabels(null, queryQ);
     const filtered = q
       ? rawProducts.filter(p => p.title.toLowerCase().includes(q) || (p.handle || '').includes(q))
       : rawProducts;

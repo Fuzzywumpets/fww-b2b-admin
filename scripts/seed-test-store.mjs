@@ -59,12 +59,14 @@ export const SEED_PRODUCTS = [
     { opt: ['Green'], sku: 'SEED-ROPE-G', price: '9.50', barcode: '', qty: 10 } ] },
 ];
 
-// [customer email, [[sku, qty]...], paid?]
+// [order name, customer email, [[sku, qty]...], paid?]. Order ids change on every reset; the NAMES do not,
+// so Gauntlet workflows reach an order by its exact link text.
+// DEPENDS: docs/gauntlet/b2badmin-test.app-scope.json clicks text="<name>" for these four.
 export const SEED_ORDERS = [
-  ['champdog@seed.test', [['SEED-BEAR-S', 6], ['SEED-ROPE-R', 12]], true],   // cancel, refund ON
-  ['champdog@seed.test', [['SEED-BEAR-L', 2]], true],                        // cancel, refund OFF
-  ['filled@seed.test', [['SEED-ROPE-B', 10], ['SEED-BEAR-S', 3]], false],    // pending (invoice)
-  ['blank@seed.test', [['SEED-ROPE-R', 4], ['SEED-ROPE-B', 4]], true],       // order edit / note
+  ['#S-REFUND', 'champdog@seed.test', [['SEED-BEAR-S', 6], ['SEED-ROPE-R', 12]], true],   // cancel, refund ON
+  ['#S-NOREFUND', 'champdog@seed.test', [['SEED-BEAR-L', 2]], true],                      // cancel, refund OFF
+  ['#S-PENDING', 'filled@seed.test', [['SEED-ROPE-B', 10], ['SEED-BEAR-S', 3]], false],   // pending (invoice)
+  ['#S-EDIT', 'blank@seed.test', [['SEED-ROPE-R', 4], ['SEED-ROPE-B', 4]], true],         // order edit / note
 ];
 
 export function upsertEnvLine(text, key, value) {
@@ -163,11 +165,11 @@ async function upsertProduct(gql, p, locationId, publicationIds) {
   return product.variants.nodes;
 }
 
-async function createOrder(gql, customerId, email, lines, variantsBySku, paid) {
+async function createOrder(gql, name, customerId, email, lines, variantsBySku, paid) {
   const lineItems = lines.map(([sku, quantity]) => ({ variantId: variantsBySku[sku].id, quantity }));
   const total = lines.reduce((s, [sku, q]) => s + Number(variantsBySku[sku].price) * q, 0).toFixed(2);
   const order = {
-    customer: { toAssociate: { id: customerId } }, email, lineItems, tags: ['b2b-portal', SEED_TAG],
+    name, customer: { toAssociate: { id: customerId } }, email, lineItems, tags: ['b2b-portal', SEED_TAG],
     currency: 'USD', financialStatus: paid ? 'PAID' : 'PENDING',
     ...(paid ? { transactions: [{ kind: 'SALE', status: 'SUCCESS', gateway: 'manual',
       amountSet: { shopMoney: { amount: total, currencyCode: 'USD' } } }] } : {}),
@@ -219,8 +221,8 @@ export async function seed({ bridgeUrl, bearer, publicationId: publicationId0, l
     log(`product ${p.handle}`);
   }
   const orders = [];
-  for (const [email, lines, paid] of SEED_ORDERS) {
-    const o = await createOrder(gql, customers[email], email, lines, variantsBySku, paid);
+  for (const [name, email, lines, paid] of SEED_ORDERS) {
+    const o = await createOrder(gql, name, customers[email], email, lines, variantsBySku, paid);
     orders.push(o);
     log(`order ${o.name} ${o.id} (${paid ? 'paid' : 'pending'})`);
   }
