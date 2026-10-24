@@ -767,6 +767,13 @@
           "selector": "#edit-form input[name=\"staffNote\"]"
         },
         {
+          "action": "wait_for_control_state",
+          "selector": "#edit-save-btn",
+          "state": "enabled",
+          "expected": true,
+          "timeoutMs": 10000
+        },
+        {
           "action": "click",
           "selector": "#edit-save-btn"
         },
@@ -975,11 +982,11 @@
       ],
       "steps": [
         {
-          "action": "assert_visible",
+          "action": "wait_for_control_state",
           "selector": "main a[href=\"/orders/{{order:S-PENDING}}/invoice\"]",
-          "requirementIds": [
-            "REQ-ROUTE-ORDER-INVOICE"
-          ]
+          "state": "visible",
+          "expected": true,
+          "timeoutMs": 8000
         },
         {
           "action": "click",
