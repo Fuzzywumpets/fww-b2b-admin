@@ -1655,7 +1655,9 @@ function layout({ title, session, activePath = '/', content, extraHead = '' }) {
       </details>
       <div class="header-user">
         <span class="user-email">${h(session?.email || '')}</span>
-        <a href="/login" id="signout-link" class="btn-signout" role="button">Sign out</a>
+        <!-- A button, not a link to the login page: that href never signed anyone out (GET /login just bounces a live
+             session to /), so without the click handler below it was a link that lied. -->
+        <button type="button" id="signout-link" class="btn-signout">Sign out</button>
       </div>
     </div>
   </header>
@@ -1947,7 +1949,7 @@ function renderDashboard(session, data) {
   const lowStockTable = data.lowStockItems?.length > 0
     ? `<table class="mini-table"><thead><tr><th>Product / Variant</th><th>SKU</th><th>Qty</th></tr></thead><tbody>
       ${data.lowStockItems.map(item => `<tr class="${item.qty===0?'row-critical':item.qty<=3?'row-warning':''}">
-        <td><a href="/catalog/${shopifyNumericId(item.productId)}">${h(item.productTitle)}</a>
+        <td><a href="/products/${shopifyNumericId(item.productId)}">${h(item.productTitle)}</a>
           ${item.variantTitle && item.variantTitle !== 'Default Title' ? `<small>${h(item.variantTitle)}</small>` : ''}</td>
         <td class="mono">${h(item.sku||'—')}</td>
         <td class="${item.qty===0?'qty-zero':item.qty<=3?'qty-critical':'qty-low'}">${item.qty}</td>
@@ -9331,7 +9333,7 @@ function renderCatalog(session, data, filters) {
     const rowClass = pStatus === 'archived' ? ' class="row-archived"' : '';
     return `<tr data-id="${h(numId)}"${rowClass}>
       <td><label class="check-hit"><input type="checkbox" name="ids" value="${h(numId)}" class="row-check" onchange="updateBulkBar()" aria-label="Select product ${h(p.title)}"></label></td>
-      <td><a href="/catalog/${h(numId)}" class="link-primary">${h(p.title)}</a>${statusBadge}</td>
+      <td><a href="/products/${h(numId)}" class="link-primary">${h(p.title)}</a>${statusBadge}</td>
       <td class="text-muted">${h(p.vendor||'—')}</td>
       <td>${style ? `<span class="tag-chip">${h(style)}</span>` : '—'}</td>
       <td class="mono text-sm">${variants.map(e => h(e.node.sku||'—')).join('<br>')}</td>
@@ -9404,7 +9406,8 @@ app.get('/catalog', requireAuth, async (req, res) => {
 });
 
 // WHAT: legacy alias — 301-style redirect from /catalog/:id to the canonical /products/:id detail page.
-// INVARIANT(S): keep this redirect so old catalog links and the row-action hrefs (/catalog/<id>) still resolve.
+// INVARIANT(S): keep this redirect so old bookmarks to /catalog/<id> still resolve. In-app links (catalog rows,
+// dashboard low-stock) point straight at /products/<id>: a redirect hop is a failed route for Gauntlet's sweep.
 app.get('/catalog/:id', requireAuth, async (req, res) => {
   res.redirect(`/products/${req.params.id}`);
 });
@@ -9822,7 +9825,7 @@ function renderReports(session, data) {
     <div class="report-section">
       <div class="report-section-header">
         <h2>Monthly Revenue (last 12 months)</h2>
-        <a href="/reports/csv/monthly" class="btn btn-ghost btn-sm">↓ CSV</a>
+        <a href="/reports/csv/monthly" download class="btn btn-ghost btn-sm">↓ CSV</a>
       </div>
       <div class="chart-container">${chart}</div>
       <table class="data-table data-table-sm">
@@ -9841,7 +9844,7 @@ function renderReports(session, data) {
     <div class="report-section">
       <div class="report-section-header">
         <h2>Sales by Customer (top ${customers?.length||0})</h2>
-        <a href="/reports/csv/customers" class="btn btn-ghost btn-sm">↓ CSV</a>
+        <a href="/reports/csv/customers" download class="btn btn-ghost btn-sm">↓ CSV</a>
       </div>
       <table class="data-table data-table-sm">
         <thead><tr><th>#</th><th>Customer</th><th>Revenue</th><th>Orders</th><th>AOV</th><th>Trend</th></tr></thead>
@@ -9852,7 +9855,7 @@ function renderReports(session, data) {
     <div class="report-section">
       <div class="report-section-header">
         <h2>Sales by Product (top ${products?.length||0})</h2>
-        <a href="/reports/csv/products" class="btn btn-ghost btn-sm">↓ CSV</a>
+        <a href="/reports/csv/products" download class="btn btn-ghost btn-sm">↓ CSV</a>
       </div>
       <table class="data-table data-table-sm">
         <thead><tr><th>#</th><th>Product</th><th>SKU</th><th>Revenue</th><th>Units</th><th>Avg Price</th></tr></thead>
@@ -11230,8 +11233,12 @@ function renderLeadDetail(session, { lead, notes, history, flash, existingInvite
             ${appRow('Products of interest', application && application.products)}
             ${application && application.submittedAt ? `<div class="kv-row"><span>Submitted</span><strong class="text-muted">${fmtDate(new Date(application.submittedAt).toISOString())}</strong></div>` : ''}
             <div class="kv-row"><span>Sales tax exemption</span><strong>${
+              // DEPENDS: GET /leads/:id/tax-doc answers 503 without PORTAL_INTERNAL_TOKEN (the TEST copy has none), so
+              // only link it when the proxy can actually fetch the PDF.
               application && application.hasTaxExemptDoc
-                ? `<a href="/leads/${lead.id}/tax-doc" target="_blank" rel="noopener noreferrer" class="link">View document →</a>`
+                ? (PORTAL_INTERNAL_TOKEN
+                  ? `<a href="/leads/${lead.id}/tax-doc" target="_blank" rel="noopener noreferrer" class="link">View document →</a>`
+                  : '<span class="text-muted">Provided (portal link not configured here)</span>')
                 : '<span class="text-muted">Not provided</span>'
             }</strong></div>
           </div>
