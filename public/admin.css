@@ -164,6 +164,10 @@ body {
 
 .btn-signout {
   text-decoration: none;
+  background: none;
+  font-family: inherit;
+  line-height: inherit;
+  cursor: pointer;
   font-size: 0.8125rem;
   color: var(--gray-400);
   padding: 0.25rem 0.625rem;
