@@ -2963,10 +2963,19 @@ function renderOrderDetail(session, order, flash, flashMsg, { resumeEdit = false
   //   where it was in the viewport (the offset stashed by rememberEditMode, which stays correct even though the
   //   flash banner above the card has changed height; without a stash the #line-items anchor is the fallback),
   //   and removes `edit` from the address bar so a later manual refresh is an ordinary view-mode load.
+  //   It ALSO keeps the result of the action visible (pinFlash): the flash banner sits above the Line Items card,
+  //   so after the restore it is thousands of px off screen on a long order (2026-10-26 verifier: a refused
+  //   backorder on row 60 of 116 left the banner at y=-3160 and the screen looked unchanged). When any flash banner is
+  //   not fully inside the viewport, a copy is shown in a fixed strip under the header (#flash-pin, styled in the
+  //   page <style>); the scroll anchor above is NOT touched, so the user stays at the row they were editing.
   // CHANGE-GUARD: emitted ONLY when the request carried ?edit=1 (renderOrderDetail's resumeEdit) — a normal load
   //   gets no script and no edit mode. The restore runs again on window load because the browser also scrolls to
   //   the #line-items fragment around then; a real user scroll (wheel / touch / key / pointer) cancels it.
-  // DEPENDS: toggleEditMode() and rememberEditMode()'s stash key (EDIT_STASH_KEY) from editModeScript above.
+  //   The pin hides itself the moment the real banner is in view (user scrolled up), can be dismissed, and a
+  //   success-only pin leaves by itself after 10 s; a warning/error pin stays until dismissed or the banner is seen.
+  // DEPENDS: toggleEditMode() and rememberEditMode()'s stash key (EDIT_STASH_KEY) from editModeScript above; the
+  //   flash banners are the `.alert` siblings after `.breadcrumb-row` (flashHtml below renders them there); the sticky
+  //   `.admin-header` (admin.css) sets the strip's floor.
   const resumeEditScript = !resumeEdit ? '' : `<script>
   (function () {
     var wantTop = null, userScrolled = false;
@@ -2983,6 +2992,29 @@ function renderOrderDetail(session, order, flash, flashMsg, { resumeEdit = false
       if (wantTop === null || userScrolled || !card) return;
       window.scrollTo(0, window.pageYOffset + card.getBoundingClientRect().top - wantTop);
     }
+    var pinDismissed = false;
+    function pinFlash() {
+      var banners = Array.prototype.slice.call(document.querySelectorAll('.breadcrumb-row ~ .alert'));
+      if (!banners.length) return;
+      var pin = document.getElementById('flash-pin');
+      var header = document.querySelector('.admin-header');
+      var floor = header ? header.getBoundingClientRect().bottom : 0;
+      var seen = banners.every(function (b) { var r = b.getBoundingClientRect(); return r.top >= floor - 1 && r.bottom <= window.innerHeight + 1; });
+      if (seen || pinDismissed) { if (pin) pin.hidden = true; return; }
+      if (!pin) {
+        pin = document.createElement('div'); pin.id = 'flash-pin'; pin.setAttribute('role', 'status');
+        banners.forEach(function (b) { pin.appendChild(b.cloneNode(true)); });
+        var x = document.createElement('button'); x.type = 'button'; x.className = 'flash-pin-x';
+        x.setAttribute('aria-label', 'Dismiss message'); x.textContent = '×';
+        x.addEventListener('click', function () { pinDismissed = true; pin.hidden = true; });
+        pin.appendChild(x);
+        document.body.appendChild(pin);
+        if (banners.every(function (b) { return b.classList.contains('alert-success'); })) {
+          setTimeout(function () { pinDismissed = true; pin.hidden = true; }, 10000);
+        }
+      }
+      pin.hidden = false;
+    }
     function resume() {
       toggleEditMode(true);
       try {
@@ -2990,9 +3022,12 @@ function renderOrderDetail(session, order, flash, flashMsg, { resumeEdit = false
         history.replaceState(history.state, '', u.pathname + u.search + u.hash);
       } catch (e) { /* cosmetic only */ }
       restore();
+      pinFlash();
     }
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', resume); else resume();
-    window.addEventListener('load', restore);
+    window.addEventListener('load', function () { restore(); pinFlash(); });
+    window.addEventListener('scroll', pinFlash, { passive: true });
+    window.addEventListener('resize', pinFlash);
   })();
   </script>`;
 
@@ -3129,6 +3164,17 @@ function renderOrderDetail(session, order, flash, flashMsg, { resumeEdit = false
       tbody.bo-struck .bo-tag { margin-left: 4px; vertical-align: middle; }
       /* Phone: the Undo button is the one control on a struck row, so give it a real tap target. */
       @media (max-width: 600px) { tbody.bo-struck .bo-undo-btn { min-height: 36px; padding: 0.5rem 0.875rem; } }
+      /* FLASH PIN: a copy of the flash banner(s) in a fixed strip under the sticky header, built by resumeEditScript ONLY
+         when the real banner is out of the viewport (an action taken deep in a long order puts the page back at that row,
+         thousands of px below the banner). The original banners are untouched. z-index 150: above the sticky header (100)
+         so it is never hidden by it, below the modals (200).
+         SYNC: ids/classes flash-pin / flash-pin-x are created by resumeEditScript's pinFlash() and asserted in test/ui.test.mjs. */
+      #flash-pin { position: fixed; z-index: 150; top: calc(var(--header-h, 52px) + 8px); left: 50%; transform: translateX(-50%); width: min(720px, calc(100vw - 16px)); max-height: 45vh; overflow-y: auto; background: #fff; border-radius: var(--radius, 6px); box-shadow: 0 6px 24px rgba(0,0,0,.22); }
+      #flash-pin[hidden] { display: none; }
+      #flash-pin .alert { margin: 0; padding-right: 2.75rem; border-radius: 0; }
+      #flash-pin .alert + .alert { border-top-width: 0; }
+      #flash-pin .flash-pin-x { position: absolute; top: 2px; right: 2px; width: 36px; height: 36px; padding: 0; border: 0; background: transparent; color: inherit; font-size: 22px; line-height: 1; cursor: pointer; }
+      @media print { #flash-pin { display: none; } }
     </style>
     ${visibleNotesScript}
     ${editModeScript}

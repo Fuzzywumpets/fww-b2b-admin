@@ -2530,6 +2530,160 @@ await test('STAY IN EDIT MODE: the B2B-only note form (reachable while editing) 
   assert.ok(!/edit=1/.test(page.url()) && !page.url().includes('#'), page.url());
 });
 
+// ── THE FLASH BANNER STAYS ON SCREEN after an edit-mode action taken deep in a long order ────────────────────────
+// 2026-10-26 round-2 verifier: the resume script puts the Line Items card back where it was in the viewport, which on
+// the real 116-live-line order #39875 is thousands of px BELOW the flash banner (it sits above the card) - after a
+// refused backorder on row 60 the banner was at y=-3160 and the screen looked unchanged. The result of the action must
+// be on screen while the user stays at the row they were editing.
+// The mock orders are short, so the test makes one long: 120 filler rows go in front of the real lines on EVERY load of
+// the page (an init script that runs before the page's own scripts), then the target line is ~6000px down.
+// SYNC: server.mjs resumeEditScript pinFlash() + the #flash-pin / .flash-pin-x CSS in renderOrderDetail's <style>.
+console.log('\nUI tests — the flash banner is on screen after an edit-mode action (deep rows, desktop and 390px):');
+
+async function makeOrderLong(page, rows = 120) {
+  await page.addInitScript((n) => {
+    document.addEventListener('DOMContentLoaded', () => {
+      const body = document.querySelector('#edit-form tbody:not(.bo-struck)');
+      if (!body) return;
+      for (let i = 0; i < n; i++) {
+        const tr = document.createElement('tr'); tr.className = 'qa-filler';
+        const td = document.createElement('td'); td.colSpan = 12; td.style.height = '48px'; td.textContent = 'filler line ' + i;
+        tr.appendChild(td); body.insertBefore(tr, body.firstChild);
+      }
+    });
+  }, rows);
+}
+// True when a flash banner whose text matches `re` - the real one or the pinned copy - is FULLY inside the viewport, below
+// the sticky header, and not covered by anything: the element at its centre is the banner itself.
+const flashOnScreen = (page, re) => page.evaluate((src) => {
+  const rx = new RegExp(src);
+  const header = document.querySelector('.admin-header');
+  const floor = header ? header.getBoundingClientRect().bottom : 0;
+  return [...document.querySelectorAll('.alert')].some(el => {
+    if (!rx.test(el.innerText)) return false;
+    const r = el.getBoundingClientRect();
+    if (r.height === 0 || r.top < floor - 1 || r.bottom > window.innerHeight + 1 || r.left < 0 || r.right > window.innerWidth + 1) return false;
+    const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+    return !!hit && el.contains(hit);
+  });
+}, re.source);
+const pinShown = page => page.evaluate(() => { const p = document.getElementById('flash-pin'); return !!p && !p.hidden && p.getBoundingClientRect().height > 0; });
+// The pin follows the SCROLL position, and scroll events are delivered on the next frame, so after scrolling the test
+// waits for the pin to settle in the state it expects instead of reading it in the same tick.
+const pinSettles = (page, want) => page.waitForFunction((w) => {
+  const p = document.getElementById('flash-pin'); return (!!p && !p.hidden && p.getBoundingClientRect().height > 0) === w;
+}, want, { timeout: 3000 }).then(() => true, () => false);
+const realBannerBottom = page => page.evaluate(() => document.querySelector('.breadcrumb-row ~ .alert').getBoundingClientRect().bottom);
+
+// Submit a refused backorder on the first live (deep) line, then check what the user sees.
+async function deepRefusedBackorder(page, ctx, label) {
+  await makeOrderLong(page);
+  await openEditMode(page, ctx, 1002);
+  const btn = boTarget(page).locator('.bo-action-btn');
+  await btn.scrollIntoViewIfNeeded();
+  await btn.click();
+  const depth = await page.evaluate(() => window.pageYOffset);
+  assert.ok(depth > 4000, `${label}: the target line really is deep (${depth}px down)`);
+  await page.evaluate(() => { const q = document.getElementById('bo-quantity'); q.removeAttribute('max'); q.value = '99999'; });
+  const topBefore = await cardTop(page);
+  await Promise.all([page.waitForURL(/error=backorder_shopify_failed/), page.click('#bo-submit')]);
+  await assertFullyEditable(page, `${label}: after the refused deep backorder`);
+  assert.ok(await realBannerBottom(page) < 0, `${label}: premise - the real banner IS above the viewport (bottom ${await realBannerBottom(page)})`);
+  assert.equal(await flashOnScreen(page, /Backorder action failed/), true, `${label}: the error is on screen`);
+  assert.equal(await pinShown(page), true, `${label}: shown through the pinned strip`);
+  assert.ok(Math.abs(await cardTop(page) - topBefore) <= 2, `${label}: the scroll anchor still holds, the user stays at the row (${topBefore} -> ${await cardTop(page)})`);
+  return { topBefore };
+}
+// Same, for a SUCCESS flash: the B2B-only note form sits below the (long) table.
+async function deepNoteSaved(page, ctx, label) {
+  await makeOrderLong(page);
+  await openEditMode(page, ctx, 1002);
+  const note = page.locator('#internal-note-card textarea[name="note"]');
+  await note.scrollIntoViewIfNeeded();
+  await note.fill('');
+  const depth = await page.evaluate(() => window.pageYOffset);
+  assert.ok(depth > 4000, `${label}: the note form really is deep (${depth}px down)`);
+  const topBefore = await cardTop(page);
+  await Promise.all([page.waitForURL(/success=local_note_saved/), page.locator('#internal-note-card button[type="submit"]').click()]);
+  await assertFullyEditable(page, `${label}: after the deep note save`);
+  assert.ok(await realBannerBottom(page) < 0, `${label}: premise - the real banner IS above the viewport`);
+  assert.equal(await flashOnScreen(page, /B2B Admin-only note saved/), true, `${label}: the success flash is on screen`);
+  assert.ok(Math.abs(await cardTop(page) - topBefore) <= 2, `${label}: the scroll anchor still holds (${topBefore} -> ${await cardTop(page)})`);
+}
+
+await test('FLASH VISIBLE (desktop): a refused backorder on a DEEP row shows its error on screen, keeps the row anchor, goes away when dismissed or when the real banner is reached', async (page, ctx) => {
+  await page.setViewportSize({ width: 1100, height: 700 });
+  await deepRefusedBackorder(page, ctx, 'desktop');
+  await boShot(page, 'flash-desktop-1-deep-refused');
+  // The strip never sits under the sticky header and stays inside the window.
+  const box = await page.locator('#flash-pin').boundingBox();
+  const header = await page.locator('.admin-header').boundingBox();
+  assert.ok(box.y >= header.y + header.height, `below the header (${box.y} vs ${header.y + header.height})`);
+  assert.ok(box.x >= 0 && box.x + box.width <= 1100, 'inside the window horizontally');
+  // The original banner is still in the page, untouched (the pin is a copy).
+  assert.equal(await page.locator('.breadcrumb-row ~ .alert').count(), 1);
+  assert.match(await page.locator('.breadcrumb-row ~ .alert').first().innerText(), /^Backorder action failed — \S/);
+  // Scrolling to the real banner retires the copy (no duplicate once the original can be read) ...
+  await page.evaluate(() => window.scrollTo(0, 0));
+  assert.equal(await pinSettles(page, false), true, 'the pin steps aside once the real banner is in view');
+  assert.equal(await flashOnScreen(page, /Backorder action failed/), true, 'and the real one is on screen');
+  // ... and it comes back when the user returns to the row, until dismissed.
+  await page.evaluate(() => window.scrollTo(0, 5000));
+  assert.equal(await pinSettles(page, true), true, 'back deep: the pin is back');
+  await page.locator('#flash-pin .flash-pin-x').click();
+  assert.equal(await pinShown(page), false, 'dismissed');
+  await page.evaluate(() => window.scrollBy(0, 40));
+  await page.waitForTimeout(250);
+  assert.equal(await pinShown(page), false, 'and it stays dismissed');
+});
+
+await test('FLASH VISIBLE (desktop): a SUCCESS flash after an action deep in the order is on screen too', async (page, ctx) => {
+  await page.setViewportSize({ width: 1100, height: 700 });
+  await deepNoteSaved(page, ctx, 'desktop');
+  assert.equal(await pinShown(page), true);
+  assert.equal(await page.locator('#flash-pin .alert-success').count(), 1, 'the copy keeps the success styling');
+});
+
+await testMobile('FLASH VISIBLE at 390px: a refused backorder on a DEEP row shows its error inside the phone viewport and adds no sideways scroll', async (page, ctx) => {
+  await deepRefusedBackorder(page, ctx, '390px');
+  await boShot(page, 'flash-mobile-1-deep-refused');
+  const box = await page.locator('#flash-pin').boundingBox();
+  assert.ok(box.x >= 0 && box.x + box.width <= 390, `the strip fits the phone width (${box.x}..${box.x + box.width})`);
+  assert.ok(box.y + box.height <= 844, 'and its height');
+  // The order page already scrolls sideways at 390px (its header action buttons are wider than the phone - not part of
+  // this fix), so the check is that the strip ADDS nothing: the page is exactly as wide with it hidden as with it shown.
+  const widths = await page.evaluate(() => {
+    const p = document.getElementById('flash-pin'); const shown = document.documentElement.scrollWidth;
+    p.hidden = true; const hidden = document.documentElement.scrollWidth; p.hidden = false;
+    return { shown, hidden };
+  });
+  assert.equal(widths.shown, widths.hidden, `the pinned strip adds no page width (${widths.shown} vs ${widths.hidden})`);
+  const x = await page.locator('#flash-pin .flash-pin-x').boundingBox();
+  assert.ok(x.width >= 36 && x.height >= 36, `the dismiss button is a real tap target (${x.width}x${x.height})`);
+  await page.locator('#flash-pin .flash-pin-x').click();
+  assert.equal(await pinShown(page), false, 'dismissed');
+});
+
+await testMobile('FLASH VISIBLE at 390px: a SUCCESS flash after an action deep in the order is inside the phone viewport', async (page, ctx) => {
+  await deepNoteSaved(page, ctx, '390px');
+  await boShot(page, 'flash-mobile-2-deep-success');
+  const box = await page.locator('#flash-pin').boundingBox();
+  assert.ok(box.x >= 0 && box.x + box.width <= 390, 'the strip fits the phone width');
+});
+
+await test('FLASH VISIBLE: a SHORT order is unchanged - once the banner is in view there is no extra strip', async (page, ctx) => {
+  await boLogin(ctx);
+  await page.goto(`${BASE}/orders/1002?error=backorder_shopify_failed&msg=nope&edit=1`);
+  await page.waitForSelector('#edit-form');
+  assert.equal(await inEditMode(page), true);
+  await page.evaluate(() => window.scrollTo(0, 0));
+  assert.equal(await flashOnScreen(page, /Backorder action failed/), true);
+  assert.equal(await pinShown(page), false, 'no duplicate strip while the real banner is readable');
+  // A normal (non-resume) load never gets the pin machinery at all.
+  await page.goto(`${BASE}/orders/1002?error=backorder_shopify_failed&msg=nope`);
+  assert.equal(await page.locator('#flash-pin').count(), 0);
+});
+
 await browser.close();
 
 console.log(`\n  ${passed} passed, ${failed} failed`);
