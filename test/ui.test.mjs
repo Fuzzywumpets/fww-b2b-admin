@@ -1891,6 +1891,337 @@ await test('a committed removal LOCKS its row — no un-toggle, no editable inpu
   assert.equal(await unloadBlocked(page), false);
 });
 
+// ── Backorder = REMOVE the units from the Shopify order; the order page keeps them as a struck row + Undo ──
+// (2026-10-26 hot-fix.) These drive the MOCK adapters, which run the real routes and the real
+// lib/backorder-edit.mjs state machine against an in-memory order. The target is #1002: one live line, and no
+// other UI test touches it. Every flow ends by undoing what it flagged, so the order is left as it was found
+// (a full-line Undo re-adds the line as a NEW line — Shopify cannot un-remove one — so the line's id changes
+// but its title, quantity and price do not). Set UI_SHOT_DIR to also write screenshots of each state there.
+// SYNC: the class names bo-struck / bo-struck-row / bo-struck-text / bo-tag / bo-undo-btn, the ids bo-form /
+//   bo-submit / bo-quantity / bo-idem-key / bo-undo-form and the flash codes are the markup contract of
+//   server.mjs renderOrderDetail (backorderedRowsHtml + the Backorder modal).
+console.log('\nUI tests — backorder: units leave the Shopify order, struck row + Undo on the order page:');
+
+const SHOT_DIR = process.env.UI_SHOT_DIR || '';
+async function boShot(target, name, opts = {}) { if (SHOT_DIR) await target.screenshot({ path: `${SHOT_DIR}/${name}.png`, ...opts }); }
+const boLiveRows = page => page.locator('#edit-form tbody:not(.bo-struck) tr[data-existing="1"]');
+const boStruckRows = page => page.locator('#edit-form tbody.bo-struck tr.bo-struck-row');
+// The first live line that is not the hostile-title fixture a previous run of this file may have left behind.
+const boTarget = page => boLiveRows(page).filter({ hasNotText: 'EVIL-1' }).first();
+async function boLogin(ctx) {
+  await ctx.addCookies([{ name: 'b2b_admin_sid', value: await seedSession(), domain: '127.0.0.1', path: '/' }]);
+}
+const boMoney = s => parseFloat(String(s).replace(/[^0-9.\-]/g, ''));
+
+await test('backorder modal says what the click does, caps quantity at the line, and mints a fresh idemKey on every open', async (page, ctx) => {
+  await openEditMode(page, ctx, 1002);
+  const btn = boTarget(page).locator('.bo-action-btn');
+  // The line button is unchanged: same label, same class (it is revealed by the edit-mode toggle).
+  assert.equal((await btn.textContent()).trim(), '⚑ Mark backordered');
+  assert.match(await btn.getAttribute('class'), /^edit-remove-btn bo-action-btn$/);
+  const liId = await btn.getAttribute('data-li-id');
+  const qty = await btn.getAttribute('data-li-qty');
+
+  await btn.click();
+  const modal = page.locator('#backorder-modal');
+  await modal.waitFor({ state: 'visible' });
+  const copy = await modal.innerText();
+  assert.match(copy, /removed from the Shopify order/i, 'must say the units LEAVE the Shopify order');
+  assert.match(copy, /its total/i, 'must say the order total drops');
+  assert.match(copy, /crossed out/i, 'must say it stays on the invoice crossed out');
+  assert.match(copy, /footnote/i);
+  assert.match(copy, /Undo backorder/, 'must say it can be undone');
+  assert.ok(!/\bETA\b|ship date/i.test(copy), 'the modal asks for no expected ship date (removed by owner decision)');
+  assert.equal(await modal.locator('input[name="eta"], input[type="date"]').count(), 0, 'no date field in the backorder modal');
+  assert.equal(await page.inputValue('#bo-li-id'), liId);
+  assert.equal(await page.inputValue('#bo-quantity'), qty, 'defaults to the whole line');
+  assert.equal(await page.getAttribute('#bo-quantity', 'max'), qty, 'max is the line CURRENT quantity');
+  assert.equal(await page.getAttribute('#bo-quantity', 'min'), '1');
+  assert.equal((await page.textContent('#bo-max-qty')).trim(), qty);
+  assert.equal(await page.isDisabled('#bo-submit'), false);
+
+  // One more than is on the order is refused by the browser before anything is sent.
+  await page.fill('#bo-quantity', String(Number(qty) + 1));
+  assert.equal(await page.$eval('#bo-quantity', el => el.validity.rangeOverflow), true, 'above the line quantity must not validate');
+  await page.fill('#bo-quantity', '0');
+  assert.equal(await page.$eval('#bo-quantity', el => el.validity.rangeUnderflow), true, 'zero must not validate');
+
+  // A fresh double-submit token each time the modal opens.
+  const k1 = await page.inputValue('#bo-idem-key');
+  assert.match(k1, /^[A-Za-z0-9_-]{8,80}$/, 'idemKey must satisfy the server-side token regex');
+  await modal.locator('button:has-text("Cancel")').click();
+  await modal.waitFor({ state: 'hidden' });
+  await btn.click();
+  const k2 = await page.inputValue('#bo-idem-key');
+  assert.notEqual(k1, k2, 'a re-opened modal is a new request, not a replay of the last token');
+  assert.equal(await page.inputValue('#bo-quantity'), qty, 're-opening resets the quantity');
+
+  // Submit disables the button (so a double click cannot send it twice). The submit itself is stopped here so
+  // nothing is changed on the order; the disabling listener is document-level and still runs.
+  await page.evaluate(() => document.getElementById('bo-form').addEventListener('submit', e => e.preventDefault()));
+  await page.fill('#bo-quantity', qty);
+  await page.click('#bo-submit');
+  assert.equal(await page.isDisabled('#bo-submit'), true, 'the submit button must disable on submit');
+  await page.keyboard.press('Escape');
+  await btn.click();
+  assert.equal(await page.isDisabled('#bo-submit'), false, 're-opening re-arms the submit button');
+  assert.equal((await page.textContent('#bo-submit')).trim(), 'Remove from order and mark backordered');
+});
+
+await test('Mark backordered removes the line from the order page and leaves a struck row; Undo puts it back', async (page, ctx) => {
+  await openEditMode(page, ctx, 1002);
+  const live = boTarget(page);
+  const btn = live.locator('.bo-action-btn');
+  const liId = await btn.getAttribute('data-li-id');
+  const title = await btn.getAttribute('data-li-title');
+  const qty = await btn.getAttribute('data-li-qty');
+  const subtotalBefore = boMoney(await page.locator('.totals-block .totals-row').first().locator('span').last().textContent());
+
+  await btn.click();
+  await boShot(page, 'desktop-1-modal');
+  await Promise.all([page.waitForURL(/success=backorder_flagged/), page.click('#bo-submit')]);
+
+  // Flash.
+  const flash = await page.locator('.alert-success').first().innerText();
+  assert.match(flash, /Marked as backordered/);
+  assert.match(flash, /removed from the Shopify order/);
+
+  // The live row is gone; a struck row took its place.
+  assert.equal(await page.locator(`#edit-form tr[data-li-id="${liId}"]`).count(), 0, 'the removed line must not render as a live row');
+  const struck = boStruckRows(page);
+  assert.equal(await struck.count(), 1, 'exactly one struck row for the one backordered line');
+  const text = await struck.innerText();
+  assert.ok(text.includes(title), `struck row shows the title (${title})`);
+  assert.ok(/Backordered/i.test(await struck.locator('.bo-tag').innerText()), 'carries a "Backordered" tag');
+  assert.ok(new RegExp(`\\b${qty}\\b`).test(text), 'shows the quantity');
+  assert.match(text, /\$\d[\d,]*\.\d{2}/, 'shows the B2B unit price and the line total');
+  assert.ok(!/\bETA\b|ship date/i.test(text), 'the struck row shows no expected ship date (removed by owner decision)');
+  const decoration = await struck.locator('.bo-struck-text').first().evaluate(el => getComputedStyle(el).textDecorationLine);
+  assert.equal(decoration, 'line-through');
+  assert.equal(await struck.locator('.bo-tag').evaluate(el => getComputedStyle(el).textDecorationLine), 'none', 'the tag is not crossed out');
+  const undo = struck.locator('.bo-undo-btn');
+  assert.equal((await undo.textContent()).trim(), 'Undo backorder');
+  const subtotalAfter = boMoney(await page.locator('.totals-block .totals-row').first().locator('span').last().textContent());
+  assert.ok(subtotalAfter < subtotalBefore, `the order subtotal must drop (${subtotalBefore} -> ${subtotalAfter}); the struck row is not part of it`);
+  const totalsAfter = await page.locator('.totals-block').innerText();
+  await boShot(page, 'desktop-2-flagged', { fullPage: true });
+
+  // Inert for the edit machinery: no line id, no inputs, no edit controls, no save chip — and its Undo form
+  // lives OUTSIDE the edit form, so nothing here can ride along with a Save.
+  assert.equal(await struck.getAttribute('data-li-id'), null);
+  assert.equal(await page.locator('tbody.bo-struck [data-li-id], tbody.bo-struck [data-existing], tbody.bo-struck [data-removed]').count(), 0);
+  assert.equal(await struck.locator('input, select, textarea, .edit-qty-input, .edit-price-input, .edit-remove-btn, .row-save-chip').count(), 0);
+  assert.equal(await page.evaluate(() => !!document.getElementById('bo-undo-form') && document.getElementById('bo-undo-form').closest('#edit-form') === null), true);
+
+  // Entering and leaving edit mode must not touch it, dim it, or change the totals.
+  await page.click('#edit-btn');
+  await page.waitForSelector('#edit-save-bar', { state: 'visible' });
+  assert.equal(await undo.isVisible(), true, 'Undo stays visible in edit mode');
+  assert.equal(await undo.isEnabled(), true);
+  assert.equal(await page.locator('.totals-block').innerText(), totalsAfter, 'edit mode must not change the totals');
+  const keys = await page.evaluate(() => [...new FormData(document.getElementById('edit-form')).keys()]);
+  assert.ok(!keys.includes('lineItemId'), `the edit form must not carry the Undo field (keys: ${keys.join(',')})`);
+  assert.equal(await struck.evaluate(el => el.style.opacity), '', 'edit mode must not dim a struck row');
+  await page.click('#edit-mode-bar button.btn-ghost');
+  assert.equal(await struck.evaluate(el => el.style.opacity), '', 'leaving edit mode must not restyle a struck row');
+  assert.equal(await undo.isVisible(), true);
+
+  // Undo asks first, in plain words — and dismissing the question changes nothing.
+  const price = await undo.getAttribute('data-bo-price');
+  assert.match(price, /^\$[\d,]+\.\d{2}$/);
+  const expected = `Put ${qty} × ${title} back on the Shopify order at ${price} (its B2B price)?`;
+  let asked = null;
+  page.once('dialog', d => { asked = d.message(); d.dismiss(); });
+  await undo.click();
+  assert.equal(asked, expected, 'the confirm must state exactly what will happen');
+  assert.ok(!/backorder_restored/.test(page.url()), 'dismissing the confirm must not undo anything');
+  assert.equal(await boStruckRows(page).count(), 1);
+  assert.equal(await undo.isEnabled(), true, 'a dismissed confirm leaves the button usable');
+
+  // Accepting it restores the line.
+  page.once('dialog', d => d.accept());
+  await Promise.all([page.waitForURL(/success=backorder_restored/), undo.click()]);
+  assert.equal(await boStruckRows(page).count(), 0, 'the struck row is gone after Undo');
+  assert.equal(await page.locator('#edit-form tbody.bo-struck').count(), 0);
+  const back = boLiveRows(page).filter({ hasText: title });
+  assert.equal(await back.count(), 1, 'the live line is back');
+  assert.equal((await back.locator('.edit-qty-static').textContent()).trim(), qty, 'at the quantity that was removed');
+  const restored = await page.locator('.alert-success').first().innerText();
+  assert.match(restored, /Backorder undone/);
+  assert.match(restored, /back on the Shopify order/);
+  await boShot(page, 'desktop-3-restored', { fullPage: true });
+});
+
+await test('a PARTIAL backorder leaves the rest live (no legacy badge on it) beside its struck row; Undo raises it back', async (page, ctx) => {
+  await openEditMode(page, ctx, 1002);
+  const live = boTarget(page);
+  const btn = live.locator('.bo-action-btn');
+  const title = await btn.getAttribute('data-li-title');
+  const qty = Number(await btn.getAttribute('data-li-qty'));
+  assert.ok(qty >= 2, `needs a line of at least 2 units to split (got ${qty})`);
+  const n = Math.floor(qty / 2);
+
+  await btn.click();
+  await page.fill('#bo-quantity', String(n));
+  await Promise.all([page.waitForURL(/success=backorder_flagged/), page.click('#bo-submit')]);
+
+  const remaining = boLiveRows(page).filter({ hasText: title });
+  assert.equal(await remaining.count(), 1, 'the line stays on the order for the units that were not backordered');
+  assert.equal((await remaining.locator('.edit-qty-static').textContent()).trim(), String(qty - n));
+  assert.equal(await remaining.locator('.badge-warning').count(), 0, 'the units still on the order are NOT backordered — no ⚠ badge on the live row');
+  const struck = boStruckRows(page);
+  assert.equal(await struck.count(), 1);
+  assert.match(await struck.innerText(), new RegExp(`\\b${n}\\b`));
+  // The remaining live line keeps working: its own ⚑ button still opens the modal with the REDUCED quantity as max.
+  await page.click('#edit-btn');
+  await remaining.locator('.bo-action-btn').click();
+  assert.equal(await page.getAttribute('#bo-quantity', 'max'), String(qty - n), 'max follows the line CURRENT quantity, not the original');
+  await page.keyboard.press('Escape');
+  await boShot(page, 'desktop-4-partial', { fullPage: true });
+
+  page.once('dialog', d => d.accept());
+  await Promise.all([page.waitForURL(/success=backorder_restored/), struck.locator('.bo-undo-btn').click()]);
+  assert.equal(await boStruckRows(page).count(), 0);
+  assert.equal((await boLiveRows(page).filter({ hasText: title }).locator('.edit-qty-static').textContent()).trim(), String(qty), 'raised back to the original quantity');
+});
+
+await test('backorder flashes render: restored (+ price warning), failed (+ server message), all escaped', async (page, ctx) => {
+  await boLogin(ctx);
+  // The flash banners are the .alert siblings that follow the breadcrumb row (other .alert boxes live inside cards).
+  const banners = () => page.locator('.breadcrumb-row ~ .alert');
+  const hostile = 'Price differs <img src=x onerror="window.__xss=1"> by $1.00';
+  await page.goto(`${BASE}/orders/1002?success=backorder_restored&msg=${encodeURIComponent(hostile)}`);
+  assert.equal(await banners().count(), 2, 'success banner + one warning line');
+  assert.match(await banners().nth(0).getAttribute('class'), /alert-success/);
+  assert.match(await banners().nth(0).innerText(), /Backorder undone/);
+  assert.match(await banners().nth(1).getAttribute('class'), /alert-warning/);
+  const warn = await banners().nth(1).innerText();
+  assert.ok(warn.includes('Price differs <img'), `the warning line must show the message as TEXT, got: ${warn}`);
+  assert.equal(await page.locator('.alert img').count(), 0, 'a ?msg= must never become markup');
+  assert.equal(await page.evaluate(() => window.__xss), undefined);
+
+  await page.goto(`${BASE}/orders/1002?success=backorder_restored`);
+  assert.equal(await banners().count(), 1, 'no msg, no warning line');
+
+  await page.goto(`${BASE}/orders/1002?error=backorder_shopify_failed&msg=${encodeURIComponent('Mock Shopify said no.')}`);
+  assert.equal(await banners().count(), 1);
+  assert.match(await banners().first().getAttribute('class'), /alert-warning/, 'errors render as alert-warning, like edit_failed / fulfillment_failed');
+  const bad = await banners().first().innerText();
+  assert.match(bad, /Backorder action failed/);
+  assert.match(bad, /Mock Shopify said no\./);
+
+  // The real thing: an over-quantity POST is refused by the server and its own message reaches the banner.
+  await page.goto(`${BASE}/orders/1002`);
+  const liId = await boTarget(page).locator('.bo-action-btn').getAttribute('data-li-id');
+  const res = await ctx.request.post(`${BASE}/orders/1002/backorder`, { form: { lineItemId: liId, quantity: '9999' }, maxRedirects: 0 });
+  const loc = res.headers().location || '';
+  assert.match(loc, /error=backorder_shopify_failed/);
+  await page.goto(`${BASE}${loc}`);
+  const real = await banners().first().innerText();
+  assert.match(real, /^Backorder action failed — \S/, `the server's reason must be on the banner, got: ${real}`);
+  assert.equal(await boStruckRows(page).count(), 0, 'a refused backorder leaves no struck row');
+});
+
+await testMobile('struck row and Undo are usable at 390px with nothing pushed off-screen; the modal fits', async (page, ctx) => {
+  await boLogin(ctx);
+  await page.goto(`${BASE}/orders/1002`);
+  const vw = page.viewportSize().width;
+  assert.equal(vw, 390);
+  const btn = boTarget(page).locator('.bo-action-btn');
+  const liId = await btn.getAttribute('data-li-id');
+  const title = await btn.getAttribute('data-li-title');
+  const qty = await btn.getAttribute('data-li-qty');
+
+  // The modal fits a phone: every edge inside the viewport, and the submit is reachable.
+  await page.click('#edit-btn');
+  await btn.click();
+  const card = page.locator('#backorder-modal > div');
+  await card.waitFor({ state: 'visible' });
+  const box = await card.boundingBox();
+  assert.ok(box.x >= 0 && box.x + box.width <= vw, `modal must fit the viewport (x=${box.x}, w=${box.width})`);
+  const sub = await page.locator('#bo-submit').boundingBox();
+  assert.ok(sub.x >= 0 && sub.x + sub.width <= vw, 'the submit button must not be pushed off-screen');
+  await boShot(page, 'mobile-1-modal');
+  await page.keyboard.press('Escape');
+
+  // Flag through the endpoint the modal posts to (the click-through is covered on desktop), then load the page.
+  const res = await ctx.request.post(`${BASE}/orders/1002/backorder`, { form: { lineItemId: liId, lineItemTitle: title, quantity: qty }, maxRedirects: 0 });
+  assert.match(res.headers().location || '', /success=backorder_flagged/);
+  await page.goto(`${BASE}/orders/1002?success=backorder_flagged`);
+  const struck = boStruckRows(page);
+  const undo = struck.locator('.bo-undo-btn');
+  await struck.waitFor({ state: 'visible' });
+  assert.equal(await undo.isVisible(), true, 'Undo must be visible without any horizontal scrolling');
+
+  const cardEl = struck.locator('xpath=ancestor::div[contains(@class,"card")][1]');
+  const geo = await cardEl.evaluate((c, selectors) => {
+    const vwNow = window.innerWidth;
+    const r = el => { const b = el.getBoundingClientRect(); return { left: b.left, right: b.right, width: b.width, height: b.height }; };
+    const offenders = [...c.querySelectorAll('*')].filter(el => { const b = el.getBoundingClientRect(); return b.width > 0 && (b.right > vwNow + 0.5 || b.left < -0.5); })
+      .map(el => `${el.tagName}.${el.className}`);
+    return {
+      vw: vwNow, offenders, cardScroll: [c.scrollWidth, c.clientWidth],
+      row: r(c.querySelector(selectors.row)), undo: r(c.querySelector(selectors.undo)),
+    };
+  }, { row: 'tr.bo-struck-row', undo: '.bo-undo-btn' });
+  assert.deepEqual(geo.offenders, [], `nothing inside the line-items card may overflow the 390px viewport: ${geo.offenders.join(', ')}`);
+  assert.ok(geo.cardScroll[0] <= geo.cardScroll[1] + 1, `the line-items card must not scroll sideways (${geo.cardScroll})`);
+  assert.ok(geo.row.left >= 0 && geo.row.right <= vw, `struck row inside the viewport (${geo.row.left}..${geo.row.right})`);
+  assert.ok(geo.undo.left >= 0 && geo.undo.right <= vw, `Undo inside the viewport (${geo.undo.left}..${geo.undo.right})`);
+  assert.ok(geo.undo.height >= 32, `Undo is a usable tap target (height ${geo.undo.height})`);
+  await cardEl.scrollIntoViewIfNeeded();
+  await boShot(cardEl, 'mobile-2-struck-card');
+  await boShot(page, 'mobile-3-struck-viewport');
+
+  // …and it actually works from there.
+  page.once('dialog', d => d.accept());
+  await Promise.all([page.waitForURL(/success=backorder_restored/), undo.click()]);
+  assert.equal(await boStruckRows(page).count(), 0);
+  assert.equal(await boLiveRows(page).filter({ hasText: title }).count(), 1, 'the live line is back after Undo at 390px');
+  await boShot(page, 'mobile-4-restored');
+});
+
+await test('a hostile line title cannot break out of the struck row, the Undo confirm or the page', async (page, ctx) => {
+  await boLogin(ctx);
+  // A title built to break every context it lands in: attribute (" '), element (<img>, </script>), and JS-string (\ ").
+  const evil = 'Evil "dq" \'sq\' <img src=x onerror="window.__pwned=1"></script><script>window.__pwned=2</script> back\\slash';
+  try {
+    const added = await ctx.request.post(`${BASE}/orders/1002/line/add`, { data: {
+      idemKey: `ui-evil-${Date.now()}`, variantId: '99001', title: evil, sku: 'EVIL-1', qty: 3, listPrice: 10, price: 5,
+    } });
+    assert.equal((await added.json()).ok, true, 'fixture line was added');
+    await page.goto(`${BASE}/orders/1002`);
+    const liId = await boLiveRows(page).filter({ hasText: 'EVIL-1' }).first().locator('.bo-action-btn').getAttribute('data-li-id');
+    assert.equal(await page.evaluate(() => window.__pwned), undefined, 'the live row already had to be safe');
+
+    const res = await ctx.request.post(`${BASE}/orders/1002/backorder`, { form: { lineItemId: liId, quantity: '3' }, maxRedirects: 0 });
+    assert.match(res.headers().location || '', /success=backorder_flagged/);
+    await page.goto(`${BASE}/orders/1002?success=backorder_flagged`);
+    const struck = boStruckRows(page);
+    assert.equal(await struck.count(), 1);
+    assert.equal(await page.evaluate(() => window.__pwned), undefined, 'no script from a title may run');
+    assert.equal(await struck.locator('img, script').count(), 0, 'a title must never become markup');
+    assert.equal(await struck.locator('.bo-struck-text').first().textContent(), evil, 'the title shows as literal text');
+    const undo = struck.locator('.bo-undo-btn');
+    assert.equal(await undo.getAttribute('data-bo-title'), evil, 'the attribute round-trips the title exactly');
+
+    let asked = null;
+    page.once('dialog', d => { asked = d.message(); d.accept(); });
+    await Promise.all([page.waitForURL(/success=backorder_restored/), undo.click()]);
+    assert.equal(asked, `Put 3 × ${evil} back on the Shopify order at $5.00 (its B2B price)?`, 'the confirm carries the title verbatim, no JS-string breakage');
+    assert.equal(await page.evaluate(() => window.__pwned), undefined);
+    assert.equal(await boStruckRows(page).count(), 0);
+  } finally {
+    // Leave #1002 as found: take the fixture line (restored by the Undo above, or never flagged if an assertion
+    // failed) off the order again. Shopify keeps a removed line at quantity 0, which the page hides.
+    await page.goto(`${BASE}/orders/1002`);
+    const ids = await boLiveRows(page).filter({ hasText: 'EVIL-1' }).evaluateAll(rows => rows.map(r => r.getAttribute('data-li-id')));
+    for (const [i, id] of ids.entries()) {
+      await ctx.request.post(`${BASE}/orders/1002/line/remove`, { data: { idemKey: `ui-evil-rm-${Date.now()}-${i}`, liId: id } });
+    }
+  }
+});
+
 await browser.close();
 
 console.log(`\n  ${passed} passed, ${failed} failed`);
