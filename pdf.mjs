@@ -167,14 +167,108 @@ export function invoiceItemTitle(item) {
   return title;
 }
 
-// WHAT: the backordered-lines display model for the ORDER invoice (struck rows + footnote), or null.
+// ── Invoice line ORDER = warehouse PICK LIST order ───────────────────────────────────────────────────────
+// WHAT: invoices list their lines in the same order the warehouse pick list walks them, so the person packing
+//   the box can tick the invoice off against the shelf and the customer can tick it off against the carton.
+//   The pick list (fww-shipping-bridge/worker.js pickAggregate, "B2B pick list") groups lines by PATTERN — the
+//   line title with its leading width ("1.5\"", "5/8\"") and the product-type words ("Luxe", "Everyday",
+//   "Limited Slip Collar", ...) stripped — sorts the patterns alphabetically, then sorts each pattern's variants
+//   by the label `width · size · typeCode` ("1.5\" · LG · LSC"). Sizes therefore sort ALPHABETICALLY (LG, MED,
+//   SM, XLG, XS), the type is not a level of its own, and there is no tie-breaker. Lines with no SKU
+//   (alterations, repairs, custom services) are not pickable and are not on the pick list at all.
+// SYNC: pick-sort-key — this block is a PORT of worker.js (fww-shipping-bridge, ~L6534-6596): pickDetectType,
+//   PICK_WIDTH_PREFIX, pickExtractWidth, PICK_TYPE_WORDS, pickExtractPattern, pickVariantLabel, and the two
+//   `localeCompare` sorts in pickAggregate. If the pick list's sort changes, change this to match (and the bridge's
+//   own `SYNC: pick-width-prefix` note applies here too: width extraction and pattern extraction share ONE regex).
+//   The bridge could not be edited from this change, so its side carries no marker — grep "SYNC: pick-sort-key" here.
+//   Deliberate differences, all invisible on the pick list: (1) the invoice has no merged rows to aggregate, so
+//   equal keys keep their ORIGINAL order (stable); (2) lines with no SKU sort LAST instead of being dropped;
+//   (3) comparison uses an explicit 'en-US' collator — the Cloudflare Worker's default locale — so the order does
+//   not depend on the server's OS locale.
+// WHY no extra Shopify fetch: the bridge's input is Shopify's line `name` ("<title> - <variantTitle>", from which
+//   it strips the variant again — i.e. the line TITLE), `variantTitle`, and `sku`. getOrderDetail already selects
+//   the line `title`, `variant.title` and `variant.sku`, and the lettered-invoice snapshot stores `title`,
+//   `variantTitle` and `sku` per line. (A variant renamed AFTER the order was placed is the only way the two can
+//   differ: the bridge reads the title the line was ordered with.)
+// INVARIANT(S): display only — never touches quantities, prices or totals; the same set of rows in a different order.
+function pickDetectType(title) {
+  const t = (title || '').toLowerCase();
+  if (t.includes('private trainer')) return 'PT';
+  if (t.includes('martingale walking lead') || t.includes('walking lead')) return 'WL';
+  if (t.includes('limited slip collar')) return 'LSC';
+  if (t.includes('leash')) return 'Leash';
+  if (t.includes('keychain')) return 'KC';
+  if (t.includes('belly band')) return 'BellyBand';
+  if (t.includes('harness')) return 'Harness';
+  return 'Other';
+}
+// Leading width prefix: decimals (1", 1.5"), fractions (5/8"), mixed (1 1/4"), unicode fractions (⅝"),
+// followed by a quote mark or "in"/"inch". SYNC: pick-width-prefix — pickExtractWidth and pickExtractPattern share it.
+const PICK_WIDTH_PREFIX = /^\s*(\d+\s+\d+\s*\/\s*\d+|\d+\s*\/\s*\d+|\d*\s*[¼½¾⅛⅜⅝⅞]|\d+(?:\.\d+)?)\s*(?:["”″“]|''|inch(?:es)?\b|in\b)\s*/i;
+function pickExtractWidth(title) {
+  const m = (title || '').match(PICK_WIDTH_PREFIX);
+  return m ? (m[1].replace(/\s*\/\s*/, '/').replace(/\s+/g, ' ').trim() + '"') : '';
+}
+const PICK_TYPE_WORDS = /\b(luxe|everyday|private\s+trainer|martingale\s+walking\s+lead|walking\s+lead|limited\s+slip\s+collar|martingale|collar|leash|keychain|belly\s+band|harness)\b/gi;
+function pickExtractPattern(title) {
+  let s = (title || '').replace(PICK_WIDTH_PREFIX, '');
+  s = s.replace(PICK_TYPE_WORDS, ' ');
+  s = s.replace(/\s+/g, ' ').trim();
+  return s || (title || '').trim() || 'Item';
+}
+function pickVariantLabel(width, size, typeCode) {
+  return [width, size, typeCode].filter(Boolean).join(' · ');
+}
+const PICK_COLLATOR = new Intl.Collator('en-US');   // == localeCompare(b) on the Worker (default locale en-US)
+
+// WHAT: the pick-list sort key of one invoice line (or one backordered-row): { hasSku, pattern, label }.
+// Accepts an order line node ({ title, variant: { title, sku }, sku }), a stored-snapshot line mapped the same
+// way (server.mjs partial-invoice re-download), or a backorders row ({ title, variantTitle, sku }).
+// INVARIANT(S): pure; a Shopify "Default Title" variant counts as no variant (Shopify omits it from the line name).
+export function invoiceSortKey(item) {
+  const sku = String(item?.variant?.sku || item?.sku || '').trim();
+  const rawVariant = String(item?.variant?.title ?? item?.variantTitle ?? '').trim();
+  const size = rawVariant === 'Default Title' ? '' : rawVariant;
+  const title = String(item?.title ?? '');
+  const type = pickDetectType(title);
+  const width = pickExtractWidth(title);
+  const pattern = pickExtractPattern(title);
+  const label = pickVariantLabel(width, size, type === 'Other' ? '' : type) || '—';
+  return { hasSku: sku !== '', pattern, label };
+}
+
+// WHAT: `items` in pick-list order (a new array; the input is not mutated). SKU lines by pattern, then variant
+//   label; ties keep their original relative order; lines with no SKU follow, in their original order.
+// DEPENDS: generateInvoicePdf sorts its active rows ONCE with this; buildOrderInvoiceBackorderModel sorts the
+//   struck backordered rows with it, so the PDF rows, the PDF footnote and the HTML block all agree.
+export function sortInvoiceLines(items) {
+  const keyed = (Array.isArray(items) ? items : []).map((item, index) => ({ item, index, key: invoiceSortKey(item) }));
+  keyed.sort((a, b) => {
+    if (a.key.hasSku !== b.key.hasSku) return a.key.hasSku ? -1 : 1;
+    if (a.key.hasSku) {
+      const byPattern = PICK_COLLATOR.compare(a.key.pattern, b.key.pattern);
+      if (byPattern) return byPattern;
+      const byLabel = PICK_COLLATOR.compare(a.key.label, b.key.label);
+      if (byLabel) return byLabel;
+    }
+    return a.index - b.index;
+  });
+  return keyed.map(k => k.item);
+}
+
+// WHAT: the backordered-lines display model for the ORDER invoice and for LETTERED invoices (struck rows +
+//   footnote), or null.
 // WHY: backordered units are REMOVED from the Shopify order (db.mjs `backorders` table), so the order's own
 //   lines no longer mention them. This builds the one model both the PDF (generateInvoicePdf) and the HTML
-//   viewer (server.mjs GET /orders/:id/invoice) render; the wording lives in lib/invoice-backorder.mjs.
+//   viewer (server.mjs GET /orders/:id/invoice, with or without ?letter=) render; the wording lives in
+//   lib/invoice-backorder.mjs, so a lettered invoice can never word it differently from the order invoice.
 // DEPENDS: invoiceItemTitle above — the same title cleaner the active rows use, so a variant Shopify baked
 //   into the title is not printed twice on the struck rows either.
+// INVARIANT(S): the rows are put in PICK-LIST order (sortInvoiceLines) before the model is built, so struck rows —
+//   a trailing block on the PDF — and the footnote, which maps 1:1 onto them, follow the same order as the active
+//   rows above them. A non-array stays a non-array (null model), exactly as before.
 export function buildOrderInvoiceBackorderModel(rows) {
-  return buildInvoiceBackorderModel(rows, { displayTitle: invoiceItemTitle });
+  return buildInvoiceBackorderModel(Array.isArray(rows) ? sortInvoiceLines(rows) : rows, { displayTitle: invoiceItemTitle });
 }
 
 // ── Backordered section geometry (struck rows + footnote) ──────────────────────────────────────────────
@@ -237,14 +331,19 @@ function registerBrandFonts(doc) {
 // is supplied, partial-invoice totals come from opts and must already be reconciled by the caller;
 // all text is black per brand spec (lime is accent-only; the struck BACKORDERED rows are the one
 // deliberate exception — muted grey).
-// opts.backorderedLines (ORDER invoice only): db.mjs getBackorderedLinesForOrder() rows — units removed from
+// ROW ORDER: active rows print in warehouse PICK-LIST order (invoiceSortKey / sortInvoiceLines above, SYNC:
+// pick-sort-key), not Shopify's line order; SKU-less lines last; the struck backordered block that trails them is
+// sorted by the same key (buildOrderInvoiceBackorderModel). Display only — totals never depend on row order.
+// opts.backorderedLines: db.mjs getBackorderedLinesForOrder()-shaped rows — units removed from
 //   the Shopify order. They are drawn AFTER the active rows, struck through and tagged, and itemised in a
 //   footnote below the totals. With none (absent/empty) every byte of the page content is exactly what it was
 //   before this option existed (test/invoice-backorder.test.mjs pins that with goldens).
 //   They are NEVER summed: subtotal/shipping/tax/total come from the Shopify order (which no longer holds the
 //   removed units) or from opts.subtotal/total, and `lineItems`/discount math never sees these rows.
-// DEPENDS: callers pass opts.backorderedLines ONLY from the full-order invoice routes (server.mjs
-//   GET /orders/:id/invoice.pdf). Partial-invoice snapshots (POST/GET /orders/:id/partial-invoice*) must not.
+// DEPENDS: callers pass opts.backorderedLines from the full-order invoice route (server.mjs
+//   GET /orders/:id/invoice.pdf: the LIVE rows) and from the lettered-invoice routes (POST/GET
+//   /orders/:id/partial-invoice*: the snapshot's own stored rows, never the live ones — see
+//   lib/partial-invoice-backorder.mjs). The caller decides WHICH rows; this function only draws them.
 export async function generateInvoicePdf(order, opts = {}) {
   return new Promise((resolve, reject) => {
     const doc = new PDFDocument({ margin: 50, size: 'LETTER', autoFirstPage: true });
@@ -370,7 +469,9 @@ export async function generateInvoicePdf(order, opts = {}) {
     drawTableHeader(tableTop);
 
     let y = tableTop + 30;
-    const lineItems = opts.lineItems ?? (order.lineItems?.edges?.map(e => e.node) || []);
+    // Pick-list order (see invoiceSortKey), sorted ONCE here so the rows, the inferred discount and everything
+    // below read one sequence. Order only: nothing about a line's quantity or price depends on its position.
+    const lineItems = sortInvoiceLines(opts.lineItems ?? (order.lineItems?.edges?.map(e => e.node) || []));
     const inferredDiscount = lineItems.reduce((sum, item) => sum + lineItemInvoiceDiscount(item), 0);
     const discountAmount = opts.discount !== undefined
       ? (parseFloat(opts.discount) || 0)

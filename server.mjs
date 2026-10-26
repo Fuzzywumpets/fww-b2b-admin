@@ -6693,14 +6693,28 @@ function invoicePdfDisposition(req, safeName) {
 import { getBackorderedLinesForOrder as getInvoiceBackorderedRows } from './db.mjs';
 import { buildOrderInvoiceBackorderModel } from './pdf.mjs';
 import { renderInvoiceBackorderHtml, INVOICE_BACKORDER_CSS } from './lib/invoice-backorder.mjs';
+import { serializeBackorderedLines, backorderedLinesForPartialInvoice } from './lib/partial-invoice-backorder.mjs';
 
-// WHAT: the backordered rows for the FULL-ORDER invoice of order `numId` (the id from the route).
-// CHANGE-GUARD: used by GET /orders/:id/invoice.pdf and the HTML viewer GET /orders/:id/invoice (no ?letter)
-//   ONLY. Partial-invoice snapshots (POST/GET /orders/:id/partial-invoice*), invoice.csv, the Xero invoice and
-//   the Helcim credit-card invoice deliberately do NOT read it. Keyed by shopifyOrderGid(numId), the same
-//   key POST /orders/:id/backorder writes.
+// WHAT: the LIVE backordered rows for order `numId` (the id from the route).
+// CHANGE-GUARD: the FULL-ORDER invoice (GET /orders/:id/invoice.pdf and the HTML viewer GET /orders/:id/invoice
+//   without ?letter) renders these directly. LETTERED invoices (POST/GET /orders/:id/partial-invoice*, the
+//   ?letter= viewer) must NOT render them directly: a new snapshot freezes them at creation and every later
+//   rendering uses that stored copy; only a legacy snapshot with no stored copy filters these by its own
+//   created_at — all through partialInvoiceBackorderedLines below. invoice.csv, the Xero invoice and the Helcim
+//   credit-card invoice deliberately do NOT read them. Keyed by shopifyOrderGid(numId), the same key
+//   POST /orders/:id/backorder writes.
 function orderInvoiceBackorderedLines(numId) {
   return getInvoiceBackorderedRows(shopifyOrderGid(numId));
+}
+
+// WHAT: the backordered rows a stored lettered invoice `inv` (a partial_invoices row) shows.
+// WHY: an issued invoice never changes — see lib/partial-invoice-backorder.mjs. The live table is only read for a
+//   legacy snapshot (backordered_json NULL).
+// DEPENDS: partial_invoices.backordered_json (db.mjs migratePartialInvoicesSchema / createPartialInvoice, written by
+//   POST /orders/:id/partial-invoice) and orderInvoiceBackorderedLines above. Used by GET
+//   /orders/:id/partial-invoice/:letter.pdf and GET /orders/:id/invoice?letter= — the two must agree, so both call this.
+function partialInvoiceBackorderedLines(numId, inv) {
+  return backorderedLinesForPartialInvoice(inv, () => orderInvoiceBackorderedLines(numId));
 }
 
 // WHAT: renders the full-order invoice PDF — inline for the viewer iframe, or as a download when
@@ -6747,8 +6761,14 @@ app.get('/orders/:id/invoice', requireAuth, async (req, res) => {
   // WHAT: backordered units (struck rows + footnote) for the FULL-ORDER view, as real page text under the PDF.
   // WHY: this page is only a shell around the PDF iframe; on a phone the embedded PDF is shrunk to a few pixels,
   //   so the backordered notice is repeated here as selectable, wrapping HTML. Same model + wording as the PDF.
-  // CHANGE-GUARD: not shown for ?letter= (a partial-invoice snapshot) — those never carry backordered rows.
-  const backorderModel = letter ? null : buildOrderInvoiceBackorderModel(orderInvoiceBackorderedLines(numId));
+  // CHANGE-GUARD: for ?letter= (a lettered snapshot) the block shows THAT snapshot's backordered lines
+  //   (partialInvoiceBackorderedLines), never the live ones — the iframe PDF above is rendered by
+  //   GET /orders/:id/partial-invoice/:letter.pdf from the same helper, so the two always agree. An unknown
+  //   letter shows nothing (its PDF is a 404).
+  const letteredInv = letter ? getPartialInvoices(shopifyOrderGid(numId)).find(r => r.invoice_letter === letter) : null;
+  const backorderModel = buildOrderInvoiceBackorderModel(letter
+    ? (letteredInv ? partialInvoiceBackorderedLines(numId, letteredInv) : [])
+    : orderInvoiceBackorderedLines(numId));
   const content = `
     <div class="page-header" style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:12px">
       <a href="/orders/${h(numId)}" class="btn btn-secondary">← Back to order ${h(orderLabel)}</a>
@@ -6824,6 +6844,14 @@ app.post('/orders/:id/partial-invoice', requireAuth, async (req, res) => {
     : 0;
   const total   = subtotal + shippingAmt + taxAmt;
 
+  // WHAT: the units backordered (removed from this order) RIGHT NOW, frozen into the snapshot below.
+  // WHY: the snapshot's lines come from the order, which no longer holds them; the invoice must still show them
+  //   struck through with the footnote, and must keep showing exactly these even if one is restored later.
+  // INVARIANT(S): a synchronous SQLite read in the same tick as getNextInvoiceLetter/createPartialInvoice (no await
+  //   between them — see this handler's header). It sits OUTSIDE the PDF try/catch on purpose: if it fails the
+  //   request fails loudly instead of issuing an invoice that silently lacks its backordered lines.
+  const backorderedRows = orderInvoiceBackorderedLines(numId);
+
   const letter = getNextInvoiceLetter(orderGid);
   const invId  = createPartialInvoice({
     orderId: orderGid,
@@ -6832,6 +6860,8 @@ app.post('/orders/:id/partial-invoice', requireAuth, async (req, res) => {
     total,
     shipping: shippingAmt,
     tax: taxAmt,
+    // '[]' (never null) when nothing is backordered: null marks a LEGACY snapshot that is rebuilt from live rows.
+    backorderedJson: serializeBackorderedLines(backorderedRows),
     // SYNC: the re-download route below reconstructs every field in this snapshot. Preserve
     // identity and allocated discount separately so archived invoices never degrade into clipped
     // titles/dash-only SKUs or hide their discount after Shopify changes later.
@@ -6862,6 +6892,7 @@ app.post('/orders/:id/partial-invoice', requireAuth, async (req, res) => {
       discount: discountAmt,
       shipping: shippingAmt,
       total,
+      backorderedLines: backorderedRows,
     });
   } catch (err) {
     return res.status(500).json({ error: err.message });
@@ -6891,6 +6922,10 @@ app.post('/orders/:id/partial-invoice', requireAuth, async (req, res) => {
 // allocations. The effective invoice discount is then the exact amount required to reconcile that
 // gross with the stored invoice total, so a fixed-dollar invoice correction remains visible instead
 // of being absorbed into line prices. Currency is hardcoded 'USD'.
+// BACKORDERED LINES (2026-10-26): drawn struck-through after the active rows, with the footnote, from the stored
+// backordered_json (legacy snapshot: live pending rows created at/before the snapshot) — see
+// partialInvoiceBackorderedLines. They are display only: subtotal/discount/shipping/total above never see them.
+// The lookup sits INSIDE the try on purpose (a failure must 500, not issue a quietly incomplete invoice).
 app.get('/orders/:id/partial-invoice/:letter.pdf', requireAuth, async (req, res) => {
   const numId  = req.params.id;
   const letter = req.params.letter.toUpperCase();
@@ -6938,6 +6973,7 @@ app.get('/orders/:id/partial-invoice/:letter.pdf', requireAuth, async (req, res)
       discount: effectiveDiscount,
       shipping: inv.shipping,
       total: inv.total,
+      backorderedLines: partialInvoiceBackorderedLines(numId, inv),
     });
     const safeName = (order.name || 'invoice').replace(/[^a-z0-9#-]/gi, '-');
     res.setHeader('Content-Type', 'application/pdf');

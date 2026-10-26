@@ -11,6 +11,10 @@
 //   and review the diff of test/fixtures/invoice-no-backorder.golden.json. The committed file was generated
 //   by the pre-feature code (commit 89a9d55: pdf.mjs for `unit`, a mock server started from that commit for
 //   `http`), so passing proves the feature leaves backorder-free invoices exactly as they were.
+//   DELIBERATE RE-PIN (2026-10-26, invoice lines now print in warehouse PICK-LIST order — pdf.mjs invoiceSortKey):
+//   only the `unit` scenarios whose line titles are not already in pick order changed — dense-multipage-with-note
+//   and partial-invoice-opts (their 38 "Long descriptive wholesale product N" lines now sort as text: 1, 10, 11…2).
+//   The other four `unit` goldens and both `http` goldens (#1001, #1002) are byte-for-byte the pre-feature hashes.
 //
 // Set INVOICE_SHOT_DIR=<dir> to also save the section-6 screenshots (390 / 768 / 1280 px) and the section-5 PDF.
 
@@ -557,14 +561,21 @@ await test('SWEEP: footnote never overlaps totals / notes / footer wherever the 
   }
 });
 
-await test('partial-invoice PDFs (opts.lineItems) are out of scope: only the order-invoice routes pass backorderedLines', () => {
+// (Lettered partial invoices render backordered lines too — since 2026-10-26 — from the SNAPSHOT's own stored copy:
+//  test/invoice-partial-backorder.test.mjs owns that behaviour; this guard only pins WHERE each route gets its rows.)
+await test('call sites: invoice.pdf renders the LIVE rows; the lettered-invoice routes render the snapshot\'s stored copy, never the live rows directly', () => {
   const src = fs.readFileSync(path.join(ROOT, 'server.mjs'), 'utf8');
   const calls = [...src.matchAll(/generateInvoicePdf\(order(?:,\s*\{([\s\S]*?)\})?\)/g)];
   const withBackorder = calls.filter(c => /backorderedLines/.test(c[1] || ''));
-  assert.equal(withBackorder.length, 1, 'exactly one generateInvoicePdf call passes backorderedLines (GET /orders/:id/invoice.pdf)');
-  assert.ok(calls.length >= 3, 'the partial-invoice call sites exist');
-  assert.ok(!/getInvoiceBackorderedRows|orderInvoiceBackorderedLines/.test(src.slice(src.indexOf("app.post('/orders/:id/partial-invoice'"), src.indexOf("app.get('/api/admin/orders/:id/partial-invoices'"))),
-    'partial-invoice POST/GET handlers must not read backordered rows');
+  assert.equal(withBackorder.length, 3, 'invoice.pdf, POST partial-invoice (validation render) and GET partial-invoice/:letter.pdf pass backorderedLines');
+  const postStart = src.indexOf("app.post('/orders/:id/partial-invoice'");
+  const getStart = src.indexOf("app.get('/orders/:id/partial-invoice/:letter.pdf'");
+  const end = src.indexOf("app.get('/api/admin/orders/:id/partial-invoices'");
+  assert.ok(postStart > 0 && getStart > postStart && end > getStart, 'handlers found');
+  const post = src.slice(postStart, getStart), get = src.slice(getStart, end);
+  assert.ok(/serializeBackorderedLines\(/.test(post), 'POST freezes the rows into the snapshot');
+  assert.ok(/partialInvoiceBackorderedLines\(/.test(get) && !/getInvoiceBackorderedRows|orderInvoiceBackorderedLines/.test(get),
+    'GET re-download reads the snapshot via partialInvoiceBackorderedLines, never the live rows directly');
 });
 
 // ════════════════════════════════════════════════════════════════════════════════════════════════
@@ -628,7 +639,7 @@ await test('the invoice viewer page carries the same block as real HTML text (no
   assert.ok(page.text.includes(BACKORDER_INTRO.replace("'", '&#x27;')));
   assert.ok(page.text.includes('<style>') && page.text.includes('.inv-bo'));
   const partial = await getText(server.base, cookie, '/orders/1001/invoice?letter=A');
-  assert.ok(!partial.text.includes('inv-bo'), 'partial-invoice viewer is untouched');
+  assert.ok(!partial.text.includes('inv-bo'), 'a letter that does not exist (no snapshot yet) shows no backordered block — not the live rows');
   assert.ok(page.text.includes('/orders/1001/invoice.pdf?download=1'), 'download link still points at the attachment route');
 });
 
@@ -639,22 +650,35 @@ await test('both invoice routes still require auth', async () => {
   }
 });
 
-await test('OUT OF SCOPE stays as it was: invoice.csv and a partial-invoice snapshot do not list backordered lines', async () => {
+await test('OUT OF SCOPE stays as it was: invoice.csv does not list backordered lines (a lettered invoice DOES — see below)', async () => {
   const csv = await getText(server.base, cookie, '/orders/1001/invoice.csv');
   assert.equal(csv.status, 200);
   assert.equal(csv.text.trim().split(/\r?\n/).length, 3, 'CSV: header + the 2 active lines only');
   assert.ok(!/backorder/i.test(csv.text));
-  const made = await postForm(server.base, cookie, '/orders/1001/partial-invoice', { type: 'full' });
-  assert.equal(made.status, 302);
-  const letter = /letter=([A-Z])/.exec(loc(made))?.[1];
-  assert.ok(letter, loc(made));
-  const snap = await getPdf(server.base, cookie, `/orders/1001/partial-invoice/${letter}.pdf`);
-  assert.equal(snap.status, 200);
-  const texts = extractPdfText(snap.buf).map(r => r.text);
-  assert.ok(!texts.includes(BACKORDER_TAG) && !texts.includes(BACKORDER_HEADING), 'partial-invoice PDF is unchanged (no backordered section)');
 });
 
-await test('UNDO: the struck rows and footnote disappear and the line is back to 5 units', async () => {
+let issuedLetter = null;
+await test('a lettered invoice issued while 2 Elite Collars are backordered shows them struck + footnote, with ITS OWN totals', async () => {
+  const made = await postForm(server.base, cookie, '/orders/1001/partial-invoice', { type: 'full' });
+  assert.equal(made.status, 302);
+  issuedLetter = /letter=([A-Z])/.exec(loc(made))?.[1];
+  assert.ok(issuedLetter, loc(made));
+  const snap = await getPdf(server.base, cookie, `/orders/1001/partial-invoice/${issuedLetter}.pdf`);
+  assert.equal(snap.status, 200);
+  const runs = extractPdfText(snap.buf);
+  const texts = runs.map(r => r.text);
+  assert.equal(texts.filter(t => t === BACKORDER_TAG).length, 1);
+  assert.ok(texts.includes(BACKORDER_HEADING) && texts.includes(BACKORDER_INTRO));
+  assert.ok(texts.includes('SKU EC-001-S-NV · Qty 2'));
+  const elite = runs.findIndex(r => r.text === 'Elite Collar'), eliteStruck = runs.findIndex((r, i) => i > elite && r.text === 'Elite Collar');
+  assert.ok(elite >= 0 && eliteStruck > elite, 'active row and struck row both present');
+  assert.deepEqual(runs.slice(eliteStruck, eliteStruck + 7).filter(r => r.size === 9.5).map(r => r.text), ['Elite Collar', '2', '$18.00', '$36.00']);
+  // The snapshot's own total (3 x 18 + 2 x 37.50 + 30 shipping + tax) is untouched by the struck $36.00.
+  assert.ok(!AMOUNT_RUNS(runs).some(s => s.endsWith(':$36.00')), 'a struck amount leaked into the totals area');
+  assertFootnoteLayout({ runs }, buildOrderInvoiceBackorderModel([boRow({ quantity: 2, unitPrice: 18, lineTotal: 36 })]));
+});
+
+await test('UNDO: the struck rows and footnote disappear from the ORDER invoice and the line is back to 5 units', async () => {
   const res = await boUndo('li1');
   assert.ok(loc(res).includes('success=backorder_restored'), loc(res));
   const runs = extractPdfText((await getPdf(server.base, cookie, '/orders/1001/invoice.pdf')).buf);
@@ -663,6 +687,15 @@ await test('UNDO: the struck rows and footnote disappear and the line is back to
   assert.deepEqual(runs.slice(elite, elite + 6).filter(r => r.size === 9.5).map(r => r.text), ['Elite Collar', '5', '$18.00', '$90.00']);
   const page = await getText(server.base, cookie, '/orders/1001/invoice');
   assert.ok(!page.text.includes('inv-bo'));
+});
+
+await test('…but the lettered invoice issued BEFORE the undo is unchanged: an issued invoice never changes (PDF and viewer)', async () => {
+  const runs = extractPdfText((await getPdf(server.base, cookie, `/orders/1001/partial-invoice/${issuedLetter}.pdf`)).buf);
+  const texts = runs.map(r => r.text);
+  assert.equal(texts.filter(t => t === BACKORDER_TAG).length, 1, 'struck row still there after the unit was restored');
+  assert.ok(texts.includes('SKU EC-001-S-NV · Qty 2'));
+  const page = await getText(server.base, cookie, `/orders/1001/invoice?letter=${issuedLetter}`);
+  assert.ok(page.text.includes('id="invoice-backorders"') && page.text.includes('<s>$36.00</s>'), 'viewer block comes from the stored copy too');
 });
 
 // ════════════════════════════════════════════════════════════════════════════════════════════════
