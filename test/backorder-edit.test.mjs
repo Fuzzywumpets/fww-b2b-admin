@@ -10,7 +10,7 @@ import { readFileSync } from 'node:fs';
 import { buildClientSchema, parse, validate } from 'graphql';
 import * as dbm from '../db.mjs';
 import {
-  flagBackorder, undoBackorder, parseBackorderRequest, priceAdjustment, pricesMatch, BACKORDER_LINE_FIELDS,
+  flagBackorder, undoBackorder, parseBackorderRequest, priceAdjustment, pricesMatch, BACKORDER_LINE_FIELDS, backorderCommitMutation, completeCommitNodes,
   stageRemoveUnits, stageRaiseUnits, stageAddVariantAtPrice, stageAddCustomAtPrice, DUPLICATE_WINDOW_MS,
 } from '../lib/backorder-edit.mjs';
 
@@ -32,6 +32,18 @@ function world(lineSpecs, { orderId } = {}) {
     nextId: 5000, clock: 1_700_000_000_000, errors: [], warns: [], calls: [],
     rejectRemove: null, rejectRestore: null, throwAfterApply: false, readFailsAfter: null, readCount: 0,
     ledger: new Map(),
+    // What the edit's COMMIT answers with (the optional { lines } of deps.removeUnits / restoreUnits):
+    //   null      - nothing (MOCK, a replay, an incomplete page): the core must read back itself
+    //   'honest'  - the post-commit lines
+    //   'stale'   - the PRE-commit lines (a lagging answer)
+    //   'empty'   - an empty list
+    commitLines: null,
+    commitAnswer(prior) {
+      if (w.commitLines === 'honest') return { lines: w.lines.map(x => ({ ...x })) };
+      if (w.commitLines === 'stale') return { lines: prior };
+      if (w.commitLines === 'empty') return { lines: [] };
+      return undefined;
+    },
   };
   w.deps = {
     db: dbm,
@@ -45,17 +57,20 @@ function world(lineSpecs, { orderId } = {}) {
       w.calls.push({ kind: 'remove', liId: line.liId, quantity, idemKey, payload });
       if (w.rejectRemove) throw new Error(w.rejectRemove);
       const l = w.lines.find(x => x.liId === line.liId);
+      const priorLines = w.lines.map(x => ({ ...x }));
       l.currentQuantity -= quantity;
       if (w.throwAfterApply) throw new Error('orderEditCommit timed out');
       w.ledger.set(idemKey, { status: 'committed', action: 'backorder/flag', payload_json: JSON.stringify(payload) });
+      return w.commitAnswer(priorLines);
     },
     restoreUnits: async ({ mode, row, live, quantity, unitPrice, idemKey }) => {
       w.calls.push({ kind: 'restore', mode, quantity, unitPrice, idemKey });
       if (w.rejectRestore) throw new Error(w.rejectRestore);
+      const priorLines = w.lines.map(x => ({ ...x }));
       if (mode === 'raise') w.lines.find(x => x.liId === live.liId).currentQuantity += quantity;
       else w.lines.push({ liId: `gid://shopify/LineItem/${++w.nextId}`, title: row.line_item_title, variantTitle: row.variant_title || '', sku: row.sku || '', variantId: row.variant_id, currentQuantity: quantity, unitPrice: w.restoredPrice ?? unitPrice, currency: row.currency });
       if (w.throwAfterApply) throw new Error('orderEditCommit timed out');
-      return { warnings: [] };
+      return { warnings: [], ...w.commitAnswer(priorLines) };
     },
     now: () => w.clock,
     log: { warn: (m) => w.warns.push(m), error: (m) => w.errors.push(m) },
@@ -422,7 +437,120 @@ await test('the restore idempotency key is derived from the backorder row, not t
   assert.equal(keys[0], keys[1]);
 });
 
+console.log('\n  commit-response read-back (speed hot-fix 2026-10-26): a POSITIVE confirmation only');
+await test('FLAG: a commit that answers with the post-edit lines needs NO second read of the order', async () => {
+  const w = world([{ currentQuantity: 10 }]);
+  w.commitLines = 'honest';
+  const r = await flag(w, { quantity: 4 });
+  assert.equal(r.ok, true);
+  assert.equal(w.readCount, 1, 'only the pre-read');
+  assert.equal(row(w).status, 'pending');
+  assert.equal(dbm.getBackorderedLinesForOrder(w.orderId)[0].quantity, 4);
+});
+await test('FLAG: a stale / empty / missing commit answer falls back to exactly ONE independent read, and the outcome is the same', async () => {
+  for (const mode of ['stale', 'empty', null]) {
+    const w = world([{ currentQuantity: 10 }]);
+    w.commitLines = mode;
+    const r = await flag(w, { quantity: 4 });
+    assert.equal(r.ok, true, String(mode));
+    assert.equal(w.readCount, 2, `${mode}: pre-read + one independent read-back`);
+    assert.equal(row(w).status, 'pending', String(mode));
+  }
+});
+await test('FLAG: an answer that merely OMITS the line proves nothing (a full removal expects 0, absent is not 0)', async () => {
+  const w = world([{ currentQuantity: 5 }, { currentQuantity: 5 }]);
+  w.deps.removeUnits = async ({ line, quantity }) => {            // really applies, answers without the target line
+    w.lines.find(x => x.liId === line.liId).currentQuantity -= quantity;
+    return { lines: w.lines.filter(x => x.liId !== line.liId).map(x => ({ ...x })) };
+  };
+  const r = await flag(w, { quantity: 5 });
+  assert.equal(r.ok, true);
+  assert.equal(w.readCount, 2, 'not trusted as a confirmation: the independent read decided');
+});
+await test('FLAG FAILS CLOSED: a commit answer showing the line unchanged can never make a no-op look applied', async () => {
+  const w = world([{ currentQuantity: 5 }]);
+  w.deps.removeUnits = async () => ({ lines: w.lines.map(x => ({ ...x })) });     // says "5", and 5 it is
+  const r = await flag(w, { quantity: 2 });
+  assert.equal(r.ok, false);
+  assert.equal(r.state, 'not_applied');
+  assert.equal(row(w), null);
+  assert.equal(w.readCount, 2, 'the unconfirmed answer still got the independent read');
+});
+await test('FLAG: after an edit ERROR no commit answer is used at all - the independent read always decides', async () => {
+  const w = world([{ currentQuantity: 6 }]);
+  w.throwAfterApply = true;                                        // edit errored after applying: no answer is trusted
+  const r = await flag(w, { quantity: 6 });
+  assert.equal(r.ok, true);
+  assert.equal(w.readCount, 2, 'after an error the independent read decides, always');
+  assert.ok(w.errors.some(m => /removal IS in effect/.test(m)));
+});
+await test('FLAG: an edit error with an INCONCLUSIVE independent read still leaves the row applying (unchanged)', async () => {
+  const w = world([{ currentQuantity: 6 }]);
+  w.commitLines = 'honest';
+  w.throwAfterApply = true;
+  w.readFailsAfter = 1;
+  const r = await flag(w, { quantity: 6 });
+  assert.equal(r.state, 'unconfirmed');
+  assert.equal(row(w).status, 'applying');
+});
+await test('UNDO: a commit answer showing the units back needs no second read; a stale one falls back to one', async () => {
+  const a = world([{ currentQuantity: 4 }]);
+  await flag(a, { quantity: 4 });
+  a.commitLines = 'honest'; a.readCount = 0;
+  assert.equal((await undo(a)).ok, true);
+  assert.equal(a.readCount, 1, 'only the pre-read');
+  assert.equal(row(a).status, 'restored');
+  const b = world([{ currentQuantity: 4 }]);
+  await flag(b, { quantity: 4 });
+  b.commitLines = 'stale'; b.readCount = 0;
+  assert.equal((await undo(b)).ok, true);
+  assert.equal(b.readCount, 2, 'pre-read + one independent read-back');
+  assert.equal(row(b).status, 'restored');
+});
+await test('UNDO: the price warning is still raised when the read-back came from the commit answer', async () => {
+  const w = world([{ currentQuantity: 4, unitPrice: 14 }]);
+  await flag(w, { quantity: 4 });
+  w.commitLines = 'honest'; w.restoredPrice = 28; w.readCount = 0;
+  const r = await undo(w);
+  assert.equal(r.ok, true);
+  assert.equal(w.readCount, 1);
+  assert.match(r.warnings.join(' '), /\$28\.00 instead of the stored \$14\.00/);
+});
+await test('UNDO FAILS CLOSED: a commit answer that shows no change is not a restore', async () => {
+  const w = world([{ currentQuantity: 4 }]);
+  await flag(w, { quantity: 4 });
+  w.deps.restoreUnits = async () => ({ warnings: [], lines: w.lines.map(x => ({ ...x })) });   // answers, changes nothing
+  const r = await undo(w);
+  assert.equal(r.ok, false);
+  assert.equal(r.state, 'not_applied');
+  assert.equal(row(w).status, 'pending', 'still backordered');
+});
+
+await test('completeCommitNodes returns the nodes ONLY for a provably complete page (the overflow check for the single-page selection)', () => {
+  const edge = (id) => ({ node: { id } });
+  assert.deepEqual(completeCommitNodes({ pageInfo: { hasNextPage: false, endCursor: null }, edges: [edge('a'), edge('b')] }), [{ id: 'a' }, { id: 'b' }]);
+  assert.deepEqual(completeCommitNodes({ pageInfo: { hasNextPage: false }, edges: [] }), [], 'complete and empty is still complete');
+  for (const bad of [
+    null, undefined, {}, { edges: [edge('a')] },                                  // no connection / no pageInfo
+    { pageInfo: { hasNextPage: true, endCursor: 'c' }, edges: [edge('a')] },      // a prefix
+    { pageInfo: {}, edges: [edge('a')] }, { pageInfo: { hasNextPage: null }, edges: [edge('a')] }, { pageInfo: { hasNextPage: 'false' }, edges: [edge('a')] },
+    { pageInfo: { hasNextPage: false }, edges: 'x' }, { pageInfo: { hasNextPage: false } },
+  ]) assert.equal(completeCommitNodes(bad), null, JSON.stringify(bad));
+});
+
 console.log('\n  Shopify documents');
+await test('the commit mutation that carries the order lines validates against the Admin schema snapshot, at the sizes the server uses', () => {
+  const snap = JSON.parse(readFileSync(new URL('./fixtures/shopify-admin-schema.json', import.meta.url), 'utf8'));
+  const schema = buildClientSchema(snap.data);
+  for (const first of [1, 9, 126, 250]) {
+    const errs = validate(schema, parse(backorderCommitMutation(first))).map(e => e.message);
+    assert.deepEqual(errs, [], `first:${first}`);
+  }
+  assert.throws(() => backorderCommitMutation(0));
+  assert.throws(() => backorderCommitMutation(251));
+  assert.throws(() => backorderCommitMutation('250'));
+  assert.match(backorderCommitMutation(126), /pageInfo\{hasNextPage endCursor\}/, 'the caller needs pageInfo to refuse an incomplete page');
+});
 await test('BACKORDER_LINE_FIELDS validates against the Admin schema snapshot (the schema scan cannot see interpolated selections)', () => {
   const snap = JSON.parse(readFileSync(new URL('./fixtures/shopify-admin-schema.json', import.meta.url), 'utf8'));
   const schema = buildClientSchema(snap.data);

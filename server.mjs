@@ -68,6 +68,9 @@ import { renderLabelSheet, expandItems, TEMPLATES as LABEL_TEMPLATES, DEFAULT_FI
 import { isInsider, resolveXeroContact, syncCustomerToXero, getXeroSyncStatus } from './lib/xero-customer-sync.mjs';
 import { parseLinePrices, applyLinePriceChanges, bulkMarkOrdersPaid, addLineDiscountsConcurrent } from './lib/order-money.mjs';
 import { resolveOrderCompany, buildOrderAddresses } from './lib/order-company.mjs';
+// DEPENDS: lib/edit-mode-resume.mjs — keeps staff in edit mode across the order page's POST -> redirect -> GET
+// round trips (see its header). Mounted below with app.use('/orders', ...); the client half is in editModeScript.
+import { keepEditModeRedirects, keepEditClientPattern, EDIT_ANCHOR } from './lib/edit-mode-resume.mjs';
 import { assertNoUserErrors } from './lib/shopify-user-errors.mjs';
 import { currentShippingAmount, findShippingInvoice, parseShippingAmount, stageShippingReplacement } from './lib/order-shipping.mjs';
 import { createCreditCardInvoice } from './helcim.mjs';
@@ -148,6 +151,9 @@ const app = express();
 // permissive, so no existing consumer changes behaviour.
 app.use(express.json({ limit: '2mb', verify: (req, _res, buf) => { req.rawBody = buf; } }));
 app.use(express.urlencoded({ extended: true }));
+// WHAT: keep-edit-mode redirect rewrite for POST /orders/:id/<action> (lib/edit-mode-resume.mjs). It reads
+// req.body.editMode, so it must stay AFTER the body parsers above and BEFORE every /orders route.
+app.use('/orders', keepEditModeRedirects);
 
 // WHAT: slow-request tripwire — any response slower than 1s logs method/path/status/ms, so a
 // "the app feels broken" report (e.g. the 10s-login complaint, 2026-07-21) yields journalctl data
@@ -2451,8 +2457,8 @@ function variantLabel(variant) {
 
 // WHAT: the large order-detail page — status timeline, editable line items, fulfillments, transactions, address, Xero/partial-invoice state, and the modal JS (edit/discount/fulfill/backorder/invoice/cancel).
 // CHANGE-GUARD: reads several SQLite stores by gid (getXeroMap, getPartialInvoices, getBackordersForOrder, getBackorderedLinesForOrder) — those keys must match shopifyOrderGid(numId). Backordered units are NOT on the Shopify order any more, so they render as inert struck-through rows in a second <tbody class="bo-struck"> (backorderedRowsHtml) that the edit machinery must never see — see the CHANGE-GUARD there. The edit form posts qtys[]/prices[]/removes/addCustomLines to /orders/:id/edit; serializeCustomLines() must run before submit (onclick on Save). Re-test edit/fulfill/cancel modals after any markup change since the inline JS selects elements by hardcoded ids.
-// INVARIANT(S): flash strings map 1:1 to alert banners — adding a server flash value needs a branch here or it renders silently; line-item product links resolve via variant.product.id or the MOCK_VARIANT_PRODUCT fallback.
-function renderOrderDetail(session, order, flash, flashMsg) {
+// EDIT-MODE RESUME (2026-10-26): `resumeEdit` (true only for ?edit=1) emits resumeEditScript, which re-enters edit mode after an action taken while editing — see lib/edit-mode-resume.mjs; never default it to true. INVARIANT(S): flash strings map 1:1 to alert banners — adding a server flash value needs a branch here or it renders silently; line-item product links resolve via variant.product.id or the MOCK_VARIANT_PRODUCT fallback.
+function renderOrderDetail(session, order, flash, flashMsg, { resumeEdit = false } = {}) {
   const numId    = shopifyNumericId(order.id);
   // DEPENDS: both the order heading and the local-note warning link to this exact Shopify order.
   // Keep the store slug aligned with the production Shopify store handle.
@@ -2876,6 +2882,8 @@ function renderOrderDetail(session, order, flash, flashMsg) {
     if (!f) return;
     document.getElementById('bo-undo-li-id').value = u.getAttribute('data-bo-line-id');
     u.disabled = true; u.textContent = 'Restoring…';
+    // form.submit() fires NO submit event, so the capture-phase listener below never sees this one.
+    rememberEditMode(f);
     f.submit();
   });
   // Back/forward can restore this page from bfcache with the buttons still disabled.
@@ -2883,6 +2891,38 @@ function renderOrderDetail(session, order, flash, flashMsg) {
     if (!e.persisted) return;
     document.querySelectorAll('.bo-undo-btn').forEach(function(b){ b.disabled = false; b.textContent = b.getAttribute('data-bo-label'); });
   });
+  // WHAT: STAY IN EDIT MODE across a full-page action (2026-10-26 owner feedback: "takes the screen out of edit
+  //   mode after every change"). When one of the order-page forms in lib/edit-mode-resume.mjs KEEP_EDIT_ACTIONS is
+  //   posted while edit mode is ON, a hidden editMode=1 rides along (the server then ends its redirect in
+  //   ?edit=1#line-items, and the resume script at the bottom of this page re-enters edit mode) and the Line
+  //   Items card's viewport offset is stashed so the scroll position survives the reload.
+  // CHANGE-GUARD: the field is added at submit time from the LIVE state of #edit-mode-bar, never at load, so a form
+  //   restored from bfcache cannot carry a stale 1 (and a stale value is cleared when edit mode is off). Save
+  //   changes (POST /edit) is not in the list on purpose: Save ends the edit session.
+  // DEPENDS: #edit-mode-bar (toggleEditMode sets its display to 'block' when editing), #line-items (the card), the
+  //   .bo-undo-btn handler above (form.submit() skips the submit event, so it calls this directly).
+  // SYNC: KEEP_EDIT_RE is built from lib/edit-mode-resume.mjs KEEP_EDIT_ACTIONS by the server; do not hand-edit it.
+  var KEEP_EDIT_RE = new RegExp(${JSON.stringify(keepEditClientPattern())});
+  var EDIT_STASH_KEY = 'b2b-edit-resume:' + ${JSON.stringify(String(numId))};
+  function editModeIsOn() {
+    var b = document.getElementById('edit-mode-bar');
+    return !!b && b.style.display === 'block';
+  }
+  function rememberEditMode(form) {
+    if (!form || !form.querySelector) return;
+    var path = '';
+    try { path = new URL(form.getAttribute('action') || '', location.href).pathname; } catch (e) { return; }
+    if (!KEEP_EDIT_RE.test(path)) return;
+    var f = form.querySelector('input[name="editMode"]');
+    if (!editModeIsOn()) { if (f) f.value = ''; return; }
+    if (!f) { f = document.createElement('input'); f.type = 'hidden'; f.name = 'editMode'; form.appendChild(f); }
+    f.value = '1';
+    try {
+      var card = document.getElementById('${EDIT_ANCHOR}');
+      if (card) sessionStorage.setItem(EDIT_STASH_KEY, JSON.stringify({ top: card.getBoundingClientRect().top, at: Date.now() }));
+    } catch (e) { /* storage blocked: the #${EDIT_ANCHOR} anchor in the redirect still brings them back to the table */ }
+  }
+  document.addEventListener('submit', function(e){ rememberEditMode(e.target); }, true);
   function toggleInvoiceModal(show) {
     document.getElementById('invoice-modal').style.display = show ? 'flex' : 'none';
   }
@@ -2916,6 +2956,44 @@ function renderOrderDetail(session, order, flash, flashMsg) {
       const rpm = document.getElementById('record-payment-modal'); if (rpm) rpm.style.display = 'none';
     }
   });
+  </script>`;
+
+  // WHAT: re-enters edit mode on a page that was reached by an action taken WHILE editing (the redirect ends in
+  //   ?edit=1#line-items — lib/edit-mode-resume.mjs). It calls toggleEditMode(true), puts the Line Items card back
+  //   where it was in the viewport (the offset stashed by rememberEditMode, which stays correct even though the
+  //   flash banner above the card has changed height; without a stash the #line-items anchor is the fallback),
+  //   and removes `edit` from the address bar so a later manual refresh is an ordinary view-mode load.
+  // CHANGE-GUARD: emitted ONLY when the request carried ?edit=1 (renderOrderDetail's resumeEdit) — a normal load
+  //   gets no script and no edit mode. The restore runs again on window load because the browser also scrolls to
+  //   the #line-items fragment around then; a real user scroll (wheel / touch / key / pointer) cancels it.
+  // DEPENDS: toggleEditMode() and rememberEditMode()'s stash key (EDIT_STASH_KEY) from editModeScript above.
+  const resumeEditScript = !resumeEdit ? '' : `<script>
+  (function () {
+    var wantTop = null, userScrolled = false;
+    try {
+      var raw = sessionStorage.getItem(EDIT_STASH_KEY); sessionStorage.removeItem(EDIT_STASH_KEY);
+      var st = raw ? JSON.parse(raw) : null;
+      if (st && typeof st.top === 'number' && Date.now() - st.at < 600000) wantTop = st.top;
+    } catch (e) { wantTop = null; }
+    ['wheel', 'touchstart', 'keydown', 'mousedown'].forEach(function (t) {
+      window.addEventListener(t, function () { userScrolled = true; }, { capture: true, passive: true });
+    });
+    function restore() {
+      var card = document.getElementById('${EDIT_ANCHOR}');
+      if (wantTop === null || userScrolled || !card) return;
+      window.scrollTo(0, window.pageYOffset + card.getBoundingClientRect().top - wantTop);
+    }
+    function resume() {
+      toggleEditMode(true);
+      try {
+        var u = new URL(location.href); u.searchParams.delete('edit');
+        history.replaceState(history.state, '', u.pathname + u.search + u.hash);
+      } catch (e) { /* cosmetic only */ }
+      restore();
+    }
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', resume); else resume();
+    window.addEventListener('load', restore);
+  })();
   </script>`;
 
 
@@ -3054,6 +3132,7 @@ function renderOrderDetail(session, order, flash, flashMsg) {
     </style>
     ${visibleNotesScript}
     ${editModeScript}
+    ${resumeEditScript}
     <div class="breadcrumb-row"><a href="/orders" class="breadcrumb">← Orders</a></div>
     ${flashHtml}
     <div class="detail-header">
@@ -3090,7 +3169,8 @@ function renderOrderDetail(session, order, flash, flashMsg) {
     ${timeline}
     <div class="detail-grid">
       <div class="detail-main">
-        <div class="card">
+        ${/* DEPENDS: id="line-items" is the scroll anchor of lib/edit-mode-resume.mjs (EDIT_ANCHOR): the keep-edit-mode redirect
+              ends in #line-items and the resume script restores the card's viewport offset. Renaming it silently drops both. */''}<div class="card" id="line-items">
           <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
             <h2>Line Items</h2>
             <span id="edit-mode-bar" style="display:none">
@@ -4209,7 +4289,7 @@ function renderOrderDetail(session, order, flash, flashMsg) {
             <textarea name="note" class="textarea" rows="3" placeholder="Add a Shopify order note…" aria-label="Shopify order note">${h(order.note||'')}</textarea>
             <div style="margin-top:0.5rem;display:flex;gap:8px;align-items:center">
               <button type="submit" class="btn btn-secondary btn-sm">Save note</button>
-              ${order.note && String(order.note).trim() ? `<button type="button" class="btn btn-ghost btn-sm" style="color:#a32d2d" onclick="if(confirm('Delete this customer note?')){this.form.note.value='';this.form.submit();}">Delete</button>` : ''}
+              ${order.note && String(order.note).trim() ? `<button type="button" class="btn btn-ghost btn-sm" style="color:#a32d2d" onclick="if(confirm('Delete this customer note?')){this.form.note.value='';rememberEditMode(this.form);this.form.submit();}">Delete</button>` : ''}
             </div>
           </form>
         </div>
@@ -4223,7 +4303,7 @@ function renderOrderDetail(session, order, flash, flashMsg) {
             <textarea name="note" class="textarea" rows="3" placeholder="Private note stored only in B2B Admin…" aria-label="B2B Admin-only note">${h(order.internalNote||'')}</textarea>
             <div style="margin-top:0.5rem;display:flex;gap:8px;align-items:center">
               <button type="submit" class="btn btn-secondary btn-sm">Save in B2B Admin only</button>
-              ${order.internalNote && String(order.internalNote).trim() ? `<button type="button" class="btn btn-ghost btn-sm" style="color:#a32d2d" onclick="if(confirm('Delete this internal note?')){this.form.note.value='';this.form.submit();}">Delete</button>` : ''}
+              ${order.internalNote && String(order.internalNote).trim() ? `<button type="button" class="btn btn-ghost btn-sm" style="color:#a32d2d" onclick="if(confirm('Delete this internal note?')){this.form.note.value='';rememberEditMode(this.form);this.form.submit();}">Delete</button>` : ''}
             </div>
           </form>
         </div>
@@ -6340,7 +6420,9 @@ app.get('/orders/:id', requireAuth, async (req, res) => {
   order.visibleNotes = getVisibleNotesForOrder(shopifyId);
   // Staff-only internal note (admin-local, keyed by numeric order id) — never synced/invoiced
   order.internalNote = getOrderInternalNote(req.params.id)?.body || '';
-  res.send(renderOrderDetail(req.adminSession, order, req.query.success || req.query.error || '', req.query.msg || ''));
+  // resumeEdit: ONLY an explicit ?edit=1 (added by lib/edit-mode-resume.mjs to the redirect that follows an
+  // action taken while editing) re-enters edit mode. A plain load never carries it, so edit mode is never forced on.
+  res.send(renderOrderDetail(req.adminSession, order, req.query.success || req.query.error || '', req.query.msg || '', { resumeEdit: req.query.edit === '1' }));
 });
 
 // WHAT: Mark a single order paid in Shopify (orderMarkAsPaid), audit it, then fire-and-forget record the payment in Xero (creating the invoice first if unsynced), skipping insiders.
@@ -7430,7 +7512,25 @@ function verifyOrderDiscount(lineState, expected) {
 // is recorded `committed`: if it throws, the action is marked `failed` and the error surfaces —
 // so the idempotency ledger never records a commit that did not actually take effect on Shopify
 // (the delete-persist false-green). Returning a string from verifyFn pushes it as a warning.
-async function runOrderEdit(orderId, idemKey, editedBy, action, payload, stageFn, verifyFn) {
+//
+// opts (2026-10-26 speed hot-fix; both default off, so every existing caller is unchanged):
+//   skipLineState: true  - do NOT run readCommittedLineState after the commit. For callers that never use
+//     result.lineState / result.order (the backorder flag/undo adapters, which re-read Shopify themselves
+//     and decide with their own state machine). Refuses to combine with verifyFn: skipping the
+//     verify-or-fail oracle must never happen silently. The ledger row stores NO lineState (a replay of a
+//     lean action returns { ok, idemKey, lean:true }), and the ~118-line payload is never persisted.
+//   commitLines: (first)=>mutation doc - use this commit mutation, which also returns the order's lines in
+//     the SAME response. If (and only if) that answer is complete (pageInfo.hasNextPage === false) the raw
+//     nodes come back as result.committedNodes (NOT persisted). The caller decides what they prove; an
+//     absent/partial answer just means the caller does its own read, as before.
+// CHANGE-GUARD: skipLineState does not change the no-op branch's meaning ("There must be at least one change"
+//   is still success here - the CALLER's read-back is what notices nothing changed).
+// DEPENDS: lib/backorder-edit.mjs backorderCommitMutation is the only commitLines builder; backorderEditOpts()
+//   (below, 16D) is the only skipLineState caller.
+async function runOrderEdit(orderId, idemKey, editedBy, action, payload, stageFn, verifyFn, opts = {}) {
+  if (opts.skipLineState && verifyFn) throw new Error('runOrderEdit: skipLineState cannot be combined with verifyFn (it would skip the verify-or-fail oracle)');
+  const _t0 = Date.now();
+  const _ms = { begin: 0, stage: 0, commit: 0, verify: 0 };
   // [order-edit] P0 instrumentation (2026-06-29): log every save attempt + its REAL outcome so a
   // future failure shows the actual Shopify userError / exception in journalctl, not just a red pill.
   const _payloadSummary = (() => { try { const p = payload || {}; return JSON.stringify({ liId: p.liId, qty: p.qty, price: p.price, variantId: p.variantId, title: p.title ? String(p.title).slice(0,40) : undefined }); } catch { return '<unserializable>'; } })();
@@ -7452,6 +7552,7 @@ async function runOrderEdit(orderId, idemKey, editedBy, action, payload, stageFn
       catch { return { replayed: true }; }
     }
     try {
+      const _beginAt = Date.now();
       const beginResult = await shopifyFetch(`
         mutation begin($id:ID!){orderEditBegin(id:$id){
           calculatedOrder{ id lineItems(first:${LINE_PAGE_MAX}){ pageInfo{hasNextPage endCursor} edges{node{ ${CALC_LINE_FIELDS} }}} }
@@ -7468,18 +7569,26 @@ async function runOrderEdit(orderId, idemKey, editedBy, action, payload, stageFn
       // reports "line not found on order" no matter how many times the operator retries.
       const calcItems = await drainLineItems(calcOrder.lineItems, 'calculated order',
         calcLineItemsPage(calcId, CALC_LINE_FIELDS));
+      _ms.begin = Date.now() - _beginAt;
 
       const ctx = { calcOrder, calcItems, sessionId: beginResult.data?.orderEditBegin?.orderEditSession?.id, warnings: [] };
       const stageStarted = Date.now();
       await stageFn(calcId, ctx);
-      console.log(`[order-edit] STAGED action=${action} order=${orderId} elapsedMs=${Date.now() - stageStarted}`);
+      _ms.stage = Date.now() - stageStarted;
+      console.log(`[order-edit] STAGED action=${action} order=${orderId} elapsedMs=${_ms.stage}`);
 
       // Commit — and ACTUALLY READ userErrors (this is the bug the user hit).
-      const commitRes = await shopifyFetch(`mutation commit($id:ID!,$notify:Boolean!,$note:String){
+      // opts.commitLines swaps in the commit mutation that also answers with the order's lines; its page size
+      // is the session's line count + headroom (an undo-add grows the order by one), never above the 250 page cap.
+      const _commitAt = Date.now();
+      const commitRes = await shopifyFetch(opts.commitLines
+        ? opts.commitLines(Math.min(LINE_PAGE_MAX, calcItems.length + 8))
+        : `mutation commit($id:ID!,$notify:Boolean!,$note:String){
         orderEditCommit(id:$id,notifyCustomer:$notify,staffNote:$note){
           order{id} userErrors{field message}}}`,
         { id: calcId, notify: false, note: payload?.staffNote || null },
         { timeoutMs: action === 'discount/order' ? 60000 : 15000 });
+      _ms.commit = Date.now() - _commitAt;
       const cErrs = commitRes.data?.orderEditCommit?.userErrors || [];
       if (cErrs.length) {
         // NO-OP IS NOT A FAILURE (P0 regression fix, 2026-06-29): Shopify returns
@@ -7494,6 +7603,13 @@ async function runOrderEdit(orderId, idemKey, editedBy, action, payload, stageFn
         const isNoChange = cErrs.every(e => /at least one change/i.test(e.message || ''));
         if (isNoChange) {
           console.log(`[order-edit] ${action} commit was a NO-OP (order already in desired state) — treating as success`);
+          if (opts.skipLineState) {
+            // Lean caller: no line state to build and none to verify. It reads Shopify itself, sees nothing changed
+            // and decides (backorder: "nothing was backordered" - fail closed).
+            const lean = { ok: true, idemKey, noop: true, lean: true, warnings: ctx.warnings };
+            putEditAction({ idemKey, orderId, action, payload, result: lean, status: 'committed', editedBy });
+            return lean;
+          }
           const lineState = await readCommittedLineState(orderId);
           if (verifyFn) { const w = await verifyFn(lineState); if (typeof w === 'string' && w) ctx.warnings.push(w); }
           const result = { ok: true, idemKey, noop: true, warnings: ctx.warnings, order: { subtotal: lineState.subtotal, total: lineState.total, lineCount: lineState.lineCount }, lineState };
@@ -7508,14 +7624,25 @@ async function runOrderEdit(orderId, idemKey, editedBy, action, payload, stageFn
       // mis-mapped or no-op'd mutation can `commit` cleanly yet leave the targeted line
       // untouched — verifyFn re-checks the live state and throws if reality disagrees, so we
       // never record a false-green in the idempotency ledger or return ok:true to the UI.
+      if (opts.skipLineState) {
+        // Lean path (backorder flag/undo). The commit may have answered with the order's lines; hand them back
+        // ONLY when the page is provably complete. They are returned to the caller but never written to the ledger.
+        const committedNodes = completeCommitNodes(commitRes.data?.orderEditCommit?.order?.lineItems);
+        const lean = { ok: true, idemKey, lean: true, warnings: ctx.warnings };
+        putEditAction({ idemKey, orderId, action, payload, result: lean, status: 'committed', editedBy });
+        console.log(`[order-edit] OK action=${action} order=${orderId} idem=${idemKey} lean=1 commitLines=${committedNodes ? committedNodes.length : 'none'} warnings=${ctx.warnings.length} ms[begin=${_ms.begin} stage=${_ms.stage} commit=${_ms.commit} verify=0 total=${Date.now() - _t0}]`);
+        return committedNodes ? { ...lean, committedNodes } : lean;
+      }
+      const _verifyAt = Date.now();
       const lineState = await readCommittedLineState(orderId);
       if (verifyFn) {
         const w = await verifyFn(lineState);
         if (typeof w === 'string' && w) ctx.warnings.push(w);
       }
+      _ms.verify = Date.now() - _verifyAt;
       const result = { ok: true, idemKey, warnings: ctx.warnings, order: { subtotal: lineState.subtotal, total: lineState.total, lineCount: lineState.lineCount }, lineState };
       putEditAction({ idemKey, orderId, action, payload, result, status: 'committed', editedBy });
-      console.log(`[order-edit] OK action=${action} order=${orderId} idem=${idemKey} lineCount=${result.order?.lineCount} subtotal=${result.order?.subtotal} warnings=${(result.warnings||[]).length}`);
+      console.log(`[order-edit] OK action=${action} order=${orderId} idem=${idemKey} lineCount=${result.order?.lineCount} subtotal=${result.order?.subtotal} warnings=${(result.warnings||[]).length} ms[begin=${_ms.begin} stage=${_ms.stage} commit=${_ms.commit} verify=${_ms.verify} total=${Date.now() - _t0}]`);
       return result;
     } catch (err) {
       const messages = err instanceof OrderEditError ? err.userMessages : [err.message];
@@ -7919,7 +8046,20 @@ app.post('/orders/:id/edit', requireAuth, async (req, res) => {
 // remove/qty/price then mutated the WRONG line while the endpoint still reported success and
 // logged "removed". Keep the suffix match first; the variant+title heuristic is a last-ditch
 // fallback only for the (rare) case where Shopify does NOT preserve the suffix.
-async function mapOrigToCalc(orderId, calcItems, origLiId) {
+//
+// SPEED (2026-10-26): needOrig:false lets a caller that only wants the calculated line (qty / remove /
+// backorder flag / backorder raise - they read calcLiId and calcItem, never `orig`) skip the whole-order
+// read when the PRIMARY suffix match already answers. The slow path below still runs for everything else:
+// no suffix match, an id that is not a LineItem gid, or a caller that needs `orig` (line/price).
+// INVARIANT(S): the fast path can only return a calc line whose numeric id equals the requested LineItem's
+//   - the same 1:1 mapping the slow path tries first - so it cannot map to a different line. A line that is
+//   not on the order has no such calc line and falls through to the slow path ("line not found").
+async function mapOrigToCalc(orderId, calcItems, origLiId, { needOrig = true } = {}) {
+  if (!needOrig && /^gid:\/\/shopify\/LineItem\/\d+$/.test(String(origLiId))) {
+    const wantNum = shopifyNumericId(origLiId);
+    const hit = calcItems.find(c => shopifyNumericId(c.id) === wantNum);
+    if (hit) return { calcLiId: hit.id, orig: null, calcItem: hit };
+  }
   // PAGED, and this one is not cosmetic: origItems is searched for origLiId itself. Under the old
   // first:100, editing line 101+ of an order found nothing here, returned calcLiId:null, and the
   // caller answered "line not found on order" — for a line plainly visible on the page, on every
@@ -8123,7 +8263,7 @@ app.post('/orders/:id/line/qty', requireAuth, async (req, res) => {
 
   try {
     const result = await runOrderEdit(orderId, idemKey, session.email, 'line/qty', payload, async (calcId, ctx) => {
-      const { calcLiId } = await mapOrigToCalc(orderId, ctx.calcItems, payload.liId);
+      const { calcLiId } = await mapOrigToCalc(orderId, ctx.calcItems, payload.liId, { needOrig: false });
       if (!calcLiId) throw new OrderEditError('line not found on order');
       const r = await shopifyFetch(`mutation setQty($id:ID!,$li:ID!,$qty:Int!,$r:Boolean!){
         orderEditSetQuantity(id:$id,lineItemId:$li,quantity:$qty,restock:$r){ calculatedOrder{id} userErrors{field message}}}`,
@@ -8266,7 +8406,7 @@ app.post('/orders/:id/line/remove', requireAuth, async (req, res) => {
 
   try {
     const result = await runOrderEdit(orderId, idemKey, session.email, 'line/remove', payload, async (calcId, ctx) => {
-      const { calcLiId } = await mapOrigToCalc(orderId, ctx.calcItems, payload.liId);
+      const { calcLiId } = await mapOrigToCalc(orderId, ctx.calcItems, payload.liId, { needOrig: false });
       if (!calcLiId) throw new OrderEditError('line not found on order');
       const r = await shopifyFetch(`mutation setQty($id:ID!,$li:ID!,$qty:Int!,$r:Boolean!){
         orderEditSetQuantity(id:$id,lineItemId:$li,quantity:$qty,restock:$r){ calculatedOrder{id} userErrors{field message}}}`,
@@ -8887,6 +9027,7 @@ app.post('/orders/:id/fulfill', requireAuth, async (req, res) => {
 import {
   flagBackorder, undoBackorder, parseBackorderRequest, errMsg as backorderErrMsg,
   stageRemoveUnits, stageRaiseUnits, stageAddVariantAtPrice, stageAddCustomAtPrice, BACKORDER_FLASH, BACKORDER_LINE_FIELDS,
+  backorderCommitMutation, completeCommitNodes,
 } from './lib/backorder-edit.mjs';
 import {
   getBackorderRow, claimBackorderRemoval, finalizeBackorderRemoval, abandonBackorderClaim,
@@ -8928,17 +9069,31 @@ async function backorderReadLines(numId, orderId) {
 // CHANGE-GUARD: no verifyFn on purpose — the core reads the order back itself and decides applied /
 //   not-applied / unknown, which a throwing verifyFn would pre-empt (it would mark the ledger 'failed'
 //   for an edit that DID commit).
+//
+// SPEED (2026-10-26, "Mark backordered seems slow": ~7.5-8.3 s per click on a 118-line order, ~2 s of it four
+//   whole-order reads): (1) mapOrigToCalc needs no order read - the suffix match answers; (2) runOrderEdit skips
+//   readCommittedLineState (this adapter never used its result); (3) the commit mutation also returns the
+//   order's lines, and flagBackorder/undoBackorder accept them as the read-back ONLY when they positively
+//   confirm (lib/backorder-edit.mjs confirmedByCommit) - otherwise they read independently, as before.
+// B2B_BACKORDER_COMMIT_READBACK=0 turns (3) off (the commit then returns no lines); (1) and (2) stay.
+// DEPENDS: lib/backorder-edit.mjs flagBackorder/undoBackorder consume the returned { lines } and need them
+//   to be COMPLETE and in readLines() shape; test/backorder-roundtrips.test.mjs pins the call sequence.
+const BACKORDER_COMMIT_READBACK = process.env.B2B_BACKORDER_COMMIT_READBACK !== '0';
+const backorderEditOpts = () => ({ skipLineState: true, ...(BACKORDER_COMMIT_READBACK ? { commitLines: backorderCommitMutation } : {}) });
+// The lines the commit answered with, in the shape readLines() returns - or {} when it gave no complete answer.
+const committedLinesOf = (r) => (r?.committedNodes ? { lines: r.committedNodes.map(normalizeBackorderLine) } : {});
 async function backorderRemoveUnitsReal({ orderId, editedBy, line, quantity, idemKey, payload }) {
-  await runOrderEdit(orderId, idemKey, editedBy, 'backorder/flag', payload, async (calcId, ctx) => {
-    const { calcLiId, calcItem } = await mapOrigToCalc(orderId, ctx.calcItems, line.liId);
+  const r = await runOrderEdit(orderId, idemKey, editedBy, 'backorder/flag', payload, async (calcId, ctx) => {
+    const { calcLiId, calcItem } = await mapOrigToCalc(orderId, ctx.calcItems, line.liId, { needOrig: false });
     if (!calcLiId) throw new OrderEditError('line not found on order');
     await stageRemoveUnits({ shopifyFetch, calcId, calcLiId, calcQty: Number(calcItem?.quantity), quantity });
-  });
+  }, undefined, backorderEditOpts());
+  return committedLinesOf(r);
 }
 async function backorderRestoreUnitsReal({ orderId, editedBy, mode, row, live, quantity, unitPrice, idemKey, payload }) {
-  await runOrderEdit(orderId, idemKey, editedBy, 'backorder/restore', payload, async (calcId, ctx) => {
+  const r = await runOrderEdit(orderId, idemKey, editedBy, 'backorder/restore', payload, async (calcId, ctx) => {
     if (mode === 'raise') {
-      const { calcLiId, calcItem } = await mapOrigToCalc(orderId, ctx.calcItems, live.liId);
+      const { calcLiId, calcItem } = await mapOrigToCalc(orderId, ctx.calcItems, live.liId, { needOrig: false });
       if (!calcLiId) throw new OrderEditError('line not found on order');
       await stageRaiseUnits({ shopifyFetch, calcId, calcLiId, calcQty: Number(calcItem?.quantity), quantity });
     } else if (row.variant_id) {
@@ -8947,8 +9102,8 @@ async function backorderRestoreUnitsReal({ orderId, editedBy, mode, row, live, q
     } else {
       await stageAddCustomAtPrice({ shopifyFetch, calcId, title: row.line_item_title, quantity, unitPrice, currency: row.currency });
     }
-  });
-  return { warnings: [] };
+  }, undefined, backorderEditOpts());
+  return { warnings: [], ...committedLinesOf(r) };
 }
 
 // MOCK adapters — drive the same mockIncrementalEdit ledger the other line routes use, and model the two

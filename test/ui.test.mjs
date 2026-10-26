@@ -2149,7 +2149,12 @@ await test('Mark backordered removes the line from the order page and leaves a s
   assert.equal(await struck.locator('input, select, textarea, .edit-qty-input, .edit-price-input, .edit-remove-btn, .row-save-chip').count(), 0);
   assert.equal(await page.evaluate(() => !!document.getElementById('bo-undo-form') && document.getElementById('bo-undo-form').closest('#edit-form') === null), true);
 
-  // Entering and leaving edit mode must not touch it, dim it, or change the totals.
+  // Entering and leaving edit mode must not touch it, dim it, or change the totals. The flag was taken IN edit
+  // mode, so the page is already back in it (the "stay in edit mode" section below pins that); leaving and
+  // re-entering is exercised right here.
+  await page.waitForSelector('#edit-save-bar', { state: 'visible' });
+  await page.click('#edit-mode-bar button.btn-ghost');
+  await page.waitForSelector('#edit-btn', { state: 'visible' });
   await page.click('#edit-btn');
   await page.waitForSelector('#edit-save-bar', { state: 'visible' });
   assert.equal(await undo.isVisible(), true, 'Undo stays visible in edit mode');
@@ -2209,7 +2214,8 @@ await test('a PARTIAL backorder leaves the rest live (no legacy badge on it) bes
   assert.equal(await struck.count(), 1);
   assert.match(await struck.innerText(), new RegExp(`\\b${n}\\b`));
   // The remaining live line keeps working: its own ⚑ button still opens the modal with the REDUCED quantity as max.
-  await page.click('#edit-btn');
+  // (Still in edit mode from the flag — no need to click "Edit order" again.)
+  await page.waitForSelector('#edit-save-bar', { state: 'visible' });
   await remaining.locator('.bo-action-btn').click();
   assert.equal(await page.getAttribute('#bo-quantity', 'max'), String(qty - n), 'max follows the line CURRENT quantity, not the original');
   await page.keyboard.press('Escape');
@@ -2356,6 +2362,172 @@ await test('a hostile line title cannot break out of the struck row, the Undo co
       await ctx.request.post(`${BASE}/orders/1002/line/remove`, { data: { idemKey: `ui-evil-rm-${Date.now()}-${i}`, liId: id } });
     }
   }
+});
+
+// ── STAY IN EDIT MODE across the full-page actions (2026-10-26 owner feedback) ───────────────────────────────
+// "It takes the screen out of edit mode after every change." Mark backordered and Undo backorder are real POSTs
+// that redirect, so the order page used to come back in VIEW mode every time. The page now sends editMode=1 with
+// the form while edit mode is on; the server ends its redirect in ?edit=1#line-items for success AND failure; the
+// page re-enters edit mode, restores where the Line Items card was in the viewport, and tidies the address bar.
+// Normal loads must never be in edit mode. Set UI_SHOT_DIR to also write screenshots there.
+// SYNC: lib/edit-mode-resume.mjs (the contract), server.mjs editModeScript (rememberEditMode) + resumeEditScript.
+console.log('\nUI tests — edit mode survives Mark backordered / Undo / other order-page actions:');
+
+const inEditMode = page => page.evaluate(() => document.getElementById('edit-mode-bar').style.display === 'block'
+  && document.getElementById('edit-save-bar').style.display === 'block'
+  && document.getElementById('edit-btn').style.display === 'none');
+const cardTop = page => page.evaluate(() => document.getElementById('line-items').getBoundingClientRect().top);
+const stashLeft = page => page.evaluate(() => sessionStorage.getItem('b2b-edit-resume:1002'));
+// Banner / chrome that proves the page is genuinely interactive again, not just "bar is visible".
+async function assertFullyEditable(page, label) {
+  assert.equal(await inEditMode(page), true, `${label}: edit bar + save bar shown, "Edit order" hidden`);
+  assert.equal(await page.isVisible('#edit-add-bar'), true, `${label}: the Add product bar is shown`);
+  assert.equal(await page.isVisible('#edit-discount-bar'), true, `${label}: the order-discount bar is shown`);
+  const qtyInputs = await page.locator('#edit-form tbody:not(.bo-struck) tr[data-existing="1"] .edit-qty-input').evaluateAll(els => els.map(e => ({ shown: getComputedStyle(e).display !== 'none', disabled: e.disabled })));
+  for (const q of qtyInputs) assert.deepEqual(q, { shown: true, disabled: false }, `${label}: every live row's qty input is enabled and shown`);
+}
+
+await test('STAY IN EDIT MODE: Mark backordered, then Undo, both land back in edit mode with the flash shown and the card where it was', async (page, ctx) => {
+  await page.setViewportSize({ width: 1100, height: 420 });      // short window so the page really scrolls
+  await openEditMode(page, ctx, 1002);
+  await page.evaluate(() => window.scrollTo(0, 150));
+  const btn = boTarget(page).locator('.bo-action-btn');
+  const title = await btn.getAttribute('data-li-title');
+  const qty = await btn.getAttribute('data-li-qty');
+  await btn.click();
+  const topBefore = await cardTop(page);
+  assert.ok(await page.evaluate(() => window.pageYOffset) > 100, 'the test page is scrolled down');
+
+  const flagReq = page.waitForRequest(r => r.method() === 'POST' && /\/orders\/1002\/backorder$/.test(r.url()));
+  await Promise.all([page.waitForURL(/success=backorder_flagged/), page.click('#bo-submit')]);
+  const flagBody = (await flagReq).postData() || '';
+  assert.match(flagBody, /(^|&)editMode=1(&|$)/, `the form posted while editing carries the opt-in: ${flagBody}`);
+  assert.match(flagBody, /(^|&)idemKey=[A-Za-z0-9_-]{8,80}(&|$)/, 'and its double-submit token');
+  assert.match(flagBody, new RegExp(`(^|&)quantity=${qty}(&|$)`), 'and the quantity');
+
+  assert.equal(page.url(), `${BASE}/orders/1002?success=backorder_flagged#line-items`, '?edit=1 is tidied away, the flash and the anchor stay');
+  await assertFullyEditable(page, 'after Mark backordered');
+  assert.match(await page.locator('.alert-success').first().innerText(), /Marked as backordered/, 'the success flash is still shown');
+  assert.equal(await boStruckRows(page).count(), 1, 'the struck row is there');
+  assert.ok(Math.abs(await cardTop(page) - topBefore) <= 2, `the Line Items card is where it was in the viewport (${topBefore} -> ${await cardTop(page)})`);
+  assert.equal(await stashLeft(page), null, 'the one-shot scroll stash was consumed');
+  await boShot(page, 'editmode-desktop-1-after-flag');
+
+  // Undo from the struck row, still in edit mode.
+  const undo = boStruckRows(page).locator('.bo-undo-btn');
+  await undo.scrollIntoViewIfNeeded();
+  const topBeforeUndo = await cardTop(page);
+  const undoReq = page.waitForRequest(r => r.method() === 'POST' && /\/orders\/1002\/backorder\/undo$/.test(r.url()));
+  page.once('dialog', d => d.accept());
+  await Promise.all([page.waitForURL(/success=backorder_restored/), undo.click()]);
+  assert.match((await undoReq).postData() || '', /(^|&)editMode=1(&|$)/, 'the Undo form (submitted with form.submit(), no submit event) opts in too');
+  assert.equal(page.url(), `${BASE}/orders/1002?success=backorder_restored#line-items`);
+  await assertFullyEditable(page, 'after Undo');
+  assert.match(await page.locator('.alert-success').first().innerText(), /Backorder undone/);
+  assert.equal(await boStruckRows(page).count(), 0);
+  assert.ok(Math.abs(await cardTop(page) - topBeforeUndo) <= 2, `Undo: the card stayed put (${topBeforeUndo} -> ${await cardTop(page)})`);
+  const back = boLiveRows(page).filter({ hasText: title });
+  assert.equal(await back.count(), 1, 'the line is back, and editable');
+  assert.equal(await back.locator('.edit-qty-input').inputValue(), qty);
+  await boShot(page, 'editmode-desktop-2-after-undo');
+  // Cancel still leaves edit mode by hand.
+  await page.click('#edit-mode-bar button.btn-ghost');
+  assert.equal(await inEditMode(page), false, 'Cancel still leaves edit mode by hand');
+});
+
+await testMobile('STAY IN EDIT MODE at 390px: flag + Undo come back in edit mode and Undo stays reachable', async (page, ctx) => {
+  await openEditMode(page, ctx, 1002);
+  const vw = page.viewportSize().width;
+  const btn = boTarget(page).locator('.bo-action-btn');
+  const title = await btn.getAttribute('data-li-title');
+  await btn.click();
+  await Promise.all([page.waitForURL(/success=backorder_flagged/), page.click('#bo-submit')]);
+  await assertFullyEditable(page, '390px after Mark backordered');
+  const undo = boStruckRows(page).locator('.bo-undo-btn');
+  const box = await undo.boundingBox();
+  assert.ok(box && box.x >= 0 && box.x + box.width <= vw, 'Undo is inside the viewport');
+  await boShot(page, 'editmode-mobile-1-after-flag');
+  page.once('dialog', d => d.accept());
+  await Promise.all([page.waitForURL(/success=backorder_restored/), undo.click()]);
+  await assertFullyEditable(page, '390px after Undo');
+  assert.equal(await boLiveRows(page).filter({ hasText: title }).count(), 1);
+  await boShot(page, 'editmode-mobile-2-after-undo');
+});
+
+await test('STAY IN EDIT MODE: a REFUSED backorder shows its error and the page is still in edit mode with the line untouched', async (page, ctx) => {
+  await openEditMode(page, ctx, 1002);
+  const btn = boTarget(page).locator('.bo-action-btn');
+  const title = await btn.getAttribute('data-li-title');
+  await btn.click();
+  // The browser would stop an over-quantity; forge one past it — the server is the authority and must refuse.
+  await page.evaluate(() => { const q = document.getElementById('bo-quantity'); q.removeAttribute('max'); q.value = '99999'; });
+  await Promise.all([page.waitForURL(/error=backorder_shopify_failed/), page.click('#bo-submit')]);
+  assert.match(page.url(), /#line-items$/, 'the anchor is kept on a failure too');
+  assert.ok(!/[?&]edit=/.test(page.url()), 'and ?edit=1 is tidied away');
+  const banner = page.locator('.breadcrumb-row ~ .alert');
+  assert.match(await banner.first().getAttribute('class'), /alert-warning/);
+  assert.match(await banner.first().innerText(), /^Backorder action failed — \S/, 'the server\'s own reason is on the banner');
+  await assertFullyEditable(page, 'after a refused backorder');
+  assert.equal(await boStruckRows(page).count(), 0, 'a refused backorder leaves no struck row');
+  assert.equal(await boLiveRows(page).filter({ hasText: title }).count(), 1, 'the line is untouched');
+  await boShot(page, 'editmode-desktop-3-refused');
+});
+
+await test('NORMAL LOADS are never in edit mode; only an explicit ?edit=1 enters it, and refreshing afterwards is a plain load', async (page, ctx) => {
+  await boLogin(ctx);
+  for (const q of ['', '?success=backorder_flagged', '?error=backorder_shopify_failed&msg=nope', '?edit=0', '?edit=yes', '?edit=', '#line-items']) {
+    await page.goto(`${BASE}/orders/1002${q}`);
+    assert.equal(await inEditMode(page), false, `GET /orders/1002${q} must be a view-mode page`);
+    assert.equal(await page.isVisible('#edit-btn'), true, `GET /orders/1002${q} shows "Edit order"`);
+    assert.equal(await page.isVisible('#edit-save-bar'), false);
+  }
+  // Going "back" to an order page must not resurrect edit mode either: the stash is only read on ?edit=1.
+  await page.evaluate(() => sessionStorage.setItem('b2b-edit-resume:1002', JSON.stringify({ top: 100, at: Date.now() })));
+  await page.goto(`${BASE}/orders/1002`);
+  assert.equal(await inEditMode(page), false, 'a leftover stash alone never enters edit mode');
+  await page.evaluate(() => sessionStorage.removeItem('b2b-edit-resume:1002'));
+
+  await page.goto(`${BASE}/orders/1002?success=backorder_restored&edit=1#line-items`);
+  assert.equal(await inEditMode(page), true, '?edit=1 enters edit mode');
+  assert.equal(page.url(), `${BASE}/orders/1002?success=backorder_restored#line-items`);
+  await page.reload();
+  assert.equal(await inEditMode(page), false, 'a manual refresh after the tidy-up is an ordinary view-mode load');
+});
+
+await test('UNDO taken in VIEW mode stays in view mode, and a stale editMode field is never sent', async (page, ctx) => {
+  await boLogin(ctx);
+  await page.goto(`${BASE}/orders/1002`);
+  const btn = boTarget(page).locator('.bo-action-btn');
+  const liId = await btn.getAttribute('data-li-id');
+  const title = await btn.getAttribute('data-li-title');
+  const qty = await btn.getAttribute('data-li-qty');
+  // Flag through the endpoint (no browser involved) so the page then opens in view mode with a struck row.
+  const res = await ctx.request.post(`${BASE}/orders/1002/backorder`, { form: { lineItemId: liId, lineItemTitle: title, quantity: qty }, maxRedirects: 0 });
+  assert.equal(res.headers().location, '/orders/1002?success=backorder_flagged', 'no opt-in, no rewrite');
+  await page.goto(`${BASE}/orders/1002?success=backorder_flagged`);
+  assert.equal(await inEditMode(page), false);
+  // Plant the stale opt-in a bfcache-restored form could carry.
+  await page.evaluate(() => { const i = document.createElement('input'); i.type = 'hidden'; i.name = 'editMode'; i.value = '1'; document.getElementById('bo-undo-form').appendChild(i); });
+  const undoReq = page.waitForRequest(r => r.method() === 'POST' && /\/orders\/1002\/backorder\/undo$/.test(r.url()));
+  page.once('dialog', d => d.accept());
+  await Promise.all([page.waitForURL(/success=backorder_restored/), boStruckRows(page).locator('.bo-undo-btn').click()]);
+  assert.match((await undoReq).postData() || '', /(^|&)editMode=(&|$)/, 'edit mode was off, so the stale 1 was cleared before sending');
+  assert.equal(page.url(), `${BASE}/orders/1002?success=backorder_restored`, 'no ?edit, no anchor: the view-mode redirect is exactly as before');
+  assert.equal(await inEditMode(page), false, 'still view mode');
+  assert.equal(await boLiveRows(page).filter({ hasText: title }).count(), 1);
+});
+
+await test('STAY IN EDIT MODE: the B2B-only note form (reachable while editing) keeps it; Save changes is the one action that ends it', async (page, ctx) => {
+  await openEditMode(page, ctx, 1002);
+  await page.locator('#internal-note-card textarea[name="note"]').fill('');
+  await Promise.all([page.waitForURL(/success=local_note_saved/), page.locator('#internal-note-card button[type="submit"]').click()]);
+  await assertFullyEditable(page, 'after saving the B2B-only note');
+  assert.match(await page.locator('.alert-success').first().innerText(), /B2B Admin-only note saved/);
+
+  // Save changes = "I am done": it deliberately leaves edit mode (lib/edit-mode-resume.mjs CHANGE-GUARD).
+  await Promise.all([page.waitForURL(/\/orders\/1002\?(success=order_edited|error=edit_failed)/), page.click('#edit-save-btn')]);
+  assert.equal(await inEditMode(page), false, 'Save changes ends the edit session');
+  assert.ok(!/edit=1/.test(page.url()) && !page.url().includes('#'), page.url());
 });
 
 await browser.close();

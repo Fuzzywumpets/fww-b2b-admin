@@ -3124,6 +3124,98 @@ await test('a removed-units backorder appears in the /backorders queue and the a
   assert.ok(!after.backorders.some(b => b.line_item_id === li), 'undone rows leave the queue');
 });
 
+// ── Edit mode survives the redirect (2026-10-26 hot-fix: "takes the screen out of edit mode after every change") ──
+// The page adds editMode=1 to the form it posts WHILE editing; lib/edit-mode-resume.mjs then ends the redirect in
+// ?edit=1#line-items for success AND failure. The browser half is in test/ui.test.mjs; unit cases in
+// test/edit-mode-resume.test.mjs. Probe lines are cleaned up by the housekeeping test below.
+const EDIT_SUFFIX = /[?&]edit=1#line-items$/;
+
+await test('EDIT MODE: an opted-in backorder / undo keeps edit mode on the success redirect (flash and anchor intact)', async () => {
+  const cookie = await seedSession();
+  const li = await boProbe(cookie, { qty: 6, title: 'BO keep-edit' });
+  const flagged = await boFlag(cookie, { lineItemId: li, quantity: '2', editMode: '1' });
+  assert.equal(flagged.status, 302);
+  assert.equal(locOf(flagged), '/orders/1001?success=backorder_flagged&edit=1#line-items');
+  const undone = await postForm('/orders/1001/backorder/undo', cookie, { lineItemId: li, editMode: '1' });
+  assert.equal(locOf(undone), '/orders/1001?success=backorder_restored&edit=1#line-items');
+  assert.equal(await boQty(cookie, li), 6, 'and the actions themselves still did their work');
+});
+
+await test('EDIT MODE: a FAILED backorder / undo keeps edit mode AND its error message', async () => {
+  const cookie = await seedSession();
+  const li = await boProbe(cookie, { qty: 3, title: 'BO keep-edit-fail' });
+  const tooMany = await boFlag(cookie, { lineItemId: li, quantity: '999', editMode: '1' });
+  assert.match(locOf(tooMany), /error=backorder_shopify_failed&msg=[^#]+&edit=1#line-items$/, locOf(tooMany));
+  assert.ok(decodeURIComponent(locOf(tooMany)).includes('Quantity must be between 1 and 3'), 'the server reason survives the rewrite byte-for-byte');
+  const badQty = await boFlag(cookie, { lineItemId: li, quantity: 'abc', editMode: '1' });
+  assert.match(locOf(badQty), EDIT_SUFFIX, locOf(badQty));
+  const never = await postForm('/orders/1001/backorder/undo', cookie, { lineItemId: 'gid://shopify/LineItem/never-flagged', editMode: '1' });
+  assert.match(locOf(never), /error=backorder_shopify_failed&msg=[^#]+&edit=1#line-items$/, locOf(never));
+  const noLine = await postForm('/orders/1001/backorder', cookie, { quantity: '1', editMode: '1' });
+  assert.equal(locOf(noLine), '/orders/1001?error=missing_line_item&edit=1#line-items');
+  assert.equal(await boQty(cookie, li), 3, 'and nothing was removed by any of the refused requests');
+});
+
+await test('EDIT MODE: no opt-in (a normal view-mode submit) leaves every redirect exactly as before', async () => {
+  const cookie = await seedSession();
+  const li = await boProbe(cookie, { qty: 6, title: 'BO view-mode' });
+  const flagged = await boFlag(cookie, { lineItemId: li, quantity: '2' });
+  assert.equal(locOf(flagged), '/orders/1001?success=backorder_flagged');
+  const undone = await boUndo(cookie, li);
+  assert.equal(locOf(undone), '/orders/1001?success=backorder_restored');
+  for (const bad of ['0', 'true', 'yes', '']) {
+    const r = await boFlag(cookie, { lineItemId: li, quantity: '999', editMode: bad });
+    assert.ok(!/edit=1/.test(locOf(r)) && !locOf(r).includes('#'), `editMode=${JSON.stringify(bad)} must not opt in: ${locOf(r)}`);
+  }
+});
+
+await test('EDIT MODE: "Save changes" ends the edit session even if a client sends the field (Save is not a keep-edit action)', async () => {
+  const cookie = await seedSession();
+  const res = await postForm('/orders/1001/edit', cookie, { editMode: '1', staffNote: '' });
+  assert.equal(res.status, 302);
+  assert.ok(!/edit=1/.test(locOf(res)) && !locOf(res).includes('#'), locOf(res));
+  assert.match(locOf(res), /^\/orders\/1001\?(success=order_edited|error=edit_failed)/, locOf(res));
+});
+
+await test('EDIT MODE: the discount / note forms reachable from edit mode keep it too; Cancel does not', async () => {
+  const cookie = await seedSession();
+  const missing = await postForm('/orders/1001/discount', cookie, { type: 'pct', editMode: '1' });
+  assert.equal(locOf(missing), '/orders/1001?error=discount_missing_fields&edit=1#line-items');
+  const note = await postForm('/orders/1001/internal-note', cookie, { note: '', editMode: '1' });
+  assert.equal(locOf(note), '/orders/1001?success=local_note_saved&edit=1#line-items');
+  const plain = await postForm('/orders/1001/internal-note', cookie, { note: '' });
+  assert.equal(locOf(plain), '/orders/1001?success=local_note_saved');
+});
+
+await test('EDIT MODE: the idempotency token and double-submit protection are unchanged by the opt-in', async () => {
+  const cookie = await seedSession();
+  const li = await boProbe(cookie, { qty: 10, title: 'BO keep-edit token' });
+  const fields = { lineItemId: li, quantity: '4', idemKey: `tok-${uuid()}`, editMode: '1' };
+  assert.equal(locOf(await boFlag(cookie, fields)), '/orders/1001?success=backorder_flagged&edit=1#line-items');
+  assert.equal(locOf(await boFlag(cookie, fields)), '/orders/1001?success=backorder_flagged&edit=1#line-items', 'the replay still reports success, still in edit mode');
+  assert.equal(await boQty(cookie, li), 6, 'removed once, not twice');
+  assert.equal((await boRows(cookie)).filter(b => b.line_item_id === li).length, 1);
+  const other = await boFlag(cookie, { ...fields, quantity: '1' });
+  assert.match(decodeURIComponent(locOf(other)), /already used for a different backorder/, 'a reused token on different data is still refused');
+  assert.match(locOf(other), EDIT_SUFFIX);
+});
+
+await test('EDIT MODE: only an explicit ?edit=1 re-enters edit mode — a normal order page load never does', async () => {
+  const cookie = await seedSession();
+  const get = (q = '') => fetch(`${BASE}/orders/1001${q}`, { headers: { Cookie: cookie } }).then(r => r.text());
+  const plain = await get();
+  const flashed = await get('?success=backorder_flagged');
+  const resumed = await get('?edit=1');
+  const garbage = await get('?edit=yes');
+  const off = await get('?edit=0');
+  for (const [name, html] of [['plain', plain], ['flash', flashed], ['edit=yes', garbage], ['edit=0', off]]) {
+    assert.ok(!html.includes('function resume()'), `${name}: no resume script`);
+  }
+  assert.ok(resumed.includes('function resume()') && resumed.includes('toggleEditMode(true)'), '?edit=1 carries the resume script');
+  assert.ok(plain.includes('id="edit-mode-bar" style="display:none"'), 'edit bar is rendered hidden by default');
+  assert.ok(plain.includes('<div class="card" id="line-items">'), 'the scroll anchor exists on every load');
+});
+
 // Housekeeping: no probe line or pending probe row may outlive this section.
 await test('backorder probe lines are cleaned up and no pending backorder is left on #1001', async () => {
   const cookie = await seedSession();

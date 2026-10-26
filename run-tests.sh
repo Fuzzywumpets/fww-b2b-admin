@@ -286,6 +286,25 @@ if [ -f test/admin-allowlist.test.mjs ]; then
   node test/admin-allowlist.test.mjs || UNIT_FAIL=$?
 fi
 
+# Edit mode survives the order page's POST -> 302 -> GET actions (2026-10-26 hot-fix: Mark backordered / Undo used to
+# bounce staff out of edit mode). The redirect rewrite is a pure function + one middleware, so its cases (including
+# "never an open redirect" and "Save changes is not a keep-edit action") and the server wiring guards run standalone;
+# the browser half is in test/ui.test.mjs and the real routes' Location headers are in test/api.test.mjs.
+if [ -f test/edit-mode-resume.test.mjs ]; then
+  echo ""
+  node test/edit-mode-resume.test.mjs || UNIT_FAIL=$?
+fi
+
+# Sequential Shopify round trips behind a backorder / undo / autosave edit, and that the shortcuts taken to cut them
+# (2026-10-26 "seems slow": 7 calls per Mark backordered, four of them whole-order reads) left every fail-closed
+# rule intact. Standalone and SELF-CONTAINED: boots the REAL (non-MOCK) server on a free port with a throwaway
+# B2B_ADMIN_DATA_DIR and test/fixtures/fake-shopify-bridge.mjs preloaded (no network, never the live admin.db), so it
+# counts and schema-validates every GraphQL document. MOCK cannot do this: it never calls Shopify.
+if [ -f test/backorder-roundtrips.test.mjs ]; then
+  echo ""
+  node test/backorder-roundtrips.test.mjs || UNIT_FAIL=$?
+fi
+
 echo ""
 echo "======================================================"
 if [ $API_FAIL -eq 0 ] && [ $UI_FAIL -eq 0 ] && [ $UNIT_FAIL -eq 0 ] && [ $AUTH_FAIL -eq 0 ]; then
