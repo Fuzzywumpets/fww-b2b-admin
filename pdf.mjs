@@ -167,10 +167,12 @@ export function invoiceItemTitle(item) {
   return title;
 }
 
-// WHAT: the backordered-lines display model for the ORDER invoice (struck rows + footnote), or null.
+// WHAT: the backordered-lines display model for the ORDER invoice and for LETTERED invoices (struck rows +
+//   footnote), or null.
 // WHY: backordered units are REMOVED from the Shopify order (db.mjs `backorders` table), so the order's own
 //   lines no longer mention them. This builds the one model both the PDF (generateInvoicePdf) and the HTML
-//   viewer (server.mjs GET /orders/:id/invoice) render; the wording lives in lib/invoice-backorder.mjs.
+//   viewer (server.mjs GET /orders/:id/invoice, with or without ?letter=) render; the wording lives in
+//   lib/invoice-backorder.mjs, so a lettered invoice can never word it differently from the order invoice.
 // DEPENDS: invoiceItemTitle above — the same title cleaner the active rows use, so a variant Shopify baked
 //   into the title is not printed twice on the struck rows either.
 export function buildOrderInvoiceBackorderModel(rows) {
@@ -237,14 +239,16 @@ function registerBrandFonts(doc) {
 // is supplied, partial-invoice totals come from opts and must already be reconciled by the caller;
 // all text is black per brand spec (lime is accent-only; the struck BACKORDERED rows are the one
 // deliberate exception — muted grey).
-// opts.backorderedLines (ORDER invoice only): db.mjs getBackorderedLinesForOrder() rows — units removed from
+// opts.backorderedLines: db.mjs getBackorderedLinesForOrder()-shaped rows — units removed from
 //   the Shopify order. They are drawn AFTER the active rows, struck through and tagged, and itemised in a
 //   footnote below the totals. With none (absent/empty) every byte of the page content is exactly what it was
 //   before this option existed (test/invoice-backorder.test.mjs pins that with goldens).
 //   They are NEVER summed: subtotal/shipping/tax/total come from the Shopify order (which no longer holds the
 //   removed units) or from opts.subtotal/total, and `lineItems`/discount math never sees these rows.
-// DEPENDS: callers pass opts.backorderedLines ONLY from the full-order invoice routes (server.mjs
-//   GET /orders/:id/invoice.pdf). Partial-invoice snapshots (POST/GET /orders/:id/partial-invoice*) must not.
+// DEPENDS: callers pass opts.backorderedLines from the full-order invoice route (server.mjs
+//   GET /orders/:id/invoice.pdf: the LIVE rows) and from the lettered-invoice routes (POST/GET
+//   /orders/:id/partial-invoice*: the snapshot's own stored rows, never the live ones — see
+//   lib/partial-invoice-backorder.mjs). The caller decides WHICH rows; this function only draws them.
 export async function generateInvoicePdf(order, opts = {}) {
   return new Promise((resolve, reject) => {
     const doc = new PDFDocument({ margin: 50, size: 'LETTER', autoFirstPage: true });

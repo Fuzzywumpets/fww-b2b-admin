@@ -193,6 +193,23 @@ if [ -f test/invoice-wholesale-lines.test.mjs ]; then
   node test/invoice-wholesale-lines.test.mjs || UNIT_FAIL=$?
 fi
 
+# Backordered lines on LETTERED partial invoices (order #39875: letter B, issued after three units were backordered,
+# printed no struck rows and no footnote). Standalone and SELF-CONTAINED like the two suites above: it boots its own mock
+# server on a free port, seeds the incident (legacy snapshots A and B + the three backorders, with their prod timestamps)
+# through a --import module, and reads back what the PDFs actually draw. Sections 1-2 are pure (lib/partial-invoice-backorder.mjs).
+if [ -f test/invoice-partial-backorder.test.mjs ]; then
+  echo ""
+  node test/invoice-partial-backorder.test.mjs || UNIT_FAIL=$?
+fi
+
+# partial_invoices.backordered_json — the additive column that freezes a lettered invoice's backordered lines. DB-level and
+# standalone: it needs an existing OLD-schema file (the mock server's fresh in-memory DB can never prove an issued invoice
+# survives the migration or that the previous release's INSERT still runs after it). Throwaway dir via B2B_ADMIN_DATA_DIR.
+if [ -f test/partial-invoice-migration.test.mjs ]; then
+  echo ""
+  node test/partial-invoice-migration.test.mjs || UNIT_FAIL=$?
+fi
+
 # The #38953 lock-up: a permanently-failing line edit armed a beforeunload guard, and the Electron
 # shell cancels a prevented unload SILENTLY — every link, the back button, "Generate PDF" and Quit
 # died at once. Standalone: it spans desktop shell code (never loaded by the server) and source-level

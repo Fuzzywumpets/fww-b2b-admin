@@ -460,6 +460,27 @@ export function migrateBackordersSchema(database) {
 }
 migrateBackordersSchema(db);
 
+// MIGRATION (2026-10-26, lettered-invoice backorders hot-fix): a lettered partial invoice is a frozen
+// snapshot (partial_invoices.line_items_json), so the backordered units it must show — units REMOVED from the
+// Shopify order, parked in `backorders` — are frozen with it, in this one new column. ADDITIVE ONLY and
+// nullable, so a rollback to the previous release is safe: that code names its INSERT columns explicitly
+// (createPartialInvoice) and never reads the column, and a row it writes simply leaves it NULL.
+//   NULL     = LEGACY snapshot (issued before this column existed, or by the previous release): renderers fall
+//              back to the live pending rows created at/before the snapshot (lib/partial-invoice-backorder.mjs).
+//   '[]'     = a NEW snapshot issued while nothing was backordered. It is NOT the same as NULL: it freezes
+//              "none", so a unit backordered LATER can never appear on an invoice already issued.
+//   '[{..}]' = a NEW snapshot's backordered lines, as written by serializeBackorderedLines().
+// Idempotent: PRAGMA reveals the existing columns and ALTER only runs when the column is missing.
+// DEPENDS: createPartialInvoice below writes it; server.mjs (POST/GET /orders/:id/partial-invoice*, GET
+//   /orders/:id/invoice?letter=) reads it through lib/partial-invoice-backorder.mjs. Not added to the CREATE
+//   TABLE above on purpose — one source of truth (this list) keeps a fresh DB and a migrated DB identical;
+//   test/partial-invoice-migration.test.mjs asserts it.
+export function migratePartialInvoicesSchema(database) {
+  const cols = new Set(database.prepare(`PRAGMA table_info(partial_invoices)`).all().map(c => c.name));
+  if (!cols.has('backordered_json')) database.exec(`ALTER TABLE partial_invoices ADD COLUMN backordered_json TEXT`);
+}
+migratePartialInvoicesSchema(db);
+
 export default db;
 
 export function createSession(sid, email, displayName, picture) {
@@ -1217,11 +1238,17 @@ export function getNextInvoiceLetter(orderId) {
   return 'Z';
 }
 
-export function createPartialInvoice({ orderId, invoiceLetter, invoiceType, total, shipping, tax, lineItemsJson, createdBy }) {
+// WHAT: stores a lettered-invoice snapshot. backorderedJson is the backordered lines frozen WITH the snapshot
+//   (lib/partial-invoice-backorder.mjs serializeBackorderedLines); omit it (undefined) only to write a LEGACY-shaped
+//   row (NULL) — every real issuing path must pass a string, '[]' when nothing was backordered.
+// CHANGE-GUARD: the INSERT names its columns explicitly; keep it that way (an older release's INSERT does too,
+//   which is what makes the additive backordered_json column rollback-safe).
+export function createPartialInvoice({ orderId, invoiceLetter, invoiceType, total, shipping, tax, lineItemsJson, backorderedJson, createdBy }) {
   return db.prepare(`
-    INSERT INTO partial_invoices (order_id, invoice_letter, invoice_type, total, shipping, tax, line_items_json, created_at, created_by)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(orderId, invoiceLetter, invoiceType || 'fulfilled_only', total, shipping || 0, tax || 0, lineItemsJson || '[]', Date.now(), createdBy).lastInsertRowid;
+    INSERT INTO partial_invoices (order_id, invoice_letter, invoice_type, total, shipping, tax, line_items_json, backordered_json, created_at, created_by)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(orderId, invoiceLetter, invoiceType || 'fulfilled_only', total, shipping || 0, tax || 0, lineItemsJson || '[]',
+    backorderedJson == null ? null : String(backorderedJson), Date.now(), createdBy).lastInsertRowid;
 }
 
 export function getPartialInvoices(orderId) {
