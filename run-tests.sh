@@ -184,6 +184,15 @@ if [ -f test/invoice-backorder.test.mjs ]; then
   node test/invoice-backorder.test.mjs || UNIT_FAIL=$?
 fi
 
+# Wholesale-priced added lines on invoices (partial invoice #39875-A: SKU 04622 printed at list price plus a
+# "Discount -$9.00" row although Shopify's net was the wholesale price). Standalone and SELF-CONTAINED: it boots its
+# own mock server on a free port (seeding two legacy partial-invoice snapshots through a --import module) so it never
+# shares state or a port with the suite above, and it reads back what the PDFs actually draw.
+if [ -f test/invoice-wholesale-lines.test.mjs ]; then
+  echo ""
+  node test/invoice-wholesale-lines.test.mjs || UNIT_FAIL=$?
+fi
+
 # The #38953 lock-up: a permanently-failing line edit armed a beforeunload guard, and the Electron
 # shell cancels a prevented unload SILENTLY — every link, the back button, "Generate PDF" and Quit
 # died at once. Standalone: it spans desktop shell code (never loaded by the server) and source-level

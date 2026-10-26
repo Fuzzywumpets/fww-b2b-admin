@@ -46,8 +46,12 @@ import {
 } from './db.mjs';
 import {
   generateInvoicePdf, lineItemTrueTotal, lineItemTrueUnit, lineItemCurrentQty,
-  lineItemInvoiceDiscount,
+  lineItemInvoiceDiscount, lineItemWholesaleDiscount, snapshotLineInvoiceDiscount,
 } from './pdf.mjs';
+// DEPENDS: the title stamped on every wholesale line discount below (POST /orders/:id/edit and
+// POST /orders/:id/line/add) is the SAME constant pdf.mjs matches to keep that price off the invoice's
+// Discount row (and lib/backorder-edit.mjs stamps it on an Undo-restored line). Never write the literal here.
+import { WHOLESALE_DISCOUNT_TITLE } from './lib/wholesale-discount.mjs';
 // Extracted so they can be unit-tested without booting this server (house pattern: lib/*.mjs).
 import { isTerminalEditError } from './lib/order-edit-errors.mjs';
 // DEPENDS: every money surface in this file picks its amount through these two — cacheRowTotal for a
@@ -928,6 +932,48 @@ const MOCK_ORDERS = [
     shippingAddress: { firstName: 'Jane', lastName: 'Smith', address1: '456 Park Ave', address2: '', city: 'Seattle', province: 'WA', zip: '98101', country: 'US' },
     billingAddress:  { firstName: 'Jane', lastName: 'Smith', address1: '456 Park Ave', address2: '', city: 'Seattle', province: 'WA', zip: '98101', country: 'US' },
     fulfillments: [{ status: 'SUCCESS', trackingInfo: [{ number: 'TRACK1009', url: null, company: 'UPS' }], createdAt: '2026-05-30T12:00:00Z' }],
+    transactions: [],
+  },
+  // WHOLESALE-PRICED ADDED LINE fixture (#1011): mirrors live partial invoice #39875-A. Shopify ignores a manual
+  // price on a catalog variant, so a line staff add with "add product" lands at LIST price and the app brings it
+  // down with a per-line percentage discount titled WHOLESALE_DISCOUNT_TITLE. li1011b is that line (SKU 04622:
+  // list 17.99, net 8.99, allocation 9.00). li1011c carries a GENUINE staff discount ("Order discount: …") that
+  // must keep printing as a Discount row. Σ net = 36.00 + 8.99 + 36.00 = 80.99 = the order total (no tax/shipping).
+  // Deliberately carries NO currentSubtotalPriceSet/currentTotalPriceSet: the mock batch /edit recomputes
+  // subtotalPriceSet/totalPriceSet from the lines, so removing li1011c in a test keeps the totals honest.
+  // The customer is NOT in MOCK_CUSTOMERS on purpose, so this order never appears in another customer's list.
+  {
+    id: 'gid://shopify/Order/1011', name: '#1011', processedAt: '2026-05-30T10:00:00Z',
+    customer: { id: 'gid://shopify/Customer/110', displayName: 'Line Pricing Co', email: 'lines@linepricing.test' },
+    displayFinancialStatus: 'PENDING', displayFulfillmentStatus: 'UNFULFILLED',
+    totalPriceSet:    { presentmentMoney: { amount: '80.99', currencyCode: 'USD' } },
+    subtotalPriceSet: { presentmentMoney: { amount: '80.99', currencyCode: 'USD' } },
+    sourceName: 'web', tags: ['b2b-portal'], note: '',
+    lineItems: { edges: [
+      { node: { id: 'li1011a', title: 'Wholesale Collar', quantity: 3, currentQuantity: 3, variant: { id: 'v701', sku: 'WC-001', price: '12.00', inventoryQuantity: 10, selectedOptions: [] },
+          discountedUnitPriceSet: { presentmentMoney: { amount: '12.00', currencyCode: 'USD' } },
+          originalUnitPriceSet:   { presentmentMoney: { amount: '12.00', currencyCode: 'USD' } },
+          discountedTotalSet:     { presentmentMoney: { amount: '36.00', currencyCode: 'USD' } } } },
+      { node: { id: 'li1011b', title: 'Added Pinpoint Leash', quantity: 1, currentQuantity: 1, variant: { id: 'v702', sku: '04622', price: '17.99', inventoryQuantity: 8, selectedOptions: [] },
+          discountedUnitPriceSet: { presentmentMoney: { amount: '8.99', currencyCode: 'USD' } },
+          originalUnitPriceSet:   { presentmentMoney: { amount: '17.99', currencyCode: 'USD' } },
+          discountedTotalSet:     { presentmentMoney: { amount: '8.99', currencyCode: 'USD' } },
+          discountAllocations: [{ allocatedAmountSet: { presentmentMoney: { amount: '9.00', currencyCode: 'USD' } },
+                                  discountApplication: { targetSelection: 'EXPLICIT', description: WHOLESALE_DISCOUNT_TITLE } }] } },
+      { node: { id: 'li1011c', title: 'Trade Show Lead', quantity: 2, currentQuantity: 2, variant: { id: 'v703', sku: 'TSL-003', price: '20.00', inventoryQuantity: 6, selectedOptions: [] },
+          discountedUnitPriceSet: { presentmentMoney: { amount: '18.00', currencyCode: 'USD' } },
+          originalUnitPriceSet:   { presentmentMoney: { amount: '20.00', currencyCode: 'USD' } },
+          discountedTotalSet:     { presentmentMoney: { amount: '36.00', currencyCode: 'USD' } },
+          discountAllocations: [{ allocatedAmountSet: { presentmentMoney: { amount: '4.00', currencyCode: 'USD' } },
+                                  discountApplication: { targetSelection: 'EXPLICIT', description: 'Order discount: Trade show' } }] } },
+    ]},
+    totalShippingPriceSet: { presentmentMoney: { amount: '0.00', currencyCode: 'USD' } },
+    totalTaxSet:           { presentmentMoney: { amount: '0.00', currencyCode: 'USD' } },
+    totalOutstandingSet:   { presentmentMoney: { amount: '80.99', currencyCode: 'USD' } },
+    totalReceivedSet:      { presentmentMoney: { amount: '0.00', currencyCode: 'USD' } },
+    shippingAddress: { firstName: 'Lena', lastName: 'Price', address1: '12 Mill Rd', address2: '', city: 'Asheville', province: 'NC', zip: '28801', country: 'US' },
+    billingAddress:  { firstName: 'Lena', lastName: 'Price', address1: '12 Mill Rd', address2: '', city: 'Asheville', province: 'NC', zip: '28801', country: 'US' },
+    fulfillments: [],
     transactions: [],
   },
 ];
@@ -6741,11 +6787,16 @@ app.post('/orders/:id/partial-invoice', requireAuth, async (req, res) => {
     // SYNC: the re-download route below reconstructs every field in this snapshot. Preserve
     // identity and allocated discount separately so archived invoices never degrade into clipped
     // titles/dash-only SKUs or hide their discount after Shopify changes later.
+    // discountAmount is the GENUINE discount only; the app's own wholesale-price discount (the line's net
+    // unitPrice already contains it) is kept apart in wholesaleDiscountAmount. That key's PRESENCE is what
+    // tells snapshotLineInvoiceDiscount (re-download) that discountAmount is already exclusive of it —
+    // snapshots written before this field existed hold the inclusive figure and get corrected there.
     lineItemsJson: JSON.stringify(lineItems
       .filter(i => lineItemCurrentQty(i) > 0)
       .map(i => ({ id: i.id, title: i.title, variantTitle: i.variant?.title || null,
         sku: i.variant?.sku || i.sku || null, quantity: lineItemCurrentQty(i),
         unitPrice: lineItemTrueUnit(i), discountAmount: lineItemInvoiceDiscount(i),
+        wholesaleDiscountAmount: lineItemWholesaleDiscount(i),
         discountReason: discountSummary.reason || null }))),
     createdBy: session.email,
   });
@@ -6814,7 +6865,11 @@ app.get('/orders/:id/partial-invoice/:letter.pdf', requireAuth, async (req, res)
       quantity: li.quantity,
       discountedUnitPriceSet: { presentmentMoney: { amount: String(li.unitPrice), currencyCode: 'USD' } },
       originalUnitPriceSet: { presentmentMoney: { amount: String(li.unitPrice), currencyCode: 'USD' } },
-      invoiceDiscountAmount: Number(li.discountAmount) || 0,
+      // GENUINE discount only. New snapshots store it that way (wholesaleDiscountAmount present); older ones
+      // stored the inclusive figure, so the app's own wholesale-price discount is taken back out using the
+      // same line as Shopify holds it now (matched by immutable line-item id, like the display metadata).
+      // DEPENDS: lib/wholesale-discount.mjs title + getOrderDetail selecting discountApplication.description.
+      invoiceDiscountAmount: snapshotLineInvoiceDiscount(li, current),
       variant: (variantTitle || sku) ? { title: variantTitle, sku } : null,
     };
   });
@@ -7692,7 +7747,8 @@ app.post('/orders/:id/edit', requireAuth, async (req, res) => {
           const dRes = await shopifyFetch(`mutation addDisc($id:ID!,$li:ID!,$d:OrderEditAppliedDiscountInput!){
             orderEditAddLineItemDiscount(id:$id,lineItemId:$li,discount:$d){
               calculatedOrder{id} userErrors{field message}}}`,
-            { id: calcId, li: calcLiId, d: { percentValue: parseFloat(pct.toFixed(4)), description: 'B2B wholesale' } });
+            // SYNC: WHOLESALE_DISCOUNT_TITLE — pdf.mjs matches this description to keep the wholesale price off the invoice's Discount row.
+            { id: calcId, li: calcLiId, d: { percentValue: parseFloat(pct.toFixed(4)), description: WHOLESALE_DISCOUNT_TITLE } });
           const dErrs = dRes.data?.orderEditAddLineItemDiscount?.userErrors || [];
           if (dErrs.length) {
             // Surface, don't swallow. The line IS added (at list price) — collect a warning.
@@ -7861,7 +7917,8 @@ app.post('/orders/:id/line/add', requireAuth, async (req, res) => {
           if (pct > 0 && pct <= 100) {
             const dRes = await shopifyFetch(`mutation addDisc($id:ID!,$li:ID!,$d:OrderEditAppliedDiscountInput!){
               orderEditAddLineItemDiscount(id:$id,lineItemId:$li,discount:$d){ calculatedOrder{id} userErrors{field message}}}`,
-              { id: calcId, li: calcLiId, d: { percentValue: parseFloat(pct.toFixed(4)), description: 'B2B wholesale' } });
+              // SYNC: WHOLESALE_DISCOUNT_TITLE — pdf.mjs matches this description to keep the wholesale price off the invoice's Discount row.
+              { id: calcId, li: calcLiId, d: { percentValue: parseFloat(pct.toFixed(4)), description: WHOLESALE_DISCOUNT_TITLE } });
             const dErrs = dRes.data?.orderEditAddLineItemDiscount?.userErrors || [];
             if (dErrs.length) ctx.warnings.push(`Added at list price — ${dErrs.map(e => e.message).join('; ')}`);
           }
