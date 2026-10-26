@@ -1,5 +1,6 @@
 import { currentShippingAmount } from './lib/order-shipping.mjs';
 import { buildInvoiceBackorderModel } from './lib/invoice-backorder.mjs';
+import { isWholesaleDiscountAllocation } from './lib/wholesale-discount.mjs';
 import PDFDocument from 'pdfkit';
 import { readFileSync, existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -78,21 +79,68 @@ export function lineItemTrueUnit(item) {
   return lineItemTrueTotal(item) / cq;
 }
 
-// WHAT: the explicit discount allocated to the CURRENT quantity of one line.
+// WHAT: the GENUINE discount allocated to the CURRENT quantity of one line — what the invoice itemises as
+//   the Discount row. The app's own per-line wholesale-price discount (WHOLESALE_DISCOUNT_TITLE) is NOT
+//   part of it: that is the line's price, so it stays inside the net unit price/total (see
+//   lineItemWholesaleDiscount below and lib/wholesale-discount.mjs for the why).
 // WHY: invoices must show the customer's discount, not hide it by printing only net unit prices.
 // Shopify bakes EXPLICIT discounts into discountedTotalSet but leaves ALL/cart discounts outside it,
 // so summing every allocation and adding it back to lineItemTrueTotal reconstructs the honest
 // pre-discount merchandise amount across both representations.
+// INVARIANT(S): excluding a wholesale allocation moves it out of BOTH sides of the reconstruction (the
+//   gross row and the Discount row), so lineItemTrueTotal — and therefore Subtotal - Discount == TOTAL —
+//   is untouched. Only an allocation whose description is exactly the wholesale title is skipped; an
+//   order-level code, an "Order discount: …" and a "B2B price adj" still count.
 // DEPENDS: partial-invoice snapshots persist this as invoiceDiscountAmount because their archived
 // quantity/pricing must not depend on whatever the live Shopify order looks like when re-downloaded.
+// Snapshots written before the wholesale exclusion existed stored the INCLUSIVE figure — see
+// snapshotLineInvoiceDiscount, which the re-download route uses to correct them.
 export function lineItemInvoiceDiscount(item) {
   const cq = lineItemCurrentQty(item);
   if (cq <= 0) return 0;
   if (item.invoiceDiscountAmount != null) return parseFloat(item.invoiceDiscountAmount) || 0;
   const q = item.quantity || cq || 1;
   const allocated = (item.discountAllocations || [])
+    .filter(allocation => !isWholesaleDiscountAllocation(allocation))
     .reduce((sum, allocation) => sum + liNum(allocation?.allocatedAmountSet), 0);
   return allocated * (cq / q);
+}
+
+// WHAT: the part of a line's discount that is the app's own wholesale price (title match), for the CURRENT
+//   quantity. Persisted on new partial-invoice snapshots as wholesaleDiscountAmount: its presence (even 0)
+//   is what marks the snapshot's discountAmount as already EXCLUDING it.
+// INVARIANT(S): lineItemInvoiceDiscount + lineItemWholesaleDiscount == Σ every allocation, scaled the same way.
+export function lineItemWholesaleDiscount(item) {
+  const cq = lineItemCurrentQty(item);
+  if (cq <= 0) return 0;
+  const q = item.quantity || cq || 1;
+  const wholesale = (item.discountAllocations || [])
+    .filter(isWholesaleDiscountAllocation)
+    .reduce((sum, allocation) => sum + liNum(allocation?.allocatedAmountSet), 0);
+  return wholesale * (cq / q);
+}
+
+// WHAT: the genuine discount to print for one line of a STORED partial invoice (re-download), given the
+//   saved snapshot line and the same line as Shopify holds it now (may be undefined).
+// WHY: snapshots created before the wholesale exclusion saved the inclusive discount (partial invoice
+//   #39875-A: SKU 04622 saved discountAmount 9.00 although 9.00 was its wholesale price). Their frozen
+//   unit price is already the net price, so the wholesale share simply has to come back OUT of the saved
+//   discount; the live line's allocations say which share that was.
+// CHANGE-GUARD: never changes a snapshot that carries wholesaleDiscountAmount (new format, already exact).
+//   For an older one the correction is proportional — wholesale / all allocations on the live line —
+//   because a line carries at most one manual discount, so in practice the share is 0 or 1; and it only
+//   ever LOWERS the discount, never invents one. If the live line no longer carries the wholesale discount
+//   (replaced or removed since) nothing identifies it, the saved figure stands, and the Discount row stays.
+export function snapshotLineInvoiceDiscount(snapshotLine, liveLine) {
+  const stored = Math.max(0, parseFloat(snapshotLine?.discountAmount) || 0);
+  if (snapshotLine?.wholesaleDiscountAmount != null) return stored;
+  if (stored <= 0) return 0;
+  const allocations = liveLine?.discountAllocations || [];
+  const all = allocations.reduce((sum, a) => sum + liNum(a?.allocatedAmountSet), 0);
+  const wholesale = allocations.filter(isWholesaleDiscountAllocation)
+    .reduce((sum, a) => sum + liNum(a?.allocatedAmountSet), 0);
+  if (!(all > 0) || !(wholesale > 0)) return stored;
+  return Math.round(Math.max(0, stored * (1 - wholesale / all)) * 100) / 100;
 }
 
 export function lineItemInvoiceGrossTotal(item) {
@@ -182,7 +230,10 @@ function registerBrandFonts(doc) {
 // WHAT: renders a branded B2B invoice PDF (pdfkit) from a Shopify order, with optional opts overrides for partial invoices (lineItems/subtotal/shipping/total/invoiceSuffix/paymentTerms).
 // CHANGE-GUARD: line rows use fixed heights + lineBreak:false + ellipsis and an explicit y>680 page-break; long titles/skus or added columns can overlap or push the footer off-page — re-render a multi-page order and an unpaid order (PAYMENT PENDING watermark) after layout edits.
 // INVARIANT(S): undiscounted invoices show post-discount unit prices directly; invoices with allocated
-// discounts show reconstructed pre-discount rows plus one negative Discount total. When opts.subtotal
+// discounts show reconstructed pre-discount rows plus one negative Discount total. The app's own per-line
+// wholesale-price discount (lib/wholesale-discount.mjs) is NOT such a discount: a line carrying only that
+// prints at its NET wholesale unit price/total and adds nothing to the Discount row, so a wholesale-added
+// line never looks like "list price + discount" next to net-priced lines. When opts.subtotal
 // is supplied, partial-invoice totals come from opts and must already be reconciled by the caller;
 // all text is black per brand spec (lime is accent-only; the struck BACKORDERED rows are the one
 // deliberate exception — muted grey).

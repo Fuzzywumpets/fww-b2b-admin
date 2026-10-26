@@ -1391,6 +1391,142 @@ await test('committed custom row: price edit re-routes to line/price (not silent
   assert.equal(Number(fee.unitPrice), 25, `post-commit price edit dropped: got ${fee.unitPrice}, expected 25`);
 });
 
+// ── REGRESSION: a line's Total must equal the qty x unit price shown beside it (2026-10-26) ──────────
+// Owner report: "when a custom line item is added you see price x qty but the line total doesn't add
+// up". Reproduced on the ORDER PAGE in edit mode (no PDF is involved): a newly added custom or catalog
+// row had NO line-total cell at all (its last cell held only Add / x), and the Total cell of an
+// existing row was static text rendered at page load, so changing a quantity or price left the old
+// Total on screen while the Subtotal (server truth) moved. The visible Totals therefore stopped summing
+// to the Subtotal. #1007 is used because its fixture has no frozen currentSubtotalPriceSet (#1008 does,
+// and the mock never refreshes it, so its first-paint Subtotal ignores earlier tests' added lines).
+// Assertions are RELATIVE (before/after deltas, DOM-vs-DOM) so they hold whatever earlier tests did to it.
+console.log('\nUI tests — REGRESSION: order-page line Total = qty x unit price:');
+
+const lineMoney = s => parseFloat(String(s).replace(/[^0-9.\-]/g, ''));
+const usd = n => n.toLocaleString('en-US', { style: 'currency', currency: 'USD' });
+const lineSubtotal = async page => lineMoney(await page.locator('.totals-block .totals-row').first().locator('span').last().textContent());
+// Every line row the operator can see (staged/committed removals excluded): its qty, unit price and Total cell.
+const lineRowFacts = page => page.$$eval('#edit-form table.data-table tbody:first-of-type tr', trs => trs
+  .filter(tr => tr.dataset.removed !== '1' && tr.dataset.lineRemoved !== '1')
+  .map(tr => {
+    const val = sel => { const el = tr.querySelector(sel); return el ? el.value : null; };
+    const amt = tr.querySelector('.line-total-amt');
+    return { qty: val('.edit-qty-input, .ncl-qty, .cl-qty'), price: val('.edit-price-input, .ncl-price, .cl-price'), total: amt ? amt.textContent.trim() : null };
+  }));
+// The per-line save is debounced 500ms, so poll for the server-confirmed Subtotal rather than sleeping.
+async function waitSubtotal(page, expected, ms = 7000) {
+  const t0 = Date.now(); let now;
+  while (Date.now() - t0 < ms) {
+    now = await lineSubtotal(page);
+    if (Math.abs(now - expected) < 0.005) return now;
+    await page.waitForTimeout(100);
+  }
+  throw new Error(`Subtotal never reached ${expected} within ${ms}ms (last seen ${now})`);
+}
+// Every visible row's Total equals its own qty x price, and (no order-level discount in play) their sum is the Subtotal.
+async function assertLinesAddUp(page, label) {
+  const facts = await lineRowFacts(page);
+  assert.ok(facts.length > 0, `${label}: no line rows found`);
+  let sum = 0;
+  for (const f of facts) {
+    assert.ok(f.total, `${label}: a row has no Total cell`);
+    const expect = Math.round(parseInt(f.qty, 10) * parseFloat(f.price) * 100) / 100;
+    assert.ok(Math.abs(lineMoney(f.total) - expect) < 0.005, `${label}: row shows ${f.qty} x ${f.price} but Total ${f.total} (expected ${usd(expect)})`);
+    sum += lineMoney(f.total);
+  }
+  if (await page.locator('#order-discount-row').count() === 0) {
+    const sub = await lineSubtotal(page);
+    assert.ok(Math.abs(sum - sub) < 0.005, `${label}: line Totals sum to ${usd(sum)} but the Subtotal reads ${usd(sub)}`);
+  }
+}
+
+await test('custom line: Total shows qty x price while typing, and the line Totals add up to the Subtotal once it is added', async (page, ctx) => {
+  await openEditMode(page, ctx, 1007);
+  const before = await lineSubtotal(page);
+  await page.click('button[onclick="addCustomLineRow()"]');
+  const row = page.locator('tr.custom-line-new');
+  await row.locator('.ncl-title').waitFor({ timeout: 4000 });
+  const amt = row.locator('.line-total-amt');
+  assert.equal(await amt.count(), 1, 'a new custom row must carry a line-total cell (it had none: its last cell held only Add / x)');
+  await row.locator('.ncl-title').fill('Total probe');
+  await row.locator('.ncl-qty').fill('3');
+  await row.locator('.ncl-price').fill('10');
+  assert.equal((await amt.textContent()).trim(), '$30.00', '3 x $10.00');
+  await row.locator('.ncl-price').fill('12.5');
+  assert.equal((await amt.textContent()).trim(), '$37.50', 'a price edit repaints the Total');
+  await row.locator('.ncl-qty').fill('');
+  assert.equal((await amt.textContent()).trim(), '—', 'an empty qty shows a dash, never NaN or a stale amount');
+  await row.locator('.ncl-qty').fill('4');
+  assert.equal((await amt.textContent()).trim(), '$50.00', '4 x $12.50');
+
+  await row.locator('.ncl-add').click();
+  await page.waitForFunction(() => document.querySelector('tr.custom-line-new')?.dataset.committedLiId, { timeout: 8000 });
+  await waitSubtotal(page, before + 50);
+  await assertLinesAddUp(page, 'after Add');
+
+  // A committed custom row stays live: change its qty and the Total and the Subtotal follow.
+  await row.locator('.ncl-qty').fill('5');
+  assert.equal((await amt.textContent()).trim(), '$62.50', 'post-commit qty edit repaints the Total immediately');
+  await page.keyboard.press('Tab');
+  await waitSubtotal(page, before + 62.5);
+  await assertLinesAddUp(page, 'after qty 4 -> 5');
+});
+
+await test('existing line: qty and price edits repaint that row Total, and the numbers survive leaving edit mode', async (page, ctx) => {
+  const row = await openEditMode(page, ctx, 1007);
+  const qtyEl = row.locator('.edit-qty-input'), priceEl = row.locator('.edit-price-input');
+  const amt = row.locator('.line-total-amt');
+  const q0 = parseInt(await qtyEl.inputValue(), 10), p0 = parseFloat(await priceEl.inputValue());
+  assert.equal((await amt.textContent()).trim(), usd(q0 * p0), 'the server-rendered Total starts consistent');
+  await assertLinesAddUp(page, 'initial');
+
+  const before = await lineSubtotal(page);
+  await qtyEl.fill(String(q0 + 4));
+  assert.equal((await amt.textContent()).trim(), usd((q0 + 4) * p0), 'a qty edit repaints the Total BEFORE any save round-trip (it stayed at the page-load value)');
+  await page.keyboard.press('Tab');
+  await waitSubtotal(page, before + 4 * p0);
+  await assertLinesAddUp(page, 'after qty edit');
+
+  await priceEl.fill('31.5');
+  assert.equal((await amt.textContent()).trim(), usd((q0 + 4) * 31.5), 'a price edit repaints the Total');
+  await page.keyboard.press('Tab');
+  await waitSubtotal(page, before + (q0 + 4) * 31.5 - q0 * p0);
+  await assertLinesAddUp(page, 'after price edit');
+
+  // Leaving edit mode: the static qty / unit price must show the NEW values next to the new Total.
+  await page.locator('#edit-mode-bar button:has-text("Cancel")').click();
+  assert.equal((await row.locator('.edit-qty-static').textContent()).trim(), String(q0 + 4), 'static qty must mirror the edit');
+  assert.equal((await row.locator('.edit-price-static').textContent()).trim(), usd(31.5), 'static unit price must mirror the edit');
+  assert.equal((await amt.textContent()).trim(), usd((q0 + 4) * 31.5), 'Total unchanged on leaving edit mode');
+
+  // Put #1007 back as found (later tests share this mock order): original qty and price again.
+  await page.click('#edit-btn');
+  await qtyEl.fill(String(q0));
+  await page.keyboard.press('Tab');
+  await waitSubtotal(page, before + q0 * (31.5 - p0)); // qty back to q0, price still 31.50
+  await priceEl.fill(String(p0));
+  await page.keyboard.press('Tab');
+  await waitSubtotal(page, before);
+  await assertLinesAddUp(page, 'restored');
+});
+
+await test('catalog line: a newly picked row shows its qty x wholesale price in the Total column and keeps it live', async (page, ctx) => {
+  // The picker auto-saves a row the moment it is added. This test is about the DISPLAY only, so the
+  // save is refused at the network edge and nothing is written to the shared mock order.
+  await page.route('**/line/add', route => route.abort('failed'));
+  await openEditMode(page, ctx, 1007);
+  // Same entry point the product picker uses (addCatalogLineRow is what "Add selected" calls).
+  await page.evaluate(() => window.addCatalogLineRow({ variantId: 'gid://shopify/ProductVariant/v-total-probe', label: 'Total probe catalog', sku: 'TP-1', price: 40 }));
+  const row = page.locator('tr.catalog-line-new');
+  await row.locator('.cl-qty').waitFor({ timeout: 4000 });
+  const amt = row.locator('.line-total-amt');
+  assert.equal(await amt.count(), 1, 'a new catalog row must carry a line-total cell');
+  const wholesale = parseFloat(await row.locator('.cl-price').inputValue());
+  assert.equal((await amt.textContent()).trim(), usd(wholesale), '1 x wholesale price on first paint');
+  await row.locator('.cl-qty').fill('6');
+  assert.equal((await amt.textContent()).trim(), usd(6 * wholesale), 'qty edit repaints the catalog row Total');
+});
+
 // REGRESSION (caught by adversarial review of the 30d3709 fix itself, 2026-07-21):
 // the custom-line idemKey MUST stay row-scoped (sticky). A fresh uuid per Add click means that
 // when Shopify commits but the HTTP response is lost, the retry stages a SECOND real money line
