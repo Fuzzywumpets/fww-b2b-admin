@@ -68,6 +68,9 @@ import { renderLabelSheet, expandItems, TEMPLATES as LABEL_TEMPLATES, DEFAULT_FI
 import { isInsider, resolveXeroContact, syncCustomerToXero, getXeroSyncStatus } from './lib/xero-customer-sync.mjs';
 import { parseLinePrices, applyLinePriceChanges, bulkMarkOrdersPaid, addLineDiscountsConcurrent } from './lib/order-money.mjs';
 import { resolveOrderCompany, buildOrderAddresses } from './lib/order-company.mjs';
+// DEPENDS: lib/edit-mode-resume.mjs — keeps staff in edit mode across the order page's POST -> redirect -> GET
+// round trips (see its header). Mounted below with app.use('/orders', ...); the client half is in editModeScript.
+import { keepEditModeRedirects, keepEditClientPattern, EDIT_ANCHOR } from './lib/edit-mode-resume.mjs';
 import { assertNoUserErrors } from './lib/shopify-user-errors.mjs';
 import { currentShippingAmount, findShippingInvoice, parseShippingAmount, stageShippingReplacement } from './lib/order-shipping.mjs';
 import { createCreditCardInvoice } from './helcim.mjs';
@@ -148,6 +151,9 @@ const app = express();
 // permissive, so no existing consumer changes behaviour.
 app.use(express.json({ limit: '2mb', verify: (req, _res, buf) => { req.rawBody = buf; } }));
 app.use(express.urlencoded({ extended: true }));
+// WHAT: keep-edit-mode redirect rewrite for POST /orders/:id/<action> (lib/edit-mode-resume.mjs). It reads
+// req.body.editMode, so it must stay AFTER the body parsers above and BEFORE every /orders route.
+app.use('/orders', keepEditModeRedirects);
 
 // WHAT: slow-request tripwire — any response slower than 1s logs method/path/status/ms, so a
 // "the app feels broken" report (e.g. the 10s-login complaint, 2026-07-21) yields journalctl data
@@ -2451,8 +2457,8 @@ function variantLabel(variant) {
 
 // WHAT: the large order-detail page — status timeline, editable line items, fulfillments, transactions, address, Xero/partial-invoice state, and the modal JS (edit/discount/fulfill/backorder/invoice/cancel).
 // CHANGE-GUARD: reads several SQLite stores by gid (getXeroMap, getPartialInvoices, getBackordersForOrder, getBackorderedLinesForOrder) — those keys must match shopifyOrderGid(numId). Backordered units are NOT on the Shopify order any more, so they render as inert struck-through rows in a second <tbody class="bo-struck"> (backorderedRowsHtml) that the edit machinery must never see — see the CHANGE-GUARD there. The edit form posts qtys[]/prices[]/removes/addCustomLines to /orders/:id/edit; serializeCustomLines() must run before submit (onclick on Save). Re-test edit/fulfill/cancel modals after any markup change since the inline JS selects elements by hardcoded ids.
-// INVARIANT(S): flash strings map 1:1 to alert banners — adding a server flash value needs a branch here or it renders silently; line-item product links resolve via variant.product.id or the MOCK_VARIANT_PRODUCT fallback.
-function renderOrderDetail(session, order, flash, flashMsg) {
+// EDIT-MODE RESUME (2026-10-26): `resumeEdit` (true only for ?edit=1) emits resumeEditScript, which re-enters edit mode after an action taken while editing — see lib/edit-mode-resume.mjs; never default it to true. INVARIANT(S): flash strings map 1:1 to alert banners — adding a server flash value needs a branch here or it renders silently; line-item product links resolve via variant.product.id or the MOCK_VARIANT_PRODUCT fallback.
+function renderOrderDetail(session, order, flash, flashMsg, { resumeEdit = false } = {}) {
   const numId    = shopifyNumericId(order.id);
   // DEPENDS: both the order heading and the local-note warning link to this exact Shopify order.
   // Keep the store slug aligned with the production Shopify store handle.
@@ -2876,6 +2882,8 @@ function renderOrderDetail(session, order, flash, flashMsg) {
     if (!f) return;
     document.getElementById('bo-undo-li-id').value = u.getAttribute('data-bo-line-id');
     u.disabled = true; u.textContent = 'Restoring…';
+    // form.submit() fires NO submit event, so the capture-phase listener below never sees this one.
+    rememberEditMode(f);
     f.submit();
   });
   // Back/forward can restore this page from bfcache with the buttons still disabled.
@@ -2883,6 +2891,38 @@ function renderOrderDetail(session, order, flash, flashMsg) {
     if (!e.persisted) return;
     document.querySelectorAll('.bo-undo-btn').forEach(function(b){ b.disabled = false; b.textContent = b.getAttribute('data-bo-label'); });
   });
+  // WHAT: STAY IN EDIT MODE across a full-page action (2026-10-26 owner feedback: "takes the screen out of edit
+  //   mode after every change"). When one of the order-page forms in lib/edit-mode-resume.mjs KEEP_EDIT_ACTIONS is
+  //   posted while edit mode is ON, a hidden editMode=1 rides along (the server then ends its redirect in
+  //   ?edit=1#line-items, and the resume script at the bottom of this page re-enters edit mode) and the Line
+  //   Items card's viewport offset is stashed so the scroll position survives the reload.
+  // CHANGE-GUARD: the field is added at submit time from the LIVE state of #edit-mode-bar, never at load, so a form
+  //   restored from bfcache cannot carry a stale 1 (and a stale value is cleared when edit mode is off). Save
+  //   changes (POST /edit) is not in the list on purpose: Save ends the edit session.
+  // DEPENDS: #edit-mode-bar (toggleEditMode sets its display to 'block' when editing), #line-items (the card), the
+  //   .bo-undo-btn handler above (form.submit() skips the submit event, so it calls this directly).
+  // SYNC: KEEP_EDIT_RE is built from lib/edit-mode-resume.mjs KEEP_EDIT_ACTIONS by the server; do not hand-edit it.
+  var KEEP_EDIT_RE = new RegExp(${JSON.stringify(keepEditClientPattern())});
+  var EDIT_STASH_KEY = 'b2b-edit-resume:' + ${JSON.stringify(String(numId))};
+  function editModeIsOn() {
+    var b = document.getElementById('edit-mode-bar');
+    return !!b && b.style.display === 'block';
+  }
+  function rememberEditMode(form) {
+    if (!form || !form.querySelector) return;
+    var path = '';
+    try { path = new URL(form.getAttribute('action') || '', location.href).pathname; } catch (e) { return; }
+    if (!KEEP_EDIT_RE.test(path)) return;
+    var f = form.querySelector('input[name="editMode"]');
+    if (!editModeIsOn()) { if (f) f.value = ''; return; }
+    if (!f) { f = document.createElement('input'); f.type = 'hidden'; f.name = 'editMode'; form.appendChild(f); }
+    f.value = '1';
+    try {
+      var card = document.getElementById('${EDIT_ANCHOR}');
+      if (card) sessionStorage.setItem(EDIT_STASH_KEY, JSON.stringify({ top: card.getBoundingClientRect().top, at: Date.now() }));
+    } catch (e) { /* storage blocked: the #${EDIT_ANCHOR} anchor in the redirect still brings them back to the table */ }
+  }
+  document.addEventListener('submit', function(e){ rememberEditMode(e.target); }, true);
   function toggleInvoiceModal(show) {
     document.getElementById('invoice-modal').style.display = show ? 'flex' : 'none';
   }
@@ -2916,6 +2956,44 @@ function renderOrderDetail(session, order, flash, flashMsg) {
       const rpm = document.getElementById('record-payment-modal'); if (rpm) rpm.style.display = 'none';
     }
   });
+  </script>`;
+
+  // WHAT: re-enters edit mode on a page that was reached by an action taken WHILE editing (the redirect ends in
+  //   ?edit=1#line-items — lib/edit-mode-resume.mjs). It calls toggleEditMode(true), puts the Line Items card back
+  //   where it was in the viewport (the offset stashed by rememberEditMode, which stays correct even though the
+  //   flash banner above the card has changed height; without a stash the #line-items anchor is the fallback),
+  //   and removes `edit` from the address bar so a later manual refresh is an ordinary view-mode load.
+  // CHANGE-GUARD: emitted ONLY when the request carried ?edit=1 (renderOrderDetail's resumeEdit) — a normal load
+  //   gets no script and no edit mode. The restore runs again on window load because the browser also scrolls to
+  //   the #line-items fragment around then; a real user scroll (wheel / touch / key / pointer) cancels it.
+  // DEPENDS: toggleEditMode() and rememberEditMode()'s stash key (EDIT_STASH_KEY) from editModeScript above.
+  const resumeEditScript = !resumeEdit ? '' : `<script>
+  (function () {
+    var wantTop = null, userScrolled = false;
+    try {
+      var raw = sessionStorage.getItem(EDIT_STASH_KEY); sessionStorage.removeItem(EDIT_STASH_KEY);
+      var st = raw ? JSON.parse(raw) : null;
+      if (st && typeof st.top === 'number' && Date.now() - st.at < 600000) wantTop = st.top;
+    } catch (e) { wantTop = null; }
+    ['wheel', 'touchstart', 'keydown', 'mousedown'].forEach(function (t) {
+      window.addEventListener(t, function () { userScrolled = true; }, { capture: true, passive: true });
+    });
+    function restore() {
+      var card = document.getElementById('${EDIT_ANCHOR}');
+      if (wantTop === null || userScrolled || !card) return;
+      window.scrollTo(0, window.pageYOffset + card.getBoundingClientRect().top - wantTop);
+    }
+    function resume() {
+      toggleEditMode(true);
+      try {
+        var u = new URL(location.href); u.searchParams.delete('edit');
+        history.replaceState(history.state, '', u.pathname + u.search + u.hash);
+      } catch (e) { /* cosmetic only */ }
+      restore();
+    }
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', resume); else resume();
+    window.addEventListener('load', restore);
+  })();
   </script>`;
 
 
@@ -3054,6 +3132,7 @@ function renderOrderDetail(session, order, flash, flashMsg) {
     </style>
     ${visibleNotesScript}
     ${editModeScript}
+    ${resumeEditScript}
     <div class="breadcrumb-row"><a href="/orders" class="breadcrumb">← Orders</a></div>
     ${flashHtml}
     <div class="detail-header">
@@ -3090,7 +3169,8 @@ function renderOrderDetail(session, order, flash, flashMsg) {
     ${timeline}
     <div class="detail-grid">
       <div class="detail-main">
-        <div class="card">
+        ${/* DEPENDS: id="line-items" is the scroll anchor of lib/edit-mode-resume.mjs (EDIT_ANCHOR): the keep-edit-mode redirect
+              ends in #line-items and the resume script restores the card's viewport offset. Renaming it silently drops both. */''}<div class="card" id="line-items">
           <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
             <h2>Line Items</h2>
             <span id="edit-mode-bar" style="display:none">
@@ -4209,7 +4289,7 @@ function renderOrderDetail(session, order, flash, flashMsg) {
             <textarea name="note" class="textarea" rows="3" placeholder="Add a Shopify order note…" aria-label="Shopify order note">${h(order.note||'')}</textarea>
             <div style="margin-top:0.5rem;display:flex;gap:8px;align-items:center">
               <button type="submit" class="btn btn-secondary btn-sm">Save note</button>
-              ${order.note && String(order.note).trim() ? `<button type="button" class="btn btn-ghost btn-sm" style="color:#a32d2d" onclick="if(confirm('Delete this customer note?')){this.form.note.value='';this.form.submit();}">Delete</button>` : ''}
+              ${order.note && String(order.note).trim() ? `<button type="button" class="btn btn-ghost btn-sm" style="color:#a32d2d" onclick="if(confirm('Delete this customer note?')){this.form.note.value='';rememberEditMode(this.form);this.form.submit();}">Delete</button>` : ''}
             </div>
           </form>
         </div>
@@ -4223,7 +4303,7 @@ function renderOrderDetail(session, order, flash, flashMsg) {
             <textarea name="note" class="textarea" rows="3" placeholder="Private note stored only in B2B Admin…" aria-label="B2B Admin-only note">${h(order.internalNote||'')}</textarea>
             <div style="margin-top:0.5rem;display:flex;gap:8px;align-items:center">
               <button type="submit" class="btn btn-secondary btn-sm">Save in B2B Admin only</button>
-              ${order.internalNote && String(order.internalNote).trim() ? `<button type="button" class="btn btn-ghost btn-sm" style="color:#a32d2d" onclick="if(confirm('Delete this internal note?')){this.form.note.value='';this.form.submit();}">Delete</button>` : ''}
+              ${order.internalNote && String(order.internalNote).trim() ? `<button type="button" class="btn btn-ghost btn-sm" style="color:#a32d2d" onclick="if(confirm('Delete this internal note?')){this.form.note.value='';rememberEditMode(this.form);this.form.submit();}">Delete</button>` : ''}
             </div>
           </form>
         </div>
@@ -6340,7 +6420,9 @@ app.get('/orders/:id', requireAuth, async (req, res) => {
   order.visibleNotes = getVisibleNotesForOrder(shopifyId);
   // Staff-only internal note (admin-local, keyed by numeric order id) — never synced/invoiced
   order.internalNote = getOrderInternalNote(req.params.id)?.body || '';
-  res.send(renderOrderDetail(req.adminSession, order, req.query.success || req.query.error || '', req.query.msg || ''));
+  // resumeEdit: ONLY an explicit ?edit=1 (added by lib/edit-mode-resume.mjs to the redirect that follows an
+  // action taken while editing) re-enters edit mode. A plain load never carries it, so edit mode is never forced on.
+  res.send(renderOrderDetail(req.adminSession, order, req.query.success || req.query.error || '', req.query.msg || '', { resumeEdit: req.query.edit === '1' }));
 });
 
 // WHAT: Mark a single order paid in Shopify (orderMarkAsPaid), audit it, then fire-and-forget record the payment in Xero (creating the invoice first if unsynced), skipping insiders.

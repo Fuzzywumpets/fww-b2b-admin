@@ -260,6 +260,15 @@ if [ -f test/admin-allowlist.test.mjs ]; then
   node test/admin-allowlist.test.mjs || UNIT_FAIL=$?
 fi
 
+# Edit mode survives the order page's POST -> 302 -> GET actions (2026-10-26 hot-fix: Mark backordered / Undo used to
+# bounce staff out of edit mode). The redirect rewrite is a pure function + one middleware, so its cases (including
+# "never an open redirect" and "Save changes is not a keep-edit action") and the server wiring guards run standalone;
+# the browser half is in test/ui.test.mjs and the real routes' Location headers are in test/api.test.mjs.
+if [ -f test/edit-mode-resume.test.mjs ]; then
+  echo ""
+  node test/edit-mode-resume.test.mjs || UNIT_FAIL=$?
+fi
+
 echo ""
 echo "======================================================"
 if [ $API_FAIL -eq 0 ] && [ $UI_FAIL -eq 0 ] && [ $UNIT_FAIL -eq 0 ] && [ $AUTH_FAIL -eq 0 ]; then
