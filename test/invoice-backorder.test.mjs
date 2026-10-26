@@ -26,8 +26,8 @@ import { fileURLToPath } from 'node:url';
 import { generateInvoicePdf, buildOrderInvoiceBackorderModel } from '../pdf.mjs';
 import {
   BACKORDER_MARK, BACKORDER_TAG, BACKORDER_HEADING, BACKORDER_HEADING_CONTINUED, BACKORDER_INTRO,
-  BACKORDER_ETA_LABEL, BACKORDER_ETA_UNKNOWN, INVOICE_BACKORDER_CSS,
-  buildInvoiceBackorderModel, formatBackorderEta, formatBackorderMoney, renderInvoiceBackorderHtml,
+  INVOICE_BACKORDER_CSS,
+  buildInvoiceBackorderModel, formatBackorderMoney, renderInvoiceBackorderHtml,
 } from '../lib/invoice-backorder.mjs';
 import { pageContentHashes, extractPdfText } from './pdf-inspect.mjs';
 
@@ -200,8 +200,8 @@ await test('the footnote wording, verbatim (customer-facing — change it on pur
   assert.equal(m.footnote.intro, "These items are currently backordered and are not included in this invoice's total.");
   assert.equal(m.tag, 'Backordered *');
   assert.deepEqual(m.footnote.items, [
-    { primary: 'Elite Collar — Small / Navy', detail: 'SKU EC-001-S-NV · Qty 3 · Expected ship date: Dec 1, 2026' },
-    { primary: 'Luxe Leash', detail: 'SKU LL-005 · Qty 1 · Expected ship date: not yet available' },
+    { primary: 'Elite Collar — Small / Navy', detail: 'SKU EC-001-S-NV · Qty 3' },
+    { primary: 'Luxe Leash', detail: 'SKU LL-005 · Qty 1' },
   ]);
 });
 
@@ -212,13 +212,11 @@ await test('the wording constants are exactly what the model carries (one source
   assert.equal(m.footnote.heading, BACKORDER_HEADING);
   assert.equal(m.footnote.headingContinued, BACKORDER_HEADING_CONTINUED);
   assert.equal(m.footnote.intro, BACKORDER_INTRO);
-  assert.match(m.footnote.items[0].detail, new RegExp(`${BACKORDER_ETA_LABEL}: Dec 1, 2026$`));
-  assert.ok(BACKORDER_ETA_UNKNOWN.length > 0);
 });
 
 await test('wording lives ONLY in lib/invoice-backorder.mjs — pdf.mjs and server.mjs hold no copy of it', () => {
   const owners = ['pdf.mjs', 'server.mjs'].map(f => [f, fs.readFileSync(path.join(ROOT, f), 'utf8')]);
-  for (const phrase of ['currently backordered', 'not included in this invoice', 'Expected ship date:', 'not yet available', 'Backordered *', '* Backordered items', '(continued)']) {
+  for (const phrase of ['currently backordered', 'not included in this invoice', 'Backordered *', '* Backordered items', '(continued)']) {
     for (const [f, src] of owners) {
       // server.mjs/pdf.mjs may MENTION a phrase in a comment; they must not build a string literal out of it.
       const literal = new RegExp(`['"\`][^'"\`\\n]*${phrase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[^'"\`\\n]*['"\`]`);
@@ -237,16 +235,34 @@ await test('customer wording is factual: no promise of billing, shipping dates o
   assert.doesNotMatch(all, /\b(hotfix|snapshot|removed|shopify|pending|status|internal)\b/i, 'no internal jargon');
 });
 
-await test('the ship date is shown only when one is on file, formatted without time-zone drift', () => {
-  assert.equal(formatBackorderEta('2026-12-01'), 'Dec 1, 2026');
-  assert.equal(formatBackorderEta('2027-01-31'), 'Jan 31, 2027');
-  assert.equal(formatBackorderEta('2028-02-29'), 'Feb 29, 2028');
-  for (const bad of [null, undefined, '', 'soon', '2026-02-30', '2026-13-01', '12/01/2026', '2026-1-1', 20261201]) {
-    assert.equal(formatBackorderEta(bad), null, String(bad));
+// Owner decision: the expected ship date is NOT printed on the invoice. The data still carries it
+// (backorders.eta_date, shown on the internal /backorders queue); the invoice model must ignore it entirely.
+// SYNC: ETA_WORDING is the phrase list every "no ETA anywhere" assertion in this file reuses (model, HTML, PDF,
+// viewer, browser). It is phrases only: a whole PDF legitimately contains other dates (invoice date), so the
+// date-shaped check (noEtaDate) is applied only where the exact ETA values used by a test are known.
+const ETA_WORDING = /expected\s+ship|ship\s+date|\beta\b|not yet available/i;
+const noEta = (s, where) => assert.doesNotMatch(String(s), ETA_WORDING, `${where}: expected-ship-date wording leaked onto the invoice`);
+const noEtaDate = (s, where, dates) => {
+  for (const d of dates) assert.ok(!String(s).includes(d), `${where}: ETA value ${JSON.stringify(d)} leaked onto the invoice`);
+};
+
+await test('no ship date on the invoice: rows may carry an etaDate (valid, null or junk) and the model ignores it', () => {
+  const rows = [boRow({ etaDate: '2026-12-01' }), boRow({ etaDate: null }), boRow({ etaDate: 'nonsense' }), boRow({ etaDate: undefined }), boRow({ etaDate: '2027-01-15' })];
+  const m = buildInvoiceBackorderModel(rows);
+  assert.equal(m.lines.length, 5);
+  for (const l of m.lines) {
+    assert.ok(!('etaDate' in l) && !('etaLabel' in l), `line leaks an eta field: ${Object.keys(l)}`);
   }
-  const m = buildInvoiceBackorderModel([boRow({ etaDate: 'nonsense' })]);
-  assert.equal(m.lines[0].etaDate, null);
-  assert.match(m.footnote.items[0].detail, /Expected ship date: not yet available$/);
+  // Same row with / without an ETA => identical model (nothing about the ETA reaches the display).
+  assert.deepEqual(buildInvoiceBackorderModel([boRow({ etaDate: '2026-12-01' })]), buildInvoiceBackorderModel([boRow({ etaDate: null })]));
+  // The footnote detail is just SKU and quantity.
+  assert.deepEqual(m.footnote.items.map(i => i.detail), Array(5).fill('SKU EC-001-S-NV · Qty 3'));
+  const ETA_VALUES = ['2026-12-01', 'Dec 1, 2026', '2027-01-15', 'Jan 15, 2027', 'nonsense'];
+  noEta(JSON.stringify(m), 'model');
+  noEtaDate(JSON.stringify(m), 'model', ETA_VALUES);
+  const html = renderInvoiceBackorderHtml(m);
+  noEta(html, 'html');
+  noEtaDate(html, 'html', ETA_VALUES);
 });
 
 await test('every character of the customer wording exists in the embedded invoice fonts (no "NO GLYPH" boxes)', () => {
@@ -274,7 +290,7 @@ await test('rows are normalised: Default Title dropped, whitespace collapsed, va
   assert.equal(m.lines[1].title, 'Plain Leash');
   assert.equal(m.lines[1].variantTitle, '');
   assert.deepEqual(m.footnote.items.map(i => i.primary), ['Luxe Limited Slip Collar - Booth — XXS / 1/2"', 'Plain Leash']);
-  assert.match(m.footnote.items[1].detail, /^Qty 3 · /, 'no SKU => no "SKU" fragment');
+  assert.equal(m.footnote.items[1].detail, 'Qty 3', 'no SKU => no "SKU" fragment');
 });
 
 await test('amounts are formatted per currency and fall back safely', () => {
@@ -299,8 +315,10 @@ await test('HTML: struck description / qty / unit price / line total, tag, footn
   assert.equal((html.match(new RegExp(BACKORDER_TAG.replace('*', '\\*'), 'g')) || []).length, 2, 'tag on each line');
   assert.ok(html.includes('>* Backordered items<'));
   assert.ok(html.includes(BACKORDER_INTRO.replace("'", '&#x27;')), 'intro sentence (apostrophe escaped in markup)');
-  assert.ok(html.includes('Elite Collar — Small / Navy') && html.includes('SKU EC-001-S-NV · Qty 3 · Expected ship date: Dec 1, 2026'));
-  assert.ok(html.includes('Expected ship date: not yet available'));
+  assert.ok(html.includes('Elite Collar — Small / Navy') && html.includes('SKU EC-001-S-NV · Qty 3<'), 'detail is SKU + Qty and nothing after it');
+  assert.ok(html.includes('SKU LL-005 · Qty 1<'));
+  assert.ok(!html.includes('·&nbsp;') && !html.includes('Qty 3 ·') && !html.includes('Qty 1 ·'), 'no dangling separator after Qty');
+  noEta(html, 'html');
 });
 
 await test('HTML: every dynamic value is escaped', () => {
@@ -441,8 +459,12 @@ await test('footnote: one sentence + one entry per backordered variant, below th
   const foot = assertFootnoteLayout(r, model);
   assert.deepEqual(foot.slice(0, 2).map(x => x.text), [BACKORDER_HEADING, BACKORDER_INTRO]);
   const text = foot.map(x => x.text).join('\n');
-  assert.ok(text.includes('SKU EC-001-S-NV · Qty 3 · Expected ship date: Dec 1, 2026'));
-  assert.ok(text.includes('Expected ship date: not yet available'));
+  assert.ok(text.includes('SKU EC-001-S-NV · Qty 3'));
+  assert.ok(text.includes('SKU LL-005 · Qty 1'));
+  // The row carries etaDate '2026-12-01' — it must not be drawn anywhere on the page.
+  assert.deepEqual(foot.filter(x => /^(SKU|Qty)/.test(x.text)).map(x => x.text), ['SKU EC-001-S-NV · Qty 3', 'SKU LL-005 · Qty 1']);
+  noEta(r.runs.map(x => x.text).join('\n'), 'pdf');
+  noEtaDate(r.runs.map(x => x.text).join('\n'), 'pdf', ['2026-12-01', 'Dec 1, 2026']);
 });
 
 await test('footnote starts below notes / payment terms, never on top of them', async () => {
@@ -587,7 +609,10 @@ await test('flag 2 of 5 Elite Collars (through the real flow): invoice.pdf keeps
   // totals = the order's current aggregates (3x18 + 2x37.50 = 129 + 30 shipping), NOT plus the struck 36.00
   assert.deepEqual(AMOUNT_RUNS(runs).map(s => s.split(':')[1]), ['$129.00', '$30.00', '$159.00']);
   assert.ok(texts.includes(BACKORDER_HEADING) && texts.includes(BACKORDER_INTRO));
-  assert.ok(texts.includes('SKU EC-001-S-NV · Qty 2 · Expected ship date: Dec 1, 2026'), texts.filter(t => /^SKU/.test(t)).join(' / '));
+  assert.ok(texts.includes('SKU EC-001-S-NV · Qty 2'), texts.filter(t => /^SKU/.test(t)).join(' / '));
+  // The flow stored eta=2026-12-01 (the internal /backorders queue still shows it); the invoice must not.
+  noEta(texts.join('\n'), 'invoice.pdf');
+  noEtaDate(texts.join('\n'), 'invoice.pdf', ['2026-12-01', 'Dec 1, 2026']);
   assertFootnoteLayout({ runs }, buildOrderInvoiceBackorderModel([boRow({ quantity: 2, unitPrice: 18, lineTotal: 36 })]));
 });
 
@@ -597,7 +622,9 @@ await test('the invoice viewer page carries the same block as real HTML text (no
   assert.ok(page.text.includes('id="invoice-backorders"'));
   assert.ok(page.text.includes('<s class="inv-bo-title">Elite Collar</s>'));
   assert.ok(page.text.includes('<s>$36.00</s>') && page.text.includes('<s>2</s>'));
-  assert.ok(page.text.includes('SKU EC-001-S-NV · Qty 2 · Expected ship date: Dec 1, 2026'));
+  assert.ok(page.text.includes('SKU EC-001-S-NV · Qty 2<'), 'detail is SKU + Qty and nothing after it');
+  noEta(page.text, 'invoice viewer');
+  noEtaDate(page.text, 'invoice viewer', ['2026-12-01', 'Dec 1, 2026']);
   assert.ok(page.text.includes(BACKORDER_INTRO.replace("'", '&#x27;')));
   assert.ok(page.text.includes('<style>') && page.text.includes('.inv-bo'));
   const partial = await getText(server.base, cookie, '/orders/1001/invoice?letter=A');
@@ -687,7 +714,11 @@ await test('no horizontal overflow, long text wraps, strike-through visible, foo
       assert.ok(m.titleRight <= m.winW + 0.5, `${tag}: long title runs past the viewport`);
       assert.ok(m.noteFont >= 12 && m.noteVisible, `${tag}: footnote not readable (${m.noteFont}px)`);
       assert.ok(m.text.includes(LONG) && m.text.includes(LONG_SKU), `${tag}: long text was cut off, not wrapped`);
-      assert.ok(m.text.includes(BACKORDER_INTRO) && m.text.includes('Expected ship date: Jan 15, 2027') && m.text.includes('Expected ship date: not yet available'), tag);
+      assert.ok(m.text.includes(BACKORDER_INTRO), tag);
+      // eta=2027-01-15 was stored by the flow for the first probe and none for the second: neither may show.
+      noEta(m.text, `${tag} rendered text`);
+      noEtaDate(m.text, `${tag} rendered text`, ['2027-01-15', 'Jan 15, 2027']);
+      assert.ok(m.text.split('\n').some(l => l.trim() === `SKU ${LONG_SKU} · Qty 4`), `${tag}: footnote detail line is "SKU · Qty" and nothing else`);
       if (process.env.INVOICE_SHOT_DIR) {
         fs.mkdirSync(process.env.INVOICE_SHOT_DIR, { recursive: true });
         await pg.screenshot({ path: path.join(process.env.INVOICE_SHOT_DIR, `invoice-viewer-${width}.png`), fullPage: true });
