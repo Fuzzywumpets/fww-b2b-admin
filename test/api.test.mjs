@@ -1968,6 +1968,19 @@ await test('order detail offers Send Credit Card Invoice and no Chase stub', asy
   assert.ok(!html.includes('Send Chase Invoice'));
 });
 
+await test('order detail CC invoice button opens a modal with a note textarea (name="note")', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/orders/1001`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  // The button opens a modal, not a bare form-submit.
+  assert.ok(html.includes('toggleCcInvoiceModal'), 'toggleCcInvoiceModal JS missing');
+  assert.ok(html.includes('id="cc-invoice-modal"'), 'cc-invoice-modal div missing');
+  assert.ok(html.includes('name="note"'), 'note textarea missing');
+  // maxlength cap must be 500.
+  assert.ok(html.includes('maxlength="500"'), 'maxlength=500 missing on note textarea');
+});
+
 await test('POST /orders/1001/send-credit-card-invoice (JSON) → creates and emails Helcim invoice', async () => {
   const cookie = await seedSession();
   const res = await fetch(`${BASE}/orders/1001/send-credit-card-invoice`, {
@@ -1984,6 +1997,45 @@ await test('POST /orders/1001/send-credit-card-invoice (JSON) → creates and em
   assert.ok(j.invoice.amount > 0);
   assert.equal(j.invoice.currency, 'USD');
   assert.deepEqual(j.email, { sent: true, to: 'buyer@acme.com' });
+});
+
+await test('POST /orders/1001/send-credit-card-invoice with form-encoded note → 302 success', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/orders/1001/send-credit-card-invoice`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ note: 'Please review your order carefully.' }),
+    redirect: 'manual',
+  });
+  assert.equal(res.status, 302);
+  assert.ok(res.headers.get('location')?.includes('credit_card_invoice_sent'),
+    `expected credit_card_invoice_sent redirect, got: ${res.headers.get('location')}`);
+});
+
+await test('POST /orders/1001/send-credit-card-invoice with JSON note → 200 ok', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/orders/1001/send-credit-card-invoice`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ note: 'Spring restock *discount* applies.' }),
+  });
+  assert.equal(res.status, 200);
+  const j = await res.json();
+  assert.equal(j.ok, true);
+});
+
+await test('POST /orders/1001/send-credit-card-invoice with over-long note → truncated, not rejected', async () => {
+  const cookie = await seedSession();
+  const longNote = 'x'.repeat(600);
+  const res = await fetch(`${BASE}/orders/1001/send-credit-card-invoice`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ note: longNote }),
+  });
+  // Must succeed (note is truncated to 500, not rejected).
+  assert.equal(res.status, 200);
+  const j = await res.json();
+  assert.equal(j.ok, true);
 });
 
 await test('POST /orders/1001/send-credit-card-invoice retry reuses the invoice and redirects with success', async () => {

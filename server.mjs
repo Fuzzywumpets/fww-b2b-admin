@@ -74,6 +74,9 @@ import { keepEditModeRedirects, keepEditClientPattern, EDIT_ANCHOR } from './lib
 import { assertNoUserErrors } from './lib/shopify-user-errors.mjs';
 import { currentShippingAmount, findShippingInvoice, parseShippingAmount, stageShippingReplacement } from './lib/order-shipping.mjs';
 import { createCreditCardInvoice } from './helcim.mjs';
+// DEPENDS: lib/helcim-note.mjs is the text contract for the CC invoice email (subject keeps the
+//   #NNNNN token; quoteForMarkdown escapes the note for Portal's Markdown renderer).
+import { normalizeStaffNote, buildLegacyInvoiceEmail } from './lib/helcim-note.mjs';
 // SYNC: same module db.mjs uses for the SQL LIMIT — the banner/footer copy and the query page size
 // must agree, otherwise the list lies about how much it is showing.
 import { ORDERS_LIST_LIMIT, CUSTOMERS_LIST_LIMIT, LEADS_LIST_LIMIT, listCountLabel, truncationNoticeHtml } from './lib/list-truncation.mjs';
@@ -2935,6 +2938,10 @@ function renderOrderDetail(session, order, flash, flashMsg, { resumeEdit = false
   function toggleCancelModal(show) {
     document.getElementById('cancel-modal').style.display = show ? 'flex' : 'none';
   }
+  function toggleCcInvoiceModal(show) {
+    document.getElementById('cc-invoice-modal').style.display = show ? 'flex' : 'none';
+    if (show) { var ta = document.getElementById('cc-invoice-note'); if (ta) ta.focus(); }
+  }
   // Second build (Build C): record-manual-payment modal toggle.
   function toggleRecordPaymentModal(show) {
     var m = document.getElementById('record-payment-modal');
@@ -3202,9 +3209,7 @@ function renderOrderDetail(session, order, flash, flashMsg, { resumeEdit = false
         <button class="btn btn-secondary" onclick="toggleFulfillModal(true)">Fulfill items</button>
         <button class="btn btn-ghost" onclick="toggleDiscountModal(true)">Apply discount</button>
         <button class="btn btn-secondary" onclick="toggleInvoiceModal(true)">Generate Invoice</button>
-        <form method="POST" action="/orders/${h(numId)}/send-credit-card-invoice" style="display:inline" onsubmit="if(!confirm('Send this Helcim credit card invoice to the customer?')) return false; this.querySelector('button').disabled=true;">
-          <button class="btn btn-secondary">Send Credit Card Invoice</button>
-        </form>
+        <button type="button" class="btn btn-secondary" onclick="toggleCcInvoiceModal(true)">Send Credit Card Invoice</button>
         <form method="POST" action="/orders/${h(numId)}/xero/sync" style="display:inline">
           <button class="btn btn-ghost" title="Create or refresh Xero invoice for this order">${xeroMap?.status === 'synced' ? '✓ Xero synced' : 'Sync to Xero'}</button>
         </form>
@@ -4273,6 +4278,23 @@ function renderOrderDetail(session, order, flash, flashMsg, { resumeEdit = false
             </form>
           </div>
         </div>` : ''}
+        ${/* Send Credit Card Invoice modal */''}<div id="cc-invoice-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center">
+          <div style="background:#fff;border-radius:8px;padding:24px;min-width:380px;max-width:500px">
+            <h3 style="margin:0 0 16px">Send Credit Card Invoice</h3>
+            <p style="color:#555;margin:0 0 16px">Send ${h(order.name)} to <strong>${h(order.customer?.email || 'the customer')}</strong> — amount due: <strong>${fmtMoney(outstanding)} ${h((order.totalPriceSet?.presentmentMoney?.currencyCode || 'USD').toUpperCase())}</strong>.</p>
+            <form method="POST" action="/orders/${h(numId)}/send-credit-card-invoice" onsubmit="var b=document.getElementById('cc-invoice-submit'); if(b){b.disabled=true;b.textContent='Sending…';}">
+              <div style="margin-bottom:16px">
+                <label for="cc-invoice-note" style="font-size:13px;font-weight:500">Note to customer</label>
+                <div style="font-size:11px;color:var(--muted);margin:4px 0 6px">Optional. Included in the payment email as a quoted note. Markdown and HTML are shown as literal text.</div>
+                <textarea id="cc-invoice-note" name="note" class="textarea" rows="4" maxlength="500" placeholder="E.g. This covers your spring restock — reach out with any questions."></textarea>
+              </div>
+              <div style="display:flex;gap:8px;justify-content:flex-end">
+                <button type="button" class="btn btn-ghost" onclick="toggleCcInvoiceModal(false)">Cancel</button>
+                <button type="submit" id="cc-invoice-submit" class="btn btn-secondary">Send invoice</button>
+              </div>
+            </form>
+          </div>
+        </div>
         ${/* Generate Invoice modal */''}<div id="invoice-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center">
           <div style="background:#fff;border-radius:8px;padding:24px;min-width:380px;max-width:500px">
             <h3 style="margin:0 0 16px">Generate Invoice</h3>
@@ -6646,6 +6668,7 @@ app.post('/orders/:id/shipping-address', requireAuth, async (req, res) => {
 // WHAT: creates (or reuses) a DUE Helcim invoice for the order's exact outstanding balance, then asks the Portal's Re:amaze bridge to email its secure online-payment link.
 // CHANGE-GUARD: the helcim_invoice_map write MUST happen before the email attempt; on delivery failure a retry reuses that invoice rather than creating a duplicate bill. JSON callers receive a non-2xx on every failure; form callers receive a truthful warning flash.
 // INVARIANT(S): no card data touches this app; paid/zero-balance orders and orders without customer email are rejected; audit rows never contain the invoice token or online-view URL.
+// DEPENDS: Portal /__internal__/visible-note now accepts an optional `subject` field passed here; lib/helcim-note.mjs is the shared text contract (subject keeps #NNNNN token; quoteForMarkdown renders note as literal Markdown blockquote).
 app.post('/orders/:id/send-credit-card-invoice', requireAuth, async (req, res) => {
   const numId = req.params.id;
   const order = await getOrderDetail(numId);
@@ -6662,6 +6685,10 @@ app.post('/orders/:id/send-credit-card-invoice', requireAuth, async (req, res) =
   const outstandingValue = order.totalOutstandingSet?.presentmentMoney?.amount;
   const outstanding = Math.round(Math.max(0, Number(outstandingValue ?? deriveCurrentOrderTotals(order).total) || 0) * 100) / 100;
   if (outstanding <= 0) return fail(409, 'This order has no outstanding balance.');
+
+  // Read and normalise the optional staff note (form field or JSON body).
+  const rawNote = wantsJson ? (req.body?.note ?? '') : (req.body?.note ?? '');
+  const staffNote = normalizeStaffNote(String(rawNote ?? ''));
 
   const orderGid = shopifyOrderGid(numId);
   let invoice = getHelcimInvoiceMap(orderGid);
@@ -6683,12 +6710,17 @@ app.post('/orders/:id/send-credit-card-invoice', requireAuth, async (req, res) =
       invoice = upsertHelcimInvoiceMap(orderGid, created);
     }
 
-    const noteBody = `Your credit card invoice for ${order.name} is ready for ${fmtMoney(outstanding)} ${currency}.\n\nPay securely with Helcim:\n${invoice.url}`;
+    // DEPENDS: lib/helcim-note.mjs buildLegacyInvoiceEmail — subject keeps the #NNNNN token so
+    //   Portal's getCustomerWholesaleThreads can scope the Re:amaze thread to this order.
+    const { subject, body: noteBody } = buildLegacyInvoiceEmail({
+      orderName: order.name, amountText: fmtMoney(outstanding), currency, url: invoice.url, note: staffNote,
+    });
     const delivery = MOCK
       ? { ok: true, email: { sent: true, via: 'mock' } }
       : await callPortalInternal('POST', '/__internal__/visible-note', {
           orderId: orderGid,
           body: noteBody,
+          subject,
           addedBy: req.adminSession.email,
           emailCustomer: true,
           sendAs: 'wholesale',
@@ -6698,6 +6730,7 @@ app.post('/orders/:id/send-credit-card-invoice', requireAuth, async (req, res) =
       setHelcimInvoiceDelivery(orderGid, 'delivery_failed', deliveryError);
       auditLog(req.adminSession.email, 'helcim_invoice_email_failed', orderGid, null, {
         invoiceId: invoice.invoice_id, invoiceNumber: invoice.invoice_number, amount: outstanding, currency,
+        hasNote: !!staffNote,
       });
       return fail(502, `Helcim invoice ${invoice.invoice_number || invoice.invoice_id} was created, but customer email delivery was not confirmed: ${deliveryError}`);
     }
@@ -6706,6 +6739,7 @@ app.post('/orders/:id/send-credit-card-invoice', requireAuth, async (req, res) =
     auditLog(req.adminSession.email, 'helcim_invoice_sent', orderGid, null, {
       invoiceId: invoice.invoice_id, invoiceNumber: invoice.invoice_number,
       amount: outstanding, currency, customerEmail, reused,
+      hasNote: !!staffNote, ...(staffNote ? { note: staffNote } : {}),
     });
     if (wantsJson) {
       return res.json({
