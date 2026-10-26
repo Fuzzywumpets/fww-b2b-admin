@@ -174,6 +174,16 @@ if [ -f test/invoice-format.test.mjs ]; then
   node test/invoice-format.test.mjs || UNIT_FAIL=$?
 fi
 
+# Backordered lines on the ORDER invoice (struck rows + footnote; lib/invoice-backorder.mjs, pdf.mjs,
+# GET /orders/:id/invoice[.pdf]). Standalone and SELF-CONTAINED: it boots its own mock server on a free port
+# (so it never shares state or a port with the suite above) and drives POST /orders/1001/backorder through the
+# real flow; it also pins "no backordered lines => byte-identical invoice" against goldens generated from the
+# pre-feature commit. Needs Playwright's Chromium for the 390/768/1280 on-screen checks, like ui.test.mjs.
+if [ -f test/invoice-backorder.test.mjs ]; then
+  echo ""
+  node test/invoice-backorder.test.mjs || UNIT_FAIL=$?
+fi
+
 # The #38953 lock-up: a permanently-failing line edit armed a beforeunload guard, and the Electron
 # shell cancels a prevented unload SILENTLY — every link, the back button, "Generate PDF" and Quit
 # died at once. Standalone: it spans desktop shell code (never loaded by the server) and source-level
