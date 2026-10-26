@@ -11,7 +11,7 @@ import { buildClientSchema, parse, validate } from 'graphql';
 import * as dbm from '../db.mjs';
 import {
   flagBackorder, undoBackorder, parseBackorderRequest, priceAdjustment, pricesMatch, BACKORDER_LINE_FIELDS, backorderCommitMutation, completeCommitNodes,
-  stageRemoveUnits, stageRaiseUnits, stageAddVariantAtPrice, stageAddCustomAtPrice, DUPLICATE_WINDOW_MS,
+  stageRemoveUnits, stageRaiseUnits, stageAddVariantAtPrice, stageAddCustomAtPrice, DUPLICATE_WINDOW_MS, READBACK_RETRY_DELAYS_MS,
 } from '../lib/backorder-edit.mjs';
 
 let passed = 0, failed = 0;
@@ -44,6 +44,10 @@ function world(lineSpecs, { orderId } = {}) {
       if (w.commitLines === 'empty') return { lines: [] };
       return undefined;
     },
+    // A lagging read replica: after an edit, the next `lagReads` readLines() calls serve the PRE-edit lines.
+    // (settleAfterCommit below does not consume the lag - it only records that the settling read happened.)
+    lagReads: 0, lagLeft: 0, preEdit: null, settled: 0, sleeps: [], settleThrows: false,
+    startLag(prior) { w.preEdit = prior; w.lagLeft = w.lagReads; },
   };
   w.deps = {
     db: dbm,
@@ -51,13 +55,17 @@ function world(lineSpecs, { orderId } = {}) {
     readLines: async () => {
       w.readCount++;
       if (w.readFailsAfter != null && w.readCount > w.readFailsAfter) throw new Error('shopify read timeout');
+      if (w.lagLeft > 0) { w.lagLeft--; return w.preEdit.map(l => ({ ...l })); }
       return w.lines.map(l => ({ ...l }));
     },
+    settleAfterCommit: async () => { w.settled++; if (w.settleThrows) throw new Error('settling read failed'); },
+    sleep: async (ms) => { w.sleeps.push(ms); },
     removeUnits: async ({ line, quantity, idemKey, payload }) => {
       w.calls.push({ kind: 'remove', liId: line.liId, quantity, idemKey, payload });
       if (w.rejectRemove) throw new Error(w.rejectRemove);
       const l = w.lines.find(x => x.liId === line.liId);
       const priorLines = w.lines.map(x => ({ ...x }));
+      w.startLag(priorLines);
       l.currentQuantity -= quantity;
       if (w.throwAfterApply) throw new Error('orderEditCommit timed out');
       w.ledger.set(idemKey, { status: 'committed', action: 'backorder/flag', payload_json: JSON.stringify(payload) });
@@ -67,6 +75,7 @@ function world(lineSpecs, { orderId } = {}) {
       w.calls.push({ kind: 'restore', mode, quantity, unitPrice, idemKey });
       if (w.rejectRestore) throw new Error(w.rejectRestore);
       const priorLines = w.lines.map(x => ({ ...x }));
+      w.startLag(priorLines);
       if (mode === 'raise') w.lines.find(x => x.liId === live.liId).currentQuantity += quantity;
       else w.lines.push({ liId: `gid://shopify/LineItem/${++w.nextId}`, title: row.line_item_title, variantTitle: row.variant_title || '', sku: row.sku || '', variantId: row.variant_id, currentQuantity: quantity, unitPrice: w.restoredPrice ?? unitPrice, currency: row.currency });
       if (w.throwAfterApply) throw new Error('orderEditCommit timed out');
@@ -238,13 +247,15 @@ await test('error AND the read-back also fails: outcome unknown → row stays ap
   assert.ok(w.errors.some(m => /UNCONFIRMED flag/.test(m)));
   assert.deepEqual(dbm.getBackorderedLinesForOrder(w.orderId), [], 'not shown as backordered until confirmed');
 });
-await test('a "successful" edit whose read-back shows NO change is NOT recorded as backordered', async () => {
+await test('a "successful" edit whose read-back shows NO change is NOT recorded as backordered - and its claim is NOT silently abandoned either', async () => {
   const w = world([{ currentQuantity: 5 }]);
   w.deps.removeUnits = async () => {};                 // claims success, changes nothing
   const r = await flag(w, { quantity: 2 });
   assert.equal(r.ok, false);
-  assert.equal(r.state, 'not_applied');
-  assert.equal(row(w), null);
+  assert.equal(r.state, 'unconfirmed');
+  assert.equal(row(w).status, 'applying', 'kept for reconcile: a read that never changes is stale-or-no-op, undecidable');
+  assert.deepEqual(dbm.getBackorderedLinesForOrder(w.orderId), [], 'never shown as backordered until confirmed');
+  assert.equal(w.lines[0].currentQuantity, 5);
 });
 await test('success with no read-back available is trusted (the edit itself was confirmed)', async () => {
   const w = world([{ currentQuantity: 5 }]);
@@ -467,14 +478,15 @@ await test('FLAG: an answer that merely OMITS the line proves nothing (a full re
   assert.equal(r.ok, true);
   assert.equal(w.readCount, 2, 'not trusted as a confirmation: the independent read decided');
 });
-await test('FLAG FAILS CLOSED: a commit answer showing the line unchanged can never make a no-op look applied', async () => {
+await test('FLAG FAILS CLOSED: a commit answer showing the line unchanged can never make a no-op look applied (and is not trusted to abandon either)', async () => {
   const w = world([{ currentQuantity: 5 }]);
   w.deps.removeUnits = async () => ({ lines: w.lines.map(x => ({ ...x })) });     // says "5", and 5 it is
   const r = await flag(w, { quantity: 2 });
   assert.equal(r.ok, false);
-  assert.equal(r.state, 'not_applied');
-  assert.equal(row(w), null);
-  assert.equal(w.readCount, 2, 'the unconfirmed answer still got the independent read');
+  assert.equal(r.state, 'unconfirmed');
+  assert.equal(row(w).status, 'applying');
+  assert.deepEqual(dbm.getBackorderedLinesForOrder(w.orderId), []);
+  assert.equal(w.readCount, 1 + 1 + READBACK_RETRY_DELAYS_MS.length, 'pre-read + the independent read + every retry');
 });
 await test('FLAG: after an edit ERROR no commit answer is used at all - the independent read always decides', async () => {
   const w = world([{ currentQuantity: 6 }]);
@@ -522,8 +534,133 @@ await test('UNDO FAILS CLOSED: a commit answer that shows no change is not a res
   w.deps.restoreUnits = async () => ({ warnings: [], lines: w.lines.map(x => ({ ...x })) });   // answers, changes nothing
   const r = await undo(w);
   assert.equal(r.ok, false);
+  assert.equal(r.state, 'unconfirmed');
+  assert.equal(row(w).status, 'restoring', 'kept for reconcile, not reverted on an unverifiable read');
+  assert.equal(dbm.getBackorderedLinesForOrder(w.orderId).length, 0, 'transient rows are invisible to the renderers');
+});
+
+console.log('\n  no silent abandon after a reported success (follow-up 2026-10-26)');
+const DELAYS = [...READBACK_RETRY_DELAYS_MS];
+await test('FLAG: commit OK + non-confirming answer + STALE first read -> not abandoned; settled, retried, row ends pending', async () => {
+  const w = world([{ currentQuantity: 10 }]);
+  w.lagReads = 1;                                                // the immediate read-back still serves the pre-edit order
+  const r = await flag(w, { quantity: 4 });
+  assert.equal(r.ok, true, r.message);
+  assert.equal(row(w).status, 'pending');
+  assert.equal(row(w).shopify_removed_qty, 4);
+  assert.equal(w.lines[0].currentQuantity, 6);
+  assert.equal(w.settled, 1, 'the pre-speed settling read happened once');
+  assert.deepEqual(w.sleeps, [DELAYS[0]], 'one retry pause');
+  assert.equal(w.readCount, 3, 'pre-read, stale read-back, good read-back');
+});
+await test('FLAG: replica lag longer than the whole retry budget -> row LEFT applying, loud log, error message, nothing abandoned', async () => {
+  const w = world([{ currentQuantity: 10 }]);
+  w.lagReads = 99;
+  const r = await flag(w, { quantity: 4 });
+  assert.equal(r.ok, false);
+  assert.equal(r.state, 'unconfirmed');
+  assert.match(r.message, /Refresh the order and check it in Shopify before retrying/);
+  assert.equal(row(w).status, 'applying', 'NOT deleted: the units really are gone on Shopify');
+  assert.equal(row(w).claim_prior_qty, 10, 'what reconcile needs');
+  assert.equal(w.lines[0].currentQuantity, 6);
+  assert.deepEqual(w.sleeps, DELAYS);
+  assert.equal(w.readCount, 1 + 1 + DELAYS.length);
+  assert.ok(w.errors.some(m => /UNCONFIRMED flag/.test(m) && /claim NOT abandoned/.test(m)), 'logged loudly');
+  assert.deepEqual(dbm.getBackorderedLinesForOrder(w.orderId), [], 'not shown as backordered until confirmed');
+  // The existing reconcile path closes it: once Shopify answers truthfully, the next flag on the line finalizes the row.
+  w.lagLeft = 0;
+  w.clock += 1_000;
+  const again = await flag(w, { quantity: 4 });
+  assert.deepEqual([again.ok, again.duplicate], [true, true], 'recovered as the same request, no second removal');
+  assert.equal(row(w).status, 'pending');
+  assert.equal(w.lines[0].currentQuantity, 6);
+  assert.equal(w.calls.filter(c => c.kind === 'remove').length, 1);
+  assert.ok(w.errors.some(m => /RECOVERED interrupted flag/.test(m)));
+});
+await test('FLAG: reported success that REALLY changed nothing is left applying too, and the next attempt discards it and proceeds', async () => {
+  const w = world([{ currentQuantity: 5 }]);
+  const real = w.deps.removeUnits;
+  w.deps.removeUnits = async () => {};                           // commit "succeeds" and changes nothing
+  assert.equal((await flag(w, { quantity: 2 })).state, 'unconfirmed');
+  assert.equal(row(w).status, 'applying');
+  w.deps.removeUnits = real;
+  const r = await flag(w, { quantity: 2 });
+  assert.equal(r.ok, true, r.message);
+  assert.equal(w.lines[0].currentQuantity, 3);
+  assert.equal(row(w).status, 'pending');
+  assert.ok(w.errors.some(m => /RECOVERED interrupted flag.*claim discarded/.test(m)));
+});
+await test('FLAG: a read-back that FAILS after one already contradicted the success is never read as "trust the success"', async () => {
+  const w = world([{ currentQuantity: 10 }]);
+  w.lagReads = 99;
+  w.readFailsAfter = 2;                                          // pre-read ok, first read-back ok (stale), the retry times out
+  const r = await flag(w, { quantity: 4 });
+  assert.equal(r.state, 'unconfirmed');
+  assert.equal(row(w).status, 'applying');
+});
+await test('FLAG: a failing settling read is logged and ignored - it only buys time', async () => {
+  const w = world([{ currentQuantity: 10 }]);
+  w.settleThrows = true;
+  const r = await flag(w, { quantity: 4 });
+  assert.equal(r.ok, true);
+  assert.equal(row(w).status, 'pending');
+  assert.ok(w.warns.some(m => /settling read after flag.*failed/.test(m)));
+});
+await test('FLAG: a commit answer that POSITIVELY confirms is untouched - no settling read, no pause, no extra read', async () => {
+  const w = world([{ currentQuantity: 10 }]);
+  w.commitLines = 'honest';
+  w.lagReads = 99;                                               // a stale replica is irrelevant when the answer itself confirms
+  assert.equal((await flag(w, { quantity: 4 })).ok, true);
+  assert.equal(w.settled, 0);
+  assert.deepEqual(w.sleeps, []);
+  assert.equal(w.readCount, 1, 'only the pre-read');
+});
+await test('FLAG: after an edit ERROR there is no settling read or retry either - still ONE independent read, unchanged semantics', async () => {
+  const w = world([{ currentQuantity: 5 }]);
+  w.rejectRemove = 'Line item cannot be removed';
+  const r = await flag(w, { quantity: 2 });
   assert.equal(r.state, 'not_applied');
-  assert.equal(row(w).status, 'pending', 'still backordered');
+  assert.equal(row(w), null, 'a rejection that changed nothing still releases the claim');
+  assert.equal(w.settled, 0);
+  assert.deepEqual(w.sleeps, []);
+  assert.equal(w.readCount, 2);
+});
+await test('UNDO: commit OK + non-confirming answer + STALE read -> restored after the retry (never reverted on a stale read)', async () => {
+  const w = world([{ currentQuantity: 4 }]);
+  await flag(w, { quantity: 4 });
+  w.settled = 0; w.sleeps = []; w.readCount = 0; w.lagReads = 1;
+  const r = await undo(w);
+  assert.equal(r.ok, true, r.message);
+  assert.equal(row(w).status, 'restored');
+  assert.equal(w.lines.filter(l => l.currentQuantity > 0).length, 1);
+  assert.equal(w.settled, 1);
+  assert.deepEqual(w.sleeps, [DELAYS[0]]);
+});
+await test('UNDO: lag longer than the retry budget -> row LEFT restoring (not reverted), loud log; the next undo reconciles without adding the units twice', async () => {
+  const w = world([{ currentQuantity: 4 }]);
+  await flag(w, { quantity: 4 });
+  w.lagReads = 99;
+  const r = await undo(w);
+  assert.equal(r.ok, false);
+  assert.equal(r.state, 'unconfirmed');
+  assert.match(r.message, /Refresh the order and check it in Shopify before retrying/);
+  assert.equal(row(w).status, 'restoring');
+  assert.ok(w.errors.some(m => /UNCONFIRMED undo/.test(m) && /NOT reverting/.test(m)));
+  assert.equal(w.lines.filter(l => l.currentQuantity > 0).length, 1, 'the units really are back (one re-added line)');
+  w.lagLeft = 0;
+  const again = await undo(w);
+  assert.deepEqual([again.ok, again.duplicate], [true, true]);
+  assert.equal(row(w).status, 'restored');
+  assert.equal(w.calls.filter(c => c.kind === 'restore').length, 1, 'no second add');
+});
+await test('UNDO: a commit answer that positively confirms needs no settling read or pause', async () => {
+  const w = world([{ currentQuantity: 4 }]);
+  await flag(w, { quantity: 4 });
+  w.settled = 0; w.sleeps = []; w.readCount = 0; w.commitLines = 'honest'; w.lagReads = 99;
+  assert.equal((await undo(w)).ok, true);
+  assert.equal(w.settled, 0);
+  assert.deepEqual(w.sleeps, []);
+  assert.equal(w.readCount, 1);
 });
 
 await test('completeCommitNodes returns the nodes ONLY for a provably complete page (the overflow check for the single-page selection)', () => {

@@ -17,6 +17,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import Database from 'better-sqlite3';
+import { READBACK_RETRY_DELAYS_MS } from '../lib/backorder-edit.mjs';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const FAKE = pathToFileURL(path.join(ROOT, 'test', 'fixtures', 'fake-shopify-bridge.mjs')).href;
@@ -111,9 +112,15 @@ function sequence(name, got, expected) {
 }
 
 // The sequences the order-edit path is allowed to make. The commit mutation itself carries the order's lines,
-// so a confirmed commit needs no separate read-back; an unconfirmed one falls back to exactly one.
+// so a confirmed commit needs no separate read-back. A commit that reported SUCCESS but did not confirm gets what it
+// had before the speed change - the settling whole-order read ('lineState') then the read-back - and the read-back is
+// retried while it still shows no change (READBACK_RETRY_DELAYS_MS). After an ERROR (rejected, timed out) it is one
+// immediate read, as ever.
 const FLAG = ['orderLines', 'begin', 'setQty', 'commit'];
-const FLAG_FALLBACK = [...FLAG, 'orderLines'];
+const FLAG_FALLBACK = [...FLAG, 'orderLines'];                 // commit threw: one independent read
+const FLAG_SETTLED = [...FLAG, 'lineState', 'orderLines'];     // commit OK, answer did not confirm, first read agrees
+const FLAG_UNCHANGED = [...FLAG, 'lineState', ...Array(1 + READBACK_RETRY_DELAYS_MS.length).fill('orderLines')];   // ... and the read never changes
+const STALE_ALL_READS = 2 + READBACK_RETRY_DELAYS_MS.length;   // settling read + every read-back: all served by the lagging replica
 const UNDO_RAISE = ['orderLines', 'begin', 'setQty', 'commit'];
 const UNDO_ADD = ['orderLines', 'begin', 'addVariant', 'addDiscount', 'commit'];
 const AUTOSAVE = ['begin', 'setQty', 'commit', 'lineState'];
@@ -169,14 +176,14 @@ await test('UNDO (add): a fully removed line comes back as a NEW line at the sto
   sequence('undo-add', u.ops, UNDO_ADD);
 });
 
-await test('FAIL CLOSED: commit response that does not confirm (stale) -> ONE independent read decides; applied edit still finalizes', async () => {
+await test('FAIL CLOSED: commit response that does not confirm (stale) -> the settling read, then ONE independent read decides; applied edit still finalizes', async () => {
   srv.control({ commitStale: true });
   const { result, ops } = await srv.call(() => flag(srv, 5002, 3, 'tok-flag-5002'));
   srv.control({});
   assert.match(flash(result), /success=backorder_flagged/);
   assert.equal(srv.state()[5002].cq, 7);
   assert.equal(srv.row(5002).status, 'pending');
-  sequence('flag, stale commit response', ops, FLAG_FALLBACK);
+  sequence('flag, stale commit response', ops, FLAG_SETTLED);
 });
 
 await test('FAIL CLOSED: commit response without lineItems, or with a next page, is never trusted as complete', async () => {
@@ -188,18 +195,70 @@ await test('FAIL CLOSED: commit response without lineItems, or with a next page,
   for (const r of [a, b]) assert.match(flash(r.result), /success=backorder_flagged/);
   assert.equal(srv.row(5003).status, 'pending');
   assert.equal(srv.row(5004).status, 'pending');
-  sequence('flag, commit response without lines', a.ops, FLAG_FALLBACK);
-  sequence('flag, commit response with a next page', b.ops, FLAG_FALLBACK);
+  sequence('flag, commit response without lines', a.ops, FLAG_SETTLED);
+  sequence('flag, commit response with a next page', b.ops, FLAG_SETTLED);
 });
 
-await test('FAIL CLOSED: a "successful" commit that changed nothing is NOT a backorder - claim abandoned, error shown, no row', async () => {
+await test('FAIL CLOSED: a "successful" commit that changed nothing is NOT a backorder - error shown, nothing counted, the claim is KEPT (undecidable vs a stale read), then reconciled', async () => {
   srv.control({ commitDrops: true });
   const { result, ops } = await srv.call(() => flag(srv, 5005, 3, 'tok-flag-5005'));
   srv.control({});
   assert.match(flash(result), /error=backorder_shopify_failed/);
+  assert.match(flash(result), /unconfirmed/);
   assert.equal(srv.state()[5005].cq, 10, 'order untouched');
-  assert.equal(srv.row(5005), null, 'no row claims the line is backordered');
-  sequence('flag, commit changed nothing', ops, FLAG_FALLBACK);
+  assert.deepEqual(srv.row(5005), { status: 'applying', quantity: 3, shopify_removed_qty: 0 }, 'transient: no invoice/queue reader sees it as backordered');
+  sequence('flag, commit changed nothing', ops, FLAG_UNCHANGED);
+  // The next attempt on the line reconciles it against Shopify (still 10 = the claim never landed), discards it and proceeds.
+  const again = await srv.call(() => flag(srv, 5005, 3, 'tok-flag-5005-retry'));
+  assert.match(flash(again.result), /success=backorder_flagged/);
+  assert.equal(srv.state()[5005].cq, 7);
+  assert.equal(srv.row(5005).status, 'pending');
+  sequence('flag, retry after the unconfirmed one', again.ops, FLAG);
+});
+
+await test('NO SILENT ABANDON: commit OK + non-confirming answer + STALE reads (settling read AND first read-back) -> the claim survives, the retry sees the truth, row ends pending', async () => {
+  srv.control({ commitStale: true, readLag: 2 });
+  const { result, ops } = await srv.call(() => flag(srv, 5012, 3, 'tok-flag-5012'));
+  srv.control({});
+  assert.match(flash(result), /success=backorder_flagged/);
+  assert.equal(srv.state()[5012].cq, 7);
+  assert.deepEqual(srv.row(5012), { status: 'pending', quantity: 3, shopify_removed_qty: 3 });
+  sequence('flag, stale commit answer + stale reads', ops, [...FLAG_SETTLED, 'orderLines']);
+});
+
+await test('NO SILENT ABANDON: the settling read alone is enough when the replica lags by one read (the pre-speed behaviour)', async () => {
+  srv.control({ commitStale: true, readLag: 1 });
+  const { result, ops } = await srv.call(() => flag(srv, 5013, 3, 'tok-flag-5013'));
+  srv.control({});
+  assert.match(flash(result), /success=backorder_flagged/);
+  assert.equal(srv.row(5013).status, 'pending');
+  sequence('flag, replica lags one read', ops, FLAG_SETTLED);
+});
+
+await test('NO SILENT ABANDON: replica still stale after the whole retry budget -> row LEFT applying, error flash, loud log; the units ARE gone, and the next attempt reconciles (no second removal)', async () => {
+  srv.control({ commitStale: true, readLag: STALE_ALL_READS });
+  const { result, ops } = await srv.call(() => flag(srv, 5014, 3, 'tok-flag-5014'));
+  srv.control({});
+  assert.match(flash(result), /error=backorder_shopify_failed/);
+  assert.match(flash(result), /Refresh the order and check it in Shopify/);
+  assert.equal(srv.state()[5014].cq, 7, 'Shopify really removed them');
+  assert.deepEqual(srv.row(5014), { status: 'applying', quantity: 3, shopify_removed_qty: 0 }, 'NOT abandoned: the record of the removal is kept for reconcile');
+  sequence('flag, stale beyond the retry budget', ops, FLAG_UNCHANGED);
+  assert.match(srv.getOut(), /\[backorder\] UNCONFIRMED flag gid:\/\/shopify\/Order\/39875 gid:\/\/shopify\/LineItem\/5014 .*claim NOT abandoned/);
+  // Reconcile: a truthful read now shows 10 - 3 = 7, so the row is finalized and the retry is a duplicate success.
+  const again = await srv.call(() => flag(srv, 5014, 3, 'tok-flag-5014-retry'));
+  assert.match(flash(again.result), /success=backorder_flagged/);
+  assert.equal(srv.state()[5014].cq, 7, 'not removed twice');
+  assert.deepEqual(srv.row(5014), { status: 'pending', quantity: 3, shopify_removed_qty: 3 });
+  sequence('flag, reconcile after the unconfirmed one', again.ops, ['orderLines']);
+});
+
+await test('a commit response that POSITIVELY confirms costs no settling read and no retry (call counts as before)', async () => {
+  const { result, ops } = await srv.call(() => flag(srv, 5015, 3, 'tok-flag-5015'));
+  assert.match(flash(result), /success=backorder_flagged/);
+  assert.ok(!ops.includes('lineState'), 'no settling read');
+  assert.equal(ops.filter(o => o === 'orderLines').length, 1, 'only the pre-read');
+  sequence('flag, confirmed by the commit answer', ops, FLAG);
 });
 
 await test('FAIL CLOSED: commit applied but the answer was a gateway timeout -> the read-back decides (still finalizes, still counted)', async () => {
@@ -294,11 +353,11 @@ await test('the OK log line carries per-phase timings so the live gain can be re
 
 console.log('\n  kill switch');
 const srv2 = await startServer({ B2B_BACKORDER_COMMIT_READBACK: '0' });
-await test('B2B_BACKORDER_COMMIT_READBACK=0 restores the independent read-back (everything else stays lean)', async () => {
+await test('B2B_BACKORDER_COMMIT_READBACK=0 restores the settled independent read-back (everything else stays lean)', async () => {
   const { result, ops } = await srv2.call(() => flag(srv2, 5000, 4, 'tok-flag-ks-1'));
   assert.match(flash(result), /success=backorder_flagged/);
   assert.equal(srv2.state()[5000].cq, 6);
-  sequence('flag, read-back switched off', ops, FLAG_FALLBACK);
+  sequence('flag, read-back switched off', ops, FLAG_SETTLED);
   assert.deepEqual(srv2.entries().filter(e => e.schemaErrors?.length), []);
 });
 

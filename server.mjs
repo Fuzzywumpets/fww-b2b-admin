@@ -9167,6 +9167,12 @@ function backorderDeps(numId, orderId, email) {
     readLines: () => backorderReadLines(numId, orderId),
     removeUnits: (a) => MOCK ? backorderRemoveUnitsMock({ numId, editedBy: email, ...a }) : backorderRemoveUnitsReal({ orderId, editedBy: email, ...a }),
     restoreUnits: async (a) => MOCK ? backorderRestoreUnitsMock({ numId, editedBy: email, ...a }) : backorderRestoreUnitsReal({ orderId, editedBy: email, ...a }),
+    // The whole-order read runOrderEdit made after every commit before the speed change (readCommittedLineState), kept
+    // ONLY for the path where the commit reported success but its own answer did not confirm: it is the pause that lets
+    // Shopify's read side catch up before the read-back (lib/backorder-edit.mjs readBackAfterUnconfirmedCommit). Its
+    // result is unused. MOCK has no Shopify, hence no lag to wait out.
+    // DEPENDS: lib/backorder-edit.mjs deps.settleAfterCommit (optional); test/backorder-roundtrips.test.mjs counts its 'lineState' call.
+    settleAfterCommit: MOCK ? undefined : () => readCommittedLineState(orderId),
     now: () => Date.now(),
     log: console,
   };
