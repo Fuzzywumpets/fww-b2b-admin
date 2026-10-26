@@ -8570,18 +8570,239 @@ app.post('/orders/:id/fulfill', requireAuth, async (req, res) => {
   }
 });
 
-// 16D: Backorder flag per line item
-// WHAT: 16D — flags a single line item as backordered via upsertBackorder(orderGid, lineItemId, title, qty, eta, by).
-// CHANGE-GUARD: synchronous handler (no await) — upsertBackorder must stay sync or wrap; quantity parsed with parseInt fallback 0, eta passed through nullable.
-// INVARIANT(S): keyed on gid://shopify/Order/<id> + lineItemId; fulfilling the same line later calls fulfillBackorder with the SAME lineItemId to clear it — id formats must match across backorder/fulfill routes.
-app.post('/orders/:id/backorder', requireAuth, (req, res) => {
-  const numId   = req.params.id;
-  const { lineItemId, lineItemTitle, quantity, eta } = req.body;
+// ── 16D: Backorder = REMOVE the units from the Shopify order, keep the snapshot, allow Undo ────────
+// (2026-10-26 hot-fix.) The orchestration, the Shopify staging and the reconcile rules live in
+// lib/backorder-edit.mjs; this region is the transport: the order-line reader, the real (runOrderEdit) and
+// MOCK edit adapters, and the two routes.
+// DEPENDS: db.mjs getBackorderedLinesForOrder is the contract the invoice/order-page renderers read; the
+//   row written here (unit_price, currency, variant/sku/title, shopify_removed_qty, eta) is its source.
+import {
+  flagBackorder, undoBackorder, parseBackorderRequest, errMsg as backorderErrMsg,
+  stageRemoveUnits, stageRaiseUnits, stageAddVariantAtPrice, stageAddCustomAtPrice, BACKORDER_FLASH, BACKORDER_LINE_FIELDS,
+} from './lib/backorder-edit.mjs';
+import {
+  getBackorderRow, claimBackorderRemoval, finalizeBackorderRemoval, abandonBackorderClaim,
+  beginBackorderRestore, revertBackorderRestore, restoreBackorder, getTransientBackorders,
+} from './db.mjs';
+
+// WHAT: one Shopify (or MOCK) order line node → the flat line shape lib/backorder-edit.mjs works with.
+// CHANGE-GUARD: unitPrice is lineItemTrueUnit — the SAME post-all-discounts per-unit price the invoice PDF,
+//   the CSV and Xero print — so the price stored with a backorder is the price the customer was actually
+//   being billed for that line, and Undo restores exactly that. Do not swap it for discountedUnitPriceSet
+//   (that omits order-level 'ALL' discounts) or originalUnitPriceSet (list price).
+function normalizeBackorderLine(node) {
+  const cur = lineItemCurrentQty(node);
+  const money = (s) => s?.presentmentMoney;
+  return {
+    liId: node.id,
+    title: node.title || '',
+    variantTitle: node.variantTitle || node.variant?.title || '',
+    sku: node.sku || node.variant?.sku || '',
+    variantId: node.variant?.id || null,
+    currentQuantity: cur,
+    unitPrice: lineItemTrueUnit(node),
+    currency: money(node.discountedUnitPriceSet)?.currencyCode || money(node.originalUnitPriceSet)?.currencyCode || 'USD',
+  };
+}
+async function backorderReadLines(numId, orderId) {
+  if (MOCK) {
+    const order = getMockOrder(numId);
+    if (!order) throw new OrderEditError('order not found');
+    return (order.lineItems?.edges || []).map(e => normalizeBackorderLine(e.node));
+  }
+  const nodes = await fetchAllOrderLineItems(orderId, BACKORDER_LINE_FIELDS, 'backorder order read');
+  return nodes.map(normalizeBackorderLine);
+}
+
+// WHAT (real): removes `quantity` units of a line inside ONE runOrderEdit session (begin → setQuantity →
+//   commit), so it inherits the per-order lock, the idempotency ledger (order_edit_action), userError
+//   inspection and notifyCustomer:false that every other order edit already uses.
+// CHANGE-GUARD: no verifyFn on purpose — the core reads the order back itself and decides applied /
+//   not-applied / unknown, which a throwing verifyFn would pre-empt (it would mark the ledger 'failed'
+//   for an edit that DID commit).
+async function backorderRemoveUnitsReal({ orderId, editedBy, line, quantity, idemKey, payload }) {
+  await runOrderEdit(orderId, idemKey, editedBy, 'backorder/flag', payload, async (calcId, ctx) => {
+    const { calcLiId, calcItem } = await mapOrigToCalc(orderId, ctx.calcItems, line.liId);
+    if (!calcLiId) throw new OrderEditError('line not found on order');
+    await stageRemoveUnits({ shopifyFetch, calcId, calcLiId, calcQty: Number(calcItem?.quantity), quantity });
+  });
+}
+async function backorderRestoreUnitsReal({ orderId, editedBy, mode, row, live, quantity, unitPrice, idemKey, payload }) {
+  await runOrderEdit(orderId, idemKey, editedBy, 'backorder/restore', payload, async (calcId, ctx) => {
+    if (mode === 'raise') {
+      const { calcLiId, calcItem } = await mapOrigToCalc(orderId, ctx.calcItems, live.liId);
+      if (!calcLiId) throw new OrderEditError('line not found on order');
+      await stageRaiseUnits({ shopifyFetch, calcId, calcLiId, calcQty: Number(calcItem?.quantity), quantity });
+    } else if (row.variant_id) {
+      const variantGid = String(row.variant_id).startsWith('gid://') ? row.variant_id : `gid://shopify/ProductVariant/${row.variant_id}`;
+      await stageAddVariantAtPrice({ shopifyFetch, calcId, variantGid, quantity, unitPrice });
+    } else {
+      await stageAddCustomAtPrice({ shopifyFetch, calcId, title: row.line_item_title, quantity, unitPrice, currency: row.currency });
+    }
+  });
+  return { warnings: [] };
+}
+
+// MOCK adapters — drive the same mockIncrementalEdit ledger the other line routes use, and model the two
+// Shopify behaviours that matter here: shipped units cannot be removed, and a removed line (quantity 0)
+// stays on the order at currentQuantity 0 and can never be edited again (Undo therefore adds a NEW line).
+// Two sentinel substrings in a line TITLE let the suite provoke a Shopify rejection (MOCK only; the whole
+// block is dead code in production because every caller branches on MOCK first).
+const MOCK_REJECT_FLAG = '[mock-reject-flag]';
+const MOCK_FAIL_ONCE_RESTORE = '[mock-fail-once-restore]';
+const mockRestoreFailedOnce = new Set();
+function backorderRemoveUnitsMock({ numId, editedBy, line, quantity, idemKey, payload }) {
+  const order = getMockOrder(numId);
+  const out = mockIncrementalEdit({ numId, idemKey, action: 'backorder/flag', payload, editedBy, editFn: (edges) => {
+    const e = edges.find(x => x.node.id === line.liId);
+    if (!e) throw new OrderEditError('line not found on order');
+    if (String(e.node.title || '').includes(MOCK_REJECT_FLAG)) throw new OrderEditError('Mock Shopify rejected this order edit.');
+    const cq = e.node.currentQuantity != null ? e.node.currentQuantity : e.node.quantity;
+    const unfulfilled = e.node.unfulfilledQuantity != null ? e.node.unfulfilledQuantity
+      : (order?.displayFulfillmentStatus === 'FULFILLED' ? 0 : cq);
+    if (quantity > cq) throw new OrderEditError(`Only ${cq} unit(s) of this line are on the order.`);
+    if (quantity > unfulfilled) throw new OrderEditError(`Cannot remove ${quantity}: only ${unfulfilled} unit(s) are unfulfilled (the rest have shipped).`);
+    if (quantity === cq) e.node.currentQuantity = 0;
+    else { e.node.currentQuantity = cq - quantity; e.node.quantity = cq - quantity; }
+    if (e.node.unfulfilledQuantity != null) e.node.unfulfilledQuantity -= quantity;
+    return [];
+  } });
+  if (!out) throw new OrderEditError('order not found');
+}
+function backorderRestoreUnitsMock({ numId, editedBy, mode, row, live, quantity, unitPrice, idemKey, payload }) {
+  const out = mockIncrementalEdit({ numId, idemKey, action: 'backorder/restore', payload, editedBy, editFn: (edges) => {
+    if (String(row.line_item_title || '').includes(MOCK_FAIL_ONCE_RESTORE) && !mockRestoreFailedOnce.has(idemKey)) {
+      mockRestoreFailedOnce.add(idemKey);
+      throw new OrderEditError('Mock Shopify rejected the restore (first attempt only).');
+    }
+    if (mode === 'raise') {
+      const e = edges.find(x => x.node.id === live.liId);
+      if (!e) throw new OrderEditError('line not found on order');
+      const cq = e.node.currentQuantity != null ? e.node.currentQuantity : e.node.quantity;
+      e.node.currentQuantity = cq + quantity; e.node.quantity = cq + quantity;
+      if (e.node.unfulfilledQuantity != null) e.node.unfulfilledQuantity += quantity;
+    } else {
+      const price = { presentmentMoney: { amount: Number(unitPrice).toFixed(2), currencyCode: row.currency || 'USD' } };
+      edges.push({ node: {
+        id: `gid://shopify/LineItem/idem-${idemKey}`, title: row.line_item_title, quantity, currentQuantity: quantity,
+        variant: row.variant_id ? { id: row.variant_id, sku: row.sku || '', title: row.variant_title || undefined } : null,
+        discountedUnitPriceSet: price, originalUnitPriceSet: price,
+      } });
+    }
+    return [];
+  } });
+  if (!out) throw new OrderEditError('order not found');
+  return { warnings: [] };
+}
+
+// Everything lib/backorder-edit.mjs needs, bound to one order + staff member.
+function backorderDeps(numId, orderId, email) {
+  return {
+    db: { getBackorderRow, claimBackorderRemoval, finalizeBackorderRemoval, abandonBackorderClaim,
+          beginBackorderRestore, revertBackorderRestore, restoreBackorder },
+    getEditAction,
+    readLines: () => backorderReadLines(numId, orderId),
+    removeUnits: (a) => MOCK ? backorderRemoveUnitsMock({ numId, editedBy: email, ...a }) : backorderRemoveUnitsReal({ orderId, editedBy: email, ...a }),
+    restoreUnits: async (a) => MOCK ? backorderRestoreUnitsMock({ numId, editedBy: email, ...a }) : backorderRestoreUnitsReal({ orderId, editedBy: email, ...a }),
+    now: () => Date.now(),
+    log: console,
+  };
+}
+// ?msg= is truncated like the neighbouring routes (fulfill: 240, edit: 300).
+const backorderFailUrl = (numId, msg) =>
+  `/orders/${numId}?error=${BACKORDER_FLASH.FAILED}&msg=${encodeURIComponent(String(msg || 'Backorder action failed.').slice(0, 240))}`;
+
+// A row left 'applying'/'restoring' means the process died between a Shopify write and the status flip.
+// The data needed to reconcile it is intact (claim_prior_qty); it is reconciled the next time anyone
+// flags/undoes that line. Say so at boot instead of leaving it for someone to stumble on.
+{
+  const stuck = getTransientBackorders();
+  if (stuck.length) {
+    console.error(`[backorder] ${stuck.length} backorder row(s) were left mid-write by an earlier run — verify these orders in Shopify: `
+      + stuck.map(r => `${r.order_id}/${r.line_item_id} (${r.status}, ${r.quantity}u)`).join(', '));
+  }
+}
+
+// POST /orders/:id/backorder — body: lineItemId, quantity, eta?, idemKey? (hidden-field double-submit token).
+// WHAT: removes `quantity` units of the line from the Shopify order and records the invoice snapshot. A full
+//   line removes the line (quantity 0); a partial quantity lowers it to current − quantity. Restock true,
+//   notifyCustomer false — identical to the existing ✕ remove route.
+// CHANGE-GUARD: FAIL CLOSED. On any Shopify rejection no 'pending' row is left behind (the claim is
+//   abandoned), and the redirect is ?error=backorder_shopify_failed&msg=… . On an outcome that cannot be
+//   confirmed the row stays 'applying' (loudly logged) and is reconciled on the next attempt — it is never
+//   silently dropped, because the units may really be gone from the order.
+// INVARIANT(S): serialised per order by withOrderLock('backorder:…'); a different key than runOrderEdit's
+//   own lock on purpose, or this would deadlock waiting on itself. A double submit (same hidden token, or
+//   an identical request within 60 s) answers success without a second removal. Flash codes:
+//   success=backorder_flagged | error=backorder_shopify_failed (also carries validation messages in ?msg=).
+app.post('/orders/:id/backorder', requireAuth, async (req, res) => {
+  const numId = req.params.id;
+  const email = req.adminSession.email;
+  const body = req.body || {};
+  if (!/^\d+$/.test(String(numId))) return res.status(400).send('Bad order id');
+  if (!body.lineItemId) return res.redirect(`/orders/${numId}?error=missing_line_item`);
+  const parsed = parseBackorderRequest(body);
+  if (!parsed.ok) return res.redirect(backorderFailUrl(numId, parsed.message));
+  const orderId = shopifyOrderGid(numId);
+  const idemKey = typeof body.idemKey === 'string' && /^[A-Za-z0-9_-]{8,80}$/.test(body.idemKey) ? body.idemKey : null;
+  let out;
+  try {
+    out = await withOrderLock(`backorder:${orderId}`, () => flagBackorder(backorderDeps(numId, orderId, email), {
+      orderId, lineItemId: parsed.lineItemId, quantity: parsed.quantity, etaDate: parsed.etaDate, email, idemKey,
+    }));
+  } catch (err) {
+    console.error(`[backorder] flag ${orderId} ${parsed.lineItemId} CRASHED: ${err && err.stack ? err.stack : err}`);
+    return res.redirect(backorderFailUrl(numId, `Unexpected error (${backorderErrMsg(err)}). Check the order in Shopify before retrying.`));
+  }
+  if (!out.ok) {
+    console.error(`[backorder] flag ${orderId} ${parsed.lineItemId} FAILED (${out.state}): ${out.message}`);
+    return res.redirect(backorderFailUrl(numId, out.message));
+  }
+  if (!out.duplicate) {
+    const row = getBackorderRow(orderId, parsed.lineItemId);
+    const detail = { lineItemId: parsed.lineItemId, lineItemTitle: row?.line_item_title, quantity: parsed.quantity, eta: parsed.etaDate, unitPrice: row?.unit_price, removedFromShopify: true };
+    logOrderEdit(orderId, email, null, { action: 'backorder/flag', payload: detail });
+    auditLog(email, 'order_backorder', orderId, null, detail);
+  }
+  res.redirect(`/orders/${numId}?success=${BACKORDER_FLASH.FLAGGED}`);
+});
+
+// POST /orders/:id/backorder/undo — body: lineItemId (the id the line had when it was flagged).
+// WHAT: puts the removed units back on the Shopify order at the unit price STORED at flag time (never a
+//   recomputed list price) and flips the row to 'restored'. If the line still exists at reduced quantity and
+//   still carries that price its quantity is raised; otherwise (removed line — Shopify cannot un-remove it —
+//   or its price has since been edited) the variant is added back as a NEW line at the stored price.
+// CHANGE-GUARD: same fail-closed / reconcile contract as the flag route. Idempotent: undoing an
+//   already-restored row answers success and changes nothing.
+// INVARIANT(S): flash codes success=backorder_restored (+ optional &msg= price warning) |
+//   error=backorder_shopify_failed. The row stays 'pending' (still backordered) whenever Shopify refused.
+app.post('/orders/:id/backorder/undo', requireAuth, async (req, res) => {
+  const numId = req.params.id;
+  const email = req.adminSession.email;
+  const body = req.body || {};
+  if (!/^\d+$/.test(String(numId))) return res.status(400).send('Bad order id');
+  const lineItemId = String(body.lineItemId ?? '').trim();
   if (!lineItemId) return res.redirect(`/orders/${numId}?error=missing_line_item`);
-  const orderId = `gid://shopify/Order/${numId}`;
-  upsertBackorder(orderId, lineItemId, lineItemTitle || '', parseInt(quantity, 10) || 0, eta || null, req.adminSession.email);
-  auditLog(req.adminSession.email, 'order_backorder', orderId, null, { lineItemId, lineItemTitle, eta });
-  res.redirect(`/orders/${numId}?success=backorder_flagged`);
+  const orderId = shopifyOrderGid(numId);
+  let out;
+  try {
+    out = await withOrderLock(`backorder:${orderId}`, () => undoBackorder(backorderDeps(numId, orderId, email), { orderId, lineItemId, email }));
+  } catch (err) {
+    console.error(`[backorder] undo ${orderId} ${lineItemId} CRASHED: ${err && err.stack ? err.stack : err}`);
+    return res.redirect(backorderFailUrl(numId, `Unexpected error (${backorderErrMsg(err)}). Check the order in Shopify before retrying.`));
+  }
+  if (!out.ok) {
+    console.error(`[backorder] undo ${orderId} ${lineItemId} FAILED (${out.state}): ${out.message}`);
+    return res.redirect(backorderFailUrl(numId, out.message));
+  }
+  if (!out.duplicate) {
+    const row = getBackorderRow(orderId, lineItemId);
+    const detail = { lineItemId, lineItemTitle: row?.line_item_title, quantity: row?.shopify_removed_qty, unitPrice: row?.unit_price, legacyFlagOnly: !!out.legacy, warnings: out.warnings || [] };
+    if (!out.legacy) logOrderEdit(orderId, email, null, { action: 'backorder/restore', payload: detail });
+    auditLog(email, 'order_backorder_undo', orderId, null, detail);
+  }
+  const warn = (out.warnings || []).length ? `&msg=${encodeURIComponent(out.warnings.join(' ').slice(0, 300))}` : '';
+  res.redirect(`/orders/${numId}?success=${BACKORDER_FLASH.RESTORED}${warn}`);
 });
 
 // API: get backorders for an order (used by order detail page)

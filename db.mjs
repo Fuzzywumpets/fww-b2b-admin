@@ -430,6 +430,36 @@ db.exec(`
   }
 }
 
+// MIGRATION (2026-10-26, backorder hot-fix): backorders used to be a LOCAL flag only (nothing touched
+// Shopify). They now carry the snapshot an invoice needs to show units that were REMOVED from the
+// Shopify order, plus the bookkeeping to undo that removal. ADDITIVE ONLY, so a rollback to the
+// previous code is safe: that code names its INSERT columns explicitly (upsertBackorder), and every
+// column added here is nullable or defaulted, so its INSERT/UPDATE statements keep working unchanged.
+// Idempotent: PRAGMA reveals the existing columns and ALTER only runs for missing ones.
+// DEPENDS: getBackorderedLinesForOrder / claimBackorderRemoval / restoreBackorder below read and write
+//   exactly these names; test/backorder-migration.test.mjs asserts the set. Do NOT also add them to the
+//   CREATE TABLE above — one source of truth (this list) keeps a fresh DB and a migrated DB identical.
+// claim_prior_qty is the one column beyond the agreed contract: the Shopify quantity observed
+//   immediately before an in-flight 'applying'/'restoring' write, so an interrupted write (process death
+//   between the Shopify commit and our status flip) can be reconciled against Shopify instead of guessed.
+const BACKORDER_ADDED_COLUMNS = [
+  ['variant_id', 'TEXT'],
+  ['sku', 'TEXT'],
+  ['variant_title', 'TEXT'],
+  ['unit_price', 'TEXT'],                              // decimal string, e.g. '14.00' — B2B price actually on the line
+  ['currency', 'TEXT'],
+  ['shopify_removed_qty', 'INTEGER NOT NULL DEFAULT 0'], // 0 = legacy flag-only row: nothing was removed from Shopify
+  ['restored_at', 'INTEGER'],
+  ['claim_prior_qty', 'INTEGER'],
+];
+export function migrateBackordersSchema(database) {
+  const cols = new Set(database.prepare(`PRAGMA table_info(backorders)`).all().map(c => c.name));
+  for (const [name, ddl] of BACKORDER_ADDED_COLUMNS) {
+    if (!cols.has(name)) database.exec(`ALTER TABLE backorders ADD COLUMN ${name} ${ddl}`);
+  }
+}
+migrateBackordersSchema(db);
+
 export default db;
 
 export function createSession(sid, email, displayName, picture) {
@@ -868,6 +898,14 @@ export function getLeadStatusHistory(leadId) {
 
 // ── Backorders ────────────────────────────────────────────────────────────────
 
+// WHAT: LEGACY flag-only writer — records "this line is backordered" locally and touches nothing else.
+// CHANGE-GUARD: POST /orders/:id/backorder no longer calls this (it removes the units from Shopify and
+//   goes through claimBackorderRemoval). It stays exported because a rollback to the old route code
+//   still uses this exact signature, and the DB unit test uses it to seed old-style rows.
+// INVARIANT(S): never overwrites a row that already represents units REMOVED from Shopify
+//   (shopify_removed_qty > 0) or an in-flight write — the WHERE on the conflict branch makes a legacy
+//   re-flag a silent no-op there, because flipping such a row's quantity/status without Shopify would
+//   desynchronise the invoice from the order.
 export function upsertBackorder(orderId, lineItemId, lineItemTitle, quantity, etaDate, createdBy) {
   db.prepare(`
     INSERT INTO backorders (order_id, line_item_id, line_item_title, quantity, eta_date, status, created_at, created_by, notified)
@@ -875,6 +913,7 @@ export function upsertBackorder(orderId, lineItemId, lineItemTitle, quantity, et
     ON CONFLICT(order_id, line_item_id) DO UPDATE SET
       eta_date = excluded.eta_date, quantity = excluded.quantity, status = 'pending',
       created_at = excluded.created_at, created_by = excluded.created_by
+    WHERE backorders.shopify_removed_qty = 0 AND backorders.status NOT IN ('applying', 'restoring')
   `).run(orderId, lineItemId, lineItemTitle, quantity, etaDate || null, Date.now(), createdBy);
 }
 
@@ -901,9 +940,169 @@ export function getOpenBackorders() {
     .all('pending');
 }
 
+// WHAT: clears a LEGACY flag-only backorder when its line ships in full (called by POST /orders/:id/fulfill).
+// CHANGE-GUARD: scoped to shopify_removed_qty = 0 AND status = 'pending' on purpose. A row with
+//   shopify_removed_qty > 0 describes units that are NOT on the Shopify order any more, so shipping the
+//   line's remaining units says nothing about them — flipping it to 'fulfilled' would make
+//   getBackorderedLinesForOrder drop units that were never shipped (they would vanish from the invoice
+//   and the queue). Those rows only leave 'pending' through restoreBackorder (the Undo route).
+//   In-flight 'applying'/'restoring' rows are likewise left alone.
 export function fulfillBackorder(orderId, lineItemId) {
-  db.prepare("UPDATE backorders SET status = 'fulfilled' WHERE order_id = ? AND line_item_id = ?")
+  db.prepare("UPDATE backorders SET status = 'fulfilled' WHERE order_id = ? AND line_item_id = ? AND status = 'pending' AND shopify_removed_qty = 0")
     .run(orderId, lineItemId);
+}
+
+// ── Backorders that REMOVE units from the Shopify order (2026-10-26 hot-fix) ─────────────────────
+// Row lifecycle:   (none) ─claim→ 'applying' ─finalize→ 'pending' ─begin→ 'restoring' ─restore→ 'restored'
+//                              └abandon→ (previous row, or none)      └revert→ 'pending'
+// 'applying'/'restoring' are TRANSIENT: they exist only while a Shopify edit is in flight (or after a
+// process death mid-edit). They are invisible to getOpenBackorders/getBackordersForOrder/
+// getBackorderedLinesForOrder, which all read status = 'pending' only, and are listed by
+// getTransientBackorders so an interrupted write can be reconciled rather than lost.
+// SYNC: the status strings here are mirrored by lib/backorder-edit.mjs (BACKORDER_STATUS) — change both.
+
+// WHAT: the raw backorders row for one order line (any status), or null.
+export function getBackorderRow(orderId, lineItemId) {
+  return db.prepare('SELECT * FROM backorders WHERE order_id = ? AND line_item_id = ?').get(orderId, lineItemId) || null;
+}
+
+// WHAT: rows stuck mid-write ('applying'/'restoring'), oldest first — for startup logging and reconcile.
+export function getTransientBackorders() {
+  return db.prepare("SELECT * FROM backorders WHERE status IN ('applying', 'restoring') ORDER BY created_at ASC").all();
+}
+
+// WHAT: units currently REMOVED from the Shopify order for one order, in the shape the invoice needs.
+// Returns [{ lineItemId, variantId, sku, title, variantTitle, quantity, unitPrice (Number), currency,
+//   lineTotal (Number, 2dp), etaDate ('YYYY-MM-DD'|null), createdAt (ms), createdBy }], oldest first.
+// CHANGE-GUARD: public contract for the invoice/PDF/order-page renderers (built in parallel with this
+//   change). status = 'pending' AND shopify_removed_qty > 0 is the WHOLE definition: legacy flag-only
+//   rows (shopify_removed_qty = 0) are deliberately excluded — they never removed anything, so showing
+//   them as struck-through invoice lines would invent lines the order never lost. 'restored', 'fulfilled'
+//   and the transient statuses are excluded too.
+// INVARIANT(S): lineItemId is the id the line had when it was flagged; after a FULL removal that id no
+//   longer names a live line (Shopify cannot un-remove it), and Undo re-adds the units under a NEW id.
+export function getBackorderedLinesForOrder(orderGid) {
+  const rows = db.prepare(`
+    SELECT * FROM backorders
+    WHERE order_id = ? AND status = 'pending' AND shopify_removed_qty > 0
+    ORDER BY created_at ASC, id ASC
+  `).all(orderGid);
+  return rows.map(r => {
+    const unitPrice = Number(r.unit_price);
+    const unit = Number.isFinite(unitPrice) ? unitPrice : 0;
+    return {
+      lineItemId: r.line_item_id,
+      variantId: r.variant_id || null,
+      sku: r.sku || '',
+      title: r.line_item_title || '',
+      variantTitle: r.variant_title || '',
+      quantity: r.shopify_removed_qty,
+      unitPrice: unit,
+      currency: r.currency || 'USD',
+      lineTotal: Math.round(unit * r.shopify_removed_qty * 100) / 100,
+      etaDate: r.eta_date || null,
+      createdAt: r.created_at,
+      createdBy: r.created_by || null,
+    };
+  });
+}
+
+// WHAT: phase 1 of a flag — reserves the (order, line) row as 'applying' BEFORE Shopify is touched, with
+// the complete invoice snapshot, so a removal that succeeds on Shopify can never be unrecorded.
+// c: { orderId, lineItemId, title, variantId, sku, variantTitle, unitPrice (decimal string), currency,
+//      quantity, priorQty, etaDate, createdBy, now }
+// Returns { ok:true, prev } (prev = the row this claim overwrote, or null — hand it back to
+// abandonBackorderClaim) or { ok:false, reason:'already_backordered'|'in_progress', row }.
+// CHANGE-GUARD: only a 'restored'/'fulfilled' row or a LEGACY flag-only pending row (shopify_removed_qty
+//   = 0) may be overwritten. A live removed row (pending, shopify_removed_qty > 0) is REFUSED rather than
+//   accumulated: accumulating would need a second "confirmed vs intended" quantity to stay reconcilable
+//   after a crash, and the Undo-then-reflag path covers the use case.
+// INVARIANT(S): a single SQLite transaction; shopify_removed_qty stays 0 until finalizeBackorderRemoval,
+//   so nothing reads the row as "units removed" until Shopify has confirmed it.
+export function claimBackorderRemoval(c) {
+  return db.transaction(() => {
+    const prev = getBackorderRow(c.orderId, c.lineItemId);
+    if (prev) {
+      const reusable = prev.status === 'restored' || prev.status === 'fulfilled'
+        || (prev.status === 'pending' && prev.shopify_removed_qty === 0);
+      if (!reusable) return { ok: false, reason: prev.status === 'pending' ? 'already_backordered' : 'in_progress', row: prev };
+    }
+    db.prepare(`
+      INSERT INTO backorders (order_id, line_item_id, line_item_title, quantity, eta_date, status, created_at, created_by, notified,
+                              variant_id, sku, variant_title, unit_price, currency, shopify_removed_qty, restored_at, claim_prior_qty)
+      VALUES (@orderId, @lineItemId, @title, @quantity, @etaDate, 'applying', @now, @createdBy, 0,
+              @variantId, @sku, @variantTitle, @unitPrice, @currency, 0, NULL, @priorQty)
+      ON CONFLICT(order_id, line_item_id) DO UPDATE SET
+        line_item_title = excluded.line_item_title, quantity = excluded.quantity, eta_date = excluded.eta_date,
+        status = 'applying', created_at = excluded.created_at, created_by = excluded.created_by, notified = 0,
+        variant_id = excluded.variant_id, sku = excluded.sku, variant_title = excluded.variant_title,
+        unit_price = excluded.unit_price, currency = excluded.currency, shopify_removed_qty = 0,
+        restored_at = NULL, claim_prior_qty = excluded.claim_prior_qty
+    `).run({
+      orderId: c.orderId, lineItemId: c.lineItemId, title: c.title || '', quantity: c.quantity,
+      etaDate: c.etaDate || null, now: c.now ?? Date.now(), createdBy: c.createdBy || null,
+      variantId: c.variantId || null, sku: c.sku || null, variantTitle: c.variantTitle || null,
+      unitPrice: c.unitPrice, currency: c.currency || 'USD', priorQty: c.priorQty ?? null,
+    });
+    return { ok: true, prev };
+  })();
+}
+
+// WHAT: phase 2 (success) — Shopify confirmed the removal: 'applying' → 'pending' with the units counted.
+// Returns true when a row transitioned.
+export function finalizeBackorderRemoval(orderId, lineItemId) {
+  return db.prepare(`
+    UPDATE backorders SET status = 'pending', shopify_removed_qty = quantity
+    WHERE order_id = ? AND line_item_id = ? AND status = 'applying'
+  `).run(orderId, lineItemId).changes > 0;
+}
+
+// WHAT: phase 2 (definite failure) — Shopify did NOT remove the units: undo the claim so no record claims
+// the line is backordered. Puts the overwritten row (`prev`, from claimBackorderRemoval) back verbatim, or
+// deletes the row when the claim created it. Only ever touches a row still in 'applying'.
+export function abandonBackorderClaim(orderId, lineItemId, prev) {
+  return db.transaction(() => {
+    if (!prev) {
+      return db.prepare("DELETE FROM backorders WHERE order_id = ? AND line_item_id = ? AND status = 'applying'")
+        .run(orderId, lineItemId).changes > 0;
+    }
+    return db.prepare(`
+      UPDATE backorders SET line_item_title = @line_item_title, quantity = @quantity, eta_date = @eta_date,
+        status = @status, created_at = @created_at, created_by = @created_by, notified = @notified,
+        variant_id = @variant_id, sku = @sku, variant_title = @variant_title, unit_price = @unit_price,
+        currency = @currency, shopify_removed_qty = @shopify_removed_qty, restored_at = @restored_at,
+        claim_prior_qty = @claim_prior_qty
+      WHERE order_id = @order_id AND line_item_id = @line_item_id AND status = 'applying'
+    `).run(prev).changes > 0;
+  })();
+}
+
+// WHAT: undo phase 1 — 'pending' (units removed) → 'restoring', recording the matching-line quantity seen
+// on Shopify beforehand. Returns false when the row is not a live removed-units row (already restored,
+// still applying, or a legacy flag-only row — those never reach Shopify).
+export function beginBackorderRestore(orderId, lineItemId, priorQty) {
+  return db.prepare(`
+    UPDATE backorders SET status = 'restoring', claim_prior_qty = ?
+    WHERE order_id = ? AND line_item_id = ? AND status = 'pending' AND shopify_removed_qty > 0
+  `).run(priorQty ?? null, orderId, lineItemId).changes > 0;
+}
+
+// WHAT: undo phase 2 (definite failure) — Shopify did NOT take the units back: 'restoring' → 'pending'.
+export function revertBackorderRestore(orderId, lineItemId) {
+  return db.prepare("UPDATE backorders SET status = 'pending' WHERE order_id = ? AND line_item_id = ? AND status = 'restoring'")
+    .run(orderId, lineItemId).changes > 0;
+}
+
+// WHAT: undo phase 2 (success) — the units are back on the order: row → 'restored' (+ restored_at). The
+// restore function the Undo route uses. Also accepts a plain 'pending' row, which is how a LEGACY
+// flag-only row is cleared (it has nothing on Shopify to put back). Returns true when a row transitioned.
+// INVARIANT(S): shopify_removed_qty is kept as history; every reader that means "currently removed"
+//   filters on status = 'pending', never on the quantity alone.
+export function restoreBackorder(orderId, lineItemId, now = Date.now()) {
+  return db.prepare(`
+    UPDATE backorders SET status = 'restored', restored_at = ?
+    WHERE order_id = ? AND line_item_id = ? AND status IN ('pending', 'restoring')
+  `).run(now, orderId, lineItemId).changes > 0;
 }
 
 export function logOrderEdit(orderId, editedBy, staffNote, changesJson) {

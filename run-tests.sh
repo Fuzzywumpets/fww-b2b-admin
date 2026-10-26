@@ -108,6 +108,21 @@ if [ -f test/order-edit-user-errors.test.mjs ]; then
   node test/order-edit-user-errors.test.mjs || UNIT_FAIL=$?
 fi
 
+# Backorder flag/undo. Two standalone runs, because the dangerous paths cannot be provoked over HTTP:
+#  - backorder-migration: DB-level. Builds a throwaway admin.db with the OLD backorders DDL (B2B_ADMIN_DATA_DIR,
+#    deliberately NOT B2B_ADMIN_MOCK — the migration only matters for an existing on-disk DB), proves an old
+#    row survives, the migration is a no-op the second time, and the previous release's INSERT still works.
+#  - backorder-edit: the orchestration state machine against a fake Shopify (commit-then-error, failed
+#    read-back, crash between the Shopify write and the status flip) over the real db.mjs SQL.
+if [ -f test/backorder-migration.test.mjs ]; then
+  echo ""
+  node test/backorder-migration.test.mjs || UNIT_FAIL=$?
+fi
+if [ -f test/backorder-edit.test.mjs ]; then
+  echo ""
+  B2B_ADMIN_MOCK=1 node test/backorder-edit.test.mjs || UNIT_FAIL=$?
+fi
+
 # Shipping replacement must abort before commit if any Shopify staging mutation fails.
 node --test test/order-shipping.test.mjs || UNIT_FAIL=$?
 node test/shipping-ui.test.mjs || UI_FAIL=$?
