@@ -22,7 +22,7 @@ import {
   logLabelBatch, logExportBatch,
   createLead, getLeads, countLeads, getLeadCounts, getLead, updateLead, upsertPortalLead,
   addLeadNote, getLeadNotes, addLeadStatusHistory, getLeadStatusHistory,
-  upsertBackorder, getBackordersForOrder, getOpenBackorders, fulfillBackorder, logOrderEdit,
+  upsertBackorder, getBackordersForOrder, getBackorderedLinesForOrder, getOpenBackorders, fulfillBackorder, logOrderEdit,
   getEditAction, putEditAction,
   getOutstandingBalanceForCustomer,
   getXeroMap, setXeroMap, addXeroPending, getXeroPending, markXeroPendingDone, markXeroPendingFailed, getXeroPendingCount, getXeroInvoiceMaps,
@@ -2404,7 +2404,7 @@ function variantLabel(variant) {
 }
 
 // WHAT: the large order-detail page — status timeline, editable line items, fulfillments, transactions, address, Xero/partial-invoice state, and the modal JS (edit/discount/fulfill/backorder/invoice/cancel).
-// CHANGE-GUARD: reads several SQLite stores by gid (getXeroMap, getPartialInvoices, getBackordersForOrder) — those keys must match shopifyOrderGid(numId). The edit form posts qtys[]/prices[]/removes/addCustomLines to /orders/:id/edit; serializeCustomLines() must run before submit (onclick on Save). Re-test edit/fulfill/cancel modals after any markup change since the inline JS selects elements by hardcoded ids.
+// CHANGE-GUARD: reads several SQLite stores by gid (getXeroMap, getPartialInvoices, getBackordersForOrder, getBackorderedLinesForOrder) — those keys must match shopifyOrderGid(numId). Backordered units are NOT on the Shopify order any more, so they render as inert struck-through rows in a second <tbody class="bo-struck"> (backorderedRowsHtml) that the edit machinery must never see — see the CHANGE-GUARD there. The edit form posts qtys[]/prices[]/removes/addCustomLines to /orders/:id/edit; serializeCustomLines() must run before submit (onclick on Save). Re-test edit/fulfill/cancel modals after any markup change since the inline JS selects elements by hardcoded ids.
 // INVARIANT(S): flash strings map 1:1 to alert banners — adding a server flash value needs a branch here or it renders silently; line-item product links resolve via variant.product.id or the MOCK_VARIANT_PRODUCT fallback.
 function renderOrderDetail(session, order, flash, flashMsg) {
   const numId    = shopifyNumericId(order.id);
@@ -2470,10 +2470,23 @@ function renderOrderDetail(session, order, flash, flashMsg) {
 
   // Backorders for this order (from SQLite) — must be before lineItemsHtml
   const backordersForOrder = getBackordersForOrder(`gid://shopify/Order/${numId}`);
-// WHAT: indexes this order's backorder rows by line_item_id so each line can render a ⚠ Backorder badge + ETA.
+// WHAT: indexes this order's backorder rows by line_item_id so each line can render a ⚠ Backorder badge (legacy flag-only rows only) and the Fulfill modal can badge it too.
 // CHANGE-GUARD: must be computed BEFORE lineItemsHtml (it is) — moving it after the .map() breaks the badge lookup. Keyed by the Shopify line-item id (item.id), which must match what fulfillBackorder/upsertBackorder persist.
 // INVARIANT(S): one backorder row per line item assumed (Map collapses duplicates to the last).
   const backorderMap = new Map(backordersForOrder.map(b => [b.line_item_id, b]));
+
+  // WHAT: the units a backorder REMOVED from the Shopify order (2026-10-26 hot-fix). They are no longer on
+  //   the order, so nothing in Shopify's line items describes them — SQLite is the only record, and without
+  //   this block they simply vanished from the page and there was no way to Undo.
+  // CHANGE-GUARD: rendered as inert struck-through rows in their OWN <tbody class="bo-struck"> (see
+  //   backorderedRowsHtml). The edit machinery (toggleEditMode, markRemove, __autosave, wireExisting, the
+  //   totals reconcile) selects rows by data-li-id / data-existing / data-removed / .edit-* / .row-save-chip —
+  //   none of which these rows may carry, or a backordered unit becomes an editable, saveable line again.
+  // DEPENDS: db.mjs getBackorderedLinesForOrder (lineItemId, title, variantTitle, sku, quantity, unitPrice,
+  //   currency, lineTotal). It returns only live removed-units rows (status 'pending',
+  //   shopify_removed_qty > 0): a legacy flag-only row has no removed units and keeps its ⚠ Backorder badge.
+  //   The order page shows NO expected-ship-date anywhere (owner decision 2026-10-26): do not read etaDate here.
+  const backorderedLines = getBackorderedLinesForOrder(`gid://shopify/Order/${numId}`);
 
   // Line items table
   const lineItems = (order.lineItems?.edges || []).map(e => e.node);
@@ -2512,7 +2525,10 @@ function renderOrderDetail(session, order, flash, flashMsg) {
     const vLabel = variantLabel(item.variant);
     const variantSub = vLabel ? `<div class="variant-sub">${h(vLabel)}</div>` : '';
     const bo = backorderMap.get(item.id);
-    const boBadge = bo ? `<span class="badge badge-warning" title="ETA: ${bo.eta_date || 'unknown'}">⚠ Backorder</span>` : '';
+    // Legacy FLAG-ONLY rows (shopify_removed_qty = 0: the old behaviour never touched Shopify) keep the badge.
+    // A removed-units row must NOT badge the live line: whatever is still on the order after a partial
+    // backorder is NOT backordered — the removed units show as their own struck row below.
+    const boBadge = bo && !(bo.shopify_removed_qty > 0) ? `<span class="badge badge-warning">⚠ Backorder</span>` : '';
     // Second build (Build 4): the per-line Backorder control read like a STATUS ("Backorder" on
     // every line in edit mode), making every line look backordered. Relabel/restyle it as a clear
     // ACTION — a small muted "⚑ Mark backordered" link — WITHOUT changing behavior (still opens
@@ -2552,6 +2568,37 @@ function renderOrderDetail(session, order, flash, flashMsg) {
       <td class="text-right">${fmtMoney(rowTotal)}</td>
     </tr>`;
   }).join('');
+
+  // WHAT: one struck-through row per backordered line (units removed from the Shopify order) + an "Undo
+  //   backorder" button, in a second <tbody> after the live lines. Nothing in here is part of the order: not
+  //   the subtotal, not the total, not anything the edit form submits.
+  // CHANGE-GUARD: these <tr>s deliberately carry NO data-li-id / data-existing / data-removed, no .edit-qty-*,
+  //   .edit-price-*, .edit-remove-btn or .row-save-chip, and no <input>. The Undo control is a type="button"
+  //   carrying data-bo-* attributes (its id is data-bo-line-id, NOT data-li-id) that a delegated listener reads
+  //   and posts through #bo-undo-form, which lives OUTSIDE #edit-form (a <form> cannot nest). Keep it on that
+  //   path: an inline onclick would concatenate attacker-controllable free text (the title) into JS.
+  // INVARIANT(S): every interpolated value goes through h(); unitPrice/lineTotal are Numbers formatted with
+  //   fmtMoney(…, currency). A second <tbody> (not extra rows in the first) is what keeps the "Add product" /
+  //   "Add custom line" rows — appended to the FIRST tbody of #edit-form's table — above the struck rows.
+  const backorderedRowsHtml = backorderedLines.length === 0 ? '' : `<tbody class="bo-struck">
+      <tr class="bo-struck-head"><td colspan="5">Backordered &mdash; removed from this order and its total</td></tr>
+      ${backorderedLines.map(b => {
+        const priceTxt = fmtMoney(b.unitPrice, b.currency);
+        return `<tr class="bo-struck-row">
+        <td>
+          <span class="bo-struck-text">${h(b.title)}</span> <span class="badge badge-warning bo-tag">Backordered</span>
+          ${b.variantTitle ? `<div class="variant-sub">${h(b.variantTitle)}</div>` : ''}
+          <div><button type="button" class="btn btn-secondary btn-sm bo-undo-btn" data-bo-label="Undo backorder"
+            title="Put these units back on the Shopify order at their B2B price"
+            data-bo-line-id="${h(b.lineItemId)}" data-bo-title="${h(b.title)}" data-bo-qty="${h(b.quantity)}" data-bo-price="${h(priceTxt)}">Undo backorder</button></div>
+        </td>
+        <td class="mono"><span class="bo-struck-text">${h(b.sku || '—')}</span></td>
+        <td class="text-right"><span class="bo-struck-text">${h(b.quantity)}</span></td>
+        <td class="text-right"><span class="bo-struck-text">${h(priceTxt)}</span></td>
+        <td class="text-right"><span class="bo-struck-text">${h(fmtMoney(b.lineTotal, b.currency))}</span></td>
+      </tr>`;
+      }).join('')}
+    </tbody>`;
 
   // CURRENT-FIELDS (2026-06-29): show the CURRENT (post-edit) subtotal/total on first paint — the frozen
   // subtotal/totalPriceSet would render the pre-edit amounts ($921.72 on #37639) until the client reconcile
@@ -2636,8 +2683,15 @@ function renderOrderDetail(session, order, flash, flashMsg) {
     ? `<div class="alert alert-success">Discount applied.</div>`
     : flash === 'fulfilled'
     ? `<div class="alert alert-success">Fulfillment recorded.</div>`
+    // DEPENDS: flash codes come from lib/backorder-edit.mjs BACKORDER_FLASH via POST /orders/:id/backorder
+    // and /backorder/undo (?success=backorder_flagged | backorder_restored[&msg=], ?error=backorder_shopify_failed&msg=).
+    // The failure code is read from ?error= — which, like every error here, is mapped to alert-warning.
     : flash === 'backorder_flagged'
-    ? `<div class="alert alert-success">Line item marked as backordered.</div>`
+    ? `<div class="alert alert-success">Marked as backordered. The units were removed from the Shopify order and its total. They stay on the invoice, crossed out. Use <strong>Undo backorder</strong> on the struck-through row to put them back.</div>`
+    : flash === 'backorder_restored'
+    ? `<div class="alert alert-success">Backorder undone &mdash; the units are back on the Shopify order.</div>${flashMsg ? `<div class="alert alert-warning">${h(flashMsg)}</div>` : ''}`
+    : flash === 'backorder_shopify_failed'
+    ? `<div class="alert alert-warning">Backorder action failed &mdash; ${flashMsg ? h(flashMsg) : 'check server logs.'}</div>`
     : flash === 'xero_synced'
     ? `<div class="alert alert-success">Xero invoice created/synced.</div>`
     : flash === 'xero_paid'
@@ -2705,22 +2759,79 @@ function renderOrderDetail(session, order, flash, flashMsg) {
   function toggleFulfillModal(show) {
     document.getElementById('fulfill-modal').style.display = show ? 'flex' : 'none';
   }
+  // WHAT: opens/closes the "Mark backordered" modal. On open it (re)fills every field from the clicked line.
+  // CHANGE-GUARD: backorder is a REAL Shopify edit now (the units leave the order and its total), so three
+  //   things are re-armed on EVERY open, not once at load: a fresh idemKey (one key per open, so a double
+  //   click or a browser retry is the same request while a deliberate second backorder is a new one), the
+  //   quantity max (the line's CURRENT quantity, not what it was when the page loaded) and the submit button
+  //   (a previous submit leaves it disabled, and bfcache can restore the page in that state).
+  // DEPENDS: POST /orders/:id/backorder reads lineItemId, lineItemTitle, quantity, idemKey from this
+  //   form (the expected-ship-date field is gone from the UI by owner decision — do not post an eta; parseBackorderRequest + the idemKey regex /^[A-Za-z0-9_-]{8,80}$/); ids bo-li-id, bo-li-title,
+  //   bo-quantity, bo-idem-key, bo-line-name, bo-max-qty, bo-submit, bo-form belong to the modal markup below.
+  function newBackorderIdemKey() {
+    if (window.crypto && typeof window.crypto.randomUUID === 'function') return window.crypto.randomUUID();
+    // randomUUID is secure-context only; this keeps the token unique enough and inside the server's regex.
+    return 'bo-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 12);
+  }
   function toggleBackorderModal(liId, liTitle, liQty, show) {
     const m = document.getElementById('backorder-modal');
     if (show) {
+      var max = Math.max(1, parseInt(liQty, 10) || 1);
       m.style.display = 'flex';
       document.getElementById('bo-li-id').value = liId || '';
       document.getElementById('bo-li-title').value = liTitle || '';
-      document.getElementById('bo-quantity').value = liQty || 1;
+      document.getElementById('bo-line-name').textContent = liTitle || '';
+      document.getElementById('bo-max-qty').textContent = String(max);
+      var qty = document.getElementById('bo-quantity');
+      qty.max = String(max);
+      qty.value = String(max);
+      document.getElementById('bo-idem-key').value = newBackorderIdemKey();
+      var sb = document.getElementById('bo-submit');
+      sb.disabled = false; sb.textContent = sb.getAttribute('data-bo-label');
     } else {
       m.style.display = 'none';
     }
   }
   // Delegated listener for line "Mark backordered" buttons — reads data-* attrs (safe: attribute
   // context) instead of an inline onclick that would concatenate the attacker-controlled title into JS.
+  // The quantity cap is the line's CURRENT quantity: the qty input's last accepted value when the edit
+  // controls have changed it since page load, else the server-rendered data-li-qty. (The server re-reads
+  // the order from Shopify and is the authority; this only keeps an impossible number out of the box.)
   document.addEventListener('click', function(e){
     var b = e.target.closest && e.target.closest('.bo-action-btn');
-    if (b) { toggleBackorderModal(b.getAttribute('data-li-id'), b.getAttribute('data-li-title'), b.getAttribute('data-li-qty'), true); }
+    if (b) {
+      var row = b.closest('tr');
+      var qIn = row && row.querySelector('.edit-qty-input');
+      var cur = (qIn && qIn.getAttribute('data-last')) || b.getAttribute('data-li-qty');
+      toggleBackorderModal(b.getAttribute('data-li-id'), b.getAttribute('data-li-title'), cur, true);
+    }
+  });
+  // Double-click guard: the submit is a real Shopify edit. Delegated (submit bubbles) because this script runs
+  // before the modal markup exists.
+  document.addEventListener('submit', function(e){
+    if (!e.target || e.target.id !== 'bo-form') return;
+    var sb = document.getElementById('bo-submit');
+    if (sb) { sb.disabled = true; sb.textContent = 'Removing from Shopify…'; }
+  });
+  // "Undo backorder" on a struck-through row. A confirm states exactly what will happen, then the hidden
+  // #bo-undo-form (outside #edit-form — forms cannot nest) is posted with the line id. Everything is read
+  // from data-bo-* attributes; nothing server-supplied is ever spliced into JS.
+  document.addEventListener('click', function(e){
+    var u = e.target.closest && e.target.closest('.bo-undo-btn');
+    if (!u || u.disabled) return;
+    var msg = 'Put ' + u.getAttribute('data-bo-qty') + ' × ' + u.getAttribute('data-bo-title')
+      + ' back on the Shopify order at ' + u.getAttribute('data-bo-price') + ' (its B2B price)?';
+    if (!window.confirm(msg)) return;
+    var f = document.getElementById('bo-undo-form');
+    if (!f) return;
+    document.getElementById('bo-undo-li-id').value = u.getAttribute('data-bo-line-id');
+    u.disabled = true; u.textContent = 'Restoring…';
+    f.submit();
+  });
+  // Back/forward can restore this page from bfcache with the buttons still disabled.
+  window.addEventListener('pageshow', function(e){
+    if (!e.persisted) return;
+    document.querySelectorAll('.bo-undo-btn').forEach(function(b){ b.disabled = false; b.textContent = b.getAttribute('data-bo-label'); });
   });
   function toggleInvoiceModal(show) {
     document.getElementById('invoice-modal').style.display = show ? 'flex' : 'none';
@@ -2879,6 +2990,17 @@ function renderOrderDetail(session, order, flash, flashMsg) {
       details.card > summary::marker { content: ''; }
       details.card > summary:hover { background: var(--gray-50, #f7f7f4); border-radius: 4px; }
       details.card[open] > summary { margin-bottom: 0.25rem; }
+      /* BACKORDERED rows (units removed from the Shopify order): grey + struck through, but the tag and
+         the Undo button stay readable — only .bo-struck-text is crossed out, never the whole cell.
+         SYNC: class names bo-struck / bo-struck-head / bo-struck-row / bo-struck-text / bo-tag / bo-undo-btn
+         are used by backorderedRowsHtml above and by the order-page backorder tests in test/ui.test.mjs. */
+      tbody.bo-struck td { color: var(--gray-500, #6b7280); vertical-align: top; }
+      tbody.bo-struck tr.bo-struck-head td { padding-top: 0.5rem; padding-bottom: 0.25rem; font-size: 0.6875rem; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; background: var(--gray-50, #f7f7f4); border-top: 1px solid var(--gray-200, #e5e7eb); }
+      tbody.bo-struck .bo-struck-text { text-decoration: line-through; }
+      tbody.bo-struck .bo-undo-btn { margin-top: 6px; }
+      tbody.bo-struck .bo-tag { margin-left: 4px; vertical-align: middle; }
+      /* Phone: the Undo button is the one control on a struck row, so give it a real tap target. */
+      @media (max-width: 600px) { tbody.bo-struck .bo-undo-btn { min-height: 36px; padding: 0.5rem 0.875rem; } }
     </style>
     ${visibleNotesScript}
     ${editModeScript}
@@ -2941,6 +3063,7 @@ function renderOrderDetail(session, order, flash, flashMsg) {
           <table class="data-table">
             <thead><tr><th>Item</th><th>SKU</th><th class="text-right">Qty</th><th class="text-right">Unit</th><th class="text-right">Total</th></tr></thead>
             <tbody>${lineItemsHtml}</tbody>
+            ${backorderedRowsHtml}
           </table>
           <div class="totals-block">
             <div class="totals-row"><span>Subtotal</span><span>${sub}</span></div>
@@ -2985,6 +3108,11 @@ function renderOrderDetail(session, order, flash, flashMsg) {
             <div style="font-size:11px;color:var(--muted);margin-top:6px">Saved with the edit and shown in Shopify's timeline. Shopify does not let apps add a timeline comment after an edit has already been committed.</div>
           </div>
           </form>
+          ${backorderedLines.length === 0 ? '' : `${/* DEPENDS: POST /orders/:id/backorder/undo reads body.lineItemId; the .bo-undo-btn click listener in
+                editModeScript fills #bo-undo-li-id and submits this form. It sits OUTSIDE #edit-form on purpose
+                (forms cannot nest, and nothing here may ride along with the edit submit). */''}<form id="bo-undo-form" method="POST" action="/orders/${h(numId)}/backorder/undo" style="display:none">
+            <input type="hidden" name="lineItemId" id="bo-undo-li-id" value="">
+          </form>`}
           <script>
             (function(){
               // Track newly added custom-line rows so they can be serialized on submit
@@ -3824,21 +3952,33 @@ function renderOrderDetail(session, order, flash, flashMsg) {
           </div>
         </div>
         ${/* Backorder modal */''}<div id="backorder-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center">
-          <div style="background:#fff;border-radius:8px;padding:24px;min-width:340px;max-width:480px">
-            <h3 style="margin:0 0 16px">Mark as backordered</h3>
-            <form method="POST" action="/orders/${h(numId)}/backorder">
+          ${/* WHAT: backorder is a real Shopify edit — the copy below must keep saying so (before the 2026-10-26
+                hot-fix this modal read as a note-only flag, so staff had no warning that the click edits the order).
+                The fields are an API: POST /orders/:id/backorder.
+                DEPENDS: toggleBackorderModal() in editModeScript fills bo-li-id, bo-li-title, bo-line-name,
+                bo-max-qty, bo-quantity (+ its max), bo-idem-key and resets bo-submit; the submit listener there
+                finds this form by id bo-form. The line name is written with textContent (it is free text). */''}
+          <div style="background:#fff;border-radius:8px;padding:24px;width:min(480px,calc(100vw - 32px));max-height:calc(100vh - 32px);overflow-y:auto;box-sizing:border-box">
+            <h3 style="margin:0 0 4px">Mark as backordered</h3>
+            <p id="bo-line-name" style="margin:0 0 12px;font-weight:600;font-size:14px;overflow-wrap:anywhere"></p>
+            <div class="alert alert-warning" style="font-size:13px;margin-bottom:14px">
+              <strong>This changes the Shopify order.</strong>
+              <ul style="margin:6px 0 0;padding-left:18px">
+                <li>The quantity you enter is <strong>removed from the Shopify order</strong> and from its total (the customer is not emailed).</li>
+                <li>It stays on the invoice <strong>crossed out</strong>, with a footnote that it is backordered.</li>
+                <li>You can put it back any time with <strong>Undo backorder</strong> on this page.</li>
+              </ul>
+            </div>
+            <form method="POST" action="/orders/${h(numId)}/backorder" id="bo-form">
               <input type="hidden" name="lineItemId" id="bo-li-id">
               <input type="hidden" name="lineItemTitle" id="bo-li-title">
-              <div style="margin-bottom:12px">
-                <label style="font-size:13px;font-weight:500">Quantity backordered</label><br>
-                <input type="number" name="quantity" id="bo-quantity" min="1" class="filter-input" style="width:100%;margin-top:4px">
-              </div>
+              <input type="hidden" name="idemKey" id="bo-idem-key" value="">
               <div style="margin-bottom:16px">
-                <label style="font-size:13px;font-weight:500">Expected ship date (optional)</label><br>
-                <input type="date" name="eta" class="filter-input" style="width:100%;margin-top:4px">
+                <label for="bo-quantity" style="font-size:13px;font-weight:500">Quantity to remove from the order and backorder <span class="text-muted">(of <span id="bo-max-qty">1</span> on the order)</span></label><br>
+                <input type="number" name="quantity" id="bo-quantity" min="1" step="1" class="filter-input" style="width:100%;margin-top:4px;box-sizing:border-box" required>
               </div>
-              <div style="display:flex;gap:8px">
-                <button type="submit" class="btn btn-primary">Mark backordered</button>
+              <div style="display:flex;gap:8px;flex-wrap:wrap">
+                <button type="submit" id="bo-submit" class="btn btn-primary" data-bo-label="Remove from order and mark backordered">Remove from order and mark backordered</button>
                 <button type="button" class="btn btn-ghost" onclick="toggleBackorderModal(null,null,null,false)">Cancel</button>
               </div>
             </form>
