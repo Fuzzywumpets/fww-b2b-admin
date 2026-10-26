@@ -2555,7 +2555,7 @@ function renderOrderDetail(session, order, flash, flashMsg) {
 // in an edit (currentQuantity 0) are HIDDEN — Shopify retains them on the order but they're not part of it
 // anymore, so they must not show as line rows, inflate the count, or contribute to the subtotal. currentQty
 // falls back to `quantity` when the field is absent (MOCK fixtures / unedited orders) so behavior is unchanged there.
-// INVARIANT(S): rowTotal = unitPrice * currentQty computed in JS for display only (server recomputes on save); productNum resolves via variant.product.id (live) or MOCK_VARIANT_PRODUCT (mock) and gates whether the title is a link; item.title is escaped into both markup and an onclick string (the onclick path uses replace(/'/g) — fragile, prefer not to add quotes-bearing data there).
+// INVARIANT(S): rowTotal = unitPrice * currentQty computed in JS for display only (server recomputes on save) — and in edit mode the client repaints it live from the row's own qty x price inputs (paintRowTotal), so a row's shown Total always equals its shown qty x unit price; productNum resolves via variant.product.id (live) or MOCK_VARIANT_PRODUCT (mock) and gates whether the title is a link; item.title is escaped into both markup and an onclick string (the onclick path uses replace(/'/g) — fragile, prefer not to add quotes-bearing data there).
   const lineItemsHtml = lineItems.map(item => {
     const currentQty = item.currentQuantity != null ? item.currentQuantity : (item.quantity || 0);
     if (currentQty <= 0) return ''; // removed in a prior edit — not part of the order anymore
@@ -2611,7 +2611,11 @@ function renderOrderDetail(session, order, flash, flashMsg) {
         <span class="edit-price-static">${fmtMoney(unitPrice)}</span>
         <input type="number" step="0.01" min="0" name="prices[${h(item.id)}]" value="${unitPrice.toFixed(2)}" class="edit-price-input" data-retail="${parseFloat(item.originalUnitPriceSet?.presentmentMoney?.amount ?? unitPrice).toFixed(2)}" style="display:none;width:72px">
       </td>
-      <td class="text-right">${fmtMoney(rowTotal)}</td>
+      ${/* DEPENDS: paintRowTotal() in the edit-mode script finds this cell by .line-total-amt and repaints it
+           as qty x unit price while the operator edits. Without it this cell was STATIC: change qty or
+           price in edit mode and the Total stayed at its page-load value while the Subtotal (server
+           truth) moved, so the visible line totals stopped summing to the Subtotal. The two other row
+           builders (addCustomLineRow, addCatalogLineRow) carry the same .line-total-amt span. */''}<td class="text-right line-total-cell"><span class="line-total-amt">${fmtMoney(rowTotal)}</span></td>
     </tr>`;
   }).join('');
 
@@ -3163,6 +3167,38 @@ function renderOrderDetail(session, order, flash, flashMsg) {
             (function(){
               // Track newly added custom-line rows so they can be serialized on submit
               window.__newCustomLines = [];
+              // WHAT: keeps every line's Total cell equal to the qty x unit price shown in that same row.
+              //   Edit-mode rows (existing, custom, catalog) each hold a .line-total-amt span that this
+              //   repaints from the row's own inputs on every keystroke; an empty or invalid qty/price
+              //   shows a dash instead of a stale or NaN amount.
+              // CHANGE-GUARD: reads the row's inputs by class, so it is the third copy of the input class
+              //   names — SYNC: .edit-qty-input / .edit-price-input (renderOrderDetail existing rows),
+              //   .ncl-qty / .ncl-price (addCustomLineRow), .cl-qty / .cl-price (addCatalogLineRow). Add a
+              //   new row type and you must give it a .line-total-amt span, call wireRowTotal(tr) and
+              //   paintRowTotal(tr) once, and list its input classes here.
+              //   An existing row also has static qty / unit-price spans (shown when edit mode is off). They
+              //   are mirrored from the same inputs here, otherwise leaving edit mode after a change would
+              //   show the OLD qty and price next to the NEW total: a different way of not adding up.
+              // INVARIANT(S): display only. The server recomputes every total; nothing here is submitted.
+              window.paintRowTotal = function(tr) {
+                var amt = tr && tr.querySelector('.line-total-amt'); if (!amt) return;
+                var q = tr.querySelector('.edit-qty-input, .ncl-qty, .cl-qty');
+                var p = tr.querySelector('.edit-price-input, .ncl-price, .cl-price');
+                var qty = q ? parseInt(q.value, 10) : NaN, price = p ? parseFloat(p.value) : NaN;
+                var usd = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' });
+                var qs = tr.querySelector('.edit-qty-static'), ps = tr.querySelector('.edit-price-static');
+                if (qs && qty >= 0) qs.textContent = String(qty);
+                if (ps && price >= 0) ps.textContent = usd.format(price);
+                if (!(qty >= 0) || !(price >= 0)) { amt.textContent = '—'; return; }
+                amt.textContent = usd.format(qty * price);
+              };
+              window.wireRowTotal = function(tr) {
+                if (!tr || tr.dataset.rtWired) return;
+                tr.dataset.rtWired = '1';
+                tr.querySelectorAll('.edit-qty-input, .edit-price-input, .ncl-qty, .ncl-price, .cl-qty, .cl-price').forEach(function(el){
+                  el.addEventListener('input', function(){ window.paintRowTotal(tr); });
+                });
+              };
               window.addCustomLineRow = function() {
                 var tbody = document.querySelector('#edit-form table.data-table tbody');
                 if (!tbody) return;
@@ -3177,9 +3213,12 @@ function renderOrderDetail(session, order, flash, flashMsg) {
                   '<td><span class="text-muted">CUSTOM</span></td>' +
                   '<td class="text-right"><input type="number" class="filter-input ncl-qty" value="1" min="1" step="1" style="width:60px;text-align:right"></td>' +
                   '<td class="text-right"><input type="number" class="filter-input ncl-price" value="0.00" min="0" step="0.01" style="width:80px;text-align:right"></td>' +
-                  '<td class="text-right" style="white-space:nowrap"><button type="button" class="btn btn-primary btn-sm ncl-add" title="Add this line to the order">Add</button> ' +
+                  '<td class="text-right" style="white-space:nowrap"><span class="line-total-amt" style="margin-right:10px"></span>' +
+                    '<button type="button" class="btn btn-primary btn-sm ncl-add" title="Add this line to the order">Add</button> ' +
                     '<button type="button" class="btn btn-ghost btn-sm" onclick="removeCustomLineRow(this)" title="Remove this new line">\u00D7</button></td>';
                 tbody.appendChild(tr);
+                // Show qty x price in the Total column from the first paint, then keep it live.
+                window.wireRowTotal(tr); window.paintRowTotal(tr);
                 tr.querySelector('.ncl-title').focus();
                 // Phase 16H: incremental auto-save \u2014 persist on blur once title/qty/price are valid.
                 if (window.__autosave) window.__autosave.wireCustomRow(tr);
@@ -3247,8 +3286,11 @@ function renderOrderDetail(session, order, flash, flashMsg) {
                   '<td><span class="text-muted">' + ((p.sku||'').replace(/</g,'&lt;') || '—') + '</span></td>' +
                   '<td class="text-right"><input type="number" class="filter-input cl-qty" value="1" min="1" step="1" style="width:60px;text-align:right"></td>' +
                   '<td class="text-right"><input type="number" class="filter-input cl-price" value="' + wholesale.toFixed(2) + '" min="0" step="0.01" style="width:80px;text-align:right" title="Wholesale unit price (list ' + listPrice.toFixed(2) + ')"></td>' +
-                  '<td class="text-right"><button type="button" class="btn btn-ghost btn-sm" onclick="removeCustomLineRow(this)" title="Remove this new line">×</button></td>';
+                  '<td class="text-right" style="white-space:nowrap"><span class="line-total-amt" style="margin-right:10px"></span>' +
+                    '<button type="button" class="btn btn-ghost btn-sm" onclick="removeCustomLineRow(this)" title="Remove this new line">×</button></td>';
                 tbody.appendChild(tr);
+                // Show qty x price in the Total column from the first paint, then keep it live.
+                window.wireRowTotal(tr); window.paintRowTotal(tr);
                 // Phase 16H: incremental auto-save — persist this added line immediately.
                 if (window.__autosave) window.__autosave.addCatalogLine(p, tr, wholesale, listPrice);
               };
@@ -3797,6 +3839,9 @@ function renderOrderDetail(session, order, flash, flashMsg) {
                     var liId = tr.dataset.liId; if (!liId) return;
                     var qtyEl = tr.querySelector('.edit-qty-input');
                     var priceEl = tr.querySelector('.edit-price-input');
+                    // Keep this row's Total cell equal to its qty x unit price as the operator types
+                    // (display only — see paintRowTotal).
+                    if (window.wireRowTotal) window.wireRowTotal(tr);
                     if (qtyEl && !qtyEl.dataset.asWired){ qtyEl.dataset.asWired='1';
                       // P0 fix (2026-06-29): save on COMMIT (change/blur) only — NOT per-keystroke.
                       // The old 'input' listener fired qtyChange on every keystroke, so editing "3" to
@@ -3816,6 +3861,9 @@ function renderOrderDetail(session, order, flash, flashMsg) {
                         // SYNC: same floor as min="1" on this input and POST /orders/:id/line/qty.
                         if (!(q >= 1)) {
                           qtyEl.value = qtyEl.dataset.last || '1';
+                          // A programmatic value change fires no input event, so repaint the Total
+                          // cell for the reverted quantity ourselves.
+                          if (window.paintRowTotal) window.paintRowTotal(tr);
                           setChip(tr, 'failed', 'Quantity must be at least 1 — use ✕ to remove this line.', true);
                           return;
                         }
