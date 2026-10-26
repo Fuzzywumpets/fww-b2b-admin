@@ -11,6 +11,10 @@
 //   and review the diff of test/fixtures/invoice-no-backorder.golden.json. The committed file was generated
 //   by the pre-feature code (commit 89a9d55: pdf.mjs for `unit`, a mock server started from that commit for
 //   `http`), so passing proves the feature leaves backorder-free invoices exactly as they were.
+//   DELIBERATE RE-PIN (2026-10-26, invoice lines now print in warehouse PICK-LIST order — pdf.mjs invoiceSortKey):
+//   only the `unit` scenarios whose line titles are not already in pick order changed — dense-multipage-with-note
+//   and partial-invoice-opts (their 38 "Long descriptive wholesale product N" lines now sort as text: 1, 10, 11…2).
+//   The other four `unit` goldens and both `http` goldens (#1001, #1002) are byte-for-byte the pre-feature hashes.
 //
 // Set INVOICE_SHOT_DIR=<dir> to also save the section-6 screenshots (390 / 768 / 1280 px) and the section-5 PDF.
 
