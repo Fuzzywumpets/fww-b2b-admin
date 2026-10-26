@@ -7476,7 +7476,25 @@ function verifyOrderDiscount(lineState, expected) {
 // is recorded `committed`: if it throws, the action is marked `failed` and the error surfaces —
 // so the idempotency ledger never records a commit that did not actually take effect on Shopify
 // (the delete-persist false-green). Returning a string from verifyFn pushes it as a warning.
-async function runOrderEdit(orderId, idemKey, editedBy, action, payload, stageFn, verifyFn) {
+//
+// opts (2026-10-26 speed hot-fix; both default off, so every existing caller is unchanged):
+//   skipLineState: true  - do NOT run readCommittedLineState after the commit. For callers that never use
+//     result.lineState / result.order (the backorder flag/undo adapters, which re-read Shopify themselves
+//     and decide with their own state machine). Refuses to combine with verifyFn: skipping the
+//     verify-or-fail oracle must never happen silently. The ledger row stores NO lineState (a replay of a
+//     lean action returns { ok, idemKey, lean:true }), and the ~118-line payload is never persisted.
+//   commitLines: (first)=>mutation doc - use this commit mutation, which also returns the order's lines in
+//     the SAME response. If (and only if) that answer is complete (pageInfo.hasNextPage === false) the raw
+//     nodes come back as result.committedNodes (NOT persisted). The caller decides what they prove; an
+//     absent/partial answer just means the caller does its own read, as before.
+// CHANGE-GUARD: skipLineState does not change the no-op branch's meaning ("There must be at least one change"
+//   is still success here - the CALLER's read-back is what notices nothing changed).
+// DEPENDS: lib/backorder-edit.mjs backorderCommitMutation is the only commitLines builder; backorderEditOpts()
+//   (below, 16D) is the only skipLineState caller.
+async function runOrderEdit(orderId, idemKey, editedBy, action, payload, stageFn, verifyFn, opts = {}) {
+  if (opts.skipLineState && verifyFn) throw new Error('runOrderEdit: skipLineState cannot be combined with verifyFn (it would skip the verify-or-fail oracle)');
+  const _t0 = Date.now();
+  const _ms = { begin: 0, stage: 0, commit: 0, verify: 0 };
   // [order-edit] P0 instrumentation (2026-06-29): log every save attempt + its REAL outcome so a
   // future failure shows the actual Shopify userError / exception in journalctl, not just a red pill.
   const _payloadSummary = (() => { try { const p = payload || {}; return JSON.stringify({ liId: p.liId, qty: p.qty, price: p.price, variantId: p.variantId, title: p.title ? String(p.title).slice(0,40) : undefined }); } catch { return '<unserializable>'; } })();
@@ -7498,6 +7516,7 @@ async function runOrderEdit(orderId, idemKey, editedBy, action, payload, stageFn
       catch { return { replayed: true }; }
     }
     try {
+      const _beginAt = Date.now();
       const beginResult = await shopifyFetch(`
         mutation begin($id:ID!){orderEditBegin(id:$id){
           calculatedOrder{ id lineItems(first:${LINE_PAGE_MAX}){ pageInfo{hasNextPage endCursor} edges{node{ ${CALC_LINE_FIELDS} }}} }
@@ -7514,18 +7533,26 @@ async function runOrderEdit(orderId, idemKey, editedBy, action, payload, stageFn
       // reports "line not found on order" no matter how many times the operator retries.
       const calcItems = await drainLineItems(calcOrder.lineItems, 'calculated order',
         calcLineItemsPage(calcId, CALC_LINE_FIELDS));
+      _ms.begin = Date.now() - _beginAt;
 
       const ctx = { calcOrder, calcItems, sessionId: beginResult.data?.orderEditBegin?.orderEditSession?.id, warnings: [] };
       const stageStarted = Date.now();
       await stageFn(calcId, ctx);
-      console.log(`[order-edit] STAGED action=${action} order=${orderId} elapsedMs=${Date.now() - stageStarted}`);
+      _ms.stage = Date.now() - stageStarted;
+      console.log(`[order-edit] STAGED action=${action} order=${orderId} elapsedMs=${_ms.stage}`);
 
       // Commit — and ACTUALLY READ userErrors (this is the bug the user hit).
-      const commitRes = await shopifyFetch(`mutation commit($id:ID!,$notify:Boolean!,$note:String){
+      // opts.commitLines swaps in the commit mutation that also answers with the order's lines; its page size
+      // is the session's line count + headroom (an undo-add grows the order by one), never above the 250 page cap.
+      const _commitAt = Date.now();
+      const commitRes = await shopifyFetch(opts.commitLines
+        ? opts.commitLines(Math.min(LINE_PAGE_MAX, calcItems.length + 8))
+        : `mutation commit($id:ID!,$notify:Boolean!,$note:String){
         orderEditCommit(id:$id,notifyCustomer:$notify,staffNote:$note){
           order{id} userErrors{field message}}}`,
         { id: calcId, notify: false, note: payload?.staffNote || null },
         { timeoutMs: action === 'discount/order' ? 60000 : 15000 });
+      _ms.commit = Date.now() - _commitAt;
       const cErrs = commitRes.data?.orderEditCommit?.userErrors || [];
       if (cErrs.length) {
         // NO-OP IS NOT A FAILURE (P0 regression fix, 2026-06-29): Shopify returns
@@ -7540,6 +7567,13 @@ async function runOrderEdit(orderId, idemKey, editedBy, action, payload, stageFn
         const isNoChange = cErrs.every(e => /at least one change/i.test(e.message || ''));
         if (isNoChange) {
           console.log(`[order-edit] ${action} commit was a NO-OP (order already in desired state) — treating as success`);
+          if (opts.skipLineState) {
+            // Lean caller: no line state to build and none to verify. It reads Shopify itself, sees nothing changed
+            // and decides (backorder: "nothing was backordered" - fail closed).
+            const lean = { ok: true, idemKey, noop: true, lean: true, warnings: ctx.warnings };
+            putEditAction({ idemKey, orderId, action, payload, result: lean, status: 'committed', editedBy });
+            return lean;
+          }
           const lineState = await readCommittedLineState(orderId);
           if (verifyFn) { const w = await verifyFn(lineState); if (typeof w === 'string' && w) ctx.warnings.push(w); }
           const result = { ok: true, idemKey, noop: true, warnings: ctx.warnings, order: { subtotal: lineState.subtotal, total: lineState.total, lineCount: lineState.lineCount }, lineState };
@@ -7554,14 +7588,25 @@ async function runOrderEdit(orderId, idemKey, editedBy, action, payload, stageFn
       // mis-mapped or no-op'd mutation can `commit` cleanly yet leave the targeted line
       // untouched — verifyFn re-checks the live state and throws if reality disagrees, so we
       // never record a false-green in the idempotency ledger or return ok:true to the UI.
+      if (opts.skipLineState) {
+        // Lean path (backorder flag/undo). The commit may have answered with the order's lines; hand them back
+        // ONLY when the page is provably complete. They are returned to the caller but never written to the ledger.
+        const committedNodes = completeCommitNodes(commitRes.data?.orderEditCommit?.order?.lineItems);
+        const lean = { ok: true, idemKey, lean: true, warnings: ctx.warnings };
+        putEditAction({ idemKey, orderId, action, payload, result: lean, status: 'committed', editedBy });
+        console.log(`[order-edit] OK action=${action} order=${orderId} idem=${idemKey} lean=1 commitLines=${committedNodes ? committedNodes.length : 'none'} warnings=${ctx.warnings.length} ms[begin=${_ms.begin} stage=${_ms.stage} commit=${_ms.commit} verify=0 total=${Date.now() - _t0}]`);
+        return committedNodes ? { ...lean, committedNodes } : lean;
+      }
+      const _verifyAt = Date.now();
       const lineState = await readCommittedLineState(orderId);
       if (verifyFn) {
         const w = await verifyFn(lineState);
         if (typeof w === 'string' && w) ctx.warnings.push(w);
       }
+      _ms.verify = Date.now() - _verifyAt;
       const result = { ok: true, idemKey, warnings: ctx.warnings, order: { subtotal: lineState.subtotal, total: lineState.total, lineCount: lineState.lineCount }, lineState };
       putEditAction({ idemKey, orderId, action, payload, result, status: 'committed', editedBy });
-      console.log(`[order-edit] OK action=${action} order=${orderId} idem=${idemKey} lineCount=${result.order?.lineCount} subtotal=${result.order?.subtotal} warnings=${(result.warnings||[]).length}`);
+      console.log(`[order-edit] OK action=${action} order=${orderId} idem=${idemKey} lineCount=${result.order?.lineCount} subtotal=${result.order?.subtotal} warnings=${(result.warnings||[]).length} ms[begin=${_ms.begin} stage=${_ms.stage} commit=${_ms.commit} verify=${_ms.verify} total=${Date.now() - _t0}]`);
       return result;
     } catch (err) {
       const messages = err instanceof OrderEditError ? err.userMessages : [err.message];
@@ -7965,7 +8010,20 @@ app.post('/orders/:id/edit', requireAuth, async (req, res) => {
 // remove/qty/price then mutated the WRONG line while the endpoint still reported success and
 // logged "removed". Keep the suffix match first; the variant+title heuristic is a last-ditch
 // fallback only for the (rare) case where Shopify does NOT preserve the suffix.
-async function mapOrigToCalc(orderId, calcItems, origLiId) {
+//
+// SPEED (2026-10-26): needOrig:false lets a caller that only wants the calculated line (qty / remove /
+// backorder flag / backorder raise - they read calcLiId and calcItem, never `orig`) skip the whole-order
+// read when the PRIMARY suffix match already answers. The slow path below still runs for everything else:
+// no suffix match, an id that is not a LineItem gid, or a caller that needs `orig` (line/price).
+// INVARIANT(S): the fast path can only return a calc line whose numeric id equals the requested LineItem's
+//   - the same 1:1 mapping the slow path tries first - so it cannot map to a different line. A line that is
+//   not on the order has no such calc line and falls through to the slow path ("line not found").
+async function mapOrigToCalc(orderId, calcItems, origLiId, { needOrig = true } = {}) {
+  if (!needOrig && /^gid:\/\/shopify\/LineItem\/\d+$/.test(String(origLiId))) {
+    const wantNum = shopifyNumericId(origLiId);
+    const hit = calcItems.find(c => shopifyNumericId(c.id) === wantNum);
+    if (hit) return { calcLiId: hit.id, orig: null, calcItem: hit };
+  }
   // PAGED, and this one is not cosmetic: origItems is searched for origLiId itself. Under the old
   // first:100, editing line 101+ of an order found nothing here, returned calcLiId:null, and the
   // caller answered "line not found on order" — for a line plainly visible on the page, on every
@@ -8169,7 +8227,7 @@ app.post('/orders/:id/line/qty', requireAuth, async (req, res) => {
 
   try {
     const result = await runOrderEdit(orderId, idemKey, session.email, 'line/qty', payload, async (calcId, ctx) => {
-      const { calcLiId } = await mapOrigToCalc(orderId, ctx.calcItems, payload.liId);
+      const { calcLiId } = await mapOrigToCalc(orderId, ctx.calcItems, payload.liId, { needOrig: false });
       if (!calcLiId) throw new OrderEditError('line not found on order');
       const r = await shopifyFetch(`mutation setQty($id:ID!,$li:ID!,$qty:Int!,$r:Boolean!){
         orderEditSetQuantity(id:$id,lineItemId:$li,quantity:$qty,restock:$r){ calculatedOrder{id} userErrors{field message}}}`,
@@ -8312,7 +8370,7 @@ app.post('/orders/:id/line/remove', requireAuth, async (req, res) => {
 
   try {
     const result = await runOrderEdit(orderId, idemKey, session.email, 'line/remove', payload, async (calcId, ctx) => {
-      const { calcLiId } = await mapOrigToCalc(orderId, ctx.calcItems, payload.liId);
+      const { calcLiId } = await mapOrigToCalc(orderId, ctx.calcItems, payload.liId, { needOrig: false });
       if (!calcLiId) throw new OrderEditError('line not found on order');
       const r = await shopifyFetch(`mutation setQty($id:ID!,$li:ID!,$qty:Int!,$r:Boolean!){
         orderEditSetQuantity(id:$id,lineItemId:$li,quantity:$qty,restock:$r){ calculatedOrder{id} userErrors{field message}}}`,
@@ -8933,6 +8991,7 @@ app.post('/orders/:id/fulfill', requireAuth, async (req, res) => {
 import {
   flagBackorder, undoBackorder, parseBackorderRequest, errMsg as backorderErrMsg,
   stageRemoveUnits, stageRaiseUnits, stageAddVariantAtPrice, stageAddCustomAtPrice, BACKORDER_FLASH, BACKORDER_LINE_FIELDS,
+  backorderCommitMutation, completeCommitNodes,
 } from './lib/backorder-edit.mjs';
 import {
   getBackorderRow, claimBackorderRemoval, finalizeBackorderRemoval, abandonBackorderClaim,
@@ -8974,17 +9033,31 @@ async function backorderReadLines(numId, orderId) {
 // CHANGE-GUARD: no verifyFn on purpose — the core reads the order back itself and decides applied /
 //   not-applied / unknown, which a throwing verifyFn would pre-empt (it would mark the ledger 'failed'
 //   for an edit that DID commit).
+//
+// SPEED (2026-10-26, "Mark backordered seems slow": ~7.5-8.3 s per click on a 118-line order, ~2 s of it four
+//   whole-order reads): (1) mapOrigToCalc needs no order read - the suffix match answers; (2) runOrderEdit skips
+//   readCommittedLineState (this adapter never used its result); (3) the commit mutation also returns the
+//   order's lines, and flagBackorder/undoBackorder accept them as the read-back ONLY when they positively
+//   confirm (lib/backorder-edit.mjs confirmedByCommit) - otherwise they read independently, as before.
+// B2B_BACKORDER_COMMIT_READBACK=0 turns (3) off (the commit then returns no lines); (1) and (2) stay.
+// DEPENDS: lib/backorder-edit.mjs flagBackorder/undoBackorder consume the returned { lines } and need them
+//   to be COMPLETE and in readLines() shape; test/backorder-roundtrips.test.mjs pins the call sequence.
+const BACKORDER_COMMIT_READBACK = process.env.B2B_BACKORDER_COMMIT_READBACK !== '0';
+const backorderEditOpts = () => ({ skipLineState: true, ...(BACKORDER_COMMIT_READBACK ? { commitLines: backorderCommitMutation } : {}) });
+// The lines the commit answered with, in the shape readLines() returns - or {} when it gave no complete answer.
+const committedLinesOf = (r) => (r?.committedNodes ? { lines: r.committedNodes.map(normalizeBackorderLine) } : {});
 async function backorderRemoveUnitsReal({ orderId, editedBy, line, quantity, idemKey, payload }) {
-  await runOrderEdit(orderId, idemKey, editedBy, 'backorder/flag', payload, async (calcId, ctx) => {
-    const { calcLiId, calcItem } = await mapOrigToCalc(orderId, ctx.calcItems, line.liId);
+  const r = await runOrderEdit(orderId, idemKey, editedBy, 'backorder/flag', payload, async (calcId, ctx) => {
+    const { calcLiId, calcItem } = await mapOrigToCalc(orderId, ctx.calcItems, line.liId, { needOrig: false });
     if (!calcLiId) throw new OrderEditError('line not found on order');
     await stageRemoveUnits({ shopifyFetch, calcId, calcLiId, calcQty: Number(calcItem?.quantity), quantity });
-  });
+  }, undefined, backorderEditOpts());
+  return committedLinesOf(r);
 }
 async function backorderRestoreUnitsReal({ orderId, editedBy, mode, row, live, quantity, unitPrice, idemKey, payload }) {
-  await runOrderEdit(orderId, idemKey, editedBy, 'backorder/restore', payload, async (calcId, ctx) => {
+  const r = await runOrderEdit(orderId, idemKey, editedBy, 'backorder/restore', payload, async (calcId, ctx) => {
     if (mode === 'raise') {
-      const { calcLiId, calcItem } = await mapOrigToCalc(orderId, ctx.calcItems, live.liId);
+      const { calcLiId, calcItem } = await mapOrigToCalc(orderId, ctx.calcItems, live.liId, { needOrig: false });
       if (!calcLiId) throw new OrderEditError('line not found on order');
       await stageRaiseUnits({ shopifyFetch, calcId, calcLiId, calcQty: Number(calcItem?.quantity), quantity });
     } else if (row.variant_id) {
@@ -8993,8 +9066,8 @@ async function backorderRestoreUnitsReal({ orderId, editedBy, mode, row, live, q
     } else {
       await stageAddCustomAtPrice({ shopifyFetch, calcId, title: row.line_item_title, quantity, unitPrice, currency: row.currency });
     }
-  });
-  return { warnings: [] };
+  }, undefined, backorderEditOpts());
+  return { warnings: [], ...committedLinesOf(r) };
 }
 
 // MOCK adapters — drive the same mockIncrementalEdit ledger the other line routes use, and model the two
