@@ -1,4 +1,5 @@
 import { currentShippingAmount } from './lib/order-shipping.mjs';
+import { buildInvoiceBackorderModel } from './lib/invoice-backorder.mjs';
 import PDFDocument from 'pdfkit';
 import { readFileSync, existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -118,6 +119,57 @@ export function invoiceItemTitle(item) {
   return title;
 }
 
+// WHAT: the backordered-lines display model for the ORDER invoice (struck rows + footnote), or null.
+// WHY: backordered units are REMOVED from the Shopify order (db.mjs `backorders` table), so the order's own
+//   lines no longer mention them. This builds the one model both the PDF (generateInvoicePdf) and the HTML
+//   viewer (server.mjs GET /orders/:id/invoice) render; the wording lives in lib/invoice-backorder.mjs.
+// DEPENDS: invoiceItemTitle above — the same title cleaner the active rows use, so a variant Shopify baked
+//   into the title is not printed twice on the struck rows either.
+export function buildOrderInvoiceBackorderModel(rows) {
+  return buildInvoiceBackorderModel(rows, { displayTitle: invoiceItemTitle });
+}
+
+// ── Backordered section geometry (struck rows + footnote) ──────────────────────────────────────────────
+// SYNC: the column x/width literals in generateInvoicePdf's backordered-rows block (title 56/210, SKU 276/100,
+//   QTY 385/40, UNIT 430/65, TOTAL 500/62) mirror drawTableHeader and the active-row loop — struck rows must
+//   sit in the same columns; move one, move all three. BO_ROW_LIMIT mirrors the active rows' `y + rowH > 694`.
+const BO_GREY = '#757575';        // struck text — muted, but still AA-contrast on white (4.6:1)
+const BO_STRIKE = '#444444';      // the line itself is darker than the text so it reads at 0.5pt
+const BO_ROW_LIMIT = 694;         // same page-break threshold as the active item rows
+const BO_FOOT_LIMIT = 700;        // lowest y the footnote may reach: the page footer is drawn at y=720
+const BO_TITLE_LINES = 4, BO_VARIANT_LINES = 3;   // wrapped, then clipped with an ellipsis beyond this
+
+// WHAT: wraps `text` into `width` at the CURRENT font/size, clipped to `maxLines` with an ellipsis.
+// WHY: pdfkit does not clip table cells — a long title/variant would run into the next column or off the
+//   page. Returns the pdfkit text options that enforce the clip plus the height it will occupy.
+// INVARIANT(S): callers must set doc.font()/fontSize() BEFORE calling; the height is in the same units
+//   (incl. lineGap) pdfkit advances doc.y by, so rows can be stacked from it exactly.
+function clampedText(doc, text, width, maxLines, lineGap = 1) {
+  const lineH = doc.currentLineHeight(true) + lineGap;
+  const full = doc.heightOfString(text, { width, lineGap });
+  return {
+    height: Math.min(Math.ceil(full), Math.ceil(lineH * maxLines)),
+    opts: { width, lineGap, height: lineH * maxLines, ellipsis: true },
+  };
+}
+
+// WHAT: the largest font size <= `size` (floor `min`) at which `text` fits `width` on one line, at the CURRENT
+//   font. Leaves the doc's font size set to the returned value.
+function fontSizeToFit(doc, text, width, size, min = 6.5) {
+  let s = size;
+  doc.fontSize(s);
+  while (s > min && doc.widthOfString(text) > width) { s -= 0.5; doc.fontSize(s); }
+  return s;
+}
+
+// WHAT: single-line text trimmed with an ellipsis so it fits `width` at the CURRENT font/size.
+function fitOneLine(doc, text, width) {
+  if (doc.widthOfString(text) <= width) return text;
+  let t = text;
+  while (t.length > 1 && doc.widthOfString(t + '…') > width) t = t.slice(0, -1);
+  return t + '…';
+}
+
 function registerBrandFonts(doc) {
   for (const [name, path] of Object.entries(FONT_PATHS)) {
     if (existsSync(path)) {
@@ -132,7 +184,16 @@ function registerBrandFonts(doc) {
 // INVARIANT(S): undiscounted invoices show post-discount unit prices directly; invoices with allocated
 // discounts show reconstructed pre-discount rows plus one negative Discount total. When opts.subtotal
 // is supplied, partial-invoice totals come from opts and must already be reconciled by the caller;
-// all text is black per brand spec (lime is accent-only).
+// all text is black per brand spec (lime is accent-only; the struck BACKORDERED rows are the one
+// deliberate exception — muted grey).
+// opts.backorderedLines (ORDER invoice only): db.mjs getBackorderedLinesForOrder() rows — units removed from
+//   the Shopify order. They are drawn AFTER the active rows, struck through and tagged, and itemised in a
+//   footnote below the totals. With none (absent/empty) every byte of the page content is exactly what it was
+//   before this option existed (test/invoice-backorder.test.mjs pins that with goldens).
+//   They are NEVER summed: subtotal/shipping/tax/total come from the Shopify order (which no longer holds the
+//   removed units) or from opts.subtotal/total, and `lineItems`/discount math never sees these rows.
+// DEPENDS: callers pass opts.backorderedLines ONLY from the full-order invoice routes (server.mjs
+//   GET /orders/:id/invoice.pdf). Partial-invoice snapshots (POST/GET /orders/:id/partial-invoice*) must not.
 export async function generateInvoicePdf(order, opts = {}) {
   return new Promise((resolve, reject) => {
     const doc = new PDFDocument({ margin: 50, size: 'LETTER', autoFirstPage: true });
@@ -264,6 +325,7 @@ export async function generateInvoicePdf(order, opts = {}) {
       ? (parseFloat(opts.discount) || 0)
       : inferredDiscount;
     const showDiscount = discountAmount > 0.004;
+    const backorder = buildOrderInvoiceBackorderModel(opts.backorderedLines);   // null => nothing below runs
     doc.font('Inter').fillColor(BLACK);
 
     for (const item of lineItems) {
@@ -297,6 +359,53 @@ export async function generateInvoicePdf(order, opts = {}) {
       doc.text(fmt(rowTotal), 500, y, { width: 62, height: 14, align: 'right', lineBreak: false });
       doc.moveTo(50, y + rowH - 4).lineTo(562, y + rowH - 4).lineWidth(0.5).strokeColor('#E5E5E5').stroke();
       y += rowH;
+    }
+
+    // ─── Backordered rows: struck through, AFTER the active rows ────────────────────────────────────
+    // WHAT: units backordered off this order (removed from Shopify) stay visible but visibly not billed:
+    //   muted grey, line-through on description / qty / unit price / line total, plus a "Backordered *" tag.
+    // WHY: they vanished from the invoice once removed from the order; the customer should still see them.
+    // INVARIANT(S): these rows only DRAW. Nothing below (subtotal, discount, shipping, TOTAL) reads them.
+    //   Long titles/variants wrap then clip (clampedText) and the SKU is trimmed to its column, so a row can
+    //   never spill into a neighbour; the page-break test is the same as the active rows'.
+    if (backorder) {
+      const TAG_H = 11;
+      for (const bl of backorder.lines) {
+        doc.fontSize(9.5).font('Inter');
+        const title = clampedText(doc, bl.title, 210, BO_TITLE_LINES);
+        let variant = null;
+        if (bl.variantTitle) {
+          doc.fontSize(8).font('Inter');
+          variant = clampedText(doc, bl.variantTitle, 210, BO_VARIANT_LINES);
+        }
+        const variantBlock = variant ? variant.height + 2 : 0;
+        const rowH = Math.max(20, title.height + variantBlock + 2 + TAG_H + 5);
+        if (y + rowH > BO_ROW_LIMIT) y = addContinuationPage(true);
+
+        doc.fillColor(BO_GREY).strokeColor(BO_STRIKE);
+        doc.fontSize(9.5).font('Inter');
+        doc.text(bl.title, 56, y, { ...title.opts, strike: true });
+        if (variant) {
+          doc.fontSize(8).font('Inter');
+          doc.text(bl.variantTitle, 56, y + title.height + 2, { ...variant.opts, strike: true });
+        }
+        // The tag is NOT struck and darker than the row: it is the part that must stay legible.
+        doc.fontSize(8).font('Inter-Bold').fillColor('#444444');
+        doc.text(backorder.tag, 56, y + title.height + variantBlock + 2, { width: 210, lineBreak: false });
+
+        doc.fillColor(BO_GREY).font('Inter').fontSize(8.5);
+        doc.text(fitOneLine(doc, bl.sku || '—', 100), 276, y, { width: 100, lineBreak: false });
+        doc.strokeColor(BO_STRIKE);
+        // Each figure is shrunk (never wrapped) until it fits its column — pdfkit would otherwise split an
+        // over-wide amount across two lines inside a fixed-height row.
+        for (const [label, x, w] of [[String(bl.quantity), 385, 40], [bl.unitPriceLabel, 430, 65], [bl.lineTotalLabel, 500, 62]]) {
+          doc.fontSize(fontSizeToFit(doc, label, w, 9.5));
+          doc.text(label, x, y, { width: w, align: 'right', lineBreak: false, strike: true });
+        }
+        doc.moveTo(50, y + rowH - 4).lineTo(562, y + rowH - 4).lineWidth(0.5).strokeColor('#E5E5E5').stroke();
+        y += rowH;
+      }
+      doc.fillColor(BLACK).font('Inter');
     }
 
     // ─── Totals ────────────────────────────────────────────────────
@@ -358,6 +467,7 @@ export async function generateInvoicePdf(order, opts = {}) {
     doc.fontSize(13).font('Inter-Bold').fillColor(BLACK);
     doc.text('TOTAL', LABEL_X, y, { width: LABEL_W, align: 'right', lineBreak: false });
     doc.text(fmt(total), AMT_X, y, { width: AMT_W, align: 'right', lineBreak: false });
+    let contentBottom = y + 18;   // lowest drawn point so far on the current page (13pt TOTAL row)
 
     // ─── Payment terms (B2B-specific) ──────────────────────────────
     if (opts.paymentTerms) {
@@ -366,6 +476,7 @@ export async function generateInvoicePdf(order, opts = {}) {
       doc.opacity(1);
       y += 12;
       doc.fontSize(10).font('Inter').fillColor(BLACK).text(opts.paymentTerms, 50, y, { width: 512 });
+      contentBottom = doc.y;
     }
 
     // ─── Customer notes (order.note) — prints on the customer invoice (alexa 2026-07-01) ──
@@ -377,6 +488,51 @@ export async function generateInvoicePdf(order, opts = {}) {
       doc.opacity(1);
       y += 12;
       doc.fontSize(10).font('Inter').fillColor(BLACK).text(order.note, 50, y, { width: 512 });
+      contentBottom = doc.y;
+    }
+
+    // ─── Backorder footnote — bottom of the invoice, below totals / terms / notes ───────────────────
+    // WHAT: heading + one plain sentence + one entry per backordered variant (wording: lib/invoice-backorder.mjs).
+    // CHANGE-GUARD: it must never overlap the totals block or the page footer (drawn at y=720) and never clip:
+    //   it starts below `contentBottom`; if the heading + intro + first entry do not fit above BO_FOOT_LIMIT it
+    //   starts on a fresh continuation page, and each further entry that does not fit moves to a new
+    //   continuation page under a "(continued)" heading. Entries are measured before they are drawn.
+    if (backorder) {
+      const fn = backorder.footnote;
+      const BULLET_W = 12, ITEM_W = 512 - BULLET_W;
+      doc.fontSize(9).font('Inter-Bold');
+      const headH = Math.ceil(doc.heightOfString(fn.heading, { width: 512 }));
+      doc.font('Inter');
+      const introH = Math.ceil(doc.heightOfString(fn.intro, { width: 512, lineGap: 1 }));
+      const blocks = fn.items.map(item => {
+        doc.fontSize(9).font('Inter-SemiBold');
+        const primary = clampedText(doc, item.primary, ITEM_W, 3);
+        doc.fontSize(8.5).font('Inter');
+        const detail = clampedText(doc, item.detail, ITEM_W, 2);
+        return { item, primary, detail, h: primary.height + detail.height + 6 };
+      });
+      const drawHeading = (text, top) => {
+        doc.fontSize(9).font('Inter-Bold').fillColor(BLACK).text(text, 50, top, { width: 512, lineBreak: false });
+        return top + headH + 3;
+      };
+
+      let fy = contentBottom + 24;
+      if (fy + headH + 3 + introH + 6 + blocks[0].h > BO_FOOT_LIMIT) fy = addContinuationPage(false);
+      else doc.moveTo(50, fy - 10).lineTo(562, fy - 10).lineWidth(0.5).strokeColor('#E5E5E5').stroke();
+      fy = drawHeading(fn.heading, fy);
+      doc.fontSize(9).font('Inter').fillColor(BLACK).text(fn.intro, 50, fy, { width: 512, lineGap: 1 });
+      fy += introH + 6;
+      for (const b of blocks) {
+        if (fy + b.h > BO_FOOT_LIMIT) {
+          fy = addContinuationPage(false);
+          fy = drawHeading(fn.headingContinued, fy);
+        }
+        doc.fontSize(9).font('Inter').fillColor(BLACK).text('•', 50, fy, { width: BULLET_W, lineBreak: false });
+        doc.fontSize(9).font('Inter-SemiBold').text(b.item.primary, 50 + BULLET_W, fy, { ...b.primary.opts });
+        doc.fontSize(8.5).font('Inter').fillColor('#333333').text(b.item.detail, 50 + BULLET_W, fy + b.primary.height, { ...b.detail.opts });
+        fy += b.h;
+      }
+      doc.fillColor(BLACK).font('Inter');
     }
 
     // ─── Footer — y=720 sits inside the default bottom margin (742) so no auto-page-break ──

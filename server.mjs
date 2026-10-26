@@ -6450,15 +6450,36 @@ function invoicePdfDisposition(req, safeName) {
   return `${download ? 'attachment' : 'inline'}; filename="${safeName}.pdf"`;
 }
 
+// Backordered units are REMOVED from the Shopify order (POST /orders/:id/backorder) and parked in the
+// `backorders` table; the ORDER invoice shows them struck through with a footnote (lib/invoice-backorder.mjs).
+// Imported here, next to its two consumers, so the hunk stays out of the big top-of-file import blocks.
+// DEPENDS: db.mjs getBackorderedLinesForOrder (row shape + 'pending AND shopify_removed_qty > 0' definition).
+// Aliased on purpose: another consumer of the same db function (e.g. the order-detail page) may import it under
+// its own name, and two bindings of one name in this module would be a SyntaxError.
+import { getBackorderedLinesForOrder as getInvoiceBackorderedRows } from './db.mjs';
+import { buildOrderInvoiceBackorderModel } from './pdf.mjs';
+import { renderInvoiceBackorderHtml, INVOICE_BACKORDER_CSS } from './lib/invoice-backorder.mjs';
+
+// WHAT: the backordered rows for the FULL-ORDER invoice of order `numId` (the id from the route).
+// CHANGE-GUARD: used by GET /orders/:id/invoice.pdf and the HTML viewer GET /orders/:id/invoice (no ?letter)
+//   ONLY. Partial-invoice snapshots (POST/GET /orders/:id/partial-invoice*), invoice.csv, the Xero invoice and
+//   the Helcim credit-card invoice deliberately do NOT read it. Keyed by shopifyOrderGid(numId), the same
+//   key POST /orders/:id/backorder writes.
+function orderInvoiceBackorderedLines(numId) {
+  return getInvoiceBackorderedRows(shopifyOrderGid(numId));
+}
+
 // WHAT: renders the full-order invoice PDF — inline for the viewer iframe, or as a download when
 //   ?download=1 (see invoicePdfDisposition).
 // CHANGE-GUARD: generateInvoicePdf is async and may throw — keep the try/catch; a 500 here means the PDF lib failed, not a missing order (that is a 404 above).
+//   The backordered-rows lookup sits INSIDE the try on purpose: if it fails the invoice must fail loudly (500),
+//   never be issued silently without the backordered lines it is supposed to show.
 // INVARIANT(S): 404 returns JSON but the success path returns binary PDF; callers must branch on Content-Type, not status alone.
 app.get('/orders/:id/invoice.pdf', requireAuth, async (req, res) => {
   const order = await getOrderDetail(req.params.id);
   if (!order) return res.status(404).json({ error: 'Order not found' });
   try {
-    const pdf = await generateInvoicePdf(order);
+    const pdf = await generateInvoicePdf(order, { backorderedLines: orderInvoiceBackorderedLines(req.params.id) });
     const safeName = (order.name || 'invoice').replace(/[^a-z0-9#-]/gi, '-');
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', invoicePdfDisposition(req, `${safeName}-invoice`));
@@ -6489,6 +6510,11 @@ app.get('/orders/:id/invoice', requireAuth, async (req, res) => {
   //   the shell writes "<order>-invoice.pdf" itself.
   // DEPENDS: invoicePdfDisposition() honours ?download=1 on BOTH pdf routes reachable from here.
   const downloadUrl = pdfUrl + '?download=1';
+  // WHAT: backordered units (struck rows + footnote) for the FULL-ORDER view, as real page text under the PDF.
+  // WHY: this page is only a shell around the PDF iframe; on a phone the embedded PDF is shrunk to a few pixels,
+  //   so the backordered notice is repeated here as selectable, wrapping HTML. Same model + wording as the PDF.
+  // CHANGE-GUARD: not shown for ?letter= (a partial-invoice snapshot) — those never carry backordered rows.
+  const backorderModel = letter ? null : buildOrderInvoiceBackorderModel(orderInvoiceBackorderedLines(numId));
   const content = `
     <div class="page-header" style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:12px">
       <a href="/orders/${h(numId)}" class="btn btn-secondary">← Back to order ${h(orderLabel)}</a>
@@ -6498,9 +6524,10 @@ app.get('/orders/:id/invoice', requireAuth, async (req, res) => {
         <a href="${h(pdfUrl)}" target="_blank" rel="noopener" class="btn btn-ghost btn-sm">Open / print ↗</a>
       </div>
     </div>
-    <iframe title="Invoice PDF" src="${h(pdfUrl)}" style="width:100%;height:82vh;border:1px solid var(--border,#e2e2dd);border-radius:8px;background:#fff"></iframe>
+    <iframe title="Invoice PDF" src="${h(pdfUrl)}" style="width:100%;height:82vh;border:1px solid var(--border,#e2e2dd);border-radius:8px;background:#fff"></iframe>${renderInvoiceBackorderHtml(backorderModel)}
   `;
-  res.send(layout({ title: `Invoice ${orderLabel}`, session: req.adminSession, activePath: '/orders', content }));
+  res.send(layout({ title: `Invoice ${orderLabel}`, session: req.adminSession, activePath: '/orders', content,
+    extraHead: backorderModel ? `<style>${INVOICE_BACKORDER_CSS}</style>` : '' }));
 });
 
 // ── Phase 16E: Partial invoices ──────────────────────────────────────────────
