@@ -973,7 +973,7 @@ export function getTransientBackorders() {
 
 // WHAT: units currently REMOVED from the Shopify order for one order, in the shape the invoice needs.
 // Returns [{ lineItemId, variantId, sku, title, variantTitle, quantity, unitPrice (Number), currency,
-//   lineTotal (Number, 2dp), etaDate ('YYYY-MM-DD'|null), createdAt (ms), createdBy }], oldest first.
+//   lineTotal (Number, 2dp), createdAt (ms), createdBy }], oldest first. (No ETA: removed by owner decision.)
 // CHANGE-GUARD: public contract for the invoice/PDF/order-page renderers (built in parallel with this
 //   change). status = 'pending' AND shopify_removed_qty > 0 is the WHOLE definition: legacy flag-only
 //   rows (shopify_removed_qty = 0) are deliberately excluded — they never removed anything, so showing
@@ -1000,7 +1000,6 @@ export function getBackorderedLinesForOrder(orderGid) {
       unitPrice: unit,
       currency: r.currency || 'USD',
       lineTotal: Math.round(unit * r.shopify_removed_qty * 100) / 100,
-      etaDate: r.eta_date || null,
       createdAt: r.created_at,
       createdBy: r.created_by || null,
     };
@@ -1010,7 +1009,7 @@ export function getBackorderedLinesForOrder(orderGid) {
 // WHAT: phase 1 of a flag — reserves the (order, line) row as 'applying' BEFORE Shopify is touched, with
 // the complete invoice snapshot, so a removal that succeeds on Shopify can never be unrecorded.
 // c: { orderId, lineItemId, title, variantId, sku, variantTitle, unitPrice (decimal string), currency,
-//      quantity, priorQty, etaDate, createdBy, now }
+//      quantity, priorQty, createdBy, now }
 // Returns { ok:true, prev } (prev = the row this claim overwrote, or null — hand it back to
 // abandonBackorderClaim) or { ok:false, reason:'already_backordered'|'in_progress', row }.
 // CHANGE-GUARD: only a 'restored'/'fulfilled' row or a LEGACY flag-only pending row (shopify_removed_qty
@@ -1019,6 +1018,9 @@ export function getBackorderedLinesForOrder(orderGid) {
 //   after a crash, and the Undo-then-reflag path covers the use case.
 // INVARIANT(S): a single SQLite transaction; shopify_removed_qty stays 0 until finalizeBackorderRemoval,
 //   so nothing reads the row as "units removed" until Shopify has confirmed it.
+//   eta_date is always written NULL (the expected-ship-date feature was removed by owner decision); the
+//   column itself stays so the schema is additive-only and an older release's inserts/reads keep working,
+//   and a claim over a restored/legacy row clears any ETA it carried.
 export function claimBackorderRemoval(c) {
   return db.transaction(() => {
     const prev = getBackorderRow(c.orderId, c.lineItemId);
@@ -1030,17 +1032,17 @@ export function claimBackorderRemoval(c) {
     db.prepare(`
       INSERT INTO backorders (order_id, line_item_id, line_item_title, quantity, eta_date, status, created_at, created_by, notified,
                               variant_id, sku, variant_title, unit_price, currency, shopify_removed_qty, restored_at, claim_prior_qty)
-      VALUES (@orderId, @lineItemId, @title, @quantity, @etaDate, 'applying', @now, @createdBy, 0,
+      VALUES (@orderId, @lineItemId, @title, @quantity, NULL, 'applying', @now, @createdBy, 0,
               @variantId, @sku, @variantTitle, @unitPrice, @currency, 0, NULL, @priorQty)
       ON CONFLICT(order_id, line_item_id) DO UPDATE SET
-        line_item_title = excluded.line_item_title, quantity = excluded.quantity, eta_date = excluded.eta_date,
+        line_item_title = excluded.line_item_title, quantity = excluded.quantity, eta_date = NULL,
         status = 'applying', created_at = excluded.created_at, created_by = excluded.created_by, notified = 0,
         variant_id = excluded.variant_id, sku = excluded.sku, variant_title = excluded.variant_title,
         unit_price = excluded.unit_price, currency = excluded.currency, shopify_removed_qty = 0,
         restored_at = NULL, claim_prior_qty = excluded.claim_prior_qty
     `).run({
       orderId: c.orderId, lineItemId: c.lineItemId, title: c.title || '', quantity: c.quantity,
-      etaDate: c.etaDate || null, now: c.now ?? Date.now(), createdBy: c.createdBy || null,
+      now: c.now ?? Date.now(), createdBy: c.createdBy || null,
       variantId: c.variantId || null, sku: c.sku || null, variantTitle: c.variantTitle || null,
       unitPrice: c.unitPrice, currency: c.currency || 'USD', priorQty: c.priorQty ?? null,
     });

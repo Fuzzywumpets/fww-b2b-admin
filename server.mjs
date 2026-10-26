@@ -8575,7 +8575,7 @@ app.post('/orders/:id/fulfill', requireAuth, async (req, res) => {
 // lib/backorder-edit.mjs; this region is the transport: the order-line reader, the real (runOrderEdit) and
 // MOCK edit adapters, and the two routes.
 // DEPENDS: db.mjs getBackorderedLinesForOrder is the contract the invoice/order-page renderers read; the
-//   row written here (unit_price, currency, variant/sku/title, shopify_removed_qty, eta) is its source.
+//   row written here (unit_price, currency, variant/sku/title, shopify_removed_qty) is its source.
 import {
   flagBackorder, undoBackorder, parseBackorderRequest, errMsg as backorderErrMsg,
   stageRemoveUnits, stageRaiseUnits, stageAddVariantAtPrice, stageAddCustomAtPrice, BACKORDER_FLASH, BACKORDER_LINE_FIELDS,
@@ -8723,7 +8723,8 @@ const backorderFailUrl = (numId, msg) =>
   }
 }
 
-// POST /orders/:id/backorder — body: lineItemId, quantity, eta?, idemKey? (hidden-field double-submit token).
+// POST /orders/:id/backorder — body: lineItemId, quantity, idemKey? (hidden-field double-submit token).
+// A stale client that still posts `eta` is ignored: the expected-ship-date feature was removed (owner decision).
 // WHAT: removes `quantity` units of the line from the Shopify order and records the invoice snapshot. A full
 //   line removes the line (quantity 0); a partial quantity lowers it to current − quantity. Restock true,
 //   notifyCustomer false — identical to the existing ✕ remove route.
@@ -8748,7 +8749,7 @@ app.post('/orders/:id/backorder', requireAuth, async (req, res) => {
   let out;
   try {
     out = await withOrderLock(`backorder:${orderId}`, () => flagBackorder(backorderDeps(numId, orderId, email), {
-      orderId, lineItemId: parsed.lineItemId, quantity: parsed.quantity, etaDate: parsed.etaDate, email, idemKey,
+      orderId, lineItemId: parsed.lineItemId, quantity: parsed.quantity, email, idemKey,
     }));
   } catch (err) {
     console.error(`[backorder] flag ${orderId} ${parsed.lineItemId} CRASHED: ${err && err.stack ? err.stack : err}`);
@@ -8760,7 +8761,7 @@ app.post('/orders/:id/backorder', requireAuth, async (req, res) => {
   }
   if (!out.duplicate) {
     const row = getBackorderRow(orderId, parsed.lineItemId);
-    const detail = { lineItemId: parsed.lineItemId, lineItemTitle: row?.line_item_title, quantity: parsed.quantity, eta: parsed.etaDate, unitPrice: row?.unit_price, removedFromShopify: true };
+    const detail = { lineItemId: parsed.lineItemId, lineItemTitle: row?.line_item_title, quantity: parsed.quantity, unitPrice: row?.unit_price, removedFromShopify: true };
     logOrderEdit(orderId, email, null, { action: 'backorder/flag', payload: detail });
     auditLog(email, 'order_backorder', orderId, null, detail);
   }
@@ -8821,21 +8822,19 @@ app.get('/api/admin/backorders', requireAuth, (req, res) => {
 });
 
 // ── Task #45: Backorder queue page ──────────────────────────────────────────
-// WHAT: Task #45 — HTML backorder-queue page; renders one row per open backorder with order link, qty, ETA, age, and creator.
-// CHANGE-GUARD: eta_date is parsed as `${eta_date}T00:00:00` (local-midnight) to avoid UTC off-by-one day shifts — keep the T00:00:00 suffix; age uses /86400000 ms-per-day.
+// WHAT: Task #45 — HTML backorder-queue page; renders one row per open backorder with order link, qty, age, and creator.
+// CHANGE-GUARD: no ETA column (the expected-ship-date feature was removed by owner decision; the eta_date DB column is kept but unused). Age uses /86400000 ms-per-day.
 // INVARIANT(S): all interpolated cells go through h() for XSS-escaping; order_id is stripped of the gid prefix only for display/link.
 app.get('/backorders', requireAuth, (req, res) => {
   const backorders = getOpenBackorders();
   const rows = backorders.map(b => {
     const numOrderId = b.order_id.replace('gid://shopify/Order/', '');
-    const etaDisplay = b.eta_date ? new Date(b.eta_date + 'T00:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : '—';
     const age = Math.floor((Date.now() - b.created_at) / 86400000);
     const ageLabel = age === 0 ? 'today' : age === 1 ? '1 day ago' : `${age} days ago`;
     return `<tr>
       <td><a href="/orders/${h(numOrderId)}" class="link">#${h(numOrderId)}</a></td>
       <td>${h(b.line_item_title || '—')}</td>
       <td>${h(String(b.quantity))}</td>
-      <td>${h(etaDisplay)}</td>
       <td><span class="text-muted small-text">${h(ageLabel)}</span></td>
       <td>${h(b.created_by || '—')}</td>
     </tr>`;
@@ -8856,7 +8855,6 @@ app.get('/backorders', requireAuth, (req, res) => {
                 <th>Order</th>
                 <th>Item</th>
                 <th>Qty</th>
-                <th>ETA</th>
                 <th>Flagged</th>
                 <th>By</th>
               </tr>

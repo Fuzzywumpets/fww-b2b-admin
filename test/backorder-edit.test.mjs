@@ -62,7 +62,7 @@ function world(lineSpecs, { orderId } = {}) {
   };
   return w;
 }
-const flag = (w, over = {}) => flagBackorder(w.deps, { orderId: w.orderId, lineItemId: w.lines[0].liId, quantity: 4, etaDate: '2026-12-01', email: 'a@fww', idemKey: null, ...over });
+const flag = (w, over = {}) => flagBackorder(w.deps, { orderId: w.orderId, lineItemId: w.lines[0].liId, quantity: 4, email: 'a@fww', idemKey: null, ...over });
 const undo = (w, over = {}) => undoBackorder(w.deps, { orderId: w.orderId, lineItemId: w.lines[0].liId, email: 'a@fww', ...over });
 const row = (w, liId = w.lines[0].liId) => dbm.getBackorderRow(w.orderId, liId);
 
@@ -71,13 +71,11 @@ await test('quantity must be a plain whole number >= 1', () => {
   for (const bad of ['', '0', '-1', 'abc', '2.5', '1e2', ' ', null, undefined, '3 units']) {
     assert.equal(parseBackorderRequest({ lineItemId: 'x', quantity: bad }).ok, false, `accepted ${JSON.stringify(bad)}`);
   }
-  assert.deepEqual(parseBackorderRequest({ lineItemId: 'x', quantity: ' 3 ' }), { ok: true, lineItemId: 'x', quantity: 3, etaDate: null });
+  assert.deepEqual(parseBackorderRequest({ lineItemId: 'x', quantity: ' 3 ' }), { ok: true, lineItemId: 'x', quantity: 3 });
 });
-await test('ETA is optional but must be a real calendar date', () => {
-  assert.equal(parseBackorderRequest({ lineItemId: 'x', quantity: '1', eta: '2026-12-01' }).etaDate, '2026-12-01');
-  assert.equal(parseBackorderRequest({ lineItemId: 'x', quantity: '1', eta: '' }).etaDate, null);
-  for (const bad of ['2026-02-30', '2026-13-01', '12/01/2026', 'soon', '2026-1-1']) {
-    assert.equal(parseBackorderRequest({ lineItemId: 'x', quantity: '1', eta: bad }).ok, false, bad);
+await test('an eta field from a stale client is ignored: not validated, not returned (expected ship date was removed)', () => {
+  for (const eta of ['2026-12-01', '', 'soon', '2026-02-30']) {
+    assert.deepEqual(parseBackorderRequest({ lineItemId: 'x', quantity: '1', eta }), { ok: true, lineItemId: 'x', quantity: 1 }, eta);
   }
   assert.equal(parseBackorderRequest({ quantity: '1' }).ok, false, 'missing line id');
 });
@@ -166,8 +164,9 @@ await test('FULL line: removed from Shopify, row finalized with the complete inv
   const [b] = dbm.getBackorderedLinesForOrder(w.orderId);
   assert.deepEqual(
     { ...b, createdAt: undefined },
-    { lineItemId: w.lines[0].liId, variantId: 'gid://shopify/ProductVariant/55', sku: 'EC-1', title: 'Elite Collar', variantTitle: 'Small / Navy', quantity: 4, unitPrice: 18, currency: 'USD', lineTotal: 72, etaDate: '2026-12-01', createdAt: undefined, createdBy: 'a@fww' });
+    { lineItemId: w.lines[0].liId, variantId: 'gid://shopify/ProductVariant/55', sku: 'EC-1', title: 'Elite Collar', variantTitle: 'Small / Navy', quantity: 4, unitPrice: 18, currency: 'USD', lineTotal: 72, createdAt: undefined, createdBy: 'a@fww' });
   assert.equal(row(w).claim_prior_qty, 4);
+  assert.equal(row(w).eta_date, null, 'no ETA is ever written to a new row');
 });
 await test('PARTIAL: Shopify line goes to current − N and only N is recorded', async () => {
   const w = world([{ currentQuantity: 10 }]);
@@ -269,9 +268,9 @@ await test('DOUBLE SUBMIT (client token): a committed ledger entry for the token
 });
 await test('RECONCILE: an orphaned applying row whose removal DID land is finalized on the next flag', async () => {
   const w = world([{ currentQuantity: 10 }]);
-  dbm.claimBackorderRemoval({ orderId: w.orderId, lineItemId: w.lines[0].liId, title: 'Elite Collar', variantId: 'v', sku: 'EC-1', variantTitle: '', unitPrice: '18.00', currency: 'USD', quantity: 4, priorQty: 10, etaDate: null, createdBy: 'a@fww', now: w.clock });
+  dbm.claimBackorderRemoval({ orderId: w.orderId, lineItemId: w.lines[0].liId, title: 'Elite Collar', variantId: 'v', sku: 'EC-1', variantTitle: '', unitPrice: '18.00', currency: 'USD', quantity: 4, priorQty: 10, createdBy: 'a@fww', now: w.clock });
   w.lines[0].currentQuantity = 6;                              // process died after Shopify applied it
-  const r = await flag(w, { quantity: 4, etaDate: null });   // same qty/eta/user as the orphan
+  const r = await flag(w, { quantity: 4 });   // same qty/user as the orphan
   assert.equal(row(w).status, 'pending');
   assert.equal(row(w).shopify_removed_qty, 4);
   assert.equal(r.ok, true, 'identical to the recovered row, so it reads as the same request');
@@ -280,14 +279,14 @@ await test('RECONCILE: an orphaned applying row whose removal DID land is finali
 });
 await test('RECONCILE: an orphaned applying row whose removal did NOT land is discarded, then the new flag proceeds', async () => {
   const w = world([{ currentQuantity: 10 }]);
-  dbm.claimBackorderRemoval({ orderId: w.orderId, lineItemId: w.lines[0].liId, title: 'Elite Collar', variantId: 'v', sku: 'EC-1', variantTitle: '', unitPrice: '18.00', currency: 'USD', quantity: 4, priorQty: 10, etaDate: null, createdBy: 'a@fww', now: w.clock });
+  dbm.claimBackorderRemoval({ orderId: w.orderId, lineItemId: w.lines[0].liId, title: 'Elite Collar', variantId: 'v', sku: 'EC-1', variantTitle: '', unitPrice: '18.00', currency: 'USD', quantity: 4, priorQty: 10, createdBy: 'a@fww', now: w.clock });
   assert.equal((await flag(w, { quantity: 2 })).ok, true);
   assert.equal(w.lines[0].currentQuantity, 8);
   assert.equal(row(w).shopify_removed_qty, 2);
 });
 await test('RECONCILE never guesses: an orphan whose Shopify quantity matches neither outcome blocks the line with a clear message', async () => {
   const w = world([{ currentQuantity: 7 }]);
-  dbm.claimBackorderRemoval({ orderId: w.orderId, lineItemId: w.lines[0].liId, title: 'Elite Collar', variantId: 'v', sku: 'EC-1', variantTitle: '', unitPrice: '18.00', currency: 'USD', quantity: 4, priorQty: 10, etaDate: null, createdBy: 'a@fww', now: w.clock });
+  dbm.claimBackorderRemoval({ orderId: w.orderId, lineItemId: w.lines[0].liId, title: 'Elite Collar', variantId: 'v', sku: 'EC-1', variantTitle: '', unitPrice: '18.00', currency: 'USD', quantity: 4, priorQty: 10, createdBy: 'a@fww', now: w.clock });
   const r = await flag(w, { quantity: 1 });
   assert.equal(r.ok, false);
   assert.equal(r.state, 'unconfirmed');

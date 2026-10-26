@@ -152,7 +152,7 @@ await test('a brand-new database (no prior table) ends up with the identical col
 console.log('\n  backorders lifecycle (claim → finalize → undo)');
 const snap = (o = {}) => ({
   orderId: 'gid://shopify/Order/9100', lineItemId: 'gid://shopify/LineItem/1', title: 'Elite Collar', variantId: 'gid://shopify/ProductVariant/55',
-  sku: 'EC-1', variantTitle: 'Small / Navy', unitPrice: '18.00', currency: 'USD', quantity: 4, priorQty: 10, etaDate: '2026-12-01',
+  sku: 'EC-1', variantTitle: 'Small / Navy', unitPrice: '18.00', currency: 'USD', quantity: 4, priorQty: 10,
   createdBy: 'a@fww', now: 1700000100000, ...o,
 });
 
@@ -174,9 +174,11 @@ await test('finalize → getBackorderedLinesForOrder returns the exact documente
   assert.equal(rest.length, 0);
   assert.deepEqual(l, {
     lineItemId: 'gid://shopify/LineItem/1', variantId: 'gid://shopify/ProductVariant/55', sku: 'EC-1', title: 'Elite Collar',
-    variantTitle: 'Small / Navy', quantity: 4, unitPrice: 18, currency: 'USD', lineTotal: 72, etaDate: '2026-12-01',
+    variantTitle: 'Small / Navy', quantity: 4, unitPrice: 18, currency: 'USD', lineTotal: 72,
     createdAt: 1700000100000, createdBy: 'a@fww',
   });
+  assert.ok(!('etaDate' in l), 'the expected ship date was removed from the contract');
+  assert.equal(dbm.getBackorderRow('gid://shopify/Order/9100', 'gid://shopify/LineItem/1').eta_date, null, 'and is never written');
   assert.equal(typeof l.unitPrice, 'number');
   assert.ok(dbm.getOpenBackorders().some(x => x.order_id === 'gid://shopify/Order/9100'), 'the queue lists it');
 });
@@ -185,12 +187,23 @@ await test('lineTotal is rounded to 2dp and lines come back oldest first', () =>
   const o = 'gid://shopify/Order/9101';
   dbm.claimBackorderRemoval(snap({ orderId: o, lineItemId: 'b', unitPrice: '3.33', quantity: 3, now: 2000 }));
   dbm.finalizeBackorderRemoval(o, 'b');
-  dbm.claimBackorderRemoval(snap({ orderId: o, lineItemId: 'a', unitPrice: '1.10', quantity: 1, etaDate: null, now: 1000 }));
+  dbm.claimBackorderRemoval(snap({ orderId: o, lineItemId: 'a', unitPrice: '1.10', quantity: 1, now: 1000 }));
   dbm.finalizeBackorderRemoval(o, 'a');
   const lines = dbm.getBackorderedLinesForOrder(o);
   assert.deepEqual(lines.map(l => l.lineItemId), ['a', 'b']);
   assert.equal(lines[1].lineTotal, 9.99);
-  assert.equal(lines[0].etaDate, null);
+  assert.ok(lines.every(l => !('etaDate' in l)));
+});
+
+await test('a claim over a LEGACY row that carried an ETA clears it; abandoning hands the legacy row back verbatim', () => {
+  const o = 'gid://shopify/Order/9150';
+  dbm.upsertBackorder(o, 'legacy-eta', 'Legacy Collar', 2, '2026-07-01', 'old@fww');
+  const c = dbm.claimBackorderRemoval(snap({ orderId: o, lineItemId: 'legacy-eta', quantity: 2 }));
+  assert.equal(c.ok, true);
+  assert.equal(dbm.getBackorderRow(o, 'legacy-eta').eta_date, null, 'the new claim carries no ETA');
+  dbm.abandonBackorderClaim(o, 'legacy-eta', c.prev);
+  const back = dbm.getBackorderRow(o, 'legacy-eta');
+  assert.deepEqual([back.status, back.eta_date, back.shopify_removed_qty], ['pending', '2026-07-01', 0], 'old data is restored exactly');
 });
 
 await test('a live removed row refuses a second claim (no accumulation)', () => {

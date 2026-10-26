@@ -2912,7 +2912,7 @@ await test('shipping the rest of a line completes it without error', async () =>
 // would now orphan the removed units from the invoice.)
 await test('shipping a line in full does NOT clear a removed-units backorder on that line', async () => {
   const cookie = await seedSession();
-  const flagged = await postForm('/orders/1004/backorder', cookie, { lineItemId: 'li6', quantity: '2', eta: '2026-12-01' });
+  const flagged = await postForm('/orders/1004/backorder', cookie, { lineItemId: 'li6', quantity: '2' });
   assert.ok(flagged.headers.get('location')?.includes('success=backorder_flagged'), flagged.headers.get('location'));
   const shipped = await postForm('/orders/1004/fulfill', cookie, { 'lineItems[li6]': '3' });   // 5 ordered - 2 removed = 3 left, all shipped
   assert.ok(shipped.headers.get('location')?.includes('fulfilled'), shipped.headers.get('location'));
@@ -2958,7 +2958,7 @@ await test('POST /orders/1001/backorder and /backorder/undo require auth (redire
 await test('backorder of a FULL line removes it from the Shopify order and snapshots everything an invoice needs', async () => {
   const cookie = await seedSession();
   const li = await boProbe(cookie, { qty: 4, price: 14, listPrice: 28, title: 'BO full' });
-  const res = await boFlag(cookie, { lineItemId: li, quantity: '4', eta: '2026-12-01' });
+  const res = await boFlag(cookie, { lineItemId: li, quantity: '4' });
   assert.equal(res.status, 302);
   assert.ok(locOf(res).includes('success=backorder_flagged'), locOf(res));
   assert.equal(await boQty(cookie, li), 0, 'the line is removed from the order (quantity 0)');
@@ -2968,7 +2968,7 @@ await test('backorder of a FULL line removes it from the Shopify order and snaps
     { status: row.status, qty: row.shopify_removed_qty, quantity: row.quantity, title: row.line_item_title, variant: row.variant_id,
       sku: row.sku, price: row.unit_price, currency: row.currency, eta: row.eta_date, by: row.created_by },
     { status: 'pending', qty: 4, quantity: 4, title: 'BO full', variant: 'gid://shopify/ProductVariant/350',
-      sku: 'BO-PROBE-1', price: '14.00', currency: 'USD', eta: '2026-12-01', by: 'alex@fuzzywumpets.com' });
+      sku: 'BO-PROBE-1', price: '14.00', currency: 'USD', eta: null, by: 'alex@fuzzywumpets.com' });
 });
 
 await test('backorder of a PARTIAL quantity lowers the line to current minus N and records only N', async () => {
@@ -2979,7 +2979,7 @@ await test('backorder of a PARTIAL quantity lowers the line to current minus N a
   assert.equal(await boQty(cookie, li), 7);
   const row = (await boRows(cookie)).find(b => b.line_item_id === li);
   assert.equal(row.shopify_removed_qty, 3);
-  assert.equal(row.eta_date, null, 'ETA is optional');
+  assert.equal(row.eta_date, null, 'no expected ship date is recorded');
 });
 
 await test('UNDO after a full removal re-adds the item as a NEW line at the STORED price (not the list price)', async () => {
@@ -3063,7 +3063,7 @@ await test('DOUBLE SUBMIT with the same idemKey removes the units once', async (
 await test('DOUBLE SUBMIT without a token (two identical requests at once) removes the units once', async () => {
   const cookie = await seedSession();
   const li = await boProbe(cookie, { qty: 10, title: 'BO concurrent' });
-  const fields = { lineItemId: li, quantity: '4', eta: '2026-11-15' };
+  const fields = { lineItemId: li, quantity: '4' };
   const [a, b] = await Promise.all([boFlag(cookie, fields), boFlag(cookie, fields)]);
   assert.ok(locOf(a).includes('success=backorder_flagged') && locOf(b).includes('success=backorder_flagged'), `${locOf(a)} | ${locOf(b)}`);
   assert.equal(await boQty(cookie, li), 6, 'removed once, not twice');
@@ -3088,8 +3088,6 @@ await test('quantity above the line, below 1, or not a whole number is rejected 
     const res = await boFlag(cookie, { lineItemId: li, quantity });
     assert.ok(locOf(res).includes('error=backorder_shopify_failed'), `quantity ${JSON.stringify(quantity)} -> ${locOf(res)}`);
   }
-  const badEta = await boFlag(cookie, { lineItemId: li, quantity: '1', eta: '2026-02-30' });
-  assert.ok(locOf(badEta).includes('error=backorder_shopify_failed'), `impossible ETA -> ${locOf(badEta)}`);
   const unknown = await boFlag(cookie, { lineItemId: 'gid://shopify/LineItem/nope', quantity: '1' });
   assert.ok(locOf(unknown).includes('error=backorder_shopify_failed'), locOf(unknown));
   const noLine = await boFlag(cookie, { quantity: '1' });
@@ -3098,15 +3096,29 @@ await test('quantity above the line, below 1, or not a whole number is rejected 
   assert.ok(!(await boRows(cookie)).some(b => b.line_item_id === li), 'and no row was written');
 });
 
+await test('a stale client that still posts an eta is accepted, and NO ETA is recorded (ignored, not validated)', async () => {
+  const cookie = await seedSession();
+  const li = await boProbe(cookie, { qty: 5, title: 'BO stale-eta' });
+  for (const eta of ['2026-12-24', 'not-a-date']) {            // even a malformed one must not reject the request
+    const l2 = eta === '2026-12-24' ? li : await boProbe(cookie, { qty: 5, title: 'BO stale-eta 2' });
+    const res = await boFlag(cookie, { lineItemId: l2, quantity: '2', eta });
+    assert.ok(locOf(res).includes('success=backorder_flagged'), `eta=${eta} -> ${locOf(res)}`);
+    assert.equal(await boQty(cookie, l2), 3);
+    assert.equal((await boRows(cookie)).find(b => b.line_item_id === l2).eta_date, null, 'no eta_date on a new row');
+  }
+});
+
 await test('a removed-units backorder appears in the /backorders queue and the admin API', async () => {
   const cookie = await seedSession();
   const li = await boProbe(cookie, { qty: 3, title: 'BO queue item' });
-  await boFlag(cookie, { lineItemId: li, quantity: '2', eta: '2026-12-24' });
+  await boFlag(cookie, { lineItemId: li, quantity: '2' });
   const page = await fetch(`${BASE}/backorders`, { headers: { Cookie: cookie } }).then(r => r.text());
   assert.ok(page.includes('BO queue item') && page.includes('#1001'), 'queue page lists it');
+  assert.ok(!/<th>ETA<\/th>/.test(page), 'the queue has no ETA column (expected ship date was removed)');
+  assert.ok(page.includes('<th>Flagged</th>') && page.includes('<th>By</th>'), 'the other columns are intact');
   const api = await fetch(`${BASE}/api/admin/backorders`, { headers: { Cookie: cookie } }).then(r => r.json());
   const row = api.backorders.find(b => b.line_item_id === li);
-  assert.ok(row && row.shopify_removed_qty === 2 && row.eta_date === '2026-12-24');
+  assert.ok(row && row.shopify_removed_qty === 2);
   assert.ok(locOf(await boUndo(cookie, li)).includes('success=backorder_restored'));
   const after = await fetch(`${BASE}/api/admin/backorders`, { headers: { Cookie: cookie } }).then(r => r.json());
   assert.ok(!after.backorders.some(b => b.line_item_id === li), 'undone rows leave the queue');
