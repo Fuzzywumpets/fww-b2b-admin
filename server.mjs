@@ -76,6 +76,7 @@ import { keepEditModeRedirects, keepEditClientPattern, EDIT_ANCHOR } from './lib
 import { assertNoUserErrors } from './lib/shopify-user-errors.mjs';
 import { currentShippingAmount, findShippingInvoice, parseShippingAmount, stageShippingReplacement } from './lib/order-shipping.mjs';
 import { createCreditCardInvoice } from './helcim.mjs';
+import { buildHelcimBillingAddress } from './lib/helcim-billing.mjs';
 // DEPENDS: lib/helcim-note.mjs is the text contract for the CC invoice email (subject keeps the
 //   #NNNNN token; the stored note body is plain text) and builds the Portal visible-note payload,
 //   including the structured `creditCardInvoice` object the Portal's Gmail sender consumes.
@@ -2340,7 +2341,8 @@ async function getOrderDetail(numericId, { throwOnError = false } = {}) {
         totalReceivedSet{presentmentMoney{amount currencyCode}}
         note tags
         shippingAddress{company firstName lastName address1 address2 city province zip country phone}
-        billingAddress{company firstName lastName address1 address2 city province zip country}
+        # SYNC: lib/helcim-billing.mjs reads exactly these billingAddress fields (provinceCode, countryCodeV2, phone were added for the Helcim invoice).
+        billingAddress{company firstName lastName address1 address2 city province provinceCode zip country countryCodeV2 phone}
         lineItems(first:250){pageInfo{hasNextPage endCursor} edges{node{id title quantity currentQuantity unfulfilledQuantity
           variant{id title sku barcode selectedOptions{name value} price inventoryQuantity product{id title}}
           discountedUnitPriceSet{presentmentMoney{amount currencyCode}}
@@ -6741,7 +6743,7 @@ app.post('/orders/:id/shipping-address', requireAuth, async (req, res) => {
 
 // WHAT: creates (or reuses) a DUE Helcim invoice for the order's exact outstanding balance, then asks the Portal to email its secure online-payment link — via Gmail (From help@, Reply-To wholesale@fuzzywumpets.com — the Portal owns the identity) when the Portal understands `creditCardInvoice` (no forced "Re:" subject prefix), via Re:amaze on an older Portal.
 // CHANGE-GUARD: the helcim_invoice_map write MUST happen before the email attempt; on delivery failure a retry reuses that invoice rather than creating a duplicate bill. JSON callers receive a non-2xx on every failure; form callers receive a truthful warning flash.
-// INVARIANT(S): no card data touches this app; paid/zero-balance orders and orders without customer email are rejected; audit rows never contain the invoice token or online-view URL.
+// INVARIANT(S): no card data touches this app; paid/zero-balance orders and orders without customer email are rejected; audit rows never contain the invoice token or online-view URL. The order's billing name/address/email is sent to Helcim (lib/helcim-billing.mjs; omitted when incomplete, dropped by helcim.mjs if Helcim refuses it) and is never logged or audited — only the boolean `billingIncluded` is.
 // DEPENDS: Portal /__internal__/visible-note accepts the optional `subject` and the structured `creditCardInvoice` { orderName, amount, currency, payUrl, staffNote } passed here (Portal gmail-invoice.mjs validateCreditCardInvoiceInput is the receiving contract; payUrl must be on the allow-listed fuzzywumpets.myhelcim.com host); lib/helcim-note.mjs is the shared text contract (subject keeps #NNNNN token; body is plain text, note lines prefixed "> "). Deploy order: Portal first — an older Portal ignores creditCardInvoice and falls back to the Re:amaze email.
 app.post('/orders/:id/send-credit-card-invoice', requireAuth, async (req, res) => {
   const numId = req.params.id;
@@ -6771,15 +6773,22 @@ app.post('/orders/:id/send-credit-card-invoice', requireAuth, async (req, res) =
     return fail(409, `The existing Helcim invoice is for ${fmtMoney(invoice.amount)} ${invoice.currency}, but the current balance is ${fmtMoney(outstanding)} ${currency}. Resolve the existing invoice in Helcim before sending another.`);
   }
 
+  // Customer name/address/email for the Helcim invoice (null => none sent, the invoice is exactly as before). Customer PII:
+  // it goes to Helcim only and is never logged or written to an audit row.
+  const billingAddress = buildHelcimBillingAddress({ billingAddress: order.billingAddress, customer: order.customer });
+  // null on a resend (the stored invoice is reused, nothing is sent to Helcim); otherwise whether Helcim kept the address.
+  let billingIncluded = null;
+
   try {
     if (!invoice) {
       const created = MOCK
         ? {
             invoiceId: `mock-helcim-${numId}`, invoiceNumber: `MOCK-${numId}`,
             token: `mock-token-${numId}`, url: `https://fuzzywumpets.myhelcim.com/order/?token=mock-token-${numId}`,
-            amount: outstanding, currency,
+            amount: outstanding, currency, billingIncluded: !!billingAddress,
           }
-        : await createCreditCardInvoice({ orderName: order.name, amount: outstanding, currency });
+        : await createCreditCardInvoice({ orderName: order.name, amount: outstanding, currency, billingAddress, companyName: order.customer?.company });
+      billingIncluded = created.billingIncluded === true;
       // SYNC: db.mjs helcim_invoice_map is the retry ledger for this exact write-before-send ordering.
       invoice = upsertHelcimInvoiceMap(orderGid, created);
     }
@@ -6808,13 +6817,13 @@ app.post('/orders/:id/send-credit-card-invoice', requireAuth, async (req, res) =
     setHelcimInvoiceDelivery(orderGid, 'sent');
     auditLog(req.adminSession.email, 'helcim_invoice_sent', orderGid, null, {
       invoiceId: invoice.invoice_id, invoiceNumber: invoice.invoice_number,
-      amount: outstanding, currency, customerEmail, reused,
+      amount: outstanding, currency, customerEmail, reused, billingIncluded,
       hasNote: !!staffNote, ...(staffNote ? { note: staffNote } : {}),
     });
     if (wantsJson) {
       return res.json({
         ok: true, status: reused ? 'resent' : 'sent',
-        invoice: { invoiceId: invoice.invoice_id, invoiceNumber: invoice.invoice_number, amount: outstanding, currency },
+        invoice: { invoiceId: invoice.invoice_id, invoiceNumber: invoice.invoice_number, amount: outstanding, currency, billingIncluded },
         email: { sent: true, to: customerEmail },
       });
     }

@@ -2048,6 +2048,9 @@ await test('POST /orders/1001/send-credit-card-invoice (JSON) → creates and em
   assert.ok(j.invoice.amount > 0);
   assert.equal(j.invoice.currency, 'USD');
   assert.deepEqual(j.email, { sent: true, to: 'buyer@acme.com' });
+  // Mock #1001 has a full billing address, so the route must have built one for the Helcim invoice (the real
+  // request body is pinned in test/helcim.test.mjs; this pins that the route derives it from the order).
+  assert.equal(j.invoice.billingIncluded, true);
 });
 
 await test('POST /orders/1001/send-credit-card-invoice with form-encoded note → 302 success', async () => {
@@ -2073,6 +2076,9 @@ await test('POST /orders/1001/send-credit-card-invoice with JSON note → 200 ok
   assert.equal(res.status, 200);
   const j = await res.json();
   assert.equal(j.ok, true);
+  // A resend reuses the stored invoice; nothing was sent to Helcim this time, so there is nothing to report.
+  assert.equal(j.status, 'resent');
+  assert.equal(j.invoice.billingIncluded, null);
 });
 
 await test('POST /orders/1001/send-credit-card-invoice with over-long note → truncated, not rejected', async () => {

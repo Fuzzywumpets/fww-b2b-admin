@@ -93,6 +93,23 @@ The Helcim credit-card invoice action additionally requires `HELCIM_API_TOKEN` a
 `HELCIM_SUBDOMAIN_URL` (`https://fuzzywumpets.myhelcim.com`) from the shared Doppler config. The API
 token remains server-side; customers receive only Helcim's per-invoice online-view URL.
 
+The Helcim invoice also carries the customer's **billing name, address and email** (`billingAddress` on
+`POST /invoices`), so the invoice in the Helcim dashboard and on the pay page says who it is for rather
+than only "Fuzzywumpets wholesale order #1234" in the notes. Source: the Shopify order's `billingAddress`
+plus `customer.email`, mapped by `lib/helcim-billing.mjs` (name = billing company, else customer company,
+else person; US/CA province must be 2 letters; country is ISO alpha-3; phone 10-15 digits). Rules worth
+knowing: if the order has no usable billing address (Helcim requires name, street and postal code) the
+invoice is created exactly as before; if Helcim answers 400/422 to the address, `helcim.mjs` retries
+**once** without it (any other failure is never retried, since it may have created the invoice); the
+address is customer PII and goes to Helcim only, never to logs or audit rows (the audit row records just
+`billingIncluded`). The `getOrderDetail` billing selection must keep `provinceCode`, `countryCodeV2` and
+`phone`; `test/helcim-billing.test.mjs` pins that. A Helcim *customer record* (`customerId`) is not created:
+that would need the Customers permission on the API token and a duplicate-handling policy.
+The company name (`order.customer.company`, the same resolved field the invoice PDF's BILL TO uses) is also
+appended to the invoice **notes** (`Fuzzywumpets wholesale order #1234 - Acme Pet Supply`), so it is on the
+invoice even when the billing address is incomplete or Helcim refuses it. Nothing parses those notes; the
+paid-sync matches invoices by id/number.
+
 ```sh
 P=$(systemctl show -p MainPID --value <unit>)
 C=$(pgrep -P $P -f node | head -1)   # MainPID is doppler/bash; the CHILD holds the env
