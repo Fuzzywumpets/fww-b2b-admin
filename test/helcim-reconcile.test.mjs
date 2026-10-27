@@ -127,7 +127,7 @@ await test('a missing order, or a currency mismatch with Shopify, is flagged', (
 // ── syncHelcimPayment: the orchestrator, against fakes ───────────────────────────────────────────────────────
 console.log('\n  syncHelcimPayment');
 
-function harness({ ledger = ledgerRow(), inv = invoice(), ord = order(), ordSecond, markResult = { ok: true }, claimOk = true, throwInvoice = null } = {}) {
+function harness({ ledger = ledgerRow(), inv = invoice(), ord = order(), ordSecond, markResult = { ok: true }, claimOk = true, throwInvoice = null, throwAudit = null, throwOnPaidSynced = null } = {}) {
   const calls = { invoice: 0, order: 0, mark: 0, claim: 0 };
   const audits = [];
   const state = { ...ledger };
@@ -136,11 +136,11 @@ function harness({ ledger = ledgerRow(), inv = invoice(), ord = order(), ordSeco
   const deps = {
     getLedger: (gid) => (gid === GID && ledger ? { ...state } : null),
     claim: () => { calls.claim++; if (!claimOk) return false; state.paid_state = 'syncing'; return true; },
-    setState: (gid, patch) => { patches.push(patch); Object.assign(state, patch); },
+    setState: (gid, patch) => { if (throwOnPaidSynced && patch.paid_state === 'paid_synced') throw throwOnPaidSynced; patches.push(patch); Object.assign(state, patch); },
     fetchInvoice: async () => { calls.invoice++; if (throwInvoice) throw throwInvoice; return inv; },
     fetchOrder: async () => orders[Math.min(calls.order++, 1)],
     markOrderPaid: async () => { calls.mark++; return markResult; },
-    audit: (actor, action, gid, before, after) => audits.push({ actor, action, gid, after }),
+    audit: (actor, action, gid, before, after) => { if (throwAudit) throw throwAudit; audits.push({ actor, action, gid, after }); },
     now: () => 1_793_000_000_000,
   };
   return { deps, calls, audits, state, patches };
@@ -275,6 +275,33 @@ await test('a Helcim/network failure leaves state=error (retryable), never stuck
   assert.equal(r.outcome, 'error');
   assert.equal(h.state.paid_state, 'error');
   assert.equal(h.calls.mark, 0);
+});
+
+// Found by DeepReview 2026-10-27: once Shopify has said ok, a failing audit/ledger write must never turn the result into an
+// 'error' ("nothing was marked paid") — that would be a lie about money that really moved.
+await test('AFTER A SUCCESSFUL SHOPIFY WRITE: an audit failure still reports "synced" (with a warning), keeps paid_synced, writes Shopify once', async () => {
+  const h = harness({ throwAudit: new Error('SQLITE_FULL: database or disk is full') });
+  const r = await syncHelcimPayment(GID, h.deps, { actor: 'a' });
+  assert.equal(r.outcome, 'synced');
+  assert.match(r.warning, /could not be (fully )?saved|not be recorded/i);
+  assert.equal(h.calls.mark, 1);
+  assert.equal(h.state.paid_state, 'paid_synced', 'the success record must not be downgraded to error');
+  assert.equal(h.patches.some(p => p.paid_state === 'error'), false);
+});
+
+await test('AFTER A SUCCESSFUL SHOPIFY WRITE: a ledger write failure still reports "synced"; the next check finds the order paid and does NOT write Shopify again', async () => {
+  const h = harness({ throwOnPaidSynced: new Error('SQLITE_BUSY') });
+  const r = await syncHelcimPayment(GID, h.deps, { actor: 'a' });
+  assert.equal(r.outcome, 'synced');
+  assert.ok(r.warning);
+  assert.equal(h.calls.mark, 1);
+  assert.equal(h.state.paid_state, 'syncing', 'the claim is left to expire; it is never rewritten to error');
+  // The claim expires; the next sync reads Shopify, sees the order PAID, and records it instead of writing again.
+  h.deps.fetchOrder = async () => order({ financialStatus: 'PAID', outstanding: 0 });
+  h.deps.setState = (gid, patch) => Object.assign(h.state, patch);
+  const again = await syncHelcimPayment(GID, h.deps, { actor: 'a' });
+  assert.equal(again.outcome, 'already_paid');
+  assert.equal(h.calls.mark, 1, 'no second orderMarkAsPaid');
 });
 
 await test('INVARIANT: no outcome ever leaves the ledger in "syncing"', async () => {
