@@ -194,5 +194,32 @@ await test('REGRESSION: a reply with no orderMarkAsPaid payload is a failure, no
   assert.deepEqual(statuses, {}, 'no status is invented when the payload carried none');
 });
 
+// The "payment received" email (lib/payment-notice.mjs) reads each paid order's name + current total from here.
+await test('each paid order\'s payload `order` is handed back in `orders` (name + currentTotalPriceSet); a refused order is absent', async () => {
+  const money = { presentmentMoney: { amount: '12.50', currencyCode: 'USD' } };
+  const shopifyFetch = async (_q, vars) => {
+    const bad = vars.input.id.endsWith('/2002');
+    return { data: { orderMarkAsPaid: {
+      order: bad ? null : { id: vars.input.id, name: `#${vars.input.id.split('/').pop()}`, displayFinancialStatus: 'PAID', currentTotalPriceSet: money },
+      userErrors: bad ? [{ field: null, message: 'Order cannot be marked as paid.' }] : [],
+    } } };
+  };
+  const { paid, orders } = await bulkMarkOrdersPaid({ shopifyFetch, ids: ['2001', '2002', '2003'], toGid });
+  assert.deepEqual(paid, ['2001', '2003']);
+  assert.deepEqual(Object.keys(orders), ['2001', '2003']);
+  assert.equal(orders['2001'].name, '#2001');
+  assert.deepEqual(orders['2003'].currentTotalPriceSet, money);
+});
+
+await test('ORDER_MARK_AS_PAID_MUTATION selects what the notice needs and is the one document both Mark Paid paths send', async () => {
+  const { ORDER_MARK_AS_PAID_MUTATION } = await import('../lib/order-money.mjs');
+  assert.match(ORDER_MARK_AS_PAID_MUTATION, /mutation orderMarkAsPaid\(\$input:OrderMarkAsPaidInput!\)/);
+  assert.match(ORDER_MARK_AS_PAID_MUTATION, /\bname\b/);
+  assert.match(ORDER_MARK_AS_PAID_MUTATION, /currentTotalPriceSet\{ presentmentMoney\{ amount currencyCode \} \}/);
+  assert.match(ORDER_MARK_AS_PAID_MUTATION, /userErrors\{ field message \}/);
+  const server = (await import('node:fs')).readFileSync(new URL('../server.mjs', import.meta.url), 'utf8');
+  assert.ok(server.includes('shopifyFetch(ORDER_MARK_AS_PAID_MUTATION,'), 'POST /orders/:id/mark-paid must use the shared document, not its own copy');
+});
+
 console.log(`\n  ${passed} passed, ${failed} failed`);
 process.exit(failed > 0 ? 1 : 0);

@@ -66,8 +66,9 @@ import { refreshCustomerFromShopify, syncRecentCustomers } from './lib/customer-
 import { drainDashboardOrders, drainLowStockItems, drainCustomerSpendOrders } from './lib/dashboard-paging.mjs';
 import { renderLabelSheet, expandItems, TEMPLATES as LABEL_TEMPLATES, DEFAULT_FIELDS } from './labels.mjs';
 import { isInsider, resolveXeroContact, syncCustomerToXero, getXeroSyncStatus } from './lib/xero-customer-sync.mjs';
-import { parseLinePrices, applyLinePriceChanges, bulkMarkOrdersPaid, addLineDiscountsConcurrent } from './lib/order-money.mjs';
+import { parseLinePrices, applyLinePriceChanges, bulkMarkOrdersPaid, addLineDiscountsConcurrent, ORDER_MARK_AS_PAID_MUTATION } from './lib/order-money.mjs';
 import { buildPaidNoteLine } from './lib/paid-note.mjs';
+import { createPaymentNotifier, orderNoticeFields } from './lib/payment-notice.mjs';
 import { resolveOrderCompany, buildOrderAddresses } from './lib/order-company.mjs';
 // DEPENDS: lib/edit-mode-resume.mjs — keeps staff in edit mode across the order page's POST -> redirect -> GET
 // round trips (see its header). Mounted below with app.use('/orders', ...); the client half is in editModeScript.
@@ -372,7 +373,8 @@ function getActiveCartFromPortal(numericCustomerId) {
 // WHAT: server-to-server call into the portal's internal API (PORTAL_INTERNAL_URL, default 127.0.0.1:8793) with a Bearer PORTAL_INTERNAL_TOKEN; the ONLY write path into the portal (vs read-only SQLite above).
 // CHANGE-GUARD: returns { ok:false, error:'no_internal_token' } when the token env is unset — callers must check .ok, not assume success. Network errors are caught and returned as ok:false (never throws).
 // INVARIANT(S): token must match the portal's expected internal secret; on localhost only — do NOT point PORTAL_INTERNAL_URL at a public host without TLS since the bearer is sent in cleartext otherwise.
-async function callPortalInternal(method, path, body) {
+// DEPENDS: the optional 4th argument { timeoutMs } is used only by the payment-notice caller below; every other caller passes 3 arguments and keeps the old no-timeout behaviour.
+async function callPortalInternal(method, path, body, { timeoutMs } = {}) {
   if (!PORTAL_INTERNAL_TOKEN) return { ok: false, error: 'no_internal_token' };
   try {
     const r = await fetch(`${PORTAL_INTERNAL_URL}${path}`, {
@@ -382,6 +384,7 @@ async function callPortalInternal(method, path, body) {
         'Content-Type': 'application/json',
       },
       body: body ? JSON.stringify(body) : undefined,
+      ...(timeoutMs ? { signal: AbortSignal.timeout(timeoutMs) } : {}),
     });
     const j = await r.json();
     return { ok: r.ok, ...j };
@@ -389,6 +392,22 @@ async function callPortalInternal(method, path, body) {
     return { ok: false, error: String(e) };
   }
 }
+
+// WHAT: the "payment received" notifier (lib/payment-notice.mjs) wired to this server: calls the Portal's
+// POST /__internal__/payment-notice through callPortalInternal, audits failures into admin_audit_log, and is OFF in MOCK
+// (there is no Portal there) and when PAYMENT_NOTICE_DISABLED=1 (kill switch, no redeploy of code needed).
+// CHANGE-GUARD: call sites invoke `paymentNotifier.notify(...)` WITHOUT await, after the Shopify call succeeded and the
+// audit row is written - a slow Portal/Gmail (up to ~14 s) must never delay or fail the staff member's redirect. The 20 s
+// timeout only frees the socket; it does not decide delivery. Staff-recorded payments ONLY: never call it from the Helcim
+// paid-sync path (Helcim's own merchant copy covers card-invoice payments; calling it there double-notifies).
+// DEPENDS: Portal POST /__internal__/payment-notice (deploy the Portal first); B2B_PORTAL_INTERNAL_TOKEN must be set (else
+// every notice is audited as payment_notice_failed with 'no_internal_token').
+const paymentNotifier = createPaymentNotifier({
+  enabled: !MOCK && process.env.PAYMENT_NOTICE_DISABLED !== '1',
+  callPortal: (body) => callPortalInternal('POST', '/__internal__/payment-notice', body, { timeoutMs: 20_000 }),
+  audit: ({ email, action, target, after }) => auditLog(email, action, target, null, after),
+  log: (...args) => console.error(...args),
+});
 
 // ── Xero accounting integration ───────────────────────────────────────────────
 
@@ -1587,6 +1606,8 @@ function summarizeAudit(action, afterJson) {
     case 'xero:invoice_failed':    return 'Xero invoice sync failed';
     case 'helcim_invoice_sent':    return `sent a Helcim credit card invoice${after.amount != null ? ` for ${fmtMoney(after.amount)}` : ''}`;
     case 'helcim_invoice_email_failed': return 'created a Helcim invoice, but email delivery failed';
+    // DEPENDS: lib/payment-notice.mjs audits this when the owner's "payment received" email could not be sent (the payment itself went through).
+    case 'payment_notice_failed':  return 'recorded the payment, but the "payment received" email to the owner could not be sent';
     default:                       return String(action || 'activity').replace(/[/_:]/g, ' ');
   }
 }
@@ -6414,7 +6435,7 @@ app.post('/orders/bulk', requireAuth, async (req, res) => {
   if (!idList.length) return res.redirect('/orders?error=mark_paid_none');
   if (action !== 'mark-paid') return res.redirect('/orders?error=bulk_unknown_action');
 
-  let paid = [], failed = [], statuses = {};
+  let paid = [], failed = [], statuses = {}, paidOrders = {};
   if (MOCK) {
     for (const numId of idList) {
       const prev = mockOrderOverrides.get(numId) || {};
@@ -6428,7 +6449,7 @@ app.post('/orders/bulk', requireAuth, async (req, res) => {
       paid.push(String(numId));
     }
   } else {
-    ({ paid, failed, statuses } = await bulkMarkOrdersPaid({
+    ({ paid, failed, statuses, orders: paidOrders } = await bulkMarkOrdersPaid({
       shopifyFetch, ids: idList, toGid: shopifyOrderGid,
       log: (...args) => console.error(...args),
     }));
@@ -6437,6 +6458,12 @@ app.post('/orders/bulk', requireAuth, async (req, res) => {
   // moved to PAID, or the audit trail asserts payment for orders that stayed unpaid.
   for (const numId of paid) auditLog(req.adminSession.email, 'mark_paid', shopifyOrderGid(numId), null, null);
   for (const numId of paid) notePaidManually(numId, req.adminSession.email);
+  // "Payment received" email to the owner: ONE digest for the whole bulk action (not N mails), only for orders Shopify
+  // really marked paid, only AFTER their audit rows exist, and not awaited (fail-open; see paymentNotifier).
+  void paymentNotifier.notify({
+    source: 'mark_paid_bulk', actorEmail: req.adminSession.email,
+    orders: paid.map(numId => orderNoticeFields(numId, paidOrders[numId])),
+  });
   // DEPENDS: GET /orders is served from orders_cache (getOrdersData) and the Shopify orders/updated webhook only
   // refreshes it 2-3 s after the mutation, but the redirect below is immediate — so write the new status through
   // now, or the page that says "marked as paid" shows the same order PENDING (2026-10-27, #39748). Fail-open: a
@@ -6540,22 +6567,26 @@ app.get('/orders/:id', requireAuth, async (req, res) => {
 // INVARIANT(S): Shopify userErrors abort with ?error before any Xero work; isInsider(customerId) must short-circuit Xero (insiders never post to accounting); this single-order path DOES record Xero payment whereas /orders/bulk mark-paid does NOT.
 app.post('/orders/:id/mark-paid', requireAuth, async (req, res) => {
   const numId = req.params.id;
+  let paidOrder = null;
   if (MOCK) {
     const prev = mockOrderOverrides.get(numId) || {};
     mockOrderOverrides.set(numId, { ...prev, displayFinancialStatus: 'PAID' });
   } else {
     try {
-      const r = await shopifyFetch(`mutation orderMarkAsPaid($input:OrderMarkAsPaidInput!){
-        orderMarkAsPaid(input:$input){ order{id displayFinancialStatus} userErrors{field message} }
-      }`, { input: { id: shopifyOrderGid(numId) } });
+      const r = await shopifyFetch(ORDER_MARK_AS_PAID_MUTATION, { input: { id: shopifyOrderGid(numId) } });
       const ue = r.data?.orderMarkAsPaid?.userErrors || [];
       if (ue.length) return res.redirect(`/orders/${numId}?error=${encodeURIComponent(ue[0].message)}`);
+      paidOrder = r.data?.orderMarkAsPaid?.order || null;
     } catch (err) {
       return res.redirect(`/orders/${numId}?error=${encodeURIComponent(err.message)}`);
     }
   }
   auditLog(req.adminSession.email, 'mark_paid', shopifyOrderGid(numId), null, null);
   notePaidManually(numId, req.adminSession.email);
+  // "Payment received" email to the owner: after Shopify accepted it and the audit row exists; not awaited (fail-open).
+  void paymentNotifier.notify({
+    source: 'mark_paid', actorEmail: req.adminSession.email, orders: [orderNoticeFields(numId, paidOrder)],
+  });
 
   // Trigger Xero payment recording (non-blocking — queue on failure)
   (async () => {
@@ -8928,7 +8959,7 @@ app.post('/orders/:id/record-payment', requireAuth, async (req, res) => {
   try {
     // Re-fetch the FRESH outstanding right before mutating (don't trust the page prefill —
     // an in-flight auto-save edit may have changed the order total since render).
-    const freshRes = await shopifyFetch(`query($id:ID!){order(id:$id){displayFinancialStatus totalOutstandingSet{presentmentMoney{amount currencyCode}}}}`, { id: orderId });
+    const freshRes = await shopifyFetch(`query($id:ID!){order(id:$id){name displayFinancialStatus totalOutstandingSet{presentmentMoney{amount currencyCode}}}}`, { id: orderId });
     const fo = freshRes.data?.order;
     if (!fo) return res.redirect(`/orders/${numId}?error=payment_failed&msg=${encodeURIComponent('Order not found.')}`);
     const outstanding = Math.max(0, parseFloat(fo.totalOutstandingSet?.presentmentMoney?.amount || 0) || 0);
@@ -8951,6 +8982,12 @@ app.post('/orders/:id/record-payment', requireAuth, async (req, res) => {
       return res.redirect(`/orders/${numId}?error=payment_failed&msg=${encodeURIComponent(msg.slice(0, 200))}`);
     }
     auditLog(session.email, 'record_manual_payment', orderId, null, { amount: amountProvided ? amt.toFixed(2) : 'full_outstanding', paymentMethod: method, note, processedAt });
+    // "Payment received" email to the owner (after Shopify accepted it and the audit row exists; not awaited, fail-open).
+    // The amount is the FRESH outstanding balance this action just settled (Record payment always clears the full balance).
+    void paymentNotifier.notify({
+      source: 'record_payment', actorEmail: session.email, paymentMethod: method,
+      orders: [{ orderId: String(numId), orderName: fo.name || `#${numId}`, amount: outstanding, currency: fo.totalOutstandingSet?.presentmentMoney?.currencyCode }],
+    });
     return res.redirect(`/orders/${numId}?success=payment_recorded`);
   } catch (err) {
     console.error('record-payment error:', err.message);
