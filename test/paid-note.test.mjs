@@ -121,5 +121,24 @@ await test('past the 4000-char cap the NEWEST line is kept and the oldest whole 
   assert(!body.startsWith('x'), 'must not start mid-line: ' + body.slice(0, 20));
 });
 
+// DeepReview (2026-10-27) suspected the cap could cut or drop the NEWEST line. These pin the two shapes it named.
+await test('cap: a 3990-char note with NO newline + a 200-char line keeps the whole new line (the old run-on is what goes)', () => {
+  const line = `[2026-10-27 17:13 UTC] ${'N'.repeat(177)}`;                    // 200 chars
+  assertEqual(line.length, 200);
+  setOrderInternalNote('7005', 'o'.repeat(3990), 'a@b.co');
+  appendOrderInternalNote('7005', line, 'a@b.co');
+  assertEqual(getOrderInternalNote('7005').body, line, 'the stored note must be exactly the new line');
+});
+
+await test('cap: the separator newline right before a long new line is not mistaken for the cut point', () => {
+  const line = 'L'.repeat(380);
+  setOrderInternalNote('7006', `${'a'.repeat(100)}\n${'b'.repeat(3600)}`, 'a@b.co');   // 3701 chars; +1 +380 > 4000
+  appendOrderInternalNote('7006', line, 'a@b.co');
+  const body = getOrderInternalNote('7006').body;
+  assert(body.length <= 4000, 'over the cap: ' + body.length);
+  assert(body.endsWith(line), 'newest line must be whole at the end');
+  assert(!body.includes('a'.repeat(10)), 'the oldest line was dropped whole, not left as a fragment');
+});
+
 console.log(`\n  ${passed} passed, ${failed} failed`);
 process.exit(failed > 0 ? 1 : 0);
