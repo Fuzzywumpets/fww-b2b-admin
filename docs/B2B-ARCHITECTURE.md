@@ -230,6 +230,18 @@ Traps:
   `POST /orders/:id/mark-paid` (order page) records it in Xero but does not touch `orders_cache` (it
   redirects to the order page, which reads Shopify live, so only the list is stale for the 2–3 s webhook
   window). Neither notifies anyone — a "payment received" notification is a separate, undecided item.
+  Both paths leave the same breadcrumb on the order itself: a `[date UTC] Marked paid manually by <who>`
+  line **appended** to the **Admin-only** order note (`order_internal_notes`, via `notePaidManually` →
+  `lib/paid-note.mjs`), plus the `mark_paid` audit row, which the order history shows as "marked the order
+  paid manually". It is deliberately **not** the Shopify order note (that holds customer instructions and
+  reaches packing slips and the CSV export). Only an order Shopify accepted is annotated; a note failure
+  never fails the payment. If a Helcim card invoice is linked to the order the line names its number and says
+  the click did not check it with Helcim — a manual click proves nothing about Helcim, and the customer could
+  still pay that invoice. The Helcim-confirmed form (`Paid by card via Helcim: transaction <id>…`) exists in
+  `buildPaidNoteLine({source:'helcim'})` for the Helcim paid-sync to call; nothing calls it yet, and the sync
+  does not currently read a transaction id from Helcim (`getInvoice` returns status/amount/currency only).
+  Per Helcim's Invoices docs the invoice object carries no transactions; the id comes from the card-transactions
+  endpoint filtered by `invoiceNumber`, so the sync needs that second read before it can write the Helcim form.
 - The Electron installer is unsigned; a real CA certificate is needed for it to install anywhere.
   Note `electron-updater` compares the cert subject against `win.publisherName` and refuses
   mismatched updates — so changing certs later orphans existing installs. Do it once, properly.

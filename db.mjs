@@ -643,6 +643,27 @@ export function setOrderInternalNote(orderId, body, email) {
   `).run(String(orderId), String(body).slice(0, 4000), Date.now(), email || '');
 }
 
+// WHAT: add ONE line under whatever staff already wrote in the Admin-only order note (used by Mark Paid to leave its
+//   "marked paid manually" breadcrumb). Returns 1 when a line was written, 0 for a blank line.
+// CHANGE-GUARD: setOrderInternalNote cuts at 4000 chars FROM THE END, which would silently drop the newest line, so
+//   when the note would pass the cap the OLDEST whole lines are dropped instead and the new line always survives.
+// INVARIANT(S): never replaces existing text; read + write happen in one synchronous tick (better-sqlite3), so two
+//   appends cannot interleave; updated_by becomes the appender (the same as any other edit of the note).
+export function appendOrderInternalNote(orderId, line, email) {
+  const add = String(line ?? '').trim();
+  if (!add) return 0;
+  const MAX = 4000;
+  const current = (getOrderInternalNote(orderId)?.body || '').replace(/\s+$/, '');
+  let body = current ? `${current}\n${add}` : add;
+  if (body.length > MAX) {
+    body = body.slice(body.length - MAX);
+    const nl = body.indexOf('\n');                       // start on a line boundary, not mid-line
+    if (nl !== -1 && nl < body.length - 1) body = body.slice(nl + 1);
+  }
+  setOrderInternalNote(orderId, body, email);
+  return 1;
+}
+
 export function getDropshipCache(customerId) {
   return db.prepare('SELECT * FROM dropship_config_cache WHERE customer_id = ?').get(customerId) || null;
 }

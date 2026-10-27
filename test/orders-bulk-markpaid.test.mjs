@@ -68,6 +68,10 @@ CACHED.forEach((o, i) => db.upsertOrderCache({
   financial_status: o.status, display_financial_status: o.status, fulfillment_status: 'UNFULFILLED',
   total_price: 10 + i, currency: 'USD',
 }));
+// For the "marked paid manually" note: 40002 already carries a staff note (must be appended to, never replaced) and
+// 40001 has a Helcim invoice on file (its number may appear in the note; its token/pay URL must never).
+db.setOrderInternalNote('40002', 'Customer asked for net-30', 'sam@example.com');
+db.upsertHelcimInvoiceMap('gid://shopify/Order/40001', { invoiceId: '55', invoiceNumber: 'INV001003', token: 'SECRET-TOKEN-xyz', url: 'https://secure.example.test/pay/SECRET', amount: 10, currency: 'USD' });
 
 const port = await freePort();
 const base = `http://127.0.0.1:${port}`;
@@ -97,6 +101,7 @@ const fakeState = () => JSON.parse(fs.readFileSync(`${logFile}.state.json`, 'utf
 const readDb = (fn) => { const d = new Database(path.join(dataDir, 'admin.db'), { readonly: true }); try { return fn(d); } finally { d.close(); } };
 const auditPaid = () => readDb(d => d.prepare("SELECT target FROM admin_audit_log WHERE action = 'mark_paid' ORDER BY id").all().map(r => r.target.split('/').pop()));
 const cachedStatus = (id) => readDb(d => d.prepare('SELECT financial_status FROM orders_cache WHERE shopify_id = ?').get(String(id))?.financial_status);
+const internalNote = (id) => readDb(d => d.prepare('SELECT body, updated_by FROM order_internal_notes WHERE order_id = ?').get(String(id)));
 const post = (body) => fetch(`${base}/orders/bulk`, {
   method: 'POST', redirect: 'manual',
   headers: { Cookie: `b2b_admin_sid=${sid}`, 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -169,6 +174,23 @@ await test('a refused order (Shopify says already paid) shows the ERROR banner, 
   } finally { await ctx.close(); }
 });
 
+// ALEX 2026-10-27: "a note left that it was parked paid manually". Mark Paid writes one line into the Admin-only
+// order note (NOT the Shopify note, which holds customer instructions). By this point 40001 and 40002 were marked
+// paid by the REGRESSION test above and 40003 was refused.
+await test('Mark Paid leaves a "Marked paid manually by <who>" line in the Admin-only note; a refused order gets none', () => {
+  const n1 = internalNote(40001);
+  assert.ok(n1, 'order 40001 was marked paid, so it needs a note');
+  assert.match(n1.body, /^\[\d{4}-\d\d-\d\d \d\d:\d\d UTC\] Marked paid manually by tester@example\.com/, n1.body);
+  assert.equal(n1.updated_by, EMAIL);
+  assert.ok(n1.body.includes('INV001003') && /not check/i.test(n1.body), 'a linked Helcim invoice is named, and the note says it was not checked: ' + n1.body);
+  assert.ok(!n1.body.includes('SECRET') && !n1.body.includes('http'), 'the Helcim token / pay URL must never reach a note: ' + n1.body);
+  const n2 = internalNote(40002);
+  assert.ok(n2.body.startsWith('Customer asked for net-30\n'), 'an existing staff note must be kept, not replaced: ' + n2.body);
+  assert.ok(/Marked paid manually by tester@example\.com/.test(n2.body), n2.body);
+  assert.ok(!/helcim/i.test(n2.body), 'no Helcim invoice on 40002, so no Helcim wording: ' + n2.body);
+  assert.equal(internalNote(40003), undefined, 'Shopify refused 40003 (already paid): it must not be annotated as marked paid');
+});
+
 await test('a request that marks nothing never gets the success banner (no ids)', async () => {
   const before = markCalls().length;
   const res = await post({ action: 'mark-paid' });
@@ -203,6 +225,7 @@ await test('FAIL-OPEN: an order that is in Shopify but not in orders_cache still
   assert.ok(auditPaid().includes('40005'));
   assert.equal(cachedStatus(40005), undefined, 'the write-through must not invent a cache row');
   assert.ok(!/write-through failed/.test(serverOut), 'a missing cache row is normal, not an error: ' + serverOut);
+  assert.match(internalNote(40005)?.body || '', /Marked paid manually by/, 'the note does not depend on the cache row existing');
 });
 
 await browser.close();
