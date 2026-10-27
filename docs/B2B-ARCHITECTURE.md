@@ -124,6 +124,45 @@ caller's human email so the audit trail names a person, not the tool; and note t
 `admin_audit_log.admin_customer_id` is `NOT NULL`, so internal callers pass a `system:b2badmin`
 sentinel — passing `null` throws and 500s the request.
 
+### `visible-note` and the credit-card invoice email
+
+`POST /__internal__/visible-note` stores a customer-visible order note and optionally emails it
+(`emailCustomer`, default true). Ordinary notes go out through Re:amaze (`sendAs`, optional `subject`).
+The **Send Credit Card Invoice** button (`POST /orders/:id/send-credit-card-invoice`) additionally
+passes a structured **`creditCardInvoice`** object, which switches the Portal to a direct Gmail send:
+
+```
+creditCardInvoice: { orderName, amount, currency, payUrl, staffNote }
+```
+
+- Producer: Admin `lib/helcim-note.mjs` `buildCreditCardInvoicePayload`. Receiver: Portal
+  `gmail-invoice.mjs` `validateCreditCardInvoiceInput`. The Portal validates the shape and answers
+  **400 before storing anything** (`orderName` string ≤100, `amount` finite ≥0, `currency` three
+  uppercase letters, `staffNote` ≤500 chars, `payUrl` on an allow-listed host: exactly
+  `b2b.fuzzywumpets.com/pay/<token>` or `fuzzywumpets.myhelcim.com/order/?token=<token>`).
+  Change a field name or the host rule on one side and you must change the other in the same release.
+- `staffNote` is the optional note the staffer types in the modal. It is HTML-escaped in the email
+  (rendered as a quote block, `> ` lines in the text part), so Markdown or tags in it show literally.
+- Sender identity: **From `Fuzzywumpets Wholesale <help@fuzzywumpets.com>`, Reply-To
+  `wholesale@fuzzywumpets.com`**, sent through the `fww-bill-scanner` broker (`account=alex`,
+  `gmail.send` token; Portal env `BILL_SCANNER_WORKER_URL` + `BILL_SCANNER_BRIDGE_BEARER`). The
+  Portal owns this identity; the `sendAs: 'wholesale'` Admin still sends only affects the legacy
+  Re:amaze path and is ignored on the Gmail path. `wholesale@` is a Google **Group**, not a send-as
+  alias, so it cannot be the From (Gmail silently rewrites From to `alex@`). **`help@` must stay a
+  verified send-as on `alex@`'s Gmail**, or the From reverts to `alex@` with no error.
+- The subject is built by Admin (`Your invoice from Fuzzywumpets is ready - order #NNNNN`, no
+  forced `Re:`); keep the `#NNNNN` token in it, because the Portal scopes Re:amaze threads to an
+  order by that order name (`getCustomerWholesaleThreads`).
+- Failure: a Gmail/broker error comes back as `email:{sent:false,error}` and Admin records
+  `helcim_invoice_email_failed` (with `hasNote` and `note`). There is deliberately **no fallback to
+  Re:amaze**, because that would bring the `Re:` prefix back and double-send on retry. A Gmail 401
+  drops the Portal's cached broker token, so the next staff retry recovers.
+- Gmail-sent invoices are not Re:amaze conversations, so they do not appear in the order page's
+  customer-messages box; the Portal still stores the body as a customer-visible order note.
+- Compatibility: an absent `creditCardInvoice` keeps the legacy Re:amaze path unchanged, so an old
+  Admin with a new Portal is safe. A new Admin with an old Portal sends the legacy Re:amaze email
+  with the staff note unescaped, so **deploy the Portal first**.
+
 ---
 
 ## 6. Settled decisions — do not re-litigate
