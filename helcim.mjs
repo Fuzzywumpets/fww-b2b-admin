@@ -1,4 +1,4 @@
-import { HELCIM_BILLING_KEYS } from './lib/helcim-billing.mjs';
+import { HELCIM_BILLING_KEYS, cleanBillingText } from './lib/helcim-billing.mjs';
 
 const HELCIM_API_BASE_URL = 'https://api.helcim.com/v2/';
 const DEFAULT_TIMEOUT_MS = 10_000;
@@ -83,14 +83,21 @@ export async function helcimRequest(path, {
 // answers 400/422 the invoice is retried ONCE without it, because the address is cosmetic and must never stop a card invoice
 // going out; those two statuses mean Helcim validated and refused the request, so no invoice exists to duplicate. Every other
 // failure (401, 429, 5xx, timeout, network) may have created the invoice and is NOT retried. Resolves with `billingIncluded`.
-// DEPENDS: server.mjs POST /orders/:id/send-credit-card-invoice passes `billingAddress` and surfaces `billingIncluded`.
-export async function createCreditCardInvoice({ orderName, amount, currency, billingAddress }, options = {}) {
+// COMPANY: an optional `companyName` is also appended to the invoice notes ("Fuzzywumpets wholesale order #1234 - Acme Pet Supply"),
+// so the company is on the invoice even when the billing address is incomplete or Helcim refuses it (Alex, 2026-10-27: "make sure
+// that is company name, somewhere"). Nothing parses these notes (the paid-sync matches by invoice id/number), but keep the leading
+// "Fuzzywumpets wholesale order <name>" text stable.
+// DEPENDS: server.mjs POST /orders/:id/send-credit-card-invoice passes `billingAddress` + `companyName` (order.customer.company,
+//   resolved by getOrderDetail) and surfaces `billingIncluded`.
+export async function createCreditCardInvoice({ orderName, amount, currency, billingAddress, companyName }, options = {}) {
   const normalizedAmount = Math.round(Number(amount) * 100) / 100;
   const normalizedCurrency = String(currency || '').toUpperCase();
   if (!Number.isFinite(normalizedAmount) || normalizedAmount <= 0) throw new TypeError('Invoice amount must be greater than zero');
   if (!['USD', 'CAD'].includes(normalizedCurrency)) throw new TypeError('Invoice currency must be USD or CAD');
 
   const { warn = console.error, ...requestOptions } = options;
+  const orderNote = `Fuzzywumpets wholesale order ${String(orderName || '').trim()}`.trim();
+  const company = cleanBillingText(companyName).slice(0, 120).trim();
   const body = {
     currency: normalizedCurrency,
     type: 'INVOICE',
@@ -100,7 +107,7 @@ export async function createCreditCardInvoice({ orderName, amount, currency, bil
       quantity: 1,
       price: normalizedAmount,
     }],
-    notes: `Fuzzywumpets wholesale order ${String(orderName || '').trim()}`.trim(),
+    notes: company ? `${orderNote} - ${company}` : orderNote,
   };
   const billing = pickBillingAddress(billingAddress);
 

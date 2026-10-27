@@ -105,6 +105,10 @@ address is customer PII and goes to Helcim only, never to logs or audit rows (th
 `billingIncluded`). The `getOrderDetail` billing selection must keep `provinceCode`, `countryCodeV2` and
 `phone`; `test/helcim-billing.test.mjs` pins that. A Helcim *customer record* (`customerId`) is not created:
 that would need the Customers permission on the API token and a duplicate-handling policy.
+The company name (`order.customer.company`, the same resolved field the invoice PDF's BILL TO uses) is also
+appended to the invoice **notes** (`Fuzzywumpets wholesale order #1234 - Acme Pet Supply`), so it is on the
+invoice even when the billing address is incomplete or Helcim refuses it. Nothing parses those notes; the
+paid-sync matches invoices by id/number.
 
 ```sh
 P=$(systemctl show -p MainPID --value <unit>)

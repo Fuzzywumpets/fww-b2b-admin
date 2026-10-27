@@ -6787,7 +6787,7 @@ app.post('/orders/:id/send-credit-card-invoice', requireAuth, async (req, res) =
             token: `mock-token-${numId}`, url: `https://fuzzywumpets.myhelcim.com/order/?token=mock-token-${numId}`,
             amount: outstanding, currency, billingIncluded: !!billingAddress,
           }
-        : await createCreditCardInvoice({ orderName: order.name, amount: outstanding, currency, billingAddress });
+        : await createCreditCardInvoice({ orderName: order.name, amount: outstanding, currency, billingAddress, companyName: order.customer?.company });
       billingIncluded = created.billingIncluded === true;
       // SYNC: db.mjs helcim_invoice_map is the retry ledger for this exact write-before-send ordering.
       invoice = upsertHelcimInvoiceMap(orderGid, created);

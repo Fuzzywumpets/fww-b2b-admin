@@ -103,6 +103,38 @@ test('never retries a failure that may have created the invoice (401, 429, 500, 
   }
 });
 
+test('the company name is appended to the invoice notes (order # text stays first and unchanged)', async () => {
+  const { calls, fetchImpl } = recorder([OK_INVOICE()]);
+  await create({ companyName: 'Happy Paws Boutique LLC' }, fetchImpl);
+  assert.equal(calls[0].notes, 'Fuzzywumpets wholesale order #1001 - Happy Paws Boutique LLC');
+  assert.equal(calls[0].lineItems[0].description, 'Balance due for Fuzzywumpets wholesale order #1001', 'line item untouched');
+  assert.equal('billingAddress' in calls[0], false, 'works with no address at all');
+});
+
+test('the company is still on the invoice when Helcim refuses the address and the retry drops it', async () => {
+  const { calls, fetchImpl } = recorder([jsonResponse({}, { status: 422 }), OK_INVOICE()]);
+  await create({ billingAddress: BILLING, companyName: 'Happy Paws Boutique LLC' }, fetchImpl);
+  assert.equal(calls.length, 2);
+  assert.equal('billingAddress' in calls[1], false);
+  assert.equal(calls[1].notes, 'Fuzzywumpets wholesale order #1001 - Happy Paws Boutique LLC');
+});
+
+test('a missing, blank or non-string company leaves the notes exactly as before', async () => {
+  for (const companyName of [undefined, null, '', '   ', 42, { a: 1 }, ['x']]) {
+    const { calls, fetchImpl } = recorder([OK_INVOICE()]);
+    await create({ companyName }, fetchImpl);
+    assert.equal(calls[0].notes, 'Fuzzywumpets wholesale order #1001', `companyName=${JSON.stringify(companyName)}`);
+  }
+});
+
+test('the company name is flattened to one line and capped at 120 characters', async () => {
+  const { calls, fetchImpl } = recorder([OK_INVOICE(), OK_INVOICE()]);
+  await create({ companyName: '  Happy\nPaws\t\tBoutique ' }, fetchImpl);
+  assert.equal(calls[0].notes, 'Fuzzywumpets wholesale order #1001 - Happy Paws Boutique');
+  await create({ companyName: 'x'.repeat(500) }, fetchImpl);
+  assert.equal(calls[1].notes, `Fuzzywumpets wholesale order #1001 - ${'x'.repeat(120)}`);
+});
+
 test('a 400 with no address to drop is not retried', async () => {
   const { calls, fetchImpl } = recorder([jsonResponse({}, { status: 400 }), OK_INVOICE()]);
   await assert.rejects(create({}, fetchImpl), error => error instanceof HelcimApiError && error.status === 400);

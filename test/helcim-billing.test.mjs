@@ -163,6 +163,7 @@ test('the send-credit-card-invoice handler builds the address from the order and
   assert.ok(handler.includes('buildHelcimBillingAddress({'), 'handler does not call buildHelcimBillingAddress');
   const call = handler.slice(handler.indexOf('createCreditCardInvoice({'));
   assert.ok(call.slice(0, call.indexOf('})')).includes('billingAddress'), 'createCreditCardInvoice is not given billingAddress');
+  assert.ok(call.slice(0, call.indexOf('})')).includes('companyName: order.customer?.company'), 'createCreditCardInvoice is not given the resolved company name');
 });
 
 test('audit rows and logs never carry the customer address', () => {
