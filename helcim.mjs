@@ -75,6 +75,40 @@ export async function helcimRequest(path, {
   }
 }
 
+// WHAT: read-only lookup of ONE Helcim invoice's payment status, reduced to the fields the paid-sync needs.
+// CHANGE-GUARD: returns ONLY { invoiceId, invoiceNumber, status, amount, amountPaid, amountDue, currency, datePaid } — never the
+// online-view token, billing address, notes or customer id, so a caller can log/audit the result without leaking payment data.
+// A response it cannot fully trust throws (fails closed): this feeds a decision to mark a Shopify order PAID, so a missing or
+// non-numeric field must never be read as "paid". datePaid is Helcim's naive account-local timestamp, informational only.
+// INVARIANT(S): invoiceId must be a plain non-negative integer (checked before any request, so it can never alter the URL path);
+// the id Helcim echoes back must equal the id requested; status/currency are upper-cased; '0000-00-00 00:00:00' => null.
+// DEPENDS: lib/helcim-reconcile.mjs assessInvoice() consumes exactly this shape.
+export async function getInvoice(invoiceId, options = {}) {
+  const id = typeof invoiceId === 'number' ? (Number.isSafeInteger(invoiceId) && invoiceId >= 0 ? String(invoiceId) : '') : String(invoiceId ?? '');
+  if (!/^[0-9]{1,20}$/.test(id)) throw new TypeError('Helcim invoice id must be a plain numeric id');
+
+  const response = await helcimRequest(`/invoices/${id}`, { ...options, method: 'GET', body: undefined });
+  const invoice = response.data?.invoice || response.data;
+  if (!invoice || typeof invoice !== 'object') throw new HelcimApiError('Helcim invoice response was not an invoice');
+  if (invoice.invoiceId !== undefined && String(invoice.invoiceId) !== id) throw new HelcimApiError('Helcim invoice response was for a different invoice');
+
+  const status = typeof invoice.status === 'string' ? invoice.status.trim().toUpperCase() : '';
+  const currency = typeof invoice.currency === 'string' ? invoice.currency.trim().toUpperCase() : '';
+  const money = (value) => (typeof value === 'number' && Number.isFinite(value) ? value : NaN);
+  const amount = money(invoice.amount), amountPaid = money(invoice.amountPaid), amountDue = money(invoice.amountDue);
+  if (!status) throw new HelcimApiError('Helcim invoice response was missing a status');
+  if (![amount, amountPaid, amountDue].every(Number.isFinite)) throw new HelcimApiError('Helcim invoice response had a missing or non-numeric amount');
+  if (!['USD', 'CAD'].includes(currency)) throw new HelcimApiError('Helcim invoice response had an unsupported currency');
+
+  const paidOn = typeof invoice.datePaid === 'string' ? invoice.datePaid.trim() : '';
+  return {
+    invoiceId: id,
+    invoiceNumber: invoice.invoiceNumber ? String(invoice.invoiceNumber) : null,
+    status, amount, amountPaid, amountDue, currency,
+    datePaid: paidOn && !paidOn.startsWith('0000-00-00') ? paidOn : null,
+  };
+}
+
 // WHAT: creates one DUE invoice for the exact outstanding Shopify balance and returns its customer-payable Helcim online-view URL.
 // CHANGE-GUARD: this intentionally uses one balance-due line, not the original item breakdown; partial payments and edited orders must bill only the current outstanding amount.
 // INVARIANT(S): amount is positive, currency is USD/CAD, and a response without invoiceId+token fails closed before any email is sent.

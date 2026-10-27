@@ -80,6 +80,8 @@ db.exec(`
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
   );
+  -- ^ helcim_invoice_map: the paid_* columns (Helcim -> Shopify paid sync) are NOT declared here; migrateHelcimInvoiceMapSchema()
+  --   below adds them to fresh and existing DBs alike so the two always end up identical.
 
   CREATE TABLE IF NOT EXISTS dropship_config_cache (
     customer_id TEXT PRIMARY KEY,
@@ -463,6 +465,30 @@ export function migrateBackordersSchema(database) {
 }
 migrateBackordersSchema(db);
 
+// MIGRATION (2026-10-27, Helcim -> Shopify paid sync): the payment-sync state lives on the existing helcim_invoice_map ledger row,
+// one row per order, so it cannot drift from the invoice it describes. ADDITIVE ONLY and every column nullable, so a rollback to the
+// previous release is safe: its explicit-column INSERT/UPDATE statements never name these, and it never reads them.
+// Idempotent: PRAGMA reveals the existing columns and ALTER only runs for missing ones.
+// DEPENDS: claimHelcimPaymentSync / setHelcimPaymentState / listHelcimInvoicesForPaymentSync below and lib/helcim-reconcile.mjs read and
+//   write exactly these names; test/helcim-paid-migration.test.mjs asserts the set. Do NOT also add them to the CREATE TABLE above.
+//   paid_state is NULL (never confirmed paid) | 'syncing' (claimed by a running sync) | 'paid_synced' | 'already_paid' |
+//   'needs_review' | 'error' — HELCIM_PAYMENT_STATES below is the one allow-list.
+const HELCIM_PAID_ADDED_COLUMNS = [
+  ['paid_state', 'TEXT'],
+  ['paid_amount', 'REAL'],        // what Helcim says was collected, set when the payment is recorded
+  ['helcim_status', 'TEXT'],      // last Helcim invoice status seen (DUE / PAID / ...), informational
+  ['paid_checked_at', 'INTEGER'], // epoch ms of the last check; doubles as the claim timestamp while paid_state = 'syncing'
+  ['paid_synced_at', 'INTEGER'],  // epoch ms the order was marked paid (or found already paid)
+  ['paid_note', 'TEXT'],          // needs_review / error / already_paid reason shown to staff (never a URL or token)
+];
+export function migrateHelcimInvoiceMapSchema(database) {
+  const cols = new Set(database.prepare(`PRAGMA table_info(helcim_invoice_map)`).all().map(c => c.name));
+  for (const [name, ddl] of HELCIM_PAID_ADDED_COLUMNS) {
+    if (!cols.has(name)) database.exec(`ALTER TABLE helcim_invoice_map ADD COLUMN ${name} ${ddl}`);
+  }
+}
+migrateHelcimInvoiceMapSchema(db);
+
 // MIGRATION (2026-10-26, lettered-invoice backorders hot-fix): a lettered partial invoice is a frozen
 // snapshot (partial_invoices.line_items_json), so the backordered units it must show — units REMOVED from the
 // Shopify order, parked in `backorders` — are frozen with it, in this one new column. ADDITIVE ONLY and
@@ -595,6 +621,8 @@ export function getHelcimInvoiceMap(orderId) {
 
 // WHAT: persists a newly created Helcim invoice before attempting Re:amaze delivery, allowing a failed delivery to be retried without creating another invoice.
 // CHANGE-GUARD: order_id is the conflict key; updates preserve created_at and replace only the current Helcim invoice metadata.
+//   Replacing the invoice also CLEARS the paid_* sync state: a paid/synced verdict belongs to one invoice and must never carry over to
+//   a different one (today's route only inserts when no row exists, so this is a guard for a future caller).
 // INVARIANT(S): caller supplies a validated Helcim invoiceId, token, URL, positive amount, and USD/CAD currency.
 export function upsertHelcimInvoiceMap(orderId, invoice) {
   const now = Date.now();
@@ -605,7 +633,8 @@ export function upsertHelcimInvoiceMap(orderId, invoice) {
     ON CONFLICT(order_id) DO UPDATE SET
       invoice_id=excluded.invoice_id, invoice_number=excluded.invoice_number, token=excluded.token,
       url=excluded.url, amount=excluded.amount, currency=excluded.currency,
-      delivery_status='created', delivery_error=NULL, updated_at=excluded.updated_at
+      delivery_status='created', delivery_error=NULL, updated_at=excluded.updated_at,
+      paid_state=NULL, paid_amount=NULL, helcim_status=NULL, paid_checked_at=NULL, paid_synced_at=NULL, paid_note=NULL
   `).run(String(orderId), String(invoice.invoiceId), invoice.invoiceNumber || null, String(invoice.token),
     String(invoice.url), Number(invoice.amount), String(invoice.currency), now, now);
   return getHelcimInvoiceMap(orderId);
@@ -619,6 +648,83 @@ export function setHelcimInvoiceDelivery(orderId, status, error = null) {
   db.prepare('UPDATE helcim_invoice_map SET delivery_status = ?, delivery_error = ?, updated_at = ? WHERE order_id = ?')
     .run(status, error ? String(error).slice(0, 500) : null, Date.now(), String(orderId));
   return getHelcimInvoiceMap(orderId);
+}
+
+// ── Helcim -> Shopify paid sync ledger (see lib/helcim-reconcile.mjs) ─────────────────────────────────────────
+// SYNC: HELCIM_PAYMENT_STATES — lib/helcim-reconcile.mjs writes exactly these via setHelcimPaymentState; server.mjs renders them
+//   on the order page (helcimPaymentStatusLine); test/helcim-paid-migration.test.mjs pins the set.
+export const HELCIM_PAYMENT_STATES = ['syncing', 'paid_synced', 'already_paid', 'needs_review', 'error'];
+const HELCIM_PAYMENT_PATCH_COLUMNS = ['paid_state', 'paid_amount', 'helcim_status', 'paid_checked_at', 'paid_synced_at', 'paid_note'];
+
+// WHAT: atomically takes the right to run ONE payment sync for an order: NULL / needs_review / error -> 'syncing', or a 'syncing'
+//   claim older than staleMs (an interrupted sync) is taken over. Returns true only for the single caller that won.
+// CHANGE-GUARD: one UPDATE ... WHERE is the whole lock (SQLite serialises writers), so the poller and a staff click can never both
+//   mutate Shopify for the same order. paid_synced / already_paid rows are never claimable: they are finished.
+// INVARIANT(S): the claim stamps paid_checked_at = nowMs, which is also how staleness is measured; never throws on a missing row (false).
+export function claimHelcimPaymentSync(orderId, nowMs, staleMs) {
+  const result = db.prepare(`
+    UPDATE helcim_invoice_map SET paid_state = 'syncing', paid_checked_at = ?
+    WHERE order_id = ? AND (
+      paid_state IS NULL OR paid_state IN ('needs_review', 'error')
+      OR (paid_state = 'syncing' AND (paid_checked_at IS NULL OR paid_checked_at < ?))
+    )
+  `).run(Number(nowMs), String(orderId), Number(nowMs) - Number(staleMs));
+  return result.changes === 1;
+}
+
+// WHAT: records the outcome of a payment sync on the ledger row. Only the six paid_* columns can be written, and paid_state must be
+//   null or one of HELCIM_PAYMENT_STATES.
+// CHANGE-GUARD: the column names interpolated into the SQL come ONLY from HELCIM_PAYMENT_PATCH_COLUMNS (never from the patch keys);
+//   an unknown key throws instead of being ignored, so a typo cannot silently skip a state write. Invoice identity, amount, token and
+//   URL are unreachable from here. paid_note is capped at 500 chars.
+// INVARIANT(S): does not touch updated_at/delivery_*: those describe the invoice email, not the payment.
+export function setHelcimPaymentState(orderId, patch) {
+  const keys = Object.keys(patch || {});
+  if (!keys.length) throw new TypeError('Empty Helcim payment state patch');
+  for (const key of keys) {
+    if (!HELCIM_PAYMENT_PATCH_COLUMNS.includes(key)) throw new TypeError(`Unknown Helcim payment column: ${key}`);
+  }
+  if ('paid_state' in patch && patch.paid_state !== null && !HELCIM_PAYMENT_STATES.includes(patch.paid_state)) {
+    throw new TypeError(`Invalid Helcim payment state: ${patch.paid_state}`);
+  }
+  const values = keys.map((key) => {
+    const v = patch[key];
+    if (v === null || v === undefined) return null;
+    if (key === 'paid_note') return String(v).slice(0, 500);
+    if (key === 'helcim_status' || key === 'paid_state') return String(v);
+    return Number(v);
+  });
+  db.prepare(`UPDATE helcim_invoice_map SET ${keys.map((k) => `${k} = ?`).join(', ')} WHERE order_id = ?`)
+    .run(...values, String(orderId));
+  return getHelcimInvoiceMap(orderId);
+}
+
+// How far back, and how often, the BACKGROUND poller re-checks an unpaid invoice. A manual "Check Helcim payment" click ignores both.
+// A fresh invoice is the likely-to-be-paid one, so it is polled often; an older one hourly; one older than the horizon is left to staff.
+export const HELCIM_POLL_FRESH_MS = 4 * 60 * 1000;
+export const HELCIM_POLL_AGED_MS = 60 * 60 * 1000;
+export const HELCIM_POLL_AGED_AFTER_MS = 3 * 24 * 60 * 60 * 1000;
+export const HELCIM_POLL_HORIZON_MS = 90 * 24 * 60 * 60 * 1000;
+
+// WHAT: the ledger rows the poller should check now, least-recently-checked first (never-checked rows first), at most `limit`.
+// CHANGE-GUARD: only paid_state NULL / 'error' / an expired 'syncing' claim are polled. needs_review is deliberately NOT polled: it
+//   needs a human, and re-polling it forever would just re-flag it; staff re-check it from the order page after fixing the cause.
+//   paid_synced / already_paid are finished. delivery_status is not filtered: a delivery_failed email may still have reached the
+//   customer, so the invoice can be paid anyway.
+// INVARIANT(S): read-only; returns plain rows (order_id first) for syncAllHelcimPayments, which re-claims each one atomically.
+export function listHelcimInvoicesForPaymentSync({ limit = 20, nowMs = Date.now(), staleMs = 10 * 60 * 1000 } = {}) {
+  return db.prepare(`
+    SELECT order_id, invoice_id, paid_state, paid_checked_at, created_at FROM helcim_invoice_map
+    WHERE created_at >= @horizon
+      AND (paid_state IS NULL OR paid_state = 'error' OR (paid_state = 'syncing' AND (paid_checked_at IS NULL OR paid_checked_at < @stale)))
+      AND (paid_checked_at IS NULL OR paid_checked_at <= @now - (CASE WHEN created_at < @agedBefore THEN @agedGap ELSE @freshGap END))
+    ORDER BY COALESCE(paid_checked_at, 0) ASC, created_at ASC
+    LIMIT @limit
+  `).all({
+    now: nowMs, stale: nowMs - staleMs, horizon: nowMs - HELCIM_POLL_HORIZON_MS,
+    agedBefore: nowMs - HELCIM_POLL_AGED_AFTER_MS, agedGap: HELCIM_POLL_AGED_MS, freshGap: HELCIM_POLL_FRESH_MS,
+    limit: Math.max(1, Math.min(100, Math.floor(Number(limit)) || 20)),
+  });
 }
 
 export function getCustomerNotes(customerId) {
