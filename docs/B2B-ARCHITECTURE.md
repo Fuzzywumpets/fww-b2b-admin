@@ -116,7 +116,7 @@ via `callPortalInternal()` → `PORTAL_INTERNAL_URL` (default `http://127.0.0.1:
 
 Live endpoints: `visible-note`, `customer-messages`, `conversations/:slug/messages`,
 `tax-exempt/:id/{approve,reject}`, `settings`, `leads/:id/tax-doc`, `theme-feedback`,
-**`invites` (POST create + GET list)**.
+**`invites` (POST create + GET list)**, **`payment-notice`** (below).
 
 Rules for adding one: share the implementation with the session-authenticated route (a drifting
 invite path is how you email a second live token to someone who already has one); require the
@@ -162,6 +162,41 @@ creditCardInvoice: { orderName, amount, currency, payUrl, staffNote }
 - Compatibility: an absent `creditCardInvoice` keeps the legacy Re:amaze path unchanged, so an old
   Admin with a new Portal is safe. A new Admin with an old Portal sends the legacy Re:amaze email
   with the staff note unescaped, so **deploy the Portal first**.
+
+### `payment-notice` — the "payment received" email for STAFF-recorded payments
+
+Alex (2026-10-27): "when a payment is made, I need notification sent to alex@fuzzywumpets.com". Settled split:
+**Helcim card-invoice payments** are announced by Helcim's own merchant copy (a Helcim dashboard setting, no code
+here; do NOT email from the paid-sync path, it would double-notify). **Payments staff record in this app** are announced by us:
+
+| Admin route | `source` | Notice |
+|---|---|---|
+| `POST /orders/bulk` (Orders list Mark Paid) | `mark_paid_bulk` | ONE digest listing every order Shopify really marked paid |
+| `POST /orders/:id/mark-paid` (order page) | `mark_paid` | one order |
+| `POST /orders/:id/record-payment` | `record_payment` | one order, with the staff-typed method, amount = the fresh outstanding balance it cleared |
+
+- **Flow.** After Shopify accepted the payment AND the `mark_paid` / `record_manual_payment` audit row is written, the route calls
+  `paymentNotifier.notify(...)` (`lib/payment-notice.mjs`) **without awaiting it**. It POSTs
+  `{ source, actorEmail, paymentMethod?, orders:[{ orderId, orderName, amount, currency }] }` to the Portal's
+  `POST /__internal__/payment-notice` (Portal `payment-notice.mjs` + `docs/PAYMENT-NOTICE.md`; the Portal owns the Gmail broker env).
+  Mark Paid reads `name` + `currentTotalPriceSet` (post-edit total) from the `orderMarkAsPaid` payload
+  (`ORDER_MARK_AS_PAID_MUTATION` in `lib/order-money.mjs`, shared by both Mark Paid paths), so there is no extra Shopify read.
+  For Mark Paid the amount is the order's current total (equal to the payment unless it was part-paid before).
+- **Recipient is the Portal's, never the request's**: env `PAYMENT_NOTICE_TO`, default `alex@fuzzywumpets.com`. Admin sends no
+  recipient, subject, sender or link. **When the staff member's login email equals the recipient the Portal sends nothing**
+  (`email.skipped = 'actor_is_recipient'`, not a failure), so Alex's own clicks do not email him.
+- **Fail-open.** Any problem (Portal down or older and answering 404, Gmail/broker error, a reply that does not say
+  `email.sent === true`, a throwing log/audit) is logged and audited as `payment_notice_failed` (`after` = `{source, orderIds, error}`)
+  and swallowed. A payment is never blocked, failed or delayed by it (the 20 s timeout only frees the socket). There is no retry
+  and no fallback mailer.
+- **Idempotent.** Key = `source|orderId|amount-in-cents`, taken in memory BEFORE the Portal call, so a double click or an
+  overlapping retry sends once (a failed send keeps its key: at most once, the audit row is the record). Keys expire after 15 min
+  so a genuine second payment of the same amount later is still announced; they are lost on restart (accepted).
+- **Off switches.** `PAYMENT_NOTICE_DISABLED=1` (kill switch, no code change) and MOCK mode. If `B2B_PORTAL_INTERNAL_TOKEN` is unset
+  every notice is audited as failed (`no_internal_token`).
+- **Never** a Helcim token, pay URL or card data: the request has no field for one (pinned by `test/payment-notice-routes.test.mjs`).
+- **Deploy the Portal FIRST.** A new Admin with an old Portal gets 404s (audited, payments unaffected); a new Portal with an old
+  Admin is inert. Rollback: Admin `git reset --keep <previous sha>`; Portal `git reset --keep f850ad4`. No schema change either side.
 
 ---
 
@@ -229,7 +264,7 @@ Traps:
   writes the status through to `orders_cache` but does **not** record the payment in Xero;
   `POST /orders/:id/mark-paid` (order page) records it in Xero but does not touch `orders_cache` (it
   redirects to the order page, which reads Shopify live, so only the list is stale for the 2–3 s webhook
-  window). Neither notifies anyone — a "payment received" notification is a separate, undecided item.
+  window). Both (and Record payment) now send the owner a "payment received" email, see section 5 `payment-notice`.
   Both paths leave the same breadcrumb on the order itself: a `[date UTC] Marked paid manually by <who>`
   line **appended** to the **Admin-only** order note (`order_internal_notes`, via `notePaidManually` →
   `lib/paid-note.mjs`), plus the `mark_paid` audit row, which the order history shows as "marked the order

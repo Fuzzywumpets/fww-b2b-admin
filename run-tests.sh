@@ -328,6 +328,20 @@ if [ -f test/orders-bulk-markpaid.test.mjs ]; then
   node test/orders-bulk-markpaid.test.mjs || UNIT_FAIL=$?
 fi
 
+# "Payment received" email to the owner for STAFF-recorded payments (Mark Paid bulk / order page, Record payment), 2026-10-27.
+# lib/payment-notice.mjs is pure and injected (no server). The routes test boots the REAL (non-MOCK) server with the fake Shopify
+# above AND an in-process fake Portal, and pins: one digest per bulk action, sent only after the audit row, double-submit = one
+# mail, fail-open (Portal 502/404/hang never fails or delays a payment, audited as payment_notice_failed). MOCK cannot: it calls
+# neither Shopify nor the Portal. Needs the Portal route (fww-b2b-portal docs/PAYMENT-NOTICE.md) only in production, not here.
+if [ -f test/payment-notice-lib.test.mjs ]; then
+  echo ""
+  node test/payment-notice-lib.test.mjs || UNIT_FAIL=$?
+fi
+if [ -f test/payment-notice-routes.test.mjs ]; then
+  echo ""
+  node test/payment-notice-routes.test.mjs || UNIT_FAIL=$?
+fi
+
 echo ""
 echo "======================================================"
 if [ $API_FAIL -eq 0 ] && [ $UI_FAIL -eq 0 ] && [ $UNIT_FAIL -eq 0 ] && [ $AUTH_FAIL -eq 0 ]; then
