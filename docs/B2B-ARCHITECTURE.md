@@ -182,6 +182,17 @@ creditCardInvoice: { orderName, amount, currency, payUrl, staffNote }
   are Fuzzywumpets actions.
 - Pre-order badge: removed for good 2026-07-02, guarded by `REGRESSION:` tests. Products are In
   stock / Out of stock only.
+- **The Orders list (`GET /orders`) is served from the local `orders_cache`, not from Shopify.** The cache
+  is refreshed by the Shopify `orders/updated` webhook (lands 2–3 s after a change) and a ~3-minute poller.
+  So anything that changes an order's status and then redirects to the list must write that status through
+  itself, or the page paints the old one under a success banner (the 2026-10-27 "Mark Paid does nothing"
+  report: Shopify had marked #39748 paid, the list still said PENDING). `POST /orders/bulk` (Mark Paid)
+  does this via `setOrderFinancialStatusInCache` — two columns, fail-open, never `synced_at`; the webhook
+  and poller still own the row and overwrite it whole. The success banner (`?success=marked_paid`) is
+  reachable only after a mark-paid that moved at least one order: no ids → `?error=mark_paid_none`,
+  unknown action → `?error=bulk_unknown_action`, any refusal → `?error=mark_paid_partial`. The bulk bar is
+  hidden until a row is ticked (`.bulk-bar[hidden]` in `public/admin.css`). Pinned end to end, in a real
+  browser against the real server, by `test/orders-bulk-markpaid.test.mjs`.
 
 ---
 
@@ -214,6 +225,11 @@ Traps:
   (`getSess` omits `company_data`; `getSessWithCompany` is dead code) and a team-member session is
   bound to the company's PRIMARY `customerId`, so the endpoints cannot tell a member from the owner.
   The escalation half (granting admin) is closed.
+- Staff **Mark Paid** is two code paths with different side effects: `POST /orders/bulk` (Orders list)
+  writes the status through to `orders_cache` but does **not** record the payment in Xero;
+  `POST /orders/:id/mark-paid` (order page) records it in Xero but does not touch `orders_cache` (it
+  redirects to the order page, which reads Shopify live, so only the list is stale for the 2–3 s webhook
+  window). Neither notifies anyone — a "payment received" notification is a separate, undecided item.
 - The Electron installer is unsigned; a real CA certificate is needed for it to install anywhere.
   Note `electron-updater` compares the cert subject against `win.publisherName` and refuses
   mismatched updates — so changing certs later orphans existing installs. Do it once, properly.

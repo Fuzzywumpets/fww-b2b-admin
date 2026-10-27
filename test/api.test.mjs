@@ -474,6 +474,34 @@ await test('POST /orders/bulk mark-paid reports a refused order instead of a bla
   assert.ok(decodeURIComponent(loc).includes('#1003'), 'failed order id must be named: ' + loc);
 });
 
+// REGRESSION (2026-10-27): a bulk POST that marked nothing still redirected with the SUCCESS banner (unknown
+// action) or silently (no ids). Neither mutates a fixture. The real-browser / orders_cache end-to-end version of
+// this lives in test/orders-bulk-markpaid.test.mjs.
+await test('POST /orders/bulk with no ids says nothing was selected, never success', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(BASE + '/orders/bulk', {
+    method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' }, body: 'action=mark-paid', redirect: 'manual',
+  });
+  assert.equal(res.status, 302);
+  const loc = res.headers.get('location') || '';
+  assert.ok(loc.includes('error=mark_paid_none') && !loc.includes('success='), loc);
+  const html = await (await fetch(BASE + loc, { headers: { Cookie: cookie } })).text();
+  assert.ok(html.includes('No orders selected'), 'banner must explain why nothing happened');
+  assert.ok(!html.includes('Order(s) marked as paid.'));
+});
+
+await test('POST /orders/bulk with an unknown action never claims success', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(BASE + '/orders/bulk', {
+    method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' }, body: 'ids=1002&action=frobnicate', redirect: 'manual',
+  });
+  assert.equal(res.status, 302);
+  const loc = res.headers.get('location') || '';
+  assert.ok(loc.includes('error=bulk_unknown_action') && !loc.includes('success='), loc);
+  const html = await (await fetch(BASE + loc, { headers: { Cookie: cookie } })).text();
+  assert.ok(html.includes('alert-error') && !html.includes('Order(s) marked as paid.'));
+});
+
 await test('GET /orders?error=mark_paid_partial renders an ERROR banner, not the success one', async () => {
   const cookie = await seedSession();
   const res = await fetch(BASE + '/orders?error=mark_paid_partial&msg=' + encodeURIComponent('1 of 2 order(s) could NOT be marked paid: #1003'), { headers: { Cookie: cookie } });

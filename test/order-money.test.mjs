@@ -175,5 +175,24 @@ await test('all-clean batch reports every id paid and no failures', async () => 
   assert.deepEqual(failed, []);
 });
 
+await test('each paid id carries the displayFinancialStatus Shopify returned (the Orders list writes it through to its cache)', async () => {
+  const shopifyFetch = async (_q, vars) => ({ data: { orderMarkAsPaid: { order: { id: vars.input.id, displayFinancialStatus: 'paid' }, userErrors: [] } } });
+  const { paid, statuses } = await bulkMarkOrdersPaid({ shopifyFetch, ids: ['1001', '1002'], toGid });
+  assert.deepEqual(paid, ['1001', '1002']);
+  assert.deepEqual(statuses, { 1001: 'PAID', 1002: 'PAID' }, 'normalised to UPPERCASE like every cache reader expects');
+});
+
+await test('REGRESSION: a reply with no orderMarkAsPaid payload is a failure, not a silent success', async () => {
+  // Nothing in this reply says the order was marked. Counting it as paid would audit-log and banner a payment
+  // that may not have happened - the "success banner, nothing changed" class of bug.
+  const replies = { 1001: { data: {} }, 1002: { data: { orderMarkAsPaid: null } }, 1003: undefined, 1004: { data: { orderMarkAsPaid: { order: { id: 'x' }, userErrors: [] } } } };
+  const shopifyFetch = async (_q, vars) => replies[vars.input.id.split('/').pop()];
+  const { paid, failed, statuses } = await bulkMarkOrdersPaid({ shopifyFetch, ids: ['1001', '1002', '1003', '1004'], toGid });
+  assert.deepEqual(paid, ['1004']);
+  assert.deepEqual(failed.map(f => f.id), ['1001', '1002', '1003']);
+  assert.match(failed[0].message, /no result/);
+  assert.deepEqual(statuses, {}, 'no status is invented when the payload carried none');
+});
+
 console.log(`\n  ${passed} passed, ${failed} failed`);
 process.exit(failed > 0 ? 1 : 0);

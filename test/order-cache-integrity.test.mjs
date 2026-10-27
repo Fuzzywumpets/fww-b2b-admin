@@ -24,6 +24,7 @@ const {
   getReportsDataFromCache,
   deleteOrderFromCache,
   getOrderShopifyIdsBatch,
+  setOrderFinancialStatusInCache,
   default: db,
 } = await import('../db.mjs');
 
@@ -210,6 +211,57 @@ await test('getOrderShopifyIdsBatch pages through the cache deterministically', 
   const page2 = getOrderShopifyIdsBatch(1, 1);
   assertEqual(page1.length, 1);
   assert(page1[0] !== page2[0], 'consecutive offset pages must not overlap');
+});
+
+// ── Mark Paid write-through (2026-10-27) ───────────────────────────────────────────────────────────────────────
+// The Orders list is served from orders_cache; the Shopify webhook refreshes it 2-3 s AFTER POST /orders/bulk has
+// already redirected. setOrderFinancialStatusInCache is what lets that redirect paint the truth.
+
+function seedPending(id, extra = {}) {
+  upsertCustomerCache({ shopify_id: '9100', gid: 'gid://shopify/Customer/9100', email: 'wt@example.com', display_name: 'WT Buyer', tags: ['b2b'], created_at: Date.now() });
+  upsertOrderCache({
+    shopify_id: id, gid: `gid://shopify/Order/${id}`, name: `#${id}`, customer_shopify_id: '9100',
+    created_at: 1_700_000_000_000, processed_at: 1_700_000_000_000, updated_at: 1_700_000_000_000,
+    financial_status: 'PENDING', display_financial_status: 'PENDING', fulfillment_status: 'UNFULFILLED', total_price: 66.5, ...extra,
+  });
+}
+const listStatus = (id) => listOrdersFromCache({ q: `#${id}` }).find(o => o.name === `#${id}`)?.displayFinancialStatus;
+
+await test('write-through: the Orders list reads PAID straight after, and nothing else on the row moves', async () => {
+  seedPending('7801', { note: 'keep me', tags: 'b2b-portal' });
+  const before = db.prepare('SELECT * FROM orders_cache WHERE shopify_id = ?').get('7801');
+  assertEqual(listStatus('7801'), 'PENDING');
+  assertEqual(setOrderFinancialStatusInCache('7801', 'paid'), 1, 'one row updated; lowercase input is normalised');
+  assertEqual(listStatus('7801'), 'PAID', 'listOrdersFromCache reads financial_status first, so this is what the page shows');
+  const after = db.prepare('SELECT * FROM orders_cache WHERE shopify_id = ?').get('7801');
+  assertEqual(after.display_financial_status, 'PAID');
+  assertEqual(after.synced_at, before.synced_at, 'synced_at feeds the "Synced just now" badge: it must keep meaning "refreshed FROM Shopify"');
+  assertEqual(after.updated_at, before.updated_at, "updated_at is Shopify's value, not ours");
+  for (const col of ['name', 'note', 'tags', 'total_price', 'customer_shopify_id', 'fulfillment_status']) {
+    assertEqual(after[col], before[col], `${col} must be untouched (an upsert would have blanked what we do not have)`);
+  }
+});
+
+await test('write-through: an order absent from the cache is a no-op (never invents a row)', async () => {
+  const n = db.prepare('SELECT COUNT(*) AS n FROM orders_cache').get().n;
+  assertEqual(setOrderFinancialStatusInCache('does-not-exist', 'PAID'), 0);
+  assertEqual(db.prepare('SELECT COUNT(*) AS n FROM orders_cache').get().n, n);
+});
+
+await test('write-through: an empty status writes nothing', async () => {
+  seedPending('7802');
+  assertEqual(setOrderFinancialStatusInCache('7802', ''), 0);
+  assertEqual(setOrderFinancialStatusInCache('7802', null), 0);
+  assertEqual(listStatus('7802'), 'PENDING');
+});
+
+await test('write-through self-heals: the webhook/poller upsert (Shopify truth) overwrites it whole', async () => {
+  seedPending('7803');
+  setOrderFinancialStatusInCache('7803', 'PAID');
+  // Shopify later reports the order as PARTIALLY_PAID - whatever the cache guessed must lose.
+  upsertOrderCache({ shopify_id: '7803', gid: 'gid://shopify/Order/7803', name: '#7803', customer_shopify_id: '9100', created_at: 1_700_000_000_000,
+    financial_status: 'partially_paid', display_financial_status: 'partially_paid', total_price: 66.5 });
+  assertEqual(listStatus('7803'), 'PARTIALLY_PAID');
 });
 
 console.log(`\n  ${passed} passed, ${failed} failed`);

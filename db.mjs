@@ -1630,6 +1630,24 @@ export function upsertOrderCache(o) {
   );
 }
 
+// WHAT: write-through of ONE field pair — financial_status + display_financial_status — onto an order whose status we
+// have just changed in Shopify (staff Mark Paid, POST /orders/bulk). The Orders list is served from orders_cache and
+// the Shopify orders/updated webhook only lands 2-3 s after the mutation, while the route redirects at once: without
+// this the page that says "marked as paid" paints the same order as PENDING (2026-10-27, #39748).
+// CHANGE-GUARD: deliberately NOT upsertOrderCache — that REPLACES the whole row and would blank every column the caller
+// does not have. This UPDATEs two columns and leaves synced_at and updated_at alone: synced_at feeds the "Synced just
+// now" badge, which must keep meaning "the cache was last refreshed FROM Shopify", and updated_at is Shopify's value.
+// INVARIANT(S): the webhook / poller still own the row — they upsert it whole, so anything written here is overwritten by
+// Shopify's truth on the next sync (a wrong guess self-heals). An order absent from the cache is a no-op (returns 0): this
+// never invents a row. Status is stored UPPERCASE, matching upsertOrderCache and every reader (STATUS-CASE above).
+// DEPENDS: server.mjs POST /orders/bulk (the only caller; wrapped in try/catch so a cache hiccup never fails a payment).
+export function setOrderFinancialStatusInCache(shopifyId, status) {
+  const s = String(status || '').toUpperCase();
+  if (!s) return 0;
+  return db.prepare('UPDATE orders_cache SET financial_status = ?, display_financial_status = ? WHERE shopify_id = ?')
+    .run(s, s, String(shopifyId)).changes;
+}
+
 // WHAT: REPLACES the cached line items for an order — deletes every existing row for
 // order_shopify_id, then inserts the supplied set, all inside one transaction.
 // CHANGE-GUARD (2026-08-09, fixes H14): this used to be a bare INSERT OR REPLACE. The table's only
