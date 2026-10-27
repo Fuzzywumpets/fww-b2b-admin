@@ -1,3 +1,5 @@
+import { HELCIM_BILLING_KEYS } from './lib/helcim-billing.mjs';
+
 const HELCIM_API_BASE_URL = 'https://api.helcim.com/v2/';
 const DEFAULT_TIMEOUT_MS = 10_000;
 
@@ -76,27 +78,44 @@ export async function helcimRequest(path, {
 // WHAT: creates one DUE invoice for the exact outstanding Shopify balance and returns its customer-payable Helcim online-view URL.
 // CHANGE-GUARD: this intentionally uses one balance-due line, not the original item breakdown; partial payments and edited orders must bill only the current outstanding amount.
 // INVARIANT(S): amount is positive, currency is USD/CAD, and a response without invoiceId+token fails closed before any email is sent.
-export async function createCreditCardInvoice({ orderName, amount, currency }, options = {}) {
+// BILLING: an optional `billingAddress` (lib/helcim-billing.mjs buildHelcimBillingAddress) puts the customer's name, address and
+// email on the invoice. It is whitelisted to HELCIM_BILLING_KEYS and omitted unless name+street1+postalCode are present. If Helcim
+// answers 400/422 the invoice is retried ONCE without it, because the address is cosmetic and must never stop a card invoice
+// going out; those two statuses mean Helcim validated and refused the request, so no invoice exists to duplicate. Every other
+// failure (401, 429, 5xx, timeout, network) may have created the invoice and is NOT retried. Resolves with `billingIncluded`.
+// DEPENDS: server.mjs POST /orders/:id/send-credit-card-invoice passes `billingAddress` and surfaces `billingIncluded`.
+export async function createCreditCardInvoice({ orderName, amount, currency, billingAddress }, options = {}) {
   const normalizedAmount = Math.round(Number(amount) * 100) / 100;
   const normalizedCurrency = String(currency || '').toUpperCase();
   if (!Number.isFinite(normalizedAmount) || normalizedAmount <= 0) throw new TypeError('Invoice amount must be greater than zero');
   if (!['USD', 'CAD'].includes(normalizedCurrency)) throw new TypeError('Invoice currency must be USD or CAD');
 
-  const response = await helcimRequest('/invoices', {
-    ...options,
-    method: 'POST',
-    body: {
-      currency: normalizedCurrency,
-      type: 'INVOICE',
-      status: 'DUE',
-      lineItems: [{
-        description: `Balance due for Fuzzywumpets wholesale order ${String(orderName || '').trim()}`.trim(),
-        quantity: 1,
-        price: normalizedAmount,
-      }],
-      notes: `Fuzzywumpets wholesale order ${String(orderName || '').trim()}`.trim(),
-    },
-  });
+  const { warn = console.error, ...requestOptions } = options;
+  const body = {
+    currency: normalizedCurrency,
+    type: 'INVOICE',
+    status: 'DUE',
+    lineItems: [{
+      description: `Balance due for Fuzzywumpets wholesale order ${String(orderName || '').trim()}`.trim(),
+      quantity: 1,
+      price: normalizedAmount,
+    }],
+    notes: `Fuzzywumpets wholesale order ${String(orderName || '').trim()}`.trim(),
+  };
+  const billing = pickBillingAddress(billingAddress);
+
+  let response;
+  let billingIncluded = false;
+  if (billing) {
+    try {
+      response = await helcimRequest('/invoices', { ...requestOptions, method: 'POST', body: { ...body, billingAddress: billing } });
+      billingIncluded = true;
+    } catch (error) {
+      if (!(error instanceof HelcimApiError) || ![400, 422].includes(error.status)) throw error;
+      warn(`Helcim refused the invoice billing address (HTTP ${error.status}); creating the invoice without it`);
+    }
+  }
+  if (!response) response = await helcimRequest('/invoices', { ...requestOptions, method: 'POST', body });
   const invoice = response.data?.invoice || response.data;
   if (!invoice?.invoiceId || !invoice?.token) throw new HelcimApiError('Helcim invoice response was missing invoiceId or token');
   const { subdomainUrl } = readConfig(options.env || process.env);
@@ -109,5 +128,17 @@ export async function createCreditCardInvoice({ orderName, amount, currency }, o
     url: url.toString(),
     amount: normalizedAmount,
     currency: normalizedCurrency,
+    billingIncluded,
   };
+}
+
+// Keeps only documented Address keys with non-empty string values and requires Helcim's three mandatory fields; anything
+// else (null, a string, a partial object) is "no address" so the request is never one Helcim would reject outright.
+function pickBillingAddress(address) {
+  if (!address || typeof address !== 'object') return null;
+  const out = {};
+  for (const key of HELCIM_BILLING_KEYS) {
+    if (typeof address[key] === 'string' && address[key].trim()) out[key] = address[key].trim();
+  }
+  return out.name && out.street1 && out.postalCode ? out : null;
 }
