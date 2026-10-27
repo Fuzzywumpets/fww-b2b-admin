@@ -43,6 +43,7 @@ import {
   getOrderByName,
   getOrderInternalNote, setOrderInternalNote,
   getHelcimInvoiceMap, upsertHelcimInvoiceMap, setHelcimInvoiceDelivery,
+  claimHelcimPaymentSync, setHelcimPaymentState, listHelcimInvoicesForPaymentSync,
 } from './db.mjs';
 import {
   generateInvoicePdf, lineItemTrueTotal, lineItemTrueUnit, lineItemCurrentQty,
@@ -73,7 +74,9 @@ import { resolveOrderCompany, buildOrderAddresses } from './lib/order-company.mj
 import { keepEditModeRedirects, keepEditClientPattern, EDIT_ANCHOR } from './lib/edit-mode-resume.mjs';
 import { assertNoUserErrors } from './lib/shopify-user-errors.mjs';
 import { currentShippingAmount, findShippingInvoice, parseShippingAmount, stageShippingReplacement } from './lib/order-shipping.mjs';
-import { createCreditCardInvoice } from './helcim.mjs';
+import { createCreditCardInvoice, getInvoice as getHelcimInvoice } from './helcim.mjs';
+// Helcim -> Shopify paid sync (route POST /orders/:id/sync-helcim-payment + the HELCIM_PAYMENT_SYNC poller). Pure rules + injected deps.
+import { syncHelcimPayment, syncAllHelcimPayments, createHelcimSyncDeps } from './lib/helcim-reconcile.mjs';
 // DEPENDS: lib/helcim-note.mjs is the text contract for the CC invoice email (subject keeps the
 //   #NNNNN token; the stored note body is plain text) and builds the Portal visible-note payload,
 //   including the structured `creditCardInvoice` object the Portal's Gmail sender consumes.
@@ -1586,6 +1589,12 @@ function summarizeAudit(action, afterJson) {
     case 'xero:invoice_failed':    return 'Xero invoice sync failed';
     case 'helcim_invoice_sent':    return `sent a Helcim credit card invoice${after.amount != null ? ` for ${fmtMoney(after.amount)}` : ''}`;
     case 'helcim_invoice_email_failed': return 'created a Helcim invoice, but email delivery failed';
+    // SYNC: the three helcim_payment_* verbs are written by lib/helcim-reconcile.mjs syncHelcimPayment (actor = staff email, or system:helcim-sync for the poller).
+    case 'helcim_payment_synced':  return after.shopifyAlreadyPaid
+      ? `found Helcim invoice ${after.invoiceNumber || ''} paid${after.amount != null ? ` (${fmtMoney(after.amount)})` : ''}; Shopify already showed the order paid, so check it is not a duplicate payment`.replace(/\s+/g, ' ')
+      : `marked the order paid: Helcim invoice ${after.invoiceNumber || ''} was paid${after.amount != null ? ` (${fmtMoney(after.amount)})` : ''}`.replace(/\s+/g, ' ');
+    case 'helcim_payment_needs_review': return `found a Helcim payment that needs review${after.reason ? `: ${after.reason}` : ''}`;
+    case 'helcim_payment_sync_failed':  return `could not mark the order paid after a Helcim payment${after.error ? `: ${after.error}` : ''}`;
     default:                       return String(action || 'activity').replace(/[/_:]/g, ' ');
   }
 }
@@ -2459,6 +2468,30 @@ function variantLabel(variant) {
   return t && t !== 'Default Title' ? t : '';
 }
 
+// WHAT: the one-line "Helcim invoice" status strip on the order page, with a "Check Helcim payment" button until the payment is recorded.
+// CHANGE-GUARD: renders nothing when the order has no Helcim ledger row. Reads ONLY the paid_* summary columns + invoice number/amount
+//   from helcim_invoice_map, never the token or pay URL. Every dynamic value is escaped via h(). paid_synced / already_paid are finished states
+//   (no button); needs_review and error keep the button because staff fix the cause and re-check from here.
+// INVARIANT(S): pure string builder; `state` comes from db.mjs HELCIM_PAYMENT_STATES (null = not confirmed paid yet).
+function helcimPaymentStatusHtml(ledger, numId) {
+  if (!ledger) return '';
+  const label = `Helcim invoice ${h(ledger.invoice_number || ledger.invoice_id)} (${fmtMoney(ledger.amount, ledger.currency)})`;
+  const state = ledger.paid_state;
+  const checked = ledger.paid_checked_at ? ` Last checked ${h(fmtDateTime(ledger.paid_checked_at))}.` : '';
+  const button = `<form method="POST" action="/orders/${h(numId)}/sync-helcim-payment" style="display:inline;margin-left:10px"><button class="btn btn-ghost" type="submit" title="Ask Helcim whether this invoice has been paid and, if it has, mark the Shopify order paid">Check Helcim payment</button></form>`;
+  let tone = 'info', text;
+  if (state === 'paid_synced') { tone = 'success'; text = `${label} was paid${ledger.paid_synced_at ? ` and the order was marked paid ${h(fmtDateTime(ledger.paid_synced_at))}` : ''}.`; }
+  else if (state === 'already_paid') { tone = 'warning'; text = `${label} was paid, but the order already showed as paid. Check this is not a duplicate payment.`; }
+  else if (state === 'needs_review') { tone = 'warning'; text = `${label}: payment needs review. ${h(ledger.paid_note || '')}`; }
+  else if (state === 'error') { tone = 'warning'; text = `${label}: the payment check failed (${h(ledger.paid_note || 'unknown error')}).${checked}`; }
+  else if (state === 'syncing') { text = `${label}: payment check in progress.`; }
+  else { text = `${label} has been sent. ${ledger.helcim_status ? `Helcim shows it as ${h(String(ledger.helcim_status).toLowerCase())}.` : 'Not yet confirmed paid.'}${checked}`; }
+  const finished = state === 'paid_synced' || state === 'already_paid';
+  const colors = { info: '#eef6ff;border:1px solid #bcd7f5', success: '#e8f5ea;border:1px solid #b7dfc0', warning: '#fff7e0;border:1px solid #f1d48a' }[tone];
+  // Deliberately NOT class="alert": that class is the one-shot ?success=/?error= flash banner (tests and the flash-visibility script count/target it); this is a standing status strip.
+  return `<div class="helcim-strip" id="helcim-payment-status" style="margin-bottom:12px;padding:10px 14px;border-radius:6px;font-size:13px;background:${colors}">${text}${finished ? '' : button}</div>`;
+}
+
 // WHAT: the large order-detail page — status timeline, editable line items, fulfillments, transactions, address, Xero/partial-invoice state, and the modal JS (edit/discount/fulfill/backorder/invoice/cancel).
 // CHANGE-GUARD: reads several SQLite stores by gid (getXeroMap, getPartialInvoices, getBackordersForOrder, getBackorderedLinesForOrder) — those keys must match shopifyOrderGid(numId). Backordered units are NOT on the Shopify order any more, so they render as inert struck-through rows in a second <tbody class="bo-struck"> (backorderedRowsHtml) that the edit machinery must never see — see the CHANGE-GUARD there. The edit form posts qtys[]/prices[]/removes/addCustomLines to /orders/:id/edit; serializeCustomLines() must run before submit (onclick on Save). Re-test edit/fulfill/cancel modals after any markup change since the inline JS selects elements by hardcoded ids.
 // EDIT-MODE RESUME (2026-10-26): `resumeEdit` (true only for ?edit=1) emits resumeEditScript, which re-enters edit mode after an action taken while editing — see lib/edit-mode-resume.mjs; never default it to true. INVARIANT(S): flash strings map 1:1 to alert banners — adding a server flash value needs a branch here or it renders silently; line-item product links resolve via variant.product.id or the MOCK_VARIANT_PRODUCT fallback.
@@ -2737,6 +2770,23 @@ function renderOrderDetail(session, order, flash, flashMsg, { resumeEdit = false
     ? `<div class="alert alert-success">Credit card invoice sent to ${h(order.customer?.email || 'the customer')} through Helcim.</div>`
     : flash === 'credit_card_invoice_failed'
     ? `<div class="alert alert-warning">Credit card invoice failed or email delivery was not confirmed. ${flashMsg ? h(flashMsg) : 'Check server logs.'}${helcimInvoice?.url ? ` <a href="${h(helcimInvoice.url)}" target="_blank" rel="noopener">Open the existing Helcim invoice</a>.` : ''}</div>`
+    // SYNC: flash codes come from POST /orders/:id/sync-helcim-payment (helcimSyncFlash); the sync-failure codes are read from ?error= and, like every error here, rendered as alert-warning.
+    : flash === 'helcim_payment_synced'
+    ? `<div class="alert alert-success">Helcim shows the invoice as paid, so this order was marked paid in Shopify. (Not recorded in Xero.)${flashMsg ? ` <strong>${h(flashMsg)}</strong>` : ''}</div>`
+    : flash === 'helcim_payment_unpaid'
+    ? `<div class="alert alert-info">Helcim does not show this invoice as paid yet${flashMsg ? ` (status ${h(flashMsg)})` : ''}. Nothing was changed.</div>`
+    : flash === 'helcim_payment_done'
+    ? `<div class="alert alert-info">This Helcim payment has already been recorded. Nothing was changed.</div>`
+    : flash === 'helcim_payment_busy'
+    ? `<div class="alert alert-info">A Helcim payment check is already running for this order. Try again in a minute.</div>`
+    : flash === 'helcim_payment_already_paid'
+    ? `<div class="alert alert-warning">Helcim shows the invoice as paid, but this order already showed as paid in Shopify, so nothing was changed. Check this is not a duplicate payment.</div>`
+    : flash === 'helcim_payment_review'
+    ? `<div class="alert alert-warning">Helcim payment found, but it needs a person to check it before the order is marked paid. ${h(flashMsg || '')}</div>`
+    : flash === 'helcim_payment_failed'
+    ? `<div class="alert alert-warning">The Helcim payment check could not finish. Nothing was marked paid. ${h(flashMsg || 'Check server logs.')}</div>`
+    : flash === 'helcim_payment_none'
+    ? `<div class="alert alert-warning">This order has no Helcim credit card invoice to check.</div>`
     : flash === 'order_edited'
     ? `<div class="alert alert-success">Order updated.${flashMsg ? ` <span style="color:#b45309">Note: ${h(flashMsg)}</span>` : ''}</div>`
     : flash === 'discount_applied'
@@ -3219,6 +3269,7 @@ function renderOrderDetail(session, order, flash, flashMsg, { resumeEdit = false
       </div>
     </div>
     ${timeline}
+    ${helcimPaymentStatusHtml(helcimInvoice, numId)}
     <div class="detail-grid">
       <div class="detail-main">
         ${/* DEPENDS: id="line-items" is the scroll anchor of lib/edit-mode-resume.mjs (EDIT_ANCHOR): the keep-edit-mode redirect
@@ -6750,6 +6801,114 @@ app.post('/orders/:id/send-credit-card-invoice', requireAuth, async (req, res) =
     console.error('Helcim credit card invoice failed:', error.message);
     return fail(502, error.message || 'Helcim invoice request failed.');
   }
+});
+
+// ── Helcim -> Shopify paid sync ───────────────────────────────────────────────
+// A customer who pays the Helcim invoice above pays Helcim, not Shopify, so the order would stay "pending" here. lib/helcim-reconcile.mjs
+// asks Helcim, and only when every money check agrees marks the Shopify order paid (see its header for THE RULE). Two triggers share it:
+// the "Check Helcim payment" button (POST /orders/:id/sync-helcim-payment) and the HELCIM_PAYMENT_SYNC=1 background poller at the bottom of this file.
+
+// MOCK-only world for the sync: which order ids the test hook below has "paid" in Helcim. Resets on restart; unused when MOCK is off.
+const mockHelcimPaid = new Set();
+
+// WHAT: MOCK stand-in for the Shopify `outstanding` read — what the fixture order still owes.
+// CHANGE-GUARD: must fall back to the CURRENT total (post-edit), exactly like renderOrderDetail's `outstanding` and the send-credit-card-invoice route that
+//   created the invoice, or an edited MOCK order would never match its own invoice amount.
+function mockOutstanding(order) {
+  const v = order.totalOutstandingSet?.presentmentMoney?.amount;
+  if (v != null && v !== '') return Math.max(0, parseFloat(v) || 0);
+  if (['PAID', 'REFUNDED', 'PARTIALLY_REFUNDED'].includes(order.displayFinancialStatus)) return 0;
+  return Math.max(0, deriveCurrentOrderTotals(order).total || 0);
+}
+
+// WHAT: the real dependency set for syncHelcimPayment / syncAllHelcimPayments; in MOCK the three external edges (Helcim read, Shopify read,
+//   Shopify mark-paid) are replaced by in-memory fixtures while the ledger store, claim logic and audit log stay REAL.
+// CHANGE-GUARD: the real branch passes the app's own shopifyFetch (the only Shopify transport) and helcim.mjs getInvoice; never build deps
+//   anywhere else, so every caller gets the same claim + audit behaviour.
+// INVARIANT(S): MOCK never reaches Helcim or Shopify; a MOCK invoice is DUE until POST /__test__/helcim-paid/:id marks it paid.
+// DEPENDS: lib/helcim-reconcile.mjs createHelcimSyncDeps (the `store` shape: getLedger / claim / setState / listDue); db.mjs ledger functions.
+function getHelcimSyncDeps() {
+  const real = createHelcimSyncDeps({
+    shopifyFetch,
+    getInvoice: getHelcimInvoice,
+    store: { getLedger: getHelcimInvoiceMap, claim: claimHelcimPaymentSync, setState: setHelcimPaymentState, listDue: listHelcimInvoicesForPaymentSync },
+    auditLog,
+  });
+  if (!MOCK) return real;
+  return {
+    ...real,
+    fetchInvoice: async (ledger) => {
+      const paid = mockHelcimPaid.has(shopifyNumericId(ledger.order_id));
+      return {
+        invoiceId: String(ledger.invoice_id), invoiceNumber: ledger.invoice_number || null, status: paid ? 'PAID' : 'DUE',
+        amount: Number(ledger.amount), amountPaid: paid ? Number(ledger.amount) : 0, amountDue: paid ? 0 : Number(ledger.amount),
+        currency: String(ledger.currency).toUpperCase(), datePaid: paid ? '2026-10-26 12:00:00' : null,
+      };
+    },
+    fetchOrder: async (gid) => {
+      const order = getMockOrder(shopifyNumericId(gid));
+      if (!order) return null;
+      return {
+        financialStatus: order.displayFinancialStatus,
+        cancelledAt: order.cancelledAt || null,
+        outstanding: mockOutstanding(order),
+        currency: (order.currentTotalPriceSet?.presentmentMoney || order.totalPriceSet?.presentmentMoney)?.currencyCode || 'USD',
+      };
+    },
+    markOrderPaid: async (gid) => {
+      const numId = shopifyNumericId(gid);
+      mockOrderOverrides.set(numId, {
+        ...(mockOrderOverrides.get(numId) || {}), displayFinancialStatus: 'PAID',
+        totalOutstandingSet: { presentmentMoney: { amount: '0.00', currencyCode: 'USD' } },
+      });
+      return { ok: true };
+    },
+  };
+}
+
+// WHAT: MOCK-only test hook — pretend the customer has just paid this order's Helcim invoice, so the HTTP suite can drive the paid path.
+// CHANGE-GUARD: 404 outside MOCK, exactly like /__test__/session without its flag; it only toggles an in-memory Set and can never reach Helcim or Shopify.
+app.post('/__test__/helcim-paid/:id', (req, res) => {
+  if (!MOCK) return res.status(404).json({ error: 'not found' });
+  mockHelcimPaid.add(String(req.params.id));
+  res.json({ ok: true });
+});
+
+// outcome -> [?success= | ?error=, flash code]. Informational results use success; anything a person should look at uses error (rendered as a warning).
+const HELCIM_SYNC_FLASH = {
+  synced: ['success', 'helcim_payment_synced'],
+  unpaid: ['success', 'helcim_payment_unpaid'],
+  done: ['success', 'helcim_payment_done'],
+  busy: ['success', 'helcim_payment_busy'],
+  already_paid: ['error', 'helcim_payment_already_paid'],
+  needs_review: ['error', 'helcim_payment_review'],
+  error: ['error', 'helcim_payment_failed'],
+  no_invoice: ['error', 'helcim_payment_none'],
+};
+
+// WHAT: staff "Check Helcim payment": asks Helcim whether this order's credit card invoice is paid and, if every check agrees, marks the Shopify order paid.
+// CHANGE-GUARD: all the money rules live in lib/helcim-reconcile.mjs (unit-tested); this route only wires deps, maps the outcome to a flash/JSON, and never throws. It does NOT
+//   record the payment in Xero (open decision: which account Helcim card deposits belong to), unlike /orders/:id/mark-paid.
+// INVARIANT(S): idempotent and safe to double-click (a held claim returns 'busy'); a Shopify order already showing paid is never written again; the audit rows are
+//   written by the reconcile module under the staff member's email; the response never contains the invoice token or pay URL.
+app.post('/orders/:id/sync-helcim-payment', requireAuth, async (req, res) => {
+  const numId = req.params.id;
+  if (!/^[0-9]{1,20}$/.test(numId)) return res.status(404).json({ error: 'Order not found' });
+  const wantsJson = req.headers['content-type']?.includes('application/json');
+  let result;
+  try {
+    result = await syncHelcimPayment(shopifyOrderGid(numId), getHelcimSyncDeps(), { actor: req.adminSession.email });
+  } catch (err) {
+    console.error('Helcim payment sync failed unexpectedly:', err.message);
+    result = { outcome: 'error', error: err.message };
+  }
+  if (wantsJson) {
+    const failed = result.outcome === 'error' || result.outcome === 'no_invoice';
+    return res.status(result.outcome === 'no_invoice' ? 404 : result.outcome === 'error' ? 502 : 200).json({ ok: !failed, ...result });
+  }
+  const [param, code] = HELCIM_SYNC_FLASH[result.outcome] || HELCIM_SYNC_FLASH.error;
+  const msg = String(result.reason || result.error || result.status || result.warning || '').slice(0, 300);
+  return res.redirect(`/orders/${numId}?${param}=${code}${msg ? `&msg=${encodeURIComponent(msg)}` : ''}`);
 });
 
 
@@ -13495,6 +13654,29 @@ if (!MOCK) {
   }, 60 * 1000);
   // Daily GC for expired impersonation nonces
   setInterval(() => gcImpersonationNonces(), 24 * 60 * 60 * 1000);
+}
+
+// WHAT: Helcim -> Shopify paid-sync poller — every 5 min, asks Helcim about the (at most 10) credit card invoices that are due a check and marks the matching Shopify orders paid.
+// CHANGE-GUARD: DEFAULT OFF — runs only when HELCIM_PAYMENT_SYNC=1 is set in the service environment, so deploying the code changes nothing until Alex turns it on; the order-page
+//   button works either way. NOT dashboardActive()-gated on purpose: a customer pays when they pay, and a payment must be recorded even if no one has the dashboard open. The first
+//   sweep waits 60s after boot so a restart cannot burst the Helcim API; _helcimSyncing stops overlapping sweeps; the per-sweep limit (10) and db.mjs poll gaps (4 min fresh, 1 h
+//   older than 3 days, none after 90 days) bound the Helcim traffic. Each order is claimed atomically in the ledger, so the poller and a staff click cannot both write Shopify.
+// INVARIANT(S): never runs in MOCK; a thrown sweep is logged (counts only, no ids/amounts/URLs) and swallowed so the interval survives; needs_review rows are never auto-retried.
+// DEPENDS: lib/helcim-reconcile.mjs syncAllHelcimPayments + db.mjs listHelcimInvoicesForPaymentSync; rollback = unset HELCIM_PAYMENT_SYNC (or redeploy the previous release, whose code ignores the paid_* columns).
+if (!MOCK && process.env.HELCIM_PAYMENT_SYNC === '1') {
+  let _helcimSyncing = false;
+  const sweep = async () => {
+    if (_helcimSyncing) return;
+    _helcimSyncing = true;
+    try {
+      const s = await syncAllHelcimPayments(getHelcimSyncDeps(), { limit: 10 });
+      if (s.synced || s.already_paid || s.needs_review || s.error) console.log('[helcim-sync] sweep', JSON.stringify(s));
+    } catch (err) {
+      console.error('[helcim-sync] sweep failed:', err.message);
+    } finally { _helcimSyncing = false; }
+  };
+  setTimeout(() => { sweep(); setInterval(sweep, 5 * 60 * 1000); }, 60 * 1000).unref?.();
+  console.log('[helcim-sync] payment poller enabled (every 5 min)');
 }
 
 // ── Phase 24E: Unified invoices page ──────────────────────────────────────────
