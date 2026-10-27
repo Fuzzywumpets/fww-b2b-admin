@@ -22,7 +22,7 @@ import {
   logLabelBatch, logExportBatch,
   createLead, getLeads, countLeads, getLeadCounts, getLead, updateLead, upsertPortalLead,
   addLeadNote, getLeadNotes, addLeadStatusHistory, getLeadStatusHistory,
-  upsertBackorder, getBackordersForOrder, getOpenBackorders, fulfillBackorder, logOrderEdit,
+  upsertBackorder, getBackordersForOrder, getBackorderedLinesForOrder, getOpenBackorders, fulfillBackorder, logOrderEdit,
   getEditAction, putEditAction,
   getOutstandingBalanceForCustomer,
   getXeroMap, setXeroMap, addXeroPending, getXeroPending, markXeroPendingDone, markXeroPendingFailed, getXeroPendingCount, getXeroInvoiceMaps,
@@ -46,8 +46,12 @@ import {
 } from './db.mjs';
 import {
   generateInvoicePdf, lineItemTrueTotal, lineItemTrueUnit, lineItemCurrentQty,
-  lineItemInvoiceDiscount,
+  lineItemInvoiceDiscount, lineItemWholesaleDiscount, snapshotLineInvoiceDiscount,
 } from './pdf.mjs';
+// DEPENDS: the title stamped on every wholesale line discount below (POST /orders/:id/edit and
+// POST /orders/:id/line/add) is the SAME constant pdf.mjs matches to keep that price off the invoice's
+// Discount row (and lib/backorder-edit.mjs stamps it on an Undo-restored line). Never write the literal here.
+import { WHOLESALE_DISCOUNT_TITLE } from './lib/wholesale-discount.mjs';
 // Extracted so they can be unit-tested without booting this server (house pattern: lib/*.mjs).
 import { isTerminalEditError } from './lib/order-edit-errors.mjs';
 // DEPENDS: every money surface in this file picks its amount through these two — cacheRowTotal for a
@@ -64,9 +68,16 @@ import { renderLabelSheet, expandItems, TEMPLATES as LABEL_TEMPLATES, DEFAULT_FI
 import { isInsider, resolveXeroContact, syncCustomerToXero, getXeroSyncStatus } from './lib/xero-customer-sync.mjs';
 import { parseLinePrices, applyLinePriceChanges, bulkMarkOrdersPaid, addLineDiscountsConcurrent } from './lib/order-money.mjs';
 import { resolveOrderCompany, buildOrderAddresses } from './lib/order-company.mjs';
+// DEPENDS: lib/edit-mode-resume.mjs — keeps staff in edit mode across the order page's POST -> redirect -> GET
+// round trips (see its header). Mounted below with app.use('/orders', ...); the client half is in editModeScript.
+import { keepEditModeRedirects, keepEditClientPattern, EDIT_ANCHOR } from './lib/edit-mode-resume.mjs';
 import { assertNoUserErrors } from './lib/shopify-user-errors.mjs';
 import { currentShippingAmount, findShippingInvoice, parseShippingAmount, stageShippingReplacement } from './lib/order-shipping.mjs';
 import { createCreditCardInvoice } from './helcim.mjs';
+// DEPENDS: lib/helcim-note.mjs is the text contract for the CC invoice email (subject keeps the
+//   #NNNNN token; the stored note body is plain text) and builds the Portal visible-note payload,
+//   including the structured `creditCardInvoice` object the Portal's Gmail sender consumes.
+import { normalizeStaffNote, buildCreditCardInvoicePayload } from './lib/helcim-note.mjs';
 // SYNC: same module db.mjs uses for the SQL LIMIT — the banner/footer copy and the query page size
 // must agree, otherwise the list lies about how much it is showing.
 import { ORDERS_LIST_LIMIT, CUSTOMERS_LIST_LIMIT, LEADS_LIST_LIMIT, listCountLabel, truncationNoticeHtml } from './lib/list-truncation.mjs';
@@ -144,6 +155,9 @@ const app = express();
 // permissive, so no existing consumer changes behaviour.
 app.use(express.json({ limit: '2mb', verify: (req, _res, buf) => { req.rawBody = buf; } }));
 app.use(express.urlencoded({ extended: true }));
+// WHAT: keep-edit-mode redirect rewrite for POST /orders/:id/<action> (lib/edit-mode-resume.mjs). It reads
+// req.body.editMode, so it must stay AFTER the body parsers above and BEFORE every /orders route.
+app.use('/orders', keepEditModeRedirects);
 
 // WHAT: slow-request tripwire — any response slower than 1s logs method/path/status/ms, so a
 // "the app feels broken" report (e.g. the 10s-login complaint, 2026-07-21) yields journalctl data
@@ -928,6 +942,48 @@ const MOCK_ORDERS = [
     shippingAddress: { firstName: 'Jane', lastName: 'Smith', address1: '456 Park Ave', address2: '', city: 'Seattle', province: 'WA', zip: '98101', country: 'US' },
     billingAddress:  { firstName: 'Jane', lastName: 'Smith', address1: '456 Park Ave', address2: '', city: 'Seattle', province: 'WA', zip: '98101', country: 'US' },
     fulfillments: [{ status: 'SUCCESS', trackingInfo: [{ number: 'TRACK1009', url: null, company: 'UPS' }], createdAt: '2026-05-30T12:00:00Z' }],
+    transactions: [],
+  },
+  // WHOLESALE-PRICED ADDED LINE fixture (#1011): mirrors live partial invoice #39875-A. Shopify ignores a manual
+  // price on a catalog variant, so a line staff add with "add product" lands at LIST price and the app brings it
+  // down with a per-line percentage discount titled WHOLESALE_DISCOUNT_TITLE. li1011b is that line (SKU 04622:
+  // list 17.99, net 8.99, allocation 9.00). li1011c carries a GENUINE staff discount ("Order discount: …") that
+  // must keep printing as a Discount row. Σ net = 36.00 + 8.99 + 36.00 = 80.99 = the order total (no tax/shipping).
+  // Deliberately carries NO currentSubtotalPriceSet/currentTotalPriceSet: the mock batch /edit recomputes
+  // subtotalPriceSet/totalPriceSet from the lines, so removing li1011c in a test keeps the totals honest.
+  // The customer is NOT in MOCK_CUSTOMERS on purpose, so this order never appears in another customer's list.
+  {
+    id: 'gid://shopify/Order/1011', name: '#1011', processedAt: '2026-05-30T10:00:00Z',
+    customer: { id: 'gid://shopify/Customer/110', displayName: 'Line Pricing Co', email: 'lines@linepricing.test' },
+    displayFinancialStatus: 'PENDING', displayFulfillmentStatus: 'UNFULFILLED',
+    totalPriceSet:    { presentmentMoney: { amount: '80.99', currencyCode: 'USD' } },
+    subtotalPriceSet: { presentmentMoney: { amount: '80.99', currencyCode: 'USD' } },
+    sourceName: 'web', tags: ['b2b-portal'], note: '',
+    lineItems: { edges: [
+      { node: { id: 'li1011a', title: 'Wholesale Collar', quantity: 3, currentQuantity: 3, variant: { id: 'v701', sku: 'WC-001', price: '12.00', inventoryQuantity: 10, selectedOptions: [] },
+          discountedUnitPriceSet: { presentmentMoney: { amount: '12.00', currencyCode: 'USD' } },
+          originalUnitPriceSet:   { presentmentMoney: { amount: '12.00', currencyCode: 'USD' } },
+          discountedTotalSet:     { presentmentMoney: { amount: '36.00', currencyCode: 'USD' } } } },
+      { node: { id: 'li1011b', title: 'Added Pinpoint Leash', quantity: 1, currentQuantity: 1, variant: { id: 'v702', sku: '04622', price: '17.99', inventoryQuantity: 8, selectedOptions: [] },
+          discountedUnitPriceSet: { presentmentMoney: { amount: '8.99', currencyCode: 'USD' } },
+          originalUnitPriceSet:   { presentmentMoney: { amount: '17.99', currencyCode: 'USD' } },
+          discountedTotalSet:     { presentmentMoney: { amount: '8.99', currencyCode: 'USD' } },
+          discountAllocations: [{ allocatedAmountSet: { presentmentMoney: { amount: '9.00', currencyCode: 'USD' } },
+                                  discountApplication: { targetSelection: 'EXPLICIT', description: WHOLESALE_DISCOUNT_TITLE } }] } },
+      { node: { id: 'li1011c', title: 'Trade Show Lead', quantity: 2, currentQuantity: 2, variant: { id: 'v703', sku: 'TSL-003', price: '20.00', inventoryQuantity: 6, selectedOptions: [] },
+          discountedUnitPriceSet: { presentmentMoney: { amount: '18.00', currencyCode: 'USD' } },
+          originalUnitPriceSet:   { presentmentMoney: { amount: '20.00', currencyCode: 'USD' } },
+          discountedTotalSet:     { presentmentMoney: { amount: '36.00', currencyCode: 'USD' } },
+          discountAllocations: [{ allocatedAmountSet: { presentmentMoney: { amount: '4.00', currencyCode: 'USD' } },
+                                  discountApplication: { targetSelection: 'EXPLICIT', description: 'Order discount: Trade show' } }] } },
+    ]},
+    totalShippingPriceSet: { presentmentMoney: { amount: '0.00', currencyCode: 'USD' } },
+    totalTaxSet:           { presentmentMoney: { amount: '0.00', currencyCode: 'USD' } },
+    totalOutstandingSet:   { presentmentMoney: { amount: '80.99', currencyCode: 'USD' } },
+    totalReceivedSet:      { presentmentMoney: { amount: '0.00', currencyCode: 'USD' } },
+    shippingAddress: { firstName: 'Lena', lastName: 'Price', address1: '12 Mill Rd', address2: '', city: 'Asheville', province: 'NC', zip: '28801', country: 'US' },
+    billingAddress:  { firstName: 'Lena', lastName: 'Price', address1: '12 Mill Rd', address2: '', city: 'Asheville', province: 'NC', zip: '28801', country: 'US' },
+    fulfillments: [],
     transactions: [],
   },
 ];
@@ -2404,9 +2460,9 @@ function variantLabel(variant) {
 }
 
 // WHAT: the large order-detail page — status timeline, editable line items, fulfillments, transactions, address, Xero/partial-invoice state, and the modal JS (edit/discount/fulfill/backorder/invoice/cancel).
-// CHANGE-GUARD: reads several SQLite stores by gid (getXeroMap, getPartialInvoices, getBackordersForOrder) — those keys must match shopifyOrderGid(numId). The edit form posts qtys[]/prices[]/removes/addCustomLines to /orders/:id/edit; serializeCustomLines() must run before submit (onclick on Save). Re-test edit/fulfill/cancel modals after any markup change since the inline JS selects elements by hardcoded ids.
-// INVARIANT(S): flash strings map 1:1 to alert banners — adding a server flash value needs a branch here or it renders silently; line-item product links resolve via variant.product.id or the MOCK_VARIANT_PRODUCT fallback.
-function renderOrderDetail(session, order, flash, flashMsg) {
+// CHANGE-GUARD: reads several SQLite stores by gid (getXeroMap, getPartialInvoices, getBackordersForOrder, getBackorderedLinesForOrder) — those keys must match shopifyOrderGid(numId). Backordered units are NOT on the Shopify order any more, so they render as inert struck-through rows in a second <tbody class="bo-struck"> (backorderedRowsHtml) that the edit machinery must never see — see the CHANGE-GUARD there. The edit form posts qtys[]/prices[]/removes/addCustomLines to /orders/:id/edit; serializeCustomLines() must run before submit (onclick on Save). Re-test edit/fulfill/cancel modals after any markup change since the inline JS selects elements by hardcoded ids.
+// EDIT-MODE RESUME (2026-10-26): `resumeEdit` (true only for ?edit=1) emits resumeEditScript, which re-enters edit mode after an action taken while editing — see lib/edit-mode-resume.mjs; never default it to true. INVARIANT(S): flash strings map 1:1 to alert banners — adding a server flash value needs a branch here or it renders silently; line-item product links resolve via variant.product.id or the MOCK_VARIANT_PRODUCT fallback.
+function renderOrderDetail(session, order, flash, flashMsg, { resumeEdit = false } = {}) {
   const numId    = shopifyNumericId(order.id);
   // DEPENDS: both the order heading and the local-note warning link to this exact Shopify order.
   // Keep the store slug aligned with the production Shopify store handle.
@@ -2470,10 +2526,23 @@ function renderOrderDetail(session, order, flash, flashMsg) {
 
   // Backorders for this order (from SQLite) — must be before lineItemsHtml
   const backordersForOrder = getBackordersForOrder(`gid://shopify/Order/${numId}`);
-// WHAT: indexes this order's backorder rows by line_item_id so each line can render a ⚠ Backorder badge + ETA.
+// WHAT: indexes this order's backorder rows by line_item_id so each line can render a ⚠ Backorder badge (legacy flag-only rows only) and the Fulfill modal can badge it too.
 // CHANGE-GUARD: must be computed BEFORE lineItemsHtml (it is) — moving it after the .map() breaks the badge lookup. Keyed by the Shopify line-item id (item.id), which must match what fulfillBackorder/upsertBackorder persist.
 // INVARIANT(S): one backorder row per line item assumed (Map collapses duplicates to the last).
   const backorderMap = new Map(backordersForOrder.map(b => [b.line_item_id, b]));
+
+  // WHAT: the units a backorder REMOVED from the Shopify order (2026-10-26 hot-fix). They are no longer on
+  //   the order, so nothing in Shopify's line items describes them — SQLite is the only record, and without
+  //   this block they simply vanished from the page and there was no way to Undo.
+  // CHANGE-GUARD: rendered as inert struck-through rows in their OWN <tbody class="bo-struck"> (see
+  //   backorderedRowsHtml). The edit machinery (toggleEditMode, markRemove, __autosave, wireExisting, the
+  //   totals reconcile) selects rows by data-li-id / data-existing / data-removed / .edit-* / .row-save-chip —
+  //   none of which these rows may carry, or a backordered unit becomes an editable, saveable line again.
+  // DEPENDS: db.mjs getBackorderedLinesForOrder (lineItemId, title, variantTitle, sku, quantity, unitPrice,
+  //   currency, lineTotal). It returns only live removed-units rows (status 'pending',
+  //   shopify_removed_qty > 0): a legacy flag-only row has no removed units and keeps its ⚠ Backorder badge.
+  //   The order page shows NO expected-ship-date anywhere (owner decision 2026-10-26): do not read etaDate here.
+  const backorderedLines = getBackorderedLinesForOrder(`gid://shopify/Order/${numId}`);
 
   // Line items table
   const lineItems = (order.lineItems?.edges || []).map(e => e.node);
@@ -2496,7 +2565,7 @@ function renderOrderDetail(session, order, flash, flashMsg) {
 // in an edit (currentQuantity 0) are HIDDEN — Shopify retains them on the order but they're not part of it
 // anymore, so they must not show as line rows, inflate the count, or contribute to the subtotal. currentQty
 // falls back to `quantity` when the field is absent (MOCK fixtures / unedited orders) so behavior is unchanged there.
-// INVARIANT(S): rowTotal = unitPrice * currentQty computed in JS for display only (server recomputes on save); productNum resolves via variant.product.id (live) or MOCK_VARIANT_PRODUCT (mock) and gates whether the title is a link; item.title is escaped into both markup and an onclick string (the onclick path uses replace(/'/g) — fragile, prefer not to add quotes-bearing data there).
+// INVARIANT(S): rowTotal = unitPrice * currentQty computed in JS for display only (server recomputes on save) — and in edit mode the client repaints it live from the row's own qty x price inputs (paintRowTotal), so a row's shown Total always equals its shown qty x unit price; productNum resolves via variant.product.id (live) or MOCK_VARIANT_PRODUCT (mock) and gates whether the title is a link; item.title is escaped into both markup and an onclick string (the onclick path uses replace(/'/g) — fragile, prefer not to add quotes-bearing data there).
   const lineItemsHtml = lineItems.map(item => {
     const currentQty = item.currentQuantity != null ? item.currentQuantity : (item.quantity || 0);
     if (currentQty <= 0) return ''; // removed in a prior edit — not part of the order anymore
@@ -2512,7 +2581,10 @@ function renderOrderDetail(session, order, flash, flashMsg) {
     const vLabel = variantLabel(item.variant);
     const variantSub = vLabel ? `<div class="variant-sub">${h(vLabel)}</div>` : '';
     const bo = backorderMap.get(item.id);
-    const boBadge = bo ? `<span class="badge badge-warning" title="ETA: ${bo.eta_date || 'unknown'}">⚠ Backorder</span>` : '';
+    // Legacy FLAG-ONLY rows (shopify_removed_qty = 0: the old behaviour never touched Shopify) keep the badge.
+    // A removed-units row must NOT badge the live line: whatever is still on the order after a partial
+    // backorder is NOT backordered — the removed units show as their own struck row below.
+    const boBadge = bo && !(bo.shopify_removed_qty > 0) ? `<span class="badge badge-warning">⚠ Backorder</span>` : '';
     // Second build (Build 4): the per-line Backorder control read like a STATUS ("Backorder" on
     // every line in edit mode), making every line look backordered. Relabel/restyle it as a clear
     // ACTION — a small muted "⚑ Mark backordered" link — WITHOUT changing behavior (still opens
@@ -2549,9 +2621,44 @@ function renderOrderDetail(session, order, flash, flashMsg) {
         <span class="edit-price-static">${fmtMoney(unitPrice)}</span>
         <input type="number" step="0.01" min="0" name="prices[${h(item.id)}]" value="${unitPrice.toFixed(2)}" class="edit-price-input" data-retail="${parseFloat(item.originalUnitPriceSet?.presentmentMoney?.amount ?? unitPrice).toFixed(2)}" style="display:none;width:72px">
       </td>
-      <td class="text-right">${fmtMoney(rowTotal)}</td>
+      ${/* DEPENDS: paintRowTotal() in the edit-mode script finds this cell by .line-total-amt and repaints it
+           as qty x unit price while the operator edits. Without it this cell was STATIC: change qty or
+           price in edit mode and the Total stayed at its page-load value while the Subtotal (server
+           truth) moved, so the visible line totals stopped summing to the Subtotal. The two other row
+           builders (addCustomLineRow, addCatalogLineRow) carry the same .line-total-amt span. */''}<td class="text-right line-total-cell"><span class="line-total-amt">${fmtMoney(rowTotal)}</span></td>
     </tr>`;
   }).join('');
+
+  // WHAT: one struck-through row per backordered line (units removed from the Shopify order) + an "Undo
+  //   backorder" button, in a second <tbody> after the live lines. Nothing in here is part of the order: not
+  //   the subtotal, not the total, not anything the edit form submits.
+  // CHANGE-GUARD: these <tr>s deliberately carry NO data-li-id / data-existing / data-removed, no .edit-qty-*,
+  //   .edit-price-*, .edit-remove-btn or .row-save-chip, and no <input>. The Undo control is a type="button"
+  //   carrying data-bo-* attributes (its id is data-bo-line-id, NOT data-li-id) that a delegated listener reads
+  //   and posts through #bo-undo-form, which lives OUTSIDE #edit-form (a <form> cannot nest). Keep it on that
+  //   path: an inline onclick would concatenate attacker-controllable free text (the title) into JS.
+  // INVARIANT(S): every interpolated value goes through h(); unitPrice/lineTotal are Numbers formatted with
+  //   fmtMoney(…, currency). A second <tbody> (not extra rows in the first) is what keeps the "Add product" /
+  //   "Add custom line" rows — appended to the FIRST tbody of #edit-form's table — above the struck rows.
+  const backorderedRowsHtml = backorderedLines.length === 0 ? '' : `<tbody class="bo-struck">
+      <tr class="bo-struck-head"><td colspan="5">Backordered &mdash; removed from this order and its total</td></tr>
+      ${backorderedLines.map(b => {
+        const priceTxt = fmtMoney(b.unitPrice, b.currency);
+        return `<tr class="bo-struck-row">
+        <td>
+          <span class="bo-struck-text">${h(b.title)}</span> <span class="badge badge-warning bo-tag">Backordered</span>
+          ${b.variantTitle ? `<div class="variant-sub">${h(b.variantTitle)}</div>` : ''}
+          <div><button type="button" class="btn btn-secondary btn-sm bo-undo-btn" data-bo-label="Undo backorder"
+            title="Put these units back on the Shopify order at their B2B price"
+            data-bo-line-id="${h(b.lineItemId)}" data-bo-title="${h(b.title)}" data-bo-qty="${h(b.quantity)}" data-bo-price="${h(priceTxt)}">Undo backorder</button></div>
+        </td>
+        <td class="mono"><span class="bo-struck-text">${h(b.sku || '—')}</span></td>
+        <td class="text-right"><span class="bo-struck-text">${h(b.quantity)}</span></td>
+        <td class="text-right"><span class="bo-struck-text">${h(priceTxt)}</span></td>
+        <td class="text-right"><span class="bo-struck-text">${h(fmtMoney(b.lineTotal, b.currency))}</span></td>
+      </tr>`;
+      }).join('')}
+    </tbody>`;
 
   // CURRENT-FIELDS (2026-06-29): show the CURRENT (post-edit) subtotal/total on first paint — the frozen
   // subtotal/totalPriceSet would render the pre-edit amounts ($921.72 on #37639) until the client reconcile
@@ -2636,8 +2743,15 @@ function renderOrderDetail(session, order, flash, flashMsg) {
     ? `<div class="alert alert-success">Discount applied.</div>`
     : flash === 'fulfilled'
     ? `<div class="alert alert-success">Fulfillment recorded.</div>`
+    // DEPENDS: flash codes come from lib/backorder-edit.mjs BACKORDER_FLASH via POST /orders/:id/backorder
+    // and /backorder/undo (?success=backorder_flagged | backorder_restored[&msg=], ?error=backorder_shopify_failed&msg=).
+    // The failure code is read from ?error= — which, like every error here, is mapped to alert-warning.
     : flash === 'backorder_flagged'
-    ? `<div class="alert alert-success">Line item marked as backordered.</div>`
+    ? `<div class="alert alert-success">Marked as backordered. The units were removed from the Shopify order and its total. They stay on the invoice, crossed out. Use <strong>Undo backorder</strong> on the struck-through row to put them back.</div>`
+    : flash === 'backorder_restored'
+    ? `<div class="alert alert-success">Backorder undone &mdash; the units are back on the Shopify order.</div>${flashMsg ? `<div class="alert alert-warning">${h(flashMsg)}</div>` : ''}`
+    : flash === 'backorder_shopify_failed'
+    ? `<div class="alert alert-warning">Backorder action failed &mdash; ${flashMsg ? h(flashMsg) : 'check server logs.'}</div>`
     : flash === 'xero_synced'
     ? `<div class="alert alert-success">Xero invoice created/synced.</div>`
     : flash === 'xero_paid'
@@ -2705,23 +2819,114 @@ function renderOrderDetail(session, order, flash, flashMsg) {
   function toggleFulfillModal(show) {
     document.getElementById('fulfill-modal').style.display = show ? 'flex' : 'none';
   }
+  // WHAT: opens/closes the "Mark backordered" modal. On open it (re)fills every field from the clicked line.
+  // CHANGE-GUARD: backorder is a REAL Shopify edit now (the units leave the order and its total), so three
+  //   things are re-armed on EVERY open, not once at load: a fresh idemKey (one key per open, so a double
+  //   click or a browser retry is the same request while a deliberate second backorder is a new one), the
+  //   quantity max (the line's CURRENT quantity, not what it was when the page loaded) and the submit button
+  //   (a previous submit leaves it disabled, and bfcache can restore the page in that state).
+  // DEPENDS: POST /orders/:id/backorder reads lineItemId, lineItemTitle, quantity, idemKey from this
+  //   form (the expected-ship-date field is gone from the UI by owner decision — do not post an eta; parseBackorderRequest + the idemKey regex /^[A-Za-z0-9_-]{8,80}$/); ids bo-li-id, bo-li-title,
+  //   bo-quantity, bo-idem-key, bo-line-name, bo-max-qty, bo-submit, bo-form belong to the modal markup below.
+  function newBackorderIdemKey() {
+    if (window.crypto && typeof window.crypto.randomUUID === 'function') return window.crypto.randomUUID();
+    // randomUUID is secure-context only; this keeps the token unique enough and inside the server's regex.
+    return 'bo-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 12);
+  }
   function toggleBackorderModal(liId, liTitle, liQty, show) {
     const m = document.getElementById('backorder-modal');
     if (show) {
+      var max = Math.max(1, parseInt(liQty, 10) || 1);
       m.style.display = 'flex';
       document.getElementById('bo-li-id').value = liId || '';
       document.getElementById('bo-li-title').value = liTitle || '';
-      document.getElementById('bo-quantity').value = liQty || 1;
+      document.getElementById('bo-line-name').textContent = liTitle || '';
+      document.getElementById('bo-max-qty').textContent = String(max);
+      var qty = document.getElementById('bo-quantity');
+      qty.max = String(max);
+      qty.value = String(max);
+      document.getElementById('bo-idem-key').value = newBackorderIdemKey();
+      var sb = document.getElementById('bo-submit');
+      sb.disabled = false; sb.textContent = sb.getAttribute('data-bo-label');
     } else {
       m.style.display = 'none';
     }
   }
   // Delegated listener for line "Mark backordered" buttons — reads data-* attrs (safe: attribute
   // context) instead of an inline onclick that would concatenate the attacker-controlled title into JS.
+  // The quantity cap is the line's CURRENT quantity: the qty input's last accepted value when the edit
+  // controls have changed it since page load, else the server-rendered data-li-qty. (The server re-reads
+  // the order from Shopify and is the authority; this only keeps an impossible number out of the box.)
   document.addEventListener('click', function(e){
     var b = e.target.closest && e.target.closest('.bo-action-btn');
-    if (b) { toggleBackorderModal(b.getAttribute('data-li-id'), b.getAttribute('data-li-title'), b.getAttribute('data-li-qty'), true); }
+    if (b) {
+      var row = b.closest('tr');
+      var qIn = row && row.querySelector('.edit-qty-input');
+      var cur = (qIn && qIn.getAttribute('data-last')) || b.getAttribute('data-li-qty');
+      toggleBackorderModal(b.getAttribute('data-li-id'), b.getAttribute('data-li-title'), cur, true);
+    }
   });
+  // Double-click guard: the submit is a real Shopify edit. Delegated (submit bubbles) because this script runs
+  // before the modal markup exists.
+  document.addEventListener('submit', function(e){
+    if (!e.target || e.target.id !== 'bo-form') return;
+    var sb = document.getElementById('bo-submit');
+    if (sb) { sb.disabled = true; sb.textContent = 'Removing from Shopify…'; }
+  });
+  // "Undo backorder" on a struck-through row. A confirm states exactly what will happen, then the hidden
+  // #bo-undo-form (outside #edit-form — forms cannot nest) is posted with the line id. Everything is read
+  // from data-bo-* attributes; nothing server-supplied is ever spliced into JS.
+  document.addEventListener('click', function(e){
+    var u = e.target.closest && e.target.closest('.bo-undo-btn');
+    if (!u || u.disabled) return;
+    var msg = 'Put ' + u.getAttribute('data-bo-qty') + ' × ' + u.getAttribute('data-bo-title')
+      + ' back on the Shopify order at ' + u.getAttribute('data-bo-price') + ' (its B2B price)?';
+    if (!window.confirm(msg)) return;
+    var f = document.getElementById('bo-undo-form');
+    if (!f) return;
+    document.getElementById('bo-undo-li-id').value = u.getAttribute('data-bo-line-id');
+    u.disabled = true; u.textContent = 'Restoring…';
+    // form.submit() fires NO submit event, so the capture-phase listener below never sees this one.
+    rememberEditMode(f);
+    f.submit();
+  });
+  // Back/forward can restore this page from bfcache with the buttons still disabled.
+  window.addEventListener('pageshow', function(e){
+    if (!e.persisted) return;
+    document.querySelectorAll('.bo-undo-btn').forEach(function(b){ b.disabled = false; b.textContent = b.getAttribute('data-bo-label'); });
+  });
+  // WHAT: STAY IN EDIT MODE across a full-page action (2026-10-26 owner feedback: "takes the screen out of edit
+  //   mode after every change"). When one of the order-page forms in lib/edit-mode-resume.mjs KEEP_EDIT_ACTIONS is
+  //   posted while edit mode is ON, a hidden editMode=1 rides along (the server then ends its redirect in
+  //   ?edit=1#line-items, and the resume script at the bottom of this page re-enters edit mode) and the Line
+  //   Items card's viewport offset is stashed so the scroll position survives the reload.
+  // CHANGE-GUARD: the field is added at submit time from the LIVE state of #edit-mode-bar, never at load, so a form
+  //   restored from bfcache cannot carry a stale 1 (and a stale value is cleared when edit mode is off). Save
+  //   changes (POST /edit) is not in the list on purpose: Save ends the edit session.
+  // DEPENDS: #edit-mode-bar (toggleEditMode sets its display to 'block' when editing), #line-items (the card), the
+  //   .bo-undo-btn handler above (form.submit() skips the submit event, so it calls this directly).
+  // SYNC: KEEP_EDIT_RE is built from lib/edit-mode-resume.mjs KEEP_EDIT_ACTIONS by the server; do not hand-edit it.
+  var KEEP_EDIT_RE = new RegExp(${JSON.stringify(keepEditClientPattern())});
+  var EDIT_STASH_KEY = 'b2b-edit-resume:' + ${JSON.stringify(String(numId))};
+  function editModeIsOn() {
+    var b = document.getElementById('edit-mode-bar');
+    return !!b && b.style.display === 'block';
+  }
+  function rememberEditMode(form) {
+    if (!form || !form.querySelector) return;
+    var path = '';
+    try { path = new URL(form.getAttribute('action') || '', location.href).pathname; } catch (e) { return; }
+    if (!KEEP_EDIT_RE.test(path)) return;
+    var f = form.querySelector('input[name="editMode"]');
+    if (!editModeIsOn()) { if (f) f.value = ''; return; }
+    if (!f) { f = document.createElement('input'); f.type = 'hidden'; f.name = 'editMode'; form.appendChild(f); }
+    f.value = '1';
+    try {
+      var card = document.getElementById('${EDIT_ANCHOR}');
+      if (card) sessionStorage.setItem(EDIT_STASH_KEY, JSON.stringify({ top: card.getBoundingClientRect().top, at: Date.now() }));
+    } catch (e) { /* storage blocked: the #${EDIT_ANCHOR} anchor in the redirect still brings them back to the table */ }
+  }
+  document.addEventListener('submit', function(e){ rememberEditMode(e.target); }, true);
   function toggleInvoiceModal(show) {
     document.getElementById('invoice-modal').style.display = show ? 'flex' : 'none';
   }
@@ -2733,6 +2938,10 @@ function renderOrderDetail(session, order, flash, flashMsg) {
   }
   function toggleCancelModal(show) {
     document.getElementById('cancel-modal').style.display = show ? 'flex' : 'none';
+  }
+  function toggleCcInvoiceModal(show) {
+    document.getElementById('cc-invoice-modal').style.display = show ? 'flex' : 'none';
+    if (show) { var ta = document.getElementById('cc-invoice-note'); if (ta) ta.focus(); }
   }
   // Second build (Build C): record-manual-payment modal toggle.
   function toggleRecordPaymentModal(show) {
@@ -2755,6 +2964,79 @@ function renderOrderDetail(session, order, flash, flashMsg) {
       const rpm = document.getElementById('record-payment-modal'); if (rpm) rpm.style.display = 'none';
     }
   });
+  </script>`;
+
+  // WHAT: re-enters edit mode on a page that was reached by an action taken WHILE editing (the redirect ends in
+  //   ?edit=1#line-items — lib/edit-mode-resume.mjs). It calls toggleEditMode(true), puts the Line Items card back
+  //   where it was in the viewport (the offset stashed by rememberEditMode, which stays correct even though the
+  //   flash banner above the card has changed height; without a stash the #line-items anchor is the fallback),
+  //   and removes `edit` from the address bar so a later manual refresh is an ordinary view-mode load.
+  //   It ALSO keeps the result of the action visible (pinFlash): the flash banner sits above the Line Items card,
+  //   so after the restore it is thousands of px off screen on a long order (2026-10-26 verifier: a refused
+  //   backorder on row 60 of 116 left the banner at y=-3160 and the screen looked unchanged). When any flash banner is
+  //   not fully inside the viewport, a copy is shown in a fixed strip under the header (#flash-pin, styled in the
+  //   page <style>); the scroll anchor above is NOT touched, so the user stays at the row they were editing.
+  // CHANGE-GUARD: emitted ONLY when the request carried ?edit=1 (renderOrderDetail's resumeEdit) — a normal load
+  //   gets no script and no edit mode. The restore runs again on window load because the browser also scrolls to
+  //   the #line-items fragment around then; a real user scroll (wheel / touch / key / pointer) cancels it.
+  //   The pin hides itself the moment the real banner is in view (user scrolled up), can be dismissed, and a
+  //   success-only pin leaves by itself after 10 s; a warning/error pin stays until dismissed or the banner is seen.
+  // DEPENDS: toggleEditMode() and rememberEditMode()'s stash key (EDIT_STASH_KEY) from editModeScript above; the
+  //   flash banners are the `.alert` siblings after `.breadcrumb-row` (flashHtml below renders them there); the sticky
+  //   `.admin-header` (admin.css) sets the strip's floor.
+  const resumeEditScript = !resumeEdit ? '' : `<script>
+  (function () {
+    var wantTop = null, userScrolled = false;
+    try {
+      var raw = sessionStorage.getItem(EDIT_STASH_KEY); sessionStorage.removeItem(EDIT_STASH_KEY);
+      var st = raw ? JSON.parse(raw) : null;
+      if (st && typeof st.top === 'number' && Date.now() - st.at < 600000) wantTop = st.top;
+    } catch (e) { wantTop = null; }
+    ['wheel', 'touchstart', 'keydown', 'mousedown'].forEach(function (t) {
+      window.addEventListener(t, function () { userScrolled = true; }, { capture: true, passive: true });
+    });
+    function restore() {
+      var card = document.getElementById('${EDIT_ANCHOR}');
+      if (wantTop === null || userScrolled || !card) return;
+      window.scrollTo(0, window.pageYOffset + card.getBoundingClientRect().top - wantTop);
+    }
+    var pinDismissed = false;
+    function pinFlash() {
+      var banners = Array.prototype.slice.call(document.querySelectorAll('.breadcrumb-row ~ .alert'));
+      if (!banners.length) return;
+      var pin = document.getElementById('flash-pin');
+      var header = document.querySelector('.admin-header');
+      var floor = header ? header.getBoundingClientRect().bottom : 0;
+      var seen = banners.every(function (b) { var r = b.getBoundingClientRect(); return r.top >= floor - 1 && r.bottom <= window.innerHeight + 1; });
+      if (seen || pinDismissed) { if (pin) pin.hidden = true; return; }
+      if (!pin) {
+        pin = document.createElement('div'); pin.id = 'flash-pin'; pin.setAttribute('role', 'status');
+        banners.forEach(function (b) { pin.appendChild(b.cloneNode(true)); });
+        var x = document.createElement('button'); x.type = 'button'; x.className = 'flash-pin-x';
+        x.setAttribute('aria-label', 'Dismiss message'); x.textContent = '×';
+        x.addEventListener('click', function () { pinDismissed = true; pin.hidden = true; });
+        pin.appendChild(x);
+        document.body.appendChild(pin);
+        if (banners.every(function (b) { return b.classList.contains('alert-success'); })) {
+          setTimeout(function () { pinDismissed = true; pin.hidden = true; }, 10000);
+        }
+      }
+      pin.hidden = false;
+    }
+    function resume() {
+      toggleEditMode(true);
+      try {
+        var u = new URL(location.href); u.searchParams.delete('edit');
+        history.replaceState(history.state, '', u.pathname + u.search + u.hash);
+      } catch (e) { /* cosmetic only */ }
+      restore();
+      pinFlash();
+    }
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', resume); else resume();
+    window.addEventListener('load', function () { restore(); pinFlash(); });
+    window.addEventListener('scroll', pinFlash, { passive: true });
+    window.addEventListener('resize', pinFlash);
+  })();
   </script>`;
 
 
@@ -2879,9 +3161,32 @@ function renderOrderDetail(session, order, flash, flashMsg) {
       details.card > summary::marker { content: ''; }
       details.card > summary:hover { background: var(--gray-50, #f7f7f4); border-radius: 4px; }
       details.card[open] > summary { margin-bottom: 0.25rem; }
+      /* BACKORDERED rows (units removed from the Shopify order): grey + struck through, but the tag and
+         the Undo button stay readable — only .bo-struck-text is crossed out, never the whole cell.
+         SYNC: class names bo-struck / bo-struck-head / bo-struck-row / bo-struck-text / bo-tag / bo-undo-btn
+         are used by backorderedRowsHtml above and by the order-page backorder tests in test/ui.test.mjs. */
+      tbody.bo-struck td { color: var(--gray-500, #6b7280); vertical-align: top; }
+      tbody.bo-struck tr.bo-struck-head td { padding-top: 0.5rem; padding-bottom: 0.25rem; font-size: 0.6875rem; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; background: var(--gray-50, #f7f7f4); border-top: 1px solid var(--gray-200, #e5e7eb); }
+      tbody.bo-struck .bo-struck-text { text-decoration: line-through; }
+      tbody.bo-struck .bo-undo-btn { margin-top: 6px; }
+      tbody.bo-struck .bo-tag { margin-left: 4px; vertical-align: middle; }
+      /* Phone: the Undo button is the one control on a struck row, so give it a real tap target. */
+      @media (max-width: 600px) { tbody.bo-struck .bo-undo-btn { min-height: 36px; padding: 0.5rem 0.875rem; } }
+      /* FLASH PIN: a copy of the flash banner(s) in a fixed strip under the sticky header, built by resumeEditScript ONLY
+         when the real banner is out of the viewport (an action taken deep in a long order puts the page back at that row,
+         thousands of px below the banner). The original banners are untouched. z-index 150: above the sticky header (100)
+         so it is never hidden by it, below the modals (200).
+         SYNC: ids/classes flash-pin / flash-pin-x are created by resumeEditScript's pinFlash() and asserted in test/ui.test.mjs. */
+      #flash-pin { position: fixed; z-index: 150; top: calc(var(--header-h, 52px) + 8px); left: 50%; transform: translateX(-50%); width: min(720px, calc(100vw - 16px)); max-height: 45vh; overflow-y: auto; background: #fff; border-radius: var(--radius, 6px); box-shadow: 0 6px 24px rgba(0,0,0,.22); }
+      #flash-pin[hidden] { display: none; }
+      #flash-pin .alert { margin: 0; padding-right: 2.75rem; border-radius: 0; }
+      #flash-pin .alert + .alert { border-top-width: 0; }
+      #flash-pin .flash-pin-x { position: absolute; top: 2px; right: 2px; width: 36px; height: 36px; padding: 0; border: 0; background: transparent; color: inherit; font-size: 22px; line-height: 1; cursor: pointer; }
+      @media print { #flash-pin { display: none; } }
     </style>
     ${visibleNotesScript}
     ${editModeScript}
+    ${resumeEditScript}
     <div class="breadcrumb-row"><a href="/orders" class="breadcrumb">← Orders</a></div>
     ${flashHtml}
     <div class="detail-header">
@@ -2905,9 +3210,7 @@ function renderOrderDetail(session, order, flash, flashMsg) {
         <button class="btn btn-secondary" onclick="toggleFulfillModal(true)">Fulfill items</button>
         <button class="btn btn-ghost" onclick="toggleDiscountModal(true)">Apply discount</button>
         <button class="btn btn-secondary" onclick="toggleInvoiceModal(true)">Generate Invoice</button>
-        <form method="POST" action="/orders/${h(numId)}/send-credit-card-invoice" style="display:inline" onsubmit="if(!confirm('Send this Helcim credit card invoice to the customer?')) return false; this.querySelector('button').disabled=true;">
-          <button class="btn btn-secondary">Send Credit Card Invoice</button>
-        </form>
+        <button type="button" class="btn btn-secondary" onclick="toggleCcInvoiceModal(true)">Send Credit Card Invoice</button>
         <form method="POST" action="/orders/${h(numId)}/xero/sync" style="display:inline">
           <button class="btn btn-ghost" title="Create or refresh Xero invoice for this order">${xeroMap?.status === 'synced' ? '✓ Xero synced' : 'Sync to Xero'}</button>
         </form>
@@ -2918,7 +3221,8 @@ function renderOrderDetail(session, order, flash, flashMsg) {
     ${timeline}
     <div class="detail-grid">
       <div class="detail-main">
-        <div class="card">
+        ${/* DEPENDS: id="line-items" is the scroll anchor of lib/edit-mode-resume.mjs (EDIT_ANCHOR): the keep-edit-mode redirect
+              ends in #line-items and the resume script restores the card's viewport offset. Renaming it silently drops both. */''}<div class="card" id="line-items">
           <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
             <h2>Line Items</h2>
             <span id="edit-mode-bar" style="display:none">
@@ -2941,6 +3245,7 @@ function renderOrderDetail(session, order, flash, flashMsg) {
           <table class="data-table">
             <thead><tr><th>Item</th><th>SKU</th><th class="text-right">Qty</th><th class="text-right">Unit</th><th class="text-right">Total</th></tr></thead>
             <tbody>${lineItemsHtml}</tbody>
+            ${backorderedRowsHtml}
           </table>
           <div class="totals-block">
             <div class="totals-row"><span>Subtotal</span><span>${sub}</span></div>
@@ -2985,10 +3290,47 @@ function renderOrderDetail(session, order, flash, flashMsg) {
             <div style="font-size:11px;color:var(--muted);margin-top:6px">Saved with the edit and shown in Shopify's timeline. Shopify does not let apps add a timeline comment after an edit has already been committed.</div>
           </div>
           </form>
+          ${backorderedLines.length === 0 ? '' : `${/* DEPENDS: POST /orders/:id/backorder/undo reads body.lineItemId; the .bo-undo-btn click listener in
+                editModeScript fills #bo-undo-li-id and submits this form. It sits OUTSIDE #edit-form on purpose
+                (forms cannot nest, and nothing here may ride along with the edit submit). */''}<form id="bo-undo-form" method="POST" action="/orders/${h(numId)}/backorder/undo" style="display:none">
+            <input type="hidden" name="lineItemId" id="bo-undo-li-id" value="">
+          </form>`}
           <script>
             (function(){
               // Track newly added custom-line rows so they can be serialized on submit
               window.__newCustomLines = [];
+              // WHAT: keeps every line's Total cell equal to the qty x unit price shown in that same row.
+              //   Edit-mode rows (existing, custom, catalog) each hold a .line-total-amt span that this
+              //   repaints from the row's own inputs on every keystroke; an empty or invalid qty/price
+              //   shows a dash instead of a stale or NaN amount.
+              // CHANGE-GUARD: reads the row's inputs by class, so it is the third copy of the input class
+              //   names — SYNC: .edit-qty-input / .edit-price-input (renderOrderDetail existing rows),
+              //   .ncl-qty / .ncl-price (addCustomLineRow), .cl-qty / .cl-price (addCatalogLineRow). Add a
+              //   new row type and you must give it a .line-total-amt span, call wireRowTotal(tr) and
+              //   paintRowTotal(tr) once, and list its input classes here.
+              //   An existing row also has static qty / unit-price spans (shown when edit mode is off). They
+              //   are mirrored from the same inputs here, otherwise leaving edit mode after a change would
+              //   show the OLD qty and price next to the NEW total: a different way of not adding up.
+              // INVARIANT(S): display only. The server recomputes every total; nothing here is submitted.
+              window.paintRowTotal = function(tr) {
+                var amt = tr && tr.querySelector('.line-total-amt'); if (!amt) return;
+                var q = tr.querySelector('.edit-qty-input, .ncl-qty, .cl-qty');
+                var p = tr.querySelector('.edit-price-input, .ncl-price, .cl-price');
+                var qty = q ? parseInt(q.value, 10) : NaN, price = p ? parseFloat(p.value) : NaN;
+                var usd = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' });
+                var qs = tr.querySelector('.edit-qty-static'), ps = tr.querySelector('.edit-price-static');
+                if (qs && qty >= 0) qs.textContent = String(qty);
+                if (ps && price >= 0) ps.textContent = usd.format(price);
+                if (!(qty >= 0) || !(price >= 0)) { amt.textContent = '—'; return; }
+                amt.textContent = usd.format(qty * price);
+              };
+              window.wireRowTotal = function(tr) {
+                if (!tr || tr.dataset.rtWired) return;
+                tr.dataset.rtWired = '1';
+                tr.querySelectorAll('.edit-qty-input, .edit-price-input, .ncl-qty, .ncl-price, .cl-qty, .cl-price').forEach(function(el){
+                  el.addEventListener('input', function(){ window.paintRowTotal(tr); });
+                });
+              };
               window.addCustomLineRow = function() {
                 var tbody = document.querySelector('#edit-form table.data-table tbody');
                 if (!tbody) return;
@@ -3003,9 +3345,12 @@ function renderOrderDetail(session, order, flash, flashMsg) {
                   '<td><span class="text-muted">CUSTOM</span></td>' +
                   '<td class="text-right"><input type="number" class="filter-input ncl-qty" value="1" min="1" step="1" style="width:60px;text-align:right"></td>' +
                   '<td class="text-right"><input type="number" class="filter-input ncl-price" value="0.00" min="0" step="0.01" style="width:80px;text-align:right"></td>' +
-                  '<td class="text-right" style="white-space:nowrap"><button type="button" class="btn btn-primary btn-sm ncl-add" title="Add this line to the order">Add</button> ' +
+                  '<td class="text-right" style="white-space:nowrap"><span class="line-total-amt" style="margin-right:10px"></span>' +
+                    '<button type="button" class="btn btn-primary btn-sm ncl-add" title="Add this line to the order">Add</button> ' +
                     '<button type="button" class="btn btn-ghost btn-sm" onclick="removeCustomLineRow(this)" title="Remove this new line">\u00D7</button></td>';
                 tbody.appendChild(tr);
+                // Show qty x price in the Total column from the first paint, then keep it live.
+                window.wireRowTotal(tr); window.paintRowTotal(tr);
                 tr.querySelector('.ncl-title').focus();
                 // Phase 16H: incremental auto-save \u2014 persist on blur once title/qty/price are valid.
                 if (window.__autosave) window.__autosave.wireCustomRow(tr);
@@ -3073,8 +3418,11 @@ function renderOrderDetail(session, order, flash, flashMsg) {
                   '<td><span class="text-muted">' + ((p.sku||'').replace(/</g,'&lt;') || '—') + '</span></td>' +
                   '<td class="text-right"><input type="number" class="filter-input cl-qty" value="1" min="1" step="1" style="width:60px;text-align:right"></td>' +
                   '<td class="text-right"><input type="number" class="filter-input cl-price" value="' + wholesale.toFixed(2) + '" min="0" step="0.01" style="width:80px;text-align:right" title="Wholesale unit price (list ' + listPrice.toFixed(2) + ')"></td>' +
-                  '<td class="text-right"><button type="button" class="btn btn-ghost btn-sm" onclick="removeCustomLineRow(this)" title="Remove this new line">×</button></td>';
+                  '<td class="text-right" style="white-space:nowrap"><span class="line-total-amt" style="margin-right:10px"></span>' +
+                    '<button type="button" class="btn btn-ghost btn-sm" onclick="removeCustomLineRow(this)" title="Remove this new line">×</button></td>';
                 tbody.appendChild(tr);
+                // Show qty x price in the Total column from the first paint, then keep it live.
+                window.wireRowTotal(tr); window.paintRowTotal(tr);
                 // Phase 16H: incremental auto-save — persist this added line immediately.
                 if (window.__autosave) window.__autosave.addCatalogLine(p, tr, wholesale, listPrice);
               };
@@ -3623,6 +3971,9 @@ function renderOrderDetail(session, order, flash, flashMsg) {
                     var liId = tr.dataset.liId; if (!liId) return;
                     var qtyEl = tr.querySelector('.edit-qty-input');
                     var priceEl = tr.querySelector('.edit-price-input');
+                    // Keep this row's Total cell equal to its qty x unit price as the operator types
+                    // (display only — see paintRowTotal).
+                    if (window.wireRowTotal) window.wireRowTotal(tr);
                     if (qtyEl && !qtyEl.dataset.asWired){ qtyEl.dataset.asWired='1';
                       // P0 fix (2026-06-29): save on COMMIT (change/blur) only — NOT per-keystroke.
                       // The old 'input' listener fired qtyChange on every keystroke, so editing "3" to
@@ -3642,6 +3993,9 @@ function renderOrderDetail(session, order, flash, flashMsg) {
                         // SYNC: same floor as min="1" on this input and POST /orders/:id/line/qty.
                         if (!(q >= 1)) {
                           qtyEl.value = qtyEl.dataset.last || '1';
+                          // A programmatic value change fires no input event, so repaint the Total
+                          // cell for the reverted quantity ourselves.
+                          if (window.paintRowTotal) window.paintRowTotal(tr);
                           setChip(tr, 'failed', 'Quantity must be at least 1 — use ✕ to remove this line.', true);
                           return;
                         }
@@ -3824,21 +4178,33 @@ function renderOrderDetail(session, order, flash, flashMsg) {
           </div>
         </div>
         ${/* Backorder modal */''}<div id="backorder-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center">
-          <div style="background:#fff;border-radius:8px;padding:24px;min-width:340px;max-width:480px">
-            <h3 style="margin:0 0 16px">Mark as backordered</h3>
-            <form method="POST" action="/orders/${h(numId)}/backorder">
+          ${/* WHAT: backorder is a real Shopify edit — the copy below must keep saying so (before the 2026-10-26
+                hot-fix this modal read as a note-only flag, so staff had no warning that the click edits the order).
+                The fields are an API: POST /orders/:id/backorder.
+                DEPENDS: toggleBackorderModal() in editModeScript fills bo-li-id, bo-li-title, bo-line-name,
+                bo-max-qty, bo-quantity (+ its max), bo-idem-key and resets bo-submit; the submit listener there
+                finds this form by id bo-form. The line name is written with textContent (it is free text). */''}
+          <div style="background:#fff;border-radius:8px;padding:24px;width:min(480px,calc(100vw - 32px));max-height:calc(100vh - 32px);overflow-y:auto;box-sizing:border-box">
+            <h3 style="margin:0 0 4px">Mark as backordered</h3>
+            <p id="bo-line-name" style="margin:0 0 12px;font-weight:600;font-size:14px;overflow-wrap:anywhere"></p>
+            <div class="alert alert-warning" style="font-size:13px;margin-bottom:14px">
+              <strong>This changes the Shopify order.</strong>
+              <ul style="margin:6px 0 0;padding-left:18px">
+                <li>The quantity you enter is <strong>removed from the Shopify order</strong> and from its total (the customer is not emailed).</li>
+                <li>It stays on the invoice <strong>crossed out</strong>, with a footnote that it is backordered.</li>
+                <li>You can put it back any time with <strong>Undo backorder</strong> on this page.</li>
+              </ul>
+            </div>
+            <form method="POST" action="/orders/${h(numId)}/backorder" id="bo-form">
               <input type="hidden" name="lineItemId" id="bo-li-id">
               <input type="hidden" name="lineItemTitle" id="bo-li-title">
-              <div style="margin-bottom:12px">
-                <label style="font-size:13px;font-weight:500">Quantity backordered</label><br>
-                <input type="number" name="quantity" id="bo-quantity" min="1" class="filter-input" style="width:100%;margin-top:4px">
-              </div>
+              <input type="hidden" name="idemKey" id="bo-idem-key" value="">
               <div style="margin-bottom:16px">
-                <label style="font-size:13px;font-weight:500">Expected ship date (optional)</label><br>
-                <input type="date" name="eta" class="filter-input" style="width:100%;margin-top:4px">
+                <label for="bo-quantity" style="font-size:13px;font-weight:500">Quantity to remove from the order and backorder <span class="text-muted">(of <span id="bo-max-qty">1</span> on the order)</span></label><br>
+                <input type="number" name="quantity" id="bo-quantity" min="1" step="1" class="filter-input" style="width:100%;margin-top:4px;box-sizing:border-box" required>
               </div>
-              <div style="display:flex;gap:8px">
-                <button type="submit" class="btn btn-primary">Mark backordered</button>
+              <div style="display:flex;gap:8px;flex-wrap:wrap">
+                <button type="submit" id="bo-submit" class="btn btn-primary" data-bo-label="Remove from order and mark backordered">Remove from order and mark backordered</button>
                 <button type="button" class="btn btn-ghost" onclick="toggleBackorderModal(null,null,null,false)">Cancel</button>
               </div>
             </form>
@@ -3913,6 +4279,23 @@ function renderOrderDetail(session, order, flash, flashMsg) {
             </form>
           </div>
         </div>` : ''}
+        ${/* Send Credit Card Invoice modal */''}<div id="cc-invoice-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center">
+          <div style="background:#fff;border-radius:8px;padding:24px;min-width:380px;max-width:500px">
+            <h3 style="margin:0 0 16px">Send Credit Card Invoice</h3>
+            <p style="color:#555;margin:0 0 16px">Send ${h(order.name)} to <strong>${h(order.customer?.email || 'the customer')}</strong> — amount due: <strong>${fmtMoney(outstanding)} ${h((order.totalPriceSet?.presentmentMoney?.currencyCode || 'USD').toUpperCase())}</strong>.</p>
+            <form method="POST" action="/orders/${h(numId)}/send-credit-card-invoice" onsubmit="var b=document.getElementById('cc-invoice-submit'); if(b){b.disabled=true;b.textContent='Sending…';}">
+              <div style="margin-bottom:16px">
+                <label for="cc-invoice-note" style="font-size:13px;font-weight:500">Note to customer</label>
+                <div style="font-size:11px;color:var(--muted);margin:4px 0 6px">Optional. Included in the payment email as a quoted note. Markdown and HTML are shown as literal text.</div>
+                <textarea id="cc-invoice-note" name="note" class="textarea" rows="4" maxlength="500" placeholder="E.g. This covers your spring restock — reach out with any questions."></textarea>
+              </div>
+              <div style="display:flex;gap:8px;justify-content:flex-end">
+                <button type="button" class="btn btn-ghost" onclick="toggleCcInvoiceModal(false)">Cancel</button>
+                <button type="submit" id="cc-invoice-submit" class="btn btn-secondary">Send invoice</button>
+              </div>
+            </form>
+          </div>
+        </div>
         ${/* Generate Invoice modal */''}<div id="invoice-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center">
           <div style="background:#fff;border-radius:8px;padding:24px;min-width:380px;max-width:500px">
             <h3 style="margin:0 0 16px">Generate Invoice</h3>
@@ -3975,7 +4358,7 @@ function renderOrderDetail(session, order, flash, flashMsg) {
             <textarea name="note" class="textarea" rows="3" placeholder="Add a Shopify order note…" aria-label="Shopify order note">${h(order.note||'')}</textarea>
             <div style="margin-top:0.5rem;display:flex;gap:8px;align-items:center">
               <button type="submit" class="btn btn-secondary btn-sm">Save note</button>
-              ${order.note && String(order.note).trim() ? `<button type="button" class="btn btn-ghost btn-sm" style="color:#a32d2d" onclick="if(confirm('Delete this customer note?')){this.form.note.value='';this.form.submit();}">Delete</button>` : ''}
+              ${order.note && String(order.note).trim() ? `<button type="button" class="btn btn-ghost btn-sm" style="color:#a32d2d" onclick="if(confirm('Delete this customer note?')){this.form.note.value='';rememberEditMode(this.form);this.form.submit();}">Delete</button>` : ''}
             </div>
           </form>
         </div>
@@ -3989,7 +4372,7 @@ function renderOrderDetail(session, order, flash, flashMsg) {
             <textarea name="note" class="textarea" rows="3" placeholder="Private note stored only in B2B Admin…" aria-label="B2B Admin-only note">${h(order.internalNote||'')}</textarea>
             <div style="margin-top:0.5rem;display:flex;gap:8px;align-items:center">
               <button type="submit" class="btn btn-secondary btn-sm">Save in B2B Admin only</button>
-              ${order.internalNote && String(order.internalNote).trim() ? `<button type="button" class="btn btn-ghost btn-sm" style="color:#a32d2d" onclick="if(confirm('Delete this internal note?')){this.form.note.value='';this.form.submit();}">Delete</button>` : ''}
+              ${order.internalNote && String(order.internalNote).trim() ? `<button type="button" class="btn btn-ghost btn-sm" style="color:#a32d2d" onclick="if(confirm('Delete this internal note?')){this.form.note.value='';rememberEditMode(this.form);this.form.submit();}">Delete</button>` : ''}
             </div>
           </form>
         </div>
@@ -6106,7 +6489,9 @@ app.get('/orders/:id', requireAuth, async (req, res) => {
   order.visibleNotes = getVisibleNotesForOrder(shopifyId);
   // Staff-only internal note (admin-local, keyed by numeric order id) — never synced/invoiced
   order.internalNote = getOrderInternalNote(req.params.id)?.body || '';
-  res.send(renderOrderDetail(req.adminSession, order, req.query.success || req.query.error || '', req.query.msg || ''));
+  // resumeEdit: ONLY an explicit ?edit=1 (added by lib/edit-mode-resume.mjs to the redirect that follows an
+  // action taken while editing) re-enters edit mode. A plain load never carries it, so edit mode is never forced on.
+  res.send(renderOrderDetail(req.adminSession, order, req.query.success || req.query.error || '', req.query.msg || '', { resumeEdit: req.query.edit === '1' }));
 });
 
 // WHAT: Mark a single order paid in Shopify (orderMarkAsPaid), audit it, then fire-and-forget record the payment in Xero (creating the invoice first if unsynced), skipping insiders.
@@ -6281,9 +6666,10 @@ app.post('/orders/:id/shipping-address', requireAuth, async (req, res) => {
   res.redirect(`/orders/${numId}?success=address_saved`);
 });
 
-// WHAT: creates (or reuses) a DUE Helcim invoice for the order's exact outstanding balance, then asks the Portal's Re:amaze bridge to email its secure online-payment link.
+// WHAT: creates (or reuses) a DUE Helcim invoice for the order's exact outstanding balance, then asks the Portal to email its secure online-payment link — via Gmail (From help@, Reply-To wholesale@fuzzywumpets.com — the Portal owns the identity) when the Portal understands `creditCardInvoice` (no forced "Re:" subject prefix), via Re:amaze on an older Portal.
 // CHANGE-GUARD: the helcim_invoice_map write MUST happen before the email attempt; on delivery failure a retry reuses that invoice rather than creating a duplicate bill. JSON callers receive a non-2xx on every failure; form callers receive a truthful warning flash.
 // INVARIANT(S): no card data touches this app; paid/zero-balance orders and orders without customer email are rejected; audit rows never contain the invoice token or online-view URL.
+// DEPENDS: Portal /__internal__/visible-note accepts the optional `subject` and the structured `creditCardInvoice` { orderName, amount, currency, payUrl, staffNote } passed here (Portal gmail-invoice.mjs validateCreditCardInvoiceInput is the receiving contract; payUrl must be on the allow-listed fuzzywumpets.myhelcim.com host); lib/helcim-note.mjs is the shared text contract (subject keeps #NNNNN token; body is plain text, note lines prefixed "> "). Deploy order: Portal first — an older Portal ignores creditCardInvoice and falls back to the Re:amaze email.
 app.post('/orders/:id/send-credit-card-invoice', requireAuth, async (req, res) => {
   const numId = req.params.id;
   const order = await getOrderDetail(numId);
@@ -6300,6 +6686,10 @@ app.post('/orders/:id/send-credit-card-invoice', requireAuth, async (req, res) =
   const outstandingValue = order.totalOutstandingSet?.presentmentMoney?.amount;
   const outstanding = Math.round(Math.max(0, Number(outstandingValue ?? deriveCurrentOrderTotals(order).total) || 0) * 100) / 100;
   if (outstanding <= 0) return fail(409, 'This order has no outstanding balance.');
+
+  // Read and normalise the optional staff note (form field or JSON body).
+  const rawNote = wantsJson ? (req.body?.note ?? '') : (req.body?.note ?? '');
+  const staffNote = normalizeStaffNote(String(rawNote ?? ''));
 
   const orderGid = shopifyOrderGid(numId);
   let invoice = getHelcimInvoiceMap(orderGid);
@@ -6321,21 +6711,23 @@ app.post('/orders/:id/send-credit-card-invoice', requireAuth, async (req, res) =
       invoice = upsertHelcimInvoiceMap(orderGid, created);
     }
 
-    const noteBody = `Your credit card invoice for ${order.name} is ready for ${fmtMoney(outstanding)} ${currency}.\n\nPay securely with Helcim:\n${invoice.url}`;
+    // DEPENDS: lib/helcim-note.mjs buildCreditCardInvoicePayload — subject keeps the #NNNNN token so
+    //   Portal's getCustomerWholesaleThreads can scope a customer's Re:amaze reply thread to this order;
+    //   `creditCardInvoice` makes a current Portal send via Gmail (wholesale@) instead of Re:amaze.
+    //   The payload carries the Helcim pay URL: never log it or put it in an audit row.
+    const portalPayload = buildCreditCardInvoicePayload({
+      orderGid, orderName: order.name, amountText: fmtMoney(outstanding), amount: outstanding, currency,
+      url: invoice.url, note: staffNote, addedBy: req.adminSession.email,
+    });
     const delivery = MOCK
       ? { ok: true, email: { sent: true, via: 'mock' } }
-      : await callPortalInternal('POST', '/__internal__/visible-note', {
-          orderId: orderGid,
-          body: noteBody,
-          addedBy: req.adminSession.email,
-          emailCustomer: true,
-          sendAs: 'wholesale',
-        });
+      : await callPortalInternal('POST', '/__internal__/visible-note', portalPayload);
     if (!delivery.ok || !delivery.email?.sent) {
-      const deliveryError = String(delivery.error || delivery.email?.error || 'Portal/Re:amaze did not confirm delivery');
+      const deliveryError = String(delivery.error || delivery.email?.error || 'Portal did not confirm delivery');
       setHelcimInvoiceDelivery(orderGid, 'delivery_failed', deliveryError);
       auditLog(req.adminSession.email, 'helcim_invoice_email_failed', orderGid, null, {
         invoiceId: invoice.invoice_id, invoiceNumber: invoice.invoice_number, amount: outstanding, currency,
+        hasNote: !!staffNote, ...(staffNote ? { note: staffNote } : {}),
       });
       return fail(502, `Helcim invoice ${invoice.invoice_number || invoice.invoice_id} was created, but customer email delivery was not confirmed: ${deliveryError}`);
     }
@@ -6344,6 +6736,7 @@ app.post('/orders/:id/send-credit-card-invoice', requireAuth, async (req, res) =
     auditLog(req.adminSession.email, 'helcim_invoice_sent', orderGid, null, {
       invoiceId: invoice.invoice_id, invoiceNumber: invoice.invoice_number,
       amount: outstanding, currency, customerEmail, reused,
+      hasNote: !!staffNote, ...(staffNote ? { note: staffNote } : {}),
     });
     if (wantsJson) {
       return res.json({
@@ -6450,15 +6843,50 @@ function invoicePdfDisposition(req, safeName) {
   return `${download ? 'attachment' : 'inline'}; filename="${safeName}.pdf"`;
 }
 
+// Backordered units are REMOVED from the Shopify order (POST /orders/:id/backorder) and parked in the
+// `backorders` table; the ORDER invoice shows them struck through with a footnote (lib/invoice-backorder.mjs).
+// Imported here, next to its two consumers, so the hunk stays out of the big top-of-file import blocks.
+// DEPENDS: db.mjs getBackorderedLinesForOrder (row shape + 'pending AND shopify_removed_qty > 0' definition).
+// Aliased on purpose: another consumer of the same db function (e.g. the order-detail page) may import it under
+// its own name, and two bindings of one name in this module would be a SyntaxError.
+import { getBackorderedLinesForOrder as getInvoiceBackorderedRows } from './db.mjs';
+import { buildOrderInvoiceBackorderModel } from './pdf.mjs';
+import { renderInvoiceBackorderHtml, INVOICE_BACKORDER_CSS } from './lib/invoice-backorder.mjs';
+import { serializeBackorderedLines, backorderedLinesForPartialInvoice } from './lib/partial-invoice-backorder.mjs';
+
+// WHAT: the LIVE backordered rows for order `numId` (the id from the route).
+// CHANGE-GUARD: the FULL-ORDER invoice (GET /orders/:id/invoice.pdf and the HTML viewer GET /orders/:id/invoice
+//   without ?letter) renders these directly. LETTERED invoices (POST/GET /orders/:id/partial-invoice*, the
+//   ?letter= viewer) must NOT render them directly: a new snapshot freezes them at creation and every later
+//   rendering uses that stored copy; only a legacy snapshot with no stored copy filters these by its own
+//   created_at — all through partialInvoiceBackorderedLines below. invoice.csv, the Xero invoice and the Helcim
+//   credit-card invoice deliberately do NOT read them. Keyed by shopifyOrderGid(numId), the same key
+//   POST /orders/:id/backorder writes.
+function orderInvoiceBackorderedLines(numId) {
+  return getInvoiceBackorderedRows(shopifyOrderGid(numId));
+}
+
+// WHAT: the backordered rows a stored lettered invoice `inv` (a partial_invoices row) shows.
+// WHY: an issued invoice never changes — see lib/partial-invoice-backorder.mjs. The live table is only read for a
+//   legacy snapshot (backordered_json NULL).
+// DEPENDS: partial_invoices.backordered_json (db.mjs migratePartialInvoicesSchema / createPartialInvoice, written by
+//   POST /orders/:id/partial-invoice) and orderInvoiceBackorderedLines above. Used by GET
+//   /orders/:id/partial-invoice/:letter.pdf and GET /orders/:id/invoice?letter= — the two must agree, so both call this.
+function partialInvoiceBackorderedLines(numId, inv) {
+  return backorderedLinesForPartialInvoice(inv, () => orderInvoiceBackorderedLines(numId));
+}
+
 // WHAT: renders the full-order invoice PDF — inline for the viewer iframe, or as a download when
 //   ?download=1 (see invoicePdfDisposition).
 // CHANGE-GUARD: generateInvoicePdf is async and may throw — keep the try/catch; a 500 here means the PDF lib failed, not a missing order (that is a 404 above).
+//   The backordered-rows lookup sits INSIDE the try on purpose: if it fails the invoice must fail loudly (500),
+//   never be issued silently without the backordered lines it is supposed to show.
 // INVARIANT(S): 404 returns JSON but the success path returns binary PDF; callers must branch on Content-Type, not status alone.
 app.get('/orders/:id/invoice.pdf', requireAuth, async (req, res) => {
   const order = await getOrderDetail(req.params.id);
   if (!order) return res.status(404).json({ error: 'Order not found' });
   try {
-    const pdf = await generateInvoicePdf(order);
+    const pdf = await generateInvoicePdf(order, { backorderedLines: orderInvoiceBackorderedLines(req.params.id) });
     const safeName = (order.name || 'invoice').replace(/[^a-z0-9#-]/gi, '-');
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', invoicePdfDisposition(req, `${safeName}-invoice`));
@@ -6489,6 +6917,17 @@ app.get('/orders/:id/invoice', requireAuth, async (req, res) => {
   //   the shell writes "<order>-invoice.pdf" itself.
   // DEPENDS: invoicePdfDisposition() honours ?download=1 on BOTH pdf routes reachable from here.
   const downloadUrl = pdfUrl + '?download=1';
+  // WHAT: backordered units (struck rows + footnote) for the FULL-ORDER view, as real page text under the PDF.
+  // WHY: this page is only a shell around the PDF iframe; on a phone the embedded PDF is shrunk to a few pixels,
+  //   so the backordered notice is repeated here as selectable, wrapping HTML. Same model + wording as the PDF.
+  // CHANGE-GUARD: for ?letter= (a lettered snapshot) the block shows THAT snapshot's backordered lines
+  //   (partialInvoiceBackorderedLines), never the live ones — the iframe PDF above is rendered by
+  //   GET /orders/:id/partial-invoice/:letter.pdf from the same helper, so the two always agree. An unknown
+  //   letter shows nothing (its PDF is a 404).
+  const letteredInv = letter ? getPartialInvoices(shopifyOrderGid(numId)).find(r => r.invoice_letter === letter) : null;
+  const backorderModel = buildOrderInvoiceBackorderModel(letter
+    ? (letteredInv ? partialInvoiceBackorderedLines(numId, letteredInv) : [])
+    : orderInvoiceBackorderedLines(numId));
   const content = `
     <div class="page-header" style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:12px">
       <a href="/orders/${h(numId)}" class="btn btn-secondary">← Back to order ${h(orderLabel)}</a>
@@ -6498,9 +6937,10 @@ app.get('/orders/:id/invoice', requireAuth, async (req, res) => {
         <a href="${h(pdfUrl)}" target="_blank" rel="noopener" class="btn btn-ghost btn-sm">Open / print ↗</a>
       </div>
     </div>
-    <iframe title="Invoice PDF" src="${h(pdfUrl)}" style="width:100%;height:82vh;border:1px solid var(--border,#e2e2dd);border-radius:8px;background:#fff"></iframe>
+    <iframe title="Invoice PDF" src="${h(pdfUrl)}" style="width:100%;height:82vh;border:1px solid var(--border,#e2e2dd);border-radius:8px;background:#fff"></iframe>${renderInvoiceBackorderHtml(backorderModel)}
   `;
-  res.send(layout({ title: `Invoice ${orderLabel}`, session: req.adminSession, activePath: '/orders', content }));
+  res.send(layout({ title: `Invoice ${orderLabel}`, session: req.adminSession, activePath: '/orders', content,
+    extraHead: backorderModel ? `<style>${INVOICE_BACKORDER_CSS}</style>` : '' }));
 });
 
 // ── Phase 16E: Partial invoices ──────────────────────────────────────────────
@@ -6563,6 +7003,14 @@ app.post('/orders/:id/partial-invoice', requireAuth, async (req, res) => {
     : 0;
   const total   = subtotal + shippingAmt + taxAmt;
 
+  // WHAT: the units backordered (removed from this order) RIGHT NOW, frozen into the snapshot below.
+  // WHY: the snapshot's lines come from the order, which no longer holds them; the invoice must still show them
+  //   struck through with the footnote, and must keep showing exactly these even if one is restored later.
+  // INVARIANT(S): a synchronous SQLite read in the same tick as getNextInvoiceLetter/createPartialInvoice (no await
+  //   between them — see this handler's header). It sits OUTSIDE the PDF try/catch on purpose: if it fails the
+  //   request fails loudly instead of issuing an invoice that silently lacks its backordered lines.
+  const backorderedRows = orderInvoiceBackorderedLines(numId);
+
   const letter = getNextInvoiceLetter(orderGid);
   const invId  = createPartialInvoice({
     orderId: orderGid,
@@ -6571,14 +7019,21 @@ app.post('/orders/:id/partial-invoice', requireAuth, async (req, res) => {
     total,
     shipping: shippingAmt,
     tax: taxAmt,
+    // '[]' (never null) when nothing is backordered: null marks a LEGACY snapshot that is rebuilt from live rows.
+    backorderedJson: serializeBackorderedLines(backorderedRows),
     // SYNC: the re-download route below reconstructs every field in this snapshot. Preserve
     // identity and allocated discount separately so archived invoices never degrade into clipped
     // titles/dash-only SKUs or hide their discount after Shopify changes later.
+    // discountAmount is the GENUINE discount only; the app's own wholesale-price discount (the line's net
+    // unitPrice already contains it) is kept apart in wholesaleDiscountAmount. That key's PRESENCE is what
+    // tells snapshotLineInvoiceDiscount (re-download) that discountAmount is already exclusive of it —
+    // snapshots written before this field existed hold the inclusive figure and get corrected there.
     lineItemsJson: JSON.stringify(lineItems
       .filter(i => lineItemCurrentQty(i) > 0)
       .map(i => ({ id: i.id, title: i.title, variantTitle: i.variant?.title || null,
         sku: i.variant?.sku || i.sku || null, quantity: lineItemCurrentQty(i),
         unitPrice: lineItemTrueUnit(i), discountAmount: lineItemInvoiceDiscount(i),
+        wholesaleDiscountAmount: lineItemWholesaleDiscount(i),
         discountReason: discountSummary.reason || null }))),
     createdBy: session.email,
   });
@@ -6596,6 +7051,7 @@ app.post('/orders/:id/partial-invoice', requireAuth, async (req, res) => {
       discount: discountAmt,
       shipping: shippingAmt,
       total,
+      backorderedLines: backorderedRows,
     });
   } catch (err) {
     return res.status(500).json({ error: err.message });
@@ -6625,6 +7081,10 @@ app.post('/orders/:id/partial-invoice', requireAuth, async (req, res) => {
 // allocations. The effective invoice discount is then the exact amount required to reconcile that
 // gross with the stored invoice total, so a fixed-dollar invoice correction remains visible instead
 // of being absorbed into line prices. Currency is hardcoded 'USD'.
+// BACKORDERED LINES (2026-10-26): drawn struck-through after the active rows, with the footnote, from the stored
+// backordered_json (legacy snapshot: live pending rows created at/before the snapshot) — see
+// partialInvoiceBackorderedLines. They are display only: subtotal/discount/shipping/total above never see them.
+// The lookup sits INSIDE the try on purpose (a failure must 500, not issue a quietly incomplete invoice).
 app.get('/orders/:id/partial-invoice/:letter.pdf', requireAuth, async (req, res) => {
   const numId  = req.params.id;
   const letter = req.params.letter.toUpperCase();
@@ -6647,7 +7107,11 @@ app.get('/orders/:id/partial-invoice/:letter.pdf', requireAuth, async (req, res)
       quantity: li.quantity,
       discountedUnitPriceSet: { presentmentMoney: { amount: String(li.unitPrice), currencyCode: 'USD' } },
       originalUnitPriceSet: { presentmentMoney: { amount: String(li.unitPrice), currencyCode: 'USD' } },
-      invoiceDiscountAmount: Number(li.discountAmount) || 0,
+      // GENUINE discount only. New snapshots store it that way (wholesaleDiscountAmount present); older ones
+      // stored the inclusive figure, so the app's own wholesale-price discount is taken back out using the
+      // same line as Shopify holds it now (matched by immutable line-item id, like the display metadata).
+      // DEPENDS: lib/wholesale-discount.mjs title + getOrderDetail selecting discountApplication.description.
+      invoiceDiscountAmount: snapshotLineInvoiceDiscount(li, current),
       variant: (variantTitle || sku) ? { title: variantTitle, sku } : null,
     };
   });
@@ -6668,6 +7132,7 @@ app.get('/orders/:id/partial-invoice/:letter.pdf', requireAuth, async (req, res)
       discount: effectiveDiscount,
       shipping: inv.shipping,
       total: inv.total,
+      backorderedLines: partialInvoiceBackorderedLines(numId, inv),
     });
     const safeName = (order.name || 'invoice').replace(/[^a-z0-9#-]/gi, '-');
     res.setHeader('Content-Type', 'application/pdf');
@@ -7124,7 +7589,25 @@ function verifyOrderDiscount(lineState, expected) {
 // is recorded `committed`: if it throws, the action is marked `failed` and the error surfaces —
 // so the idempotency ledger never records a commit that did not actually take effect on Shopify
 // (the delete-persist false-green). Returning a string from verifyFn pushes it as a warning.
-async function runOrderEdit(orderId, idemKey, editedBy, action, payload, stageFn, verifyFn) {
+//
+// opts (2026-10-26 speed hot-fix; both default off, so every existing caller is unchanged):
+//   skipLineState: true  - do NOT run readCommittedLineState after the commit. For callers that never use
+//     result.lineState / result.order (the backorder flag/undo adapters, which re-read Shopify themselves
+//     and decide with their own state machine). Refuses to combine with verifyFn: skipping the
+//     verify-or-fail oracle must never happen silently. The ledger row stores NO lineState (a replay of a
+//     lean action returns { ok, idemKey, lean:true }), and the ~118-line payload is never persisted.
+//   commitLines: (first)=>mutation doc - use this commit mutation, which also returns the order's lines in
+//     the SAME response. If (and only if) that answer is complete (pageInfo.hasNextPage === false) the raw
+//     nodes come back as result.committedNodes (NOT persisted). The caller decides what they prove; an
+//     absent/partial answer just means the caller does its own read, as before.
+// CHANGE-GUARD: skipLineState does not change the no-op branch's meaning ("There must be at least one change"
+//   is still success here - the CALLER's read-back is what notices nothing changed).
+// DEPENDS: lib/backorder-edit.mjs backorderCommitMutation is the only commitLines builder; backorderEditOpts()
+//   (below, 16D) is the only skipLineState caller.
+async function runOrderEdit(orderId, idemKey, editedBy, action, payload, stageFn, verifyFn, opts = {}) {
+  if (opts.skipLineState && verifyFn) throw new Error('runOrderEdit: skipLineState cannot be combined with verifyFn (it would skip the verify-or-fail oracle)');
+  const _t0 = Date.now();
+  const _ms = { begin: 0, stage: 0, commit: 0, verify: 0 };
   // [order-edit] P0 instrumentation (2026-06-29): log every save attempt + its REAL outcome so a
   // future failure shows the actual Shopify userError / exception in journalctl, not just a red pill.
   const _payloadSummary = (() => { try { const p = payload || {}; return JSON.stringify({ liId: p.liId, qty: p.qty, price: p.price, variantId: p.variantId, title: p.title ? String(p.title).slice(0,40) : undefined }); } catch { return '<unserializable>'; } })();
@@ -7146,6 +7629,7 @@ async function runOrderEdit(orderId, idemKey, editedBy, action, payload, stageFn
       catch { return { replayed: true }; }
     }
     try {
+      const _beginAt = Date.now();
       const beginResult = await shopifyFetch(`
         mutation begin($id:ID!){orderEditBegin(id:$id){
           calculatedOrder{ id lineItems(first:${LINE_PAGE_MAX}){ pageInfo{hasNextPage endCursor} edges{node{ ${CALC_LINE_FIELDS} }}} }
@@ -7162,18 +7646,26 @@ async function runOrderEdit(orderId, idemKey, editedBy, action, payload, stageFn
       // reports "line not found on order" no matter how many times the operator retries.
       const calcItems = await drainLineItems(calcOrder.lineItems, 'calculated order',
         calcLineItemsPage(calcId, CALC_LINE_FIELDS));
+      _ms.begin = Date.now() - _beginAt;
 
       const ctx = { calcOrder, calcItems, sessionId: beginResult.data?.orderEditBegin?.orderEditSession?.id, warnings: [] };
       const stageStarted = Date.now();
       await stageFn(calcId, ctx);
-      console.log(`[order-edit] STAGED action=${action} order=${orderId} elapsedMs=${Date.now() - stageStarted}`);
+      _ms.stage = Date.now() - stageStarted;
+      console.log(`[order-edit] STAGED action=${action} order=${orderId} elapsedMs=${_ms.stage}`);
 
       // Commit — and ACTUALLY READ userErrors (this is the bug the user hit).
-      const commitRes = await shopifyFetch(`mutation commit($id:ID!,$notify:Boolean!,$note:String){
+      // opts.commitLines swaps in the commit mutation that also answers with the order's lines; its page size
+      // is the session's line count + headroom (an undo-add grows the order by one), never above the 250 page cap.
+      const _commitAt = Date.now();
+      const commitRes = await shopifyFetch(opts.commitLines
+        ? opts.commitLines(Math.min(LINE_PAGE_MAX, calcItems.length + 8))
+        : `mutation commit($id:ID!,$notify:Boolean!,$note:String){
         orderEditCommit(id:$id,notifyCustomer:$notify,staffNote:$note){
           order{id} userErrors{field message}}}`,
         { id: calcId, notify: false, note: payload?.staffNote || null },
         { timeoutMs: action === 'discount/order' ? 60000 : 15000 });
+      _ms.commit = Date.now() - _commitAt;
       const cErrs = commitRes.data?.orderEditCommit?.userErrors || [];
       if (cErrs.length) {
         // NO-OP IS NOT A FAILURE (P0 regression fix, 2026-06-29): Shopify returns
@@ -7188,6 +7680,13 @@ async function runOrderEdit(orderId, idemKey, editedBy, action, payload, stageFn
         const isNoChange = cErrs.every(e => /at least one change/i.test(e.message || ''));
         if (isNoChange) {
           console.log(`[order-edit] ${action} commit was a NO-OP (order already in desired state) — treating as success`);
+          if (opts.skipLineState) {
+            // Lean caller: no line state to build and none to verify. It reads Shopify itself, sees nothing changed
+            // and decides (backorder: "nothing was backordered" - fail closed).
+            const lean = { ok: true, idemKey, noop: true, lean: true, warnings: ctx.warnings };
+            putEditAction({ idemKey, orderId, action, payload, result: lean, status: 'committed', editedBy });
+            return lean;
+          }
           const lineState = await readCommittedLineState(orderId);
           if (verifyFn) { const w = await verifyFn(lineState); if (typeof w === 'string' && w) ctx.warnings.push(w); }
           const result = { ok: true, idemKey, noop: true, warnings: ctx.warnings, order: { subtotal: lineState.subtotal, total: lineState.total, lineCount: lineState.lineCount }, lineState };
@@ -7202,14 +7701,25 @@ async function runOrderEdit(orderId, idemKey, editedBy, action, payload, stageFn
       // mis-mapped or no-op'd mutation can `commit` cleanly yet leave the targeted line
       // untouched — verifyFn re-checks the live state and throws if reality disagrees, so we
       // never record a false-green in the idempotency ledger or return ok:true to the UI.
+      if (opts.skipLineState) {
+        // Lean path (backorder flag/undo). The commit may have answered with the order's lines; hand them back
+        // ONLY when the page is provably complete. They are returned to the caller but never written to the ledger.
+        const committedNodes = completeCommitNodes(commitRes.data?.orderEditCommit?.order?.lineItems);
+        const lean = { ok: true, idemKey, lean: true, warnings: ctx.warnings };
+        putEditAction({ idemKey, orderId, action, payload, result: lean, status: 'committed', editedBy });
+        console.log(`[order-edit] OK action=${action} order=${orderId} idem=${idemKey} lean=1 commitLines=${committedNodes ? committedNodes.length : 'none'} warnings=${ctx.warnings.length} ms[begin=${_ms.begin} stage=${_ms.stage} commit=${_ms.commit} verify=0 total=${Date.now() - _t0}]`);
+        return committedNodes ? { ...lean, committedNodes } : lean;
+      }
+      const _verifyAt = Date.now();
       const lineState = await readCommittedLineState(orderId);
       if (verifyFn) {
         const w = await verifyFn(lineState);
         if (typeof w === 'string' && w) ctx.warnings.push(w);
       }
+      _ms.verify = Date.now() - _verifyAt;
       const result = { ok: true, idemKey, warnings: ctx.warnings, order: { subtotal: lineState.subtotal, total: lineState.total, lineCount: lineState.lineCount }, lineState };
       putEditAction({ idemKey, orderId, action, payload, result, status: 'committed', editedBy });
-      console.log(`[order-edit] OK action=${action} order=${orderId} idem=${idemKey} lineCount=${result.order?.lineCount} subtotal=${result.order?.subtotal} warnings=${(result.warnings||[]).length}`);
+      console.log(`[order-edit] OK action=${action} order=${orderId} idem=${idemKey} lineCount=${result.order?.lineCount} subtotal=${result.order?.subtotal} warnings=${(result.warnings||[]).length} ms[begin=${_ms.begin} stage=${_ms.stage} commit=${_ms.commit} verify=${_ms.verify} total=${Date.now() - _t0}]`);
       return result;
     } catch (err) {
       const messages = err instanceof OrderEditError ? err.userMessages : [err.message];
@@ -7525,7 +8035,8 @@ app.post('/orders/:id/edit', requireAuth, async (req, res) => {
           const dRes = await shopifyFetch(`mutation addDisc($id:ID!,$li:ID!,$d:OrderEditAppliedDiscountInput!){
             orderEditAddLineItemDiscount(id:$id,lineItemId:$li,discount:$d){
               calculatedOrder{id} userErrors{field message}}}`,
-            { id: calcId, li: calcLiId, d: { percentValue: parseFloat(pct.toFixed(4)), description: 'B2B wholesale' } });
+            // SYNC: WHOLESALE_DISCOUNT_TITLE — pdf.mjs matches this description to keep the wholesale price off the invoice's Discount row.
+            { id: calcId, li: calcLiId, d: { percentValue: parseFloat(pct.toFixed(4)), description: WHOLESALE_DISCOUNT_TITLE } });
           const dErrs = dRes.data?.orderEditAddLineItemDiscount?.userErrors || [];
           if (dErrs.length) {
             // Surface, don't swallow. The line IS added (at list price) — collect a warning.
@@ -7612,7 +8123,20 @@ app.post('/orders/:id/edit', requireAuth, async (req, res) => {
 // remove/qty/price then mutated the WRONG line while the endpoint still reported success and
 // logged "removed". Keep the suffix match first; the variant+title heuristic is a last-ditch
 // fallback only for the (rare) case where Shopify does NOT preserve the suffix.
-async function mapOrigToCalc(orderId, calcItems, origLiId) {
+//
+// SPEED (2026-10-26): needOrig:false lets a caller that only wants the calculated line (qty / remove /
+// backorder flag / backorder raise - they read calcLiId and calcItem, never `orig`) skip the whole-order
+// read when the PRIMARY suffix match already answers. The slow path below still runs for everything else:
+// no suffix match, an id that is not a LineItem gid, or a caller that needs `orig` (line/price).
+// INVARIANT(S): the fast path can only return a calc line whose numeric id equals the requested LineItem's
+//   - the same 1:1 mapping the slow path tries first - so it cannot map to a different line. A line that is
+//   not on the order has no such calc line and falls through to the slow path ("line not found").
+async function mapOrigToCalc(orderId, calcItems, origLiId, { needOrig = true } = {}) {
+  if (!needOrig && /^gid:\/\/shopify\/LineItem\/\d+$/.test(String(origLiId))) {
+    const wantNum = shopifyNumericId(origLiId);
+    const hit = calcItems.find(c => shopifyNumericId(c.id) === wantNum);
+    if (hit) return { calcLiId: hit.id, orig: null, calcItem: hit };
+  }
   // PAGED, and this one is not cosmetic: origItems is searched for origLiId itself. Under the old
   // first:100, editing line 101+ of an order found nothing here, returned calcLiId:null, and the
   // caller answered "line not found on order" — for a line plainly visible on the page, on every
@@ -7694,7 +8218,8 @@ app.post('/orders/:id/line/add', requireAuth, async (req, res) => {
           if (pct > 0 && pct <= 100) {
             const dRes = await shopifyFetch(`mutation addDisc($id:ID!,$li:ID!,$d:OrderEditAppliedDiscountInput!){
               orderEditAddLineItemDiscount(id:$id,lineItemId:$li,discount:$d){ calculatedOrder{id} userErrors{field message}}}`,
-              { id: calcId, li: calcLiId, d: { percentValue: parseFloat(pct.toFixed(4)), description: 'B2B wholesale' } });
+              // SYNC: WHOLESALE_DISCOUNT_TITLE — pdf.mjs matches this description to keep the wholesale price off the invoice's Discount row.
+              { id: calcId, li: calcLiId, d: { percentValue: parseFloat(pct.toFixed(4)), description: WHOLESALE_DISCOUNT_TITLE } });
             const dErrs = dRes.data?.orderEditAddLineItemDiscount?.userErrors || [];
             if (dErrs.length) ctx.warnings.push(`Added at list price — ${dErrs.map(e => e.message).join('; ')}`);
           }
@@ -7815,7 +8340,7 @@ app.post('/orders/:id/line/qty', requireAuth, async (req, res) => {
 
   try {
     const result = await runOrderEdit(orderId, idemKey, session.email, 'line/qty', payload, async (calcId, ctx) => {
-      const { calcLiId } = await mapOrigToCalc(orderId, ctx.calcItems, payload.liId);
+      const { calcLiId } = await mapOrigToCalc(orderId, ctx.calcItems, payload.liId, { needOrig: false });
       if (!calcLiId) throw new OrderEditError('line not found on order');
       const r = await shopifyFetch(`mutation setQty($id:ID!,$li:ID!,$qty:Int!,$r:Boolean!){
         orderEditSetQuantity(id:$id,lineItemId:$li,quantity:$qty,restock:$r){ calculatedOrder{id} userErrors{field message}}}`,
@@ -7958,7 +8483,7 @@ app.post('/orders/:id/line/remove', requireAuth, async (req, res) => {
 
   try {
     const result = await runOrderEdit(orderId, idemKey, session.email, 'line/remove', payload, async (calcId, ctx) => {
-      const { calcLiId } = await mapOrigToCalc(orderId, ctx.calcItems, payload.liId);
+      const { calcLiId } = await mapOrigToCalc(orderId, ctx.calcItems, payload.liId, { needOrig: false });
       if (!calcLiId) throw new OrderEditError('line not found on order');
       const r = await shopifyFetch(`mutation setQty($id:ID!,$li:ID!,$qty:Int!,$r:Boolean!){
         orderEditSetQuantity(id:$id,lineItemId:$li,quantity:$qty,restock:$r){ calculatedOrder{id} userErrors{field message}}}`,
@@ -8570,18 +9095,261 @@ app.post('/orders/:id/fulfill', requireAuth, async (req, res) => {
   }
 });
 
-// 16D: Backorder flag per line item
-// WHAT: 16D — flags a single line item as backordered via upsertBackorder(orderGid, lineItemId, title, qty, eta, by).
-// CHANGE-GUARD: synchronous handler (no await) — upsertBackorder must stay sync or wrap; quantity parsed with parseInt fallback 0, eta passed through nullable.
-// INVARIANT(S): keyed on gid://shopify/Order/<id> + lineItemId; fulfilling the same line later calls fulfillBackorder with the SAME lineItemId to clear it — id formats must match across backorder/fulfill routes.
-app.post('/orders/:id/backorder', requireAuth, (req, res) => {
-  const numId   = req.params.id;
-  const { lineItemId, lineItemTitle, quantity, eta } = req.body;
+// ── 16D: Backorder = REMOVE the units from the Shopify order, keep the snapshot, allow Undo ────────
+// (2026-10-26 hot-fix.) The orchestration, the Shopify staging and the reconcile rules live in
+// lib/backorder-edit.mjs; this region is the transport: the order-line reader, the real (runOrderEdit) and
+// MOCK edit adapters, and the two routes.
+// DEPENDS: db.mjs getBackorderedLinesForOrder is the contract the invoice/order-page renderers read; the
+//   row written here (unit_price, currency, variant/sku/title, shopify_removed_qty) is its source.
+import {
+  flagBackorder, undoBackorder, parseBackorderRequest, errMsg as backorderErrMsg,
+  stageRemoveUnits, stageRaiseUnits, stageAddVariantAtPrice, stageAddCustomAtPrice, BACKORDER_FLASH, BACKORDER_LINE_FIELDS,
+  backorderCommitMutation, completeCommitNodes,
+} from './lib/backorder-edit.mjs';
+import {
+  getBackorderRow, claimBackorderRemoval, finalizeBackorderRemoval, abandonBackorderClaim,
+  beginBackorderRestore, revertBackorderRestore, restoreBackorder, getTransientBackorders,
+} from './db.mjs';
+
+// WHAT: one Shopify (or MOCK) order line node → the flat line shape lib/backorder-edit.mjs works with.
+// CHANGE-GUARD: unitPrice is lineItemTrueUnit — the SAME post-all-discounts per-unit price the invoice PDF,
+//   the CSV and Xero print — so the price stored with a backorder is the price the customer was actually
+//   being billed for that line, and Undo restores exactly that. Do not swap it for discountedUnitPriceSet
+//   (that omits order-level 'ALL' discounts) or originalUnitPriceSet (list price).
+function normalizeBackorderLine(node) {
+  const cur = lineItemCurrentQty(node);
+  const money = (s) => s?.presentmentMoney;
+  return {
+    liId: node.id,
+    title: node.title || '',
+    variantTitle: node.variantTitle || node.variant?.title || '',
+    sku: node.sku || node.variant?.sku || '',
+    variantId: node.variant?.id || null,
+    currentQuantity: cur,
+    unitPrice: lineItemTrueUnit(node),
+    currency: money(node.discountedUnitPriceSet)?.currencyCode || money(node.originalUnitPriceSet)?.currencyCode || 'USD',
+  };
+}
+async function backorderReadLines(numId, orderId) {
+  if (MOCK) {
+    const order = getMockOrder(numId);
+    if (!order) throw new OrderEditError('order not found');
+    return (order.lineItems?.edges || []).map(e => normalizeBackorderLine(e.node));
+  }
+  const nodes = await fetchAllOrderLineItems(orderId, BACKORDER_LINE_FIELDS, 'backorder order read');
+  return nodes.map(normalizeBackorderLine);
+}
+
+// WHAT (real): removes `quantity` units of a line inside ONE runOrderEdit session (begin → setQuantity →
+//   commit), so it inherits the per-order lock, the idempotency ledger (order_edit_action), userError
+//   inspection and notifyCustomer:false that every other order edit already uses.
+// CHANGE-GUARD: no verifyFn on purpose — the core reads the order back itself and decides applied /
+//   not-applied / unknown, which a throwing verifyFn would pre-empt (it would mark the ledger 'failed'
+//   for an edit that DID commit).
+//
+// SPEED (2026-10-26, "Mark backordered seems slow": ~7.5-8.3 s per click on a 118-line order, ~2 s of it four
+//   whole-order reads): (1) mapOrigToCalc needs no order read - the suffix match answers; (2) runOrderEdit skips
+//   readCommittedLineState (this adapter never used its result); (3) the commit mutation also returns the
+//   order's lines, and flagBackorder/undoBackorder accept them as the read-back ONLY when they positively
+//   confirm (lib/backorder-edit.mjs confirmedByCommit) - otherwise they read independently, as before.
+// B2B_BACKORDER_COMMIT_READBACK=0 turns (3) off (the commit then returns no lines); (1) and (2) stay.
+// DEPENDS: lib/backorder-edit.mjs flagBackorder/undoBackorder consume the returned { lines } and need them
+//   to be COMPLETE and in readLines() shape; test/backorder-roundtrips.test.mjs pins the call sequence.
+const BACKORDER_COMMIT_READBACK = process.env.B2B_BACKORDER_COMMIT_READBACK !== '0';
+const backorderEditOpts = () => ({ skipLineState: true, ...(BACKORDER_COMMIT_READBACK ? { commitLines: backorderCommitMutation } : {}) });
+// The lines the commit answered with, in the shape readLines() returns - or {} when it gave no complete answer.
+const committedLinesOf = (r) => (r?.committedNodes ? { lines: r.committedNodes.map(normalizeBackorderLine) } : {});
+async function backorderRemoveUnitsReal({ orderId, editedBy, line, quantity, idemKey, payload }) {
+  const r = await runOrderEdit(orderId, idemKey, editedBy, 'backorder/flag', payload, async (calcId, ctx) => {
+    const { calcLiId, calcItem } = await mapOrigToCalc(orderId, ctx.calcItems, line.liId, { needOrig: false });
+    if (!calcLiId) throw new OrderEditError('line not found on order');
+    await stageRemoveUnits({ shopifyFetch, calcId, calcLiId, calcQty: Number(calcItem?.quantity), quantity });
+  }, undefined, backorderEditOpts());
+  return committedLinesOf(r);
+}
+async function backorderRestoreUnitsReal({ orderId, editedBy, mode, row, live, quantity, unitPrice, idemKey, payload }) {
+  const r = await runOrderEdit(orderId, idemKey, editedBy, 'backorder/restore', payload, async (calcId, ctx) => {
+    if (mode === 'raise') {
+      const { calcLiId, calcItem } = await mapOrigToCalc(orderId, ctx.calcItems, live.liId, { needOrig: false });
+      if (!calcLiId) throw new OrderEditError('line not found on order');
+      await stageRaiseUnits({ shopifyFetch, calcId, calcLiId, calcQty: Number(calcItem?.quantity), quantity });
+    } else if (row.variant_id) {
+      const variantGid = String(row.variant_id).startsWith('gid://') ? row.variant_id : `gid://shopify/ProductVariant/${row.variant_id}`;
+      await stageAddVariantAtPrice({ shopifyFetch, calcId, variantGid, quantity, unitPrice });
+    } else {
+      await stageAddCustomAtPrice({ shopifyFetch, calcId, title: row.line_item_title, quantity, unitPrice, currency: row.currency });
+    }
+  }, undefined, backorderEditOpts());
+  return { warnings: [], ...committedLinesOf(r) };
+}
+
+// MOCK adapters — drive the same mockIncrementalEdit ledger the other line routes use, and model the two
+// Shopify behaviours that matter here: shipped units cannot be removed, and a removed line (quantity 0)
+// stays on the order at currentQuantity 0 and can never be edited again (Undo therefore adds a NEW line).
+// Two sentinel substrings in a line TITLE let the suite provoke a Shopify rejection (MOCK only; the whole
+// block is dead code in production because every caller branches on MOCK first).
+const MOCK_REJECT_FLAG = '[mock-reject-flag]';
+const MOCK_FAIL_ONCE_RESTORE = '[mock-fail-once-restore]';
+const mockRestoreFailedOnce = new Set();
+function backorderRemoveUnitsMock({ numId, editedBy, line, quantity, idemKey, payload }) {
+  const order = getMockOrder(numId);
+  const out = mockIncrementalEdit({ numId, idemKey, action: 'backorder/flag', payload, editedBy, editFn: (edges) => {
+    const e = edges.find(x => x.node.id === line.liId);
+    if (!e) throw new OrderEditError('line not found on order');
+    if (String(e.node.title || '').includes(MOCK_REJECT_FLAG)) throw new OrderEditError('Mock Shopify rejected this order edit.');
+    const cq = e.node.currentQuantity != null ? e.node.currentQuantity : e.node.quantity;
+    const unfulfilled = e.node.unfulfilledQuantity != null ? e.node.unfulfilledQuantity
+      : (order?.displayFulfillmentStatus === 'FULFILLED' ? 0 : cq);
+    if (quantity > cq) throw new OrderEditError(`Only ${cq} unit(s) of this line are on the order.`);
+    if (quantity > unfulfilled) throw new OrderEditError(`Cannot remove ${quantity}: only ${unfulfilled} unit(s) are unfulfilled (the rest have shipped).`);
+    if (quantity === cq) e.node.currentQuantity = 0;
+    else { e.node.currentQuantity = cq - quantity; e.node.quantity = cq - quantity; }
+    if (e.node.unfulfilledQuantity != null) e.node.unfulfilledQuantity -= quantity;
+    return [];
+  } });
+  if (!out) throw new OrderEditError('order not found');
+}
+function backorderRestoreUnitsMock({ numId, editedBy, mode, row, live, quantity, unitPrice, idemKey, payload }) {
+  const out = mockIncrementalEdit({ numId, idemKey, action: 'backorder/restore', payload, editedBy, editFn: (edges) => {
+    if (String(row.line_item_title || '').includes(MOCK_FAIL_ONCE_RESTORE) && !mockRestoreFailedOnce.has(idemKey)) {
+      mockRestoreFailedOnce.add(idemKey);
+      throw new OrderEditError('Mock Shopify rejected the restore (first attempt only).');
+    }
+    if (mode === 'raise') {
+      const e = edges.find(x => x.node.id === live.liId);
+      if (!e) throw new OrderEditError('line not found on order');
+      const cq = e.node.currentQuantity != null ? e.node.currentQuantity : e.node.quantity;
+      e.node.currentQuantity = cq + quantity; e.node.quantity = cq + quantity;
+      if (e.node.unfulfilledQuantity != null) e.node.unfulfilledQuantity += quantity;
+    } else {
+      const price = { presentmentMoney: { amount: Number(unitPrice).toFixed(2), currencyCode: row.currency || 'USD' } };
+      edges.push({ node: {
+        id: `gid://shopify/LineItem/idem-${idemKey}`, title: row.line_item_title, quantity, currentQuantity: quantity,
+        variant: row.variant_id ? { id: row.variant_id, sku: row.sku || '', title: row.variant_title || undefined } : null,
+        discountedUnitPriceSet: price, originalUnitPriceSet: price,
+      } });
+    }
+    return [];
+  } });
+  if (!out) throw new OrderEditError('order not found');
+  return { warnings: [] };
+}
+
+// Everything lib/backorder-edit.mjs needs, bound to one order + staff member.
+function backorderDeps(numId, orderId, email) {
+  return {
+    db: { getBackorderRow, claimBackorderRemoval, finalizeBackorderRemoval, abandonBackorderClaim,
+          beginBackorderRestore, revertBackorderRestore, restoreBackorder },
+    getEditAction,
+    readLines: () => backorderReadLines(numId, orderId),
+    removeUnits: (a) => MOCK ? backorderRemoveUnitsMock({ numId, editedBy: email, ...a }) : backorderRemoveUnitsReal({ orderId, editedBy: email, ...a }),
+    restoreUnits: async (a) => MOCK ? backorderRestoreUnitsMock({ numId, editedBy: email, ...a }) : backorderRestoreUnitsReal({ orderId, editedBy: email, ...a }),
+    // The whole-order read runOrderEdit made after every commit before the speed change (readCommittedLineState), kept
+    // ONLY for the path where the commit reported success but its own answer did not confirm: it is the pause that lets
+    // Shopify's read side catch up before the read-back (lib/backorder-edit.mjs readBackAfterUnconfirmedCommit). Its
+    // result is unused. MOCK has no Shopify, hence no lag to wait out.
+    // DEPENDS: lib/backorder-edit.mjs deps.settleAfterCommit (optional); test/backorder-roundtrips.test.mjs counts its 'lineState' call.
+    settleAfterCommit: MOCK ? undefined : () => readCommittedLineState(orderId),
+    now: () => Date.now(),
+    log: console,
+  };
+}
+// ?msg= is truncated like the neighbouring routes (fulfill: 240, edit: 300).
+const backorderFailUrl = (numId, msg) =>
+  `/orders/${numId}?error=${BACKORDER_FLASH.FAILED}&msg=${encodeURIComponent(String(msg || 'Backorder action failed.').slice(0, 240))}`;
+
+// A row left 'applying'/'restoring' means the process died between a Shopify write and the status flip.
+// The data needed to reconcile it is intact (claim_prior_qty); it is reconciled the next time anyone
+// flags/undoes that line. Say so at boot instead of leaving it for someone to stumble on.
+{
+  const stuck = getTransientBackorders();
+  if (stuck.length) {
+    console.error(`[backorder] ${stuck.length} backorder row(s) were left mid-write by an earlier run — verify these orders in Shopify: `
+      + stuck.map(r => `${r.order_id}/${r.line_item_id} (${r.status}, ${r.quantity}u)`).join(', '));
+  }
+}
+
+// POST /orders/:id/backorder — body: lineItemId, quantity, idemKey? (hidden-field double-submit token).
+// A stale client that still posts `eta` is ignored: the expected-ship-date feature was removed (owner decision).
+// WHAT: removes `quantity` units of the line from the Shopify order and records the invoice snapshot. A full
+//   line removes the line (quantity 0); a partial quantity lowers it to current − quantity. Restock true,
+//   notifyCustomer false — identical to the existing ✕ remove route.
+// CHANGE-GUARD: FAIL CLOSED. On any Shopify rejection no 'pending' row is left behind (the claim is
+//   abandoned), and the redirect is ?error=backorder_shopify_failed&msg=… . On an outcome that cannot be
+//   confirmed the row stays 'applying' (loudly logged) and is reconciled on the next attempt — it is never
+//   silently dropped, because the units may really be gone from the order.
+// INVARIANT(S): serialised per order by withOrderLock('backorder:…'); a different key than runOrderEdit's
+//   own lock on purpose, or this would deadlock waiting on itself. A double submit (same hidden token, or
+//   an identical request within 60 s) answers success without a second removal. Flash codes:
+//   success=backorder_flagged | error=backorder_shopify_failed (also carries validation messages in ?msg=).
+app.post('/orders/:id/backorder', requireAuth, async (req, res) => {
+  const numId = req.params.id;
+  const email = req.adminSession.email;
+  const body = req.body || {};
+  if (!/^\d+$/.test(String(numId))) return res.status(400).send('Bad order id');
+  if (!body.lineItemId) return res.redirect(`/orders/${numId}?error=missing_line_item`);
+  const parsed = parseBackorderRequest(body);
+  if (!parsed.ok) return res.redirect(backorderFailUrl(numId, parsed.message));
+  const orderId = shopifyOrderGid(numId);
+  const idemKey = typeof body.idemKey === 'string' && /^[A-Za-z0-9_-]{8,80}$/.test(body.idemKey) ? body.idemKey : null;
+  let out;
+  try {
+    out = await withOrderLock(`backorder:${orderId}`, () => flagBackorder(backorderDeps(numId, orderId, email), {
+      orderId, lineItemId: parsed.lineItemId, quantity: parsed.quantity, email, idemKey,
+    }));
+  } catch (err) {
+    console.error(`[backorder] flag ${orderId} ${parsed.lineItemId} CRASHED: ${err && err.stack ? err.stack : err}`);
+    return res.redirect(backorderFailUrl(numId, `Unexpected error (${backorderErrMsg(err)}). Check the order in Shopify before retrying.`));
+  }
+  if (!out.ok) {
+    console.error(`[backorder] flag ${orderId} ${parsed.lineItemId} FAILED (${out.state}): ${out.message}`);
+    return res.redirect(backorderFailUrl(numId, out.message));
+  }
+  if (!out.duplicate) {
+    const row = getBackorderRow(orderId, parsed.lineItemId);
+    const detail = { lineItemId: parsed.lineItemId, lineItemTitle: row?.line_item_title, quantity: parsed.quantity, unitPrice: row?.unit_price, removedFromShopify: true };
+    logOrderEdit(orderId, email, null, { action: 'backorder/flag', payload: detail });
+    auditLog(email, 'order_backorder', orderId, null, detail);
+  }
+  res.redirect(`/orders/${numId}?success=${BACKORDER_FLASH.FLAGGED}`);
+});
+
+// POST /orders/:id/backorder/undo — body: lineItemId (the id the line had when it was flagged).
+// WHAT: puts the removed units back on the Shopify order at the unit price STORED at flag time (never a
+//   recomputed list price) and flips the row to 'restored'. If the line still exists at reduced quantity and
+//   still carries that price its quantity is raised; otherwise (removed line — Shopify cannot un-remove it —
+//   or its price has since been edited) the variant is added back as a NEW line at the stored price.
+// CHANGE-GUARD: same fail-closed / reconcile contract as the flag route. Idempotent: undoing an
+//   already-restored row answers success and changes nothing.
+// INVARIANT(S): flash codes success=backorder_restored (+ optional &msg= price warning) |
+//   error=backorder_shopify_failed. The row stays 'pending' (still backordered) whenever Shopify refused.
+app.post('/orders/:id/backorder/undo', requireAuth, async (req, res) => {
+  const numId = req.params.id;
+  const email = req.adminSession.email;
+  const body = req.body || {};
+  if (!/^\d+$/.test(String(numId))) return res.status(400).send('Bad order id');
+  const lineItemId = String(body.lineItemId ?? '').trim();
   if (!lineItemId) return res.redirect(`/orders/${numId}?error=missing_line_item`);
-  const orderId = `gid://shopify/Order/${numId}`;
-  upsertBackorder(orderId, lineItemId, lineItemTitle || '', parseInt(quantity, 10) || 0, eta || null, req.adminSession.email);
-  auditLog(req.adminSession.email, 'order_backorder', orderId, null, { lineItemId, lineItemTitle, eta });
-  res.redirect(`/orders/${numId}?success=backorder_flagged`);
+  const orderId = shopifyOrderGid(numId);
+  let out;
+  try {
+    out = await withOrderLock(`backorder:${orderId}`, () => undoBackorder(backorderDeps(numId, orderId, email), { orderId, lineItemId, email }));
+  } catch (err) {
+    console.error(`[backorder] undo ${orderId} ${lineItemId} CRASHED: ${err && err.stack ? err.stack : err}`);
+    return res.redirect(backorderFailUrl(numId, `Unexpected error (${backorderErrMsg(err)}). Check the order in Shopify before retrying.`));
+  }
+  if (!out.ok) {
+    console.error(`[backorder] undo ${orderId} ${lineItemId} FAILED (${out.state}): ${out.message}`);
+    return res.redirect(backorderFailUrl(numId, out.message));
+  }
+  if (!out.duplicate) {
+    const row = getBackorderRow(orderId, lineItemId);
+    const detail = { lineItemId, lineItemTitle: row?.line_item_title, quantity: row?.shopify_removed_qty, unitPrice: row?.unit_price, legacyFlagOnly: !!out.legacy, warnings: out.warnings || [] };
+    if (!out.legacy) logOrderEdit(orderId, email, null, { action: 'backorder/restore', payload: detail });
+    auditLog(email, 'order_backorder_undo', orderId, null, detail);
+  }
+  const warn = (out.warnings || []).length ? `&msg=${encodeURIComponent(out.warnings.join(' ').slice(0, 300))}` : '';
+  res.redirect(`/orders/${numId}?success=${BACKORDER_FLASH.RESTORED}${warn}`);
 });
 
 // API: get backorders for an order (used by order detail page)
@@ -8600,21 +9368,19 @@ app.get('/api/admin/backorders', requireAuth, (req, res) => {
 });
 
 // ── Task #45: Backorder queue page ──────────────────────────────────────────
-// WHAT: Task #45 — HTML backorder-queue page; renders one row per open backorder with order link, qty, ETA, age, and creator.
-// CHANGE-GUARD: eta_date is parsed as `${eta_date}T00:00:00` (local-midnight) to avoid UTC off-by-one day shifts — keep the T00:00:00 suffix; age uses /86400000 ms-per-day.
+// WHAT: Task #45 — HTML backorder-queue page; renders one row per open backorder with order link, qty, age, and creator.
+// CHANGE-GUARD: no ETA column (the expected-ship-date feature was removed by owner decision; the eta_date DB column is kept but unused). Age uses /86400000 ms-per-day.
 // INVARIANT(S): all interpolated cells go through h() for XSS-escaping; order_id is stripped of the gid prefix only for display/link.
 app.get('/backorders', requireAuth, (req, res) => {
   const backorders = getOpenBackorders();
   const rows = backorders.map(b => {
     const numOrderId = b.order_id.replace('gid://shopify/Order/', '');
-    const etaDisplay = b.eta_date ? new Date(b.eta_date + 'T00:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : '—';
     const age = Math.floor((Date.now() - b.created_at) / 86400000);
     const ageLabel = age === 0 ? 'today' : age === 1 ? '1 day ago' : `${age} days ago`;
     return `<tr>
       <td><a href="/orders/${h(numOrderId)}" class="link">#${h(numOrderId)}</a></td>
       <td>${h(b.line_item_title || '—')}</td>
       <td>${h(String(b.quantity))}</td>
-      <td>${h(etaDisplay)}</td>
       <td><span class="text-muted small-text">${h(ageLabel)}</span></td>
       <td>${h(b.created_by || '—')}</td>
     </tr>`;
@@ -8635,7 +9401,6 @@ app.get('/backorders', requireAuth, (req, res) => {
                 <th>Order</th>
                 <th>Item</th>
                 <th>Qty</th>
-                <th>ETA</th>
                 <th>Flagged</th>
                 <th>By</th>
               </tr>

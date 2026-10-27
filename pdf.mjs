@@ -1,4 +1,6 @@
 import { currentShippingAmount } from './lib/order-shipping.mjs';
+import { buildInvoiceBackorderModel } from './lib/invoice-backorder.mjs';
+import { isWholesaleDiscountAllocation } from './lib/wholesale-discount.mjs';
 import PDFDocument from 'pdfkit';
 import { readFileSync, existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -77,21 +79,68 @@ export function lineItemTrueUnit(item) {
   return lineItemTrueTotal(item) / cq;
 }
 
-// WHAT: the explicit discount allocated to the CURRENT quantity of one line.
+// WHAT: the GENUINE discount allocated to the CURRENT quantity of one line — what the invoice itemises as
+//   the Discount row. The app's own per-line wholesale-price discount (WHOLESALE_DISCOUNT_TITLE) is NOT
+//   part of it: that is the line's price, so it stays inside the net unit price/total (see
+//   lineItemWholesaleDiscount below and lib/wholesale-discount.mjs for the why).
 // WHY: invoices must show the customer's discount, not hide it by printing only net unit prices.
 // Shopify bakes EXPLICIT discounts into discountedTotalSet but leaves ALL/cart discounts outside it,
 // so summing every allocation and adding it back to lineItemTrueTotal reconstructs the honest
 // pre-discount merchandise amount across both representations.
+// INVARIANT(S): excluding a wholesale allocation moves it out of BOTH sides of the reconstruction (the
+//   gross row and the Discount row), so lineItemTrueTotal — and therefore Subtotal - Discount == TOTAL —
+//   is untouched. Only an allocation whose description is exactly the wholesale title is skipped; an
+//   order-level code, an "Order discount: …" and a "B2B price adj" still count.
 // DEPENDS: partial-invoice snapshots persist this as invoiceDiscountAmount because their archived
 // quantity/pricing must not depend on whatever the live Shopify order looks like when re-downloaded.
+// Snapshots written before the wholesale exclusion existed stored the INCLUSIVE figure — see
+// snapshotLineInvoiceDiscount, which the re-download route uses to correct them.
 export function lineItemInvoiceDiscount(item) {
   const cq = lineItemCurrentQty(item);
   if (cq <= 0) return 0;
   if (item.invoiceDiscountAmount != null) return parseFloat(item.invoiceDiscountAmount) || 0;
   const q = item.quantity || cq || 1;
   const allocated = (item.discountAllocations || [])
+    .filter(allocation => !isWholesaleDiscountAllocation(allocation))
     .reduce((sum, allocation) => sum + liNum(allocation?.allocatedAmountSet), 0);
   return allocated * (cq / q);
+}
+
+// WHAT: the part of a line's discount that is the app's own wholesale price (title match), for the CURRENT
+//   quantity. Persisted on new partial-invoice snapshots as wholesaleDiscountAmount: its presence (even 0)
+//   is what marks the snapshot's discountAmount as already EXCLUDING it.
+// INVARIANT(S): lineItemInvoiceDiscount + lineItemWholesaleDiscount == Σ every allocation, scaled the same way.
+export function lineItemWholesaleDiscount(item) {
+  const cq = lineItemCurrentQty(item);
+  if (cq <= 0) return 0;
+  const q = item.quantity || cq || 1;
+  const wholesale = (item.discountAllocations || [])
+    .filter(isWholesaleDiscountAllocation)
+    .reduce((sum, allocation) => sum + liNum(allocation?.allocatedAmountSet), 0);
+  return wholesale * (cq / q);
+}
+
+// WHAT: the genuine discount to print for one line of a STORED partial invoice (re-download), given the
+//   saved snapshot line and the same line as Shopify holds it now (may be undefined).
+// WHY: snapshots created before the wholesale exclusion saved the inclusive discount (partial invoice
+//   #39875-A: SKU 04622 saved discountAmount 9.00 although 9.00 was its wholesale price). Their frozen
+//   unit price is already the net price, so the wholesale share simply has to come back OUT of the saved
+//   discount; the live line's allocations say which share that was.
+// CHANGE-GUARD: never changes a snapshot that carries wholesaleDiscountAmount (new format, already exact).
+//   For an older one the correction is proportional — wholesale / all allocations on the live line —
+//   because a line carries at most one manual discount, so in practice the share is 0 or 1; and it only
+//   ever LOWERS the discount, never invents one. If the live line no longer carries the wholesale discount
+//   (replaced or removed since) nothing identifies it, the saved figure stands, and the Discount row stays.
+export function snapshotLineInvoiceDiscount(snapshotLine, liveLine) {
+  const stored = Math.max(0, parseFloat(snapshotLine?.discountAmount) || 0);
+  if (snapshotLine?.wholesaleDiscountAmount != null) return stored;
+  if (stored <= 0) return 0;
+  const allocations = liveLine?.discountAllocations || [];
+  const all = allocations.reduce((sum, a) => sum + liNum(a?.allocatedAmountSet), 0);
+  const wholesale = allocations.filter(isWholesaleDiscountAllocation)
+    .reduce((sum, a) => sum + liNum(a?.allocatedAmountSet), 0);
+  if (!(all > 0) || !(wholesale > 0)) return stored;
+  return Math.round(Math.max(0, stored * (1 - wholesale / all)) * 100) / 100;
 }
 
 export function lineItemInvoiceGrossTotal(item) {
@@ -118,6 +167,151 @@ export function invoiceItemTitle(item) {
   return title;
 }
 
+// ── Invoice line ORDER = warehouse PICK LIST order ───────────────────────────────────────────────────────
+// WHAT: invoices list their lines in the same order the warehouse pick list walks them, so the person packing
+//   the box can tick the invoice off against the shelf and the customer can tick it off against the carton.
+//   The pick list (fww-shipping-bridge/worker.js pickAggregate, "B2B pick list") groups lines by PATTERN — the
+//   line title with its leading width ("1.5\"", "5/8\"") and the product-type words ("Luxe", "Everyday",
+//   "Limited Slip Collar", ...) stripped — sorts the patterns alphabetically, then sorts each pattern's variants
+//   by the label `width · size · typeCode` ("1.5\" · LG · LSC"). Sizes therefore sort ALPHABETICALLY (LG, MED,
+//   SM, XLG, XS), the type is not a level of its own, and there is no tie-breaker. Lines with no SKU
+//   (alterations, repairs, custom services) are not pickable and are not on the pick list at all.
+// SYNC: pick-sort-key — this block is a PORT of worker.js (fww-shipping-bridge, ~L6534-6596): pickDetectType,
+//   PICK_WIDTH_PREFIX, pickExtractWidth, PICK_TYPE_WORDS, pickExtractPattern, pickVariantLabel, and the two
+//   `localeCompare` sorts in pickAggregate. If the pick list's sort changes, change this to match (and the bridge's
+//   own `SYNC: pick-width-prefix` note applies here too: width extraction and pattern extraction share ONE regex).
+//   The bridge could not be edited from this change, so its side carries no marker — grep "SYNC: pick-sort-key" here.
+//   Deliberate differences, all invisible on the pick list: (1) the invoice has no merged rows to aggregate, so
+//   equal keys keep their ORIGINAL order (stable); (2) lines with no SKU sort LAST instead of being dropped;
+//   (3) comparison uses an explicit 'en-US' collator — the Cloudflare Worker's default locale — so the order does
+//   not depend on the server's OS locale.
+// WHY no extra Shopify fetch: the bridge's input is Shopify's line `name` ("<title> - <variantTitle>", from which
+//   it strips the variant again — i.e. the line TITLE), `variantTitle`, and `sku`. getOrderDetail already selects
+//   the line `title`, `variant.title` and `variant.sku`, and the lettered-invoice snapshot stores `title`,
+//   `variantTitle` and `sku` per line. (A variant renamed AFTER the order was placed is the only way the two can
+//   differ: the bridge reads the title the line was ordered with.)
+// INVARIANT(S): display only — never touches quantities, prices or totals; the same set of rows in a different order.
+function pickDetectType(title) {
+  const t = (title || '').toLowerCase();
+  if (t.includes('private trainer')) return 'PT';
+  if (t.includes('martingale walking lead') || t.includes('walking lead')) return 'WL';
+  if (t.includes('limited slip collar')) return 'LSC';
+  if (t.includes('leash')) return 'Leash';
+  if (t.includes('keychain')) return 'KC';
+  if (t.includes('belly band')) return 'BellyBand';
+  if (t.includes('harness')) return 'Harness';
+  return 'Other';
+}
+// Leading width prefix: decimals (1", 1.5"), fractions (5/8"), mixed (1 1/4"), unicode fractions (⅝"),
+// followed by a quote mark or "in"/"inch". SYNC: pick-width-prefix — pickExtractWidth and pickExtractPattern share it.
+const PICK_WIDTH_PREFIX = /^\s*(\d+\s+\d+\s*\/\s*\d+|\d+\s*\/\s*\d+|\d*\s*[¼½¾⅛⅜⅝⅞]|\d+(?:\.\d+)?)\s*(?:["”″“]|''|inch(?:es)?\b|in\b)\s*/i;
+function pickExtractWidth(title) {
+  const m = (title || '').match(PICK_WIDTH_PREFIX);
+  return m ? (m[1].replace(/\s*\/\s*/, '/').replace(/\s+/g, ' ').trim() + '"') : '';
+}
+const PICK_TYPE_WORDS = /\b(luxe|everyday|private\s+trainer|martingale\s+walking\s+lead|walking\s+lead|limited\s+slip\s+collar|martingale|collar|leash|keychain|belly\s+band|harness)\b/gi;
+function pickExtractPattern(title) {
+  let s = (title || '').replace(PICK_WIDTH_PREFIX, '');
+  s = s.replace(PICK_TYPE_WORDS, ' ');
+  s = s.replace(/\s+/g, ' ').trim();
+  return s || (title || '').trim() || 'Item';
+}
+function pickVariantLabel(width, size, typeCode) {
+  return [width, size, typeCode].filter(Boolean).join(' · ');
+}
+const PICK_COLLATOR = new Intl.Collator('en-US');   // == localeCompare(b) on the Worker (default locale en-US)
+
+// WHAT: the pick-list sort key of one invoice line (or one backordered-row): { hasSku, pattern, label }.
+// Accepts an order line node ({ title, variant: { title, sku }, sku }), a stored-snapshot line mapped the same
+// way (server.mjs partial-invoice re-download), or a backorders row ({ title, variantTitle, sku }).
+// INVARIANT(S): pure; a Shopify "Default Title" variant counts as no variant (Shopify omits it from the line name).
+export function invoiceSortKey(item) {
+  const sku = String(item?.variant?.sku || item?.sku || '').trim();
+  const rawVariant = String(item?.variant?.title ?? item?.variantTitle ?? '').trim();
+  const size = rawVariant === 'Default Title' ? '' : rawVariant;
+  const title = String(item?.title ?? '');
+  const type = pickDetectType(title);
+  const width = pickExtractWidth(title);
+  const pattern = pickExtractPattern(title);
+  const label = pickVariantLabel(width, size, type === 'Other' ? '' : type) || '—';
+  return { hasSku: sku !== '', pattern, label };
+}
+
+// WHAT: `items` in pick-list order (a new array; the input is not mutated). SKU lines by pattern, then variant
+//   label; ties keep their original relative order; lines with no SKU follow, in their original order.
+// DEPENDS: generateInvoicePdf sorts its active rows ONCE with this; buildOrderInvoiceBackorderModel sorts the
+//   struck backordered rows with it, so the PDF rows, the PDF footnote and the HTML block all agree.
+export function sortInvoiceLines(items) {
+  const keyed = (Array.isArray(items) ? items : []).map((item, index) => ({ item, index, key: invoiceSortKey(item) }));
+  keyed.sort((a, b) => {
+    if (a.key.hasSku !== b.key.hasSku) return a.key.hasSku ? -1 : 1;
+    if (a.key.hasSku) {
+      const byPattern = PICK_COLLATOR.compare(a.key.pattern, b.key.pattern);
+      if (byPattern) return byPattern;
+      const byLabel = PICK_COLLATOR.compare(a.key.label, b.key.label);
+      if (byLabel) return byLabel;
+    }
+    return a.index - b.index;
+  });
+  return keyed.map(k => k.item);
+}
+
+// WHAT: the backordered-lines display model for the ORDER invoice and for LETTERED invoices (struck rows +
+//   footnote), or null.
+// WHY: backordered units are REMOVED from the Shopify order (db.mjs `backorders` table), so the order's own
+//   lines no longer mention them. This builds the one model both the PDF (generateInvoicePdf) and the HTML
+//   viewer (server.mjs GET /orders/:id/invoice, with or without ?letter=) render; the wording lives in
+//   lib/invoice-backorder.mjs, so a lettered invoice can never word it differently from the order invoice.
+// DEPENDS: invoiceItemTitle above — the same title cleaner the active rows use, so a variant Shopify baked
+//   into the title is not printed twice on the struck rows either.
+// INVARIANT(S): the rows are put in PICK-LIST order (sortInvoiceLines) before the model is built, so struck rows —
+//   a trailing block on the PDF — and the footnote, which maps 1:1 onto them, follow the same order as the active
+//   rows above them. A non-array stays a non-array (null model), exactly as before.
+export function buildOrderInvoiceBackorderModel(rows) {
+  return buildInvoiceBackorderModel(Array.isArray(rows) ? sortInvoiceLines(rows) : rows, { displayTitle: invoiceItemTitle });
+}
+
+// ── Backordered section geometry (struck rows + footnote) ──────────────────────────────────────────────
+// SYNC: the column x/width literals in generateInvoicePdf's backordered-rows block (title 56/210, SKU 276/100,
+//   QTY 385/40, UNIT 430/65, TOTAL 500/62) mirror drawTableHeader and the active-row loop — struck rows must
+//   sit in the same columns; move one, move all three. BO_ROW_LIMIT mirrors the active rows' `y + rowH > 694`.
+const BO_GREY = '#757575';        // struck text — muted, but still AA-contrast on white (4.6:1)
+const BO_STRIKE = '#444444';      // the line itself is darker than the text so it reads at 0.5pt
+const BO_ROW_LIMIT = 694;         // same page-break threshold as the active item rows
+const BO_FOOT_LIMIT = 700;        // lowest y the footnote may reach: the page footer is drawn at y=720
+const BO_TITLE_LINES = 4, BO_VARIANT_LINES = 3;   // wrapped, then clipped with an ellipsis beyond this
+
+// WHAT: wraps `text` into `width` at the CURRENT font/size, clipped to `maxLines` with an ellipsis.
+// WHY: pdfkit does not clip table cells — a long title/variant would run into the next column or off the
+//   page. Returns the pdfkit text options that enforce the clip plus the height it will occupy.
+// INVARIANT(S): callers must set doc.font()/fontSize() BEFORE calling; the height is in the same units
+//   (incl. lineGap) pdfkit advances doc.y by, so rows can be stacked from it exactly.
+function clampedText(doc, text, width, maxLines, lineGap = 1) {
+  const lineH = doc.currentLineHeight(true) + lineGap;
+  const full = doc.heightOfString(text, { width, lineGap });
+  return {
+    height: Math.min(Math.ceil(full), Math.ceil(lineH * maxLines)),
+    opts: { width, lineGap, height: lineH * maxLines, ellipsis: true },
+  };
+}
+
+// WHAT: the largest font size <= `size` (floor `min`) at which `text` fits `width` on one line, at the CURRENT
+//   font. Leaves the doc's font size set to the returned value.
+function fontSizeToFit(doc, text, width, size, min = 6.5) {
+  let s = size;
+  doc.fontSize(s);
+  while (s > min && doc.widthOfString(text) > width) { s -= 0.5; doc.fontSize(s); }
+  return s;
+}
+
+// WHAT: single-line text trimmed with an ellipsis so it fits `width` at the CURRENT font/size.
+function fitOneLine(doc, text, width) {
+  if (doc.widthOfString(text) <= width) return text;
+  let t = text;
+  while (t.length > 1 && doc.widthOfString(t + '…') > width) t = t.slice(0, -1);
+  return t + '…';
+}
+
 function registerBrandFonts(doc) {
   for (const [name, path] of Object.entries(FONT_PATHS)) {
     if (existsSync(path)) {
@@ -130,9 +324,26 @@ function registerBrandFonts(doc) {
 // WHAT: renders a branded B2B invoice PDF (pdfkit) from a Shopify order, with optional opts overrides for partial invoices (lineItems/subtotal/shipping/total/invoiceSuffix/paymentTerms).
 // CHANGE-GUARD: line rows use fixed heights + lineBreak:false + ellipsis and an explicit y>680 page-break; long titles/skus or added columns can overlap or push the footer off-page — re-render a multi-page order and an unpaid order (PAYMENT PENDING watermark) after layout edits.
 // INVARIANT(S): undiscounted invoices show post-discount unit prices directly; invoices with allocated
-// discounts show reconstructed pre-discount rows plus one negative Discount total. When opts.subtotal
+// discounts show reconstructed pre-discount rows plus one negative Discount total. The app's own per-line
+// wholesale-price discount (lib/wholesale-discount.mjs) is NOT such a discount: a line carrying only that
+// prints at its NET wholesale unit price/total and adds nothing to the Discount row, so a wholesale-added
+// line never looks like "list price + discount" next to net-priced lines. When opts.subtotal
 // is supplied, partial-invoice totals come from opts and must already be reconciled by the caller;
-// all text is black per brand spec (lime is accent-only).
+// all text is black per brand spec (lime is accent-only; the struck BACKORDERED rows are the one
+// deliberate exception — muted grey).
+// ROW ORDER: active rows print in warehouse PICK-LIST order (invoiceSortKey / sortInvoiceLines above, SYNC:
+// pick-sort-key), not Shopify's line order; SKU-less lines last; the struck backordered block that trails them is
+// sorted by the same key (buildOrderInvoiceBackorderModel). Display only — totals never depend on row order.
+// opts.backorderedLines: db.mjs getBackorderedLinesForOrder()-shaped rows — units removed from
+//   the Shopify order. They are drawn AFTER the active rows, struck through and tagged, and itemised in a
+//   footnote below the totals. With none (absent/empty) every byte of the page content is exactly what it was
+//   before this option existed (test/invoice-backorder.test.mjs pins that with goldens).
+//   They are NEVER summed: subtotal/shipping/tax/total come from the Shopify order (which no longer holds the
+//   removed units) or from opts.subtotal/total, and `lineItems`/discount math never sees these rows.
+// DEPENDS: callers pass opts.backorderedLines from the full-order invoice route (server.mjs
+//   GET /orders/:id/invoice.pdf: the LIVE rows) and from the lettered-invoice routes (POST/GET
+//   /orders/:id/partial-invoice*: the snapshot's own stored rows, never the live ones — see
+//   lib/partial-invoice-backorder.mjs). The caller decides WHICH rows; this function only draws them.
 export async function generateInvoicePdf(order, opts = {}) {
   return new Promise((resolve, reject) => {
     const doc = new PDFDocument({ margin: 50, size: 'LETTER', autoFirstPage: true });
@@ -258,12 +469,15 @@ export async function generateInvoicePdf(order, opts = {}) {
     drawTableHeader(tableTop);
 
     let y = tableTop + 30;
-    const lineItems = opts.lineItems ?? (order.lineItems?.edges?.map(e => e.node) || []);
+    // Pick-list order (see invoiceSortKey), sorted ONCE here so the rows, the inferred discount and everything
+    // below read one sequence. Order only: nothing about a line's quantity or price depends on its position.
+    const lineItems = sortInvoiceLines(opts.lineItems ?? (order.lineItems?.edges?.map(e => e.node) || []));
     const inferredDiscount = lineItems.reduce((sum, item) => sum + lineItemInvoiceDiscount(item), 0);
     const discountAmount = opts.discount !== undefined
       ? (parseFloat(opts.discount) || 0)
       : inferredDiscount;
     const showDiscount = discountAmount > 0.004;
+    const backorder = buildOrderInvoiceBackorderModel(opts.backorderedLines);   // null => nothing below runs
     doc.font('Inter').fillColor(BLACK);
 
     for (const item of lineItems) {
@@ -297,6 +511,53 @@ export async function generateInvoicePdf(order, opts = {}) {
       doc.text(fmt(rowTotal), 500, y, { width: 62, height: 14, align: 'right', lineBreak: false });
       doc.moveTo(50, y + rowH - 4).lineTo(562, y + rowH - 4).lineWidth(0.5).strokeColor('#E5E5E5').stroke();
       y += rowH;
+    }
+
+    // ─── Backordered rows: struck through, AFTER the active rows ────────────────────────────────────
+    // WHAT: units backordered off this order (removed from Shopify) stay visible but visibly not billed:
+    //   muted grey, line-through on description / qty / unit price / line total, plus a "Backordered *" tag.
+    // WHY: they vanished from the invoice once removed from the order; the customer should still see them.
+    // INVARIANT(S): these rows only DRAW. Nothing below (subtotal, discount, shipping, TOTAL) reads them.
+    //   Long titles/variants wrap then clip (clampedText) and the SKU is trimmed to its column, so a row can
+    //   never spill into a neighbour; the page-break test is the same as the active rows'.
+    if (backorder) {
+      const TAG_H = 11;
+      for (const bl of backorder.lines) {
+        doc.fontSize(9.5).font('Inter');
+        const title = clampedText(doc, bl.title, 210, BO_TITLE_LINES);
+        let variant = null;
+        if (bl.variantTitle) {
+          doc.fontSize(8).font('Inter');
+          variant = clampedText(doc, bl.variantTitle, 210, BO_VARIANT_LINES);
+        }
+        const variantBlock = variant ? variant.height + 2 : 0;
+        const rowH = Math.max(20, title.height + variantBlock + 2 + TAG_H + 5);
+        if (y + rowH > BO_ROW_LIMIT) y = addContinuationPage(true);
+
+        doc.fillColor(BO_GREY).strokeColor(BO_STRIKE);
+        doc.fontSize(9.5).font('Inter');
+        doc.text(bl.title, 56, y, { ...title.opts, strike: true });
+        if (variant) {
+          doc.fontSize(8).font('Inter');
+          doc.text(bl.variantTitle, 56, y + title.height + 2, { ...variant.opts, strike: true });
+        }
+        // The tag is NOT struck and darker than the row: it is the part that must stay legible.
+        doc.fontSize(8).font('Inter-Bold').fillColor('#444444');
+        doc.text(backorder.tag, 56, y + title.height + variantBlock + 2, { width: 210, lineBreak: false });
+
+        doc.fillColor(BO_GREY).font('Inter').fontSize(8.5);
+        doc.text(fitOneLine(doc, bl.sku || '—', 100), 276, y, { width: 100, lineBreak: false });
+        doc.strokeColor(BO_STRIKE);
+        // Each figure is shrunk (never wrapped) until it fits its column — pdfkit would otherwise split an
+        // over-wide amount across two lines inside a fixed-height row.
+        for (const [label, x, w] of [[String(bl.quantity), 385, 40], [bl.unitPriceLabel, 430, 65], [bl.lineTotalLabel, 500, 62]]) {
+          doc.fontSize(fontSizeToFit(doc, label, w, 9.5));
+          doc.text(label, x, y, { width: w, align: 'right', lineBreak: false, strike: true });
+        }
+        doc.moveTo(50, y + rowH - 4).lineTo(562, y + rowH - 4).lineWidth(0.5).strokeColor('#E5E5E5').stroke();
+        y += rowH;
+      }
+      doc.fillColor(BLACK).font('Inter');
     }
 
     // ─── Totals ────────────────────────────────────────────────────
@@ -358,6 +619,7 @@ export async function generateInvoicePdf(order, opts = {}) {
     doc.fontSize(13).font('Inter-Bold').fillColor(BLACK);
     doc.text('TOTAL', LABEL_X, y, { width: LABEL_W, align: 'right', lineBreak: false });
     doc.text(fmt(total), AMT_X, y, { width: AMT_W, align: 'right', lineBreak: false });
+    let contentBottom = y + 18;   // lowest drawn point so far on the current page (13pt TOTAL row)
 
     // ─── Payment terms (B2B-specific) ──────────────────────────────
     if (opts.paymentTerms) {
@@ -366,6 +628,7 @@ export async function generateInvoicePdf(order, opts = {}) {
       doc.opacity(1);
       y += 12;
       doc.fontSize(10).font('Inter').fillColor(BLACK).text(opts.paymentTerms, 50, y, { width: 512 });
+      contentBottom = doc.y;
     }
 
     // ─── Customer notes (order.note) — prints on the customer invoice (alexa 2026-07-01) ──
@@ -377,6 +640,51 @@ export async function generateInvoicePdf(order, opts = {}) {
       doc.opacity(1);
       y += 12;
       doc.fontSize(10).font('Inter').fillColor(BLACK).text(order.note, 50, y, { width: 512 });
+      contentBottom = doc.y;
+    }
+
+    // ─── Backorder footnote — bottom of the invoice, below totals / terms / notes ───────────────────
+    // WHAT: heading + one plain sentence + one entry per backordered variant (wording: lib/invoice-backorder.mjs).
+    // CHANGE-GUARD: it must never overlap the totals block or the page footer (drawn at y=720) and never clip:
+    //   it starts below `contentBottom`; if the heading + intro + first entry do not fit above BO_FOOT_LIMIT it
+    //   starts on a fresh continuation page, and each further entry that does not fit moves to a new
+    //   continuation page under a "(continued)" heading. Entries are measured before they are drawn.
+    if (backorder) {
+      const fn = backorder.footnote;
+      const BULLET_W = 12, ITEM_W = 512 - BULLET_W;
+      doc.fontSize(9).font('Inter-Bold');
+      const headH = Math.ceil(doc.heightOfString(fn.heading, { width: 512 }));
+      doc.font('Inter');
+      const introH = Math.ceil(doc.heightOfString(fn.intro, { width: 512, lineGap: 1 }));
+      const blocks = fn.items.map(item => {
+        doc.fontSize(9).font('Inter-SemiBold');
+        const primary = clampedText(doc, item.primary, ITEM_W, 3);
+        doc.fontSize(8.5).font('Inter');
+        const detail = clampedText(doc, item.detail, ITEM_W, 2);
+        return { item, primary, detail, h: primary.height + detail.height + 6 };
+      });
+      const drawHeading = (text, top) => {
+        doc.fontSize(9).font('Inter-Bold').fillColor(BLACK).text(text, 50, top, { width: 512, lineBreak: false });
+        return top + headH + 3;
+      };
+
+      let fy = contentBottom + 24;
+      if (fy + headH + 3 + introH + 6 + blocks[0].h > BO_FOOT_LIMIT) fy = addContinuationPage(false);
+      else doc.moveTo(50, fy - 10).lineTo(562, fy - 10).lineWidth(0.5).strokeColor('#E5E5E5').stroke();
+      fy = drawHeading(fn.heading, fy);
+      doc.fontSize(9).font('Inter').fillColor(BLACK).text(fn.intro, 50, fy, { width: 512, lineGap: 1 });
+      fy += introH + 6;
+      for (const b of blocks) {
+        if (fy + b.h > BO_FOOT_LIMIT) {
+          fy = addContinuationPage(false);
+          fy = drawHeading(fn.headingContinued, fy);
+        }
+        doc.fontSize(9).font('Inter').fillColor(BLACK).text('•', 50, fy, { width: BULLET_W, lineBreak: false });
+        doc.fontSize(9).font('Inter-SemiBold').text(b.item.primary, 50 + BULLET_W, fy, { ...b.primary.opts });
+        doc.fontSize(8.5).font('Inter').fillColor('#333333').text(b.item.detail, 50 + BULLET_W, fy + b.primary.height, { ...b.detail.opts });
+        fy += b.h;
+      }
+      doc.fillColor(BLACK).font('Inter');
     }
 
     // ─── Footer — y=720 sits inside the default bottom margin (742) so no auto-page-break ──
