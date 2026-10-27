@@ -2802,7 +2802,7 @@ function renderOrderDetail(session, order, flash, flashMsg, { resumeEdit = false
     ? `<div class="alert alert-warning">Credit card invoice failed or email delivery was not confirmed. ${flashMsg ? h(flashMsg) : 'Check server logs.'}${helcimInvoice?.url ? ` <a href="${h(helcimInvoice.url)}" target="_blank" rel="noopener">Open the existing Helcim invoice</a>.` : ''}</div>`
     // SYNC: flash codes come from POST /orders/:id/sync-helcim-payment (helcimSyncFlash); the sync-failure codes are read from ?error= and, like every error here, rendered as alert-warning.
     : flash === 'helcim_payment_synced'
-    ? `<div class="alert alert-success">Helcim shows the invoice as paid, so this order was marked paid in Shopify. (Not recorded in Xero.)</div>`
+    ? `<div class="alert alert-success">Helcim shows the invoice as paid, so this order was marked paid in Shopify. (Not recorded in Xero.)${flashMsg ? ` <strong>${h(flashMsg)}</strong>` : ''}</div>`
     : flash === 'helcim_payment_unpaid'
     ? `<div class="alert alert-info">Helcim does not show this invoice as paid yet${flashMsg ? ` (status ${h(flashMsg)})` : ''}. Nothing was changed.</div>`
     : flash === 'helcim_payment_done'
@@ -6989,7 +6989,7 @@ app.post('/orders/:id/sync-helcim-payment', requireAuth, async (req, res) => {
     return res.status(result.outcome === 'no_invoice' ? 404 : result.outcome === 'error' ? 502 : 200).json({ ok: !failed, ...result });
   }
   const [param, code] = HELCIM_SYNC_FLASH[result.outcome] || HELCIM_SYNC_FLASH.error;
-  const msg = String(result.reason || result.error || result.status || '').slice(0, 300);
+  const msg = String(result.reason || result.error || result.status || result.warning || '').slice(0, 300);
   return res.redirect(`/orders/${numId}?${param}=${code}${msg ? `&msg=${encodeURIComponent(msg)}` : ''}`);
 });
 
