@@ -643,6 +643,27 @@ export function setOrderInternalNote(orderId, body, email) {
   `).run(String(orderId), String(body).slice(0, 4000), Date.now(), email || '');
 }
 
+// WHAT: add ONE line under whatever staff already wrote in the Admin-only order note (used by Mark Paid to leave its
+//   "marked paid manually" breadcrumb). Returns 1 when a line was written, 0 for a blank line.
+// CHANGE-GUARD: setOrderInternalNote cuts at 4000 chars FROM THE END, which would silently drop the newest line, so
+//   when the note would pass the cap the OLDEST whole lines are dropped instead and the new line always survives.
+// INVARIANT(S): never replaces existing text; read + write happen in one synchronous tick (better-sqlite3), so two
+//   appends cannot interleave; updated_by becomes the appender (the same as any other edit of the note).
+export function appendOrderInternalNote(orderId, line, email) {
+  const add = String(line ?? '').trim();
+  if (!add) return 0;
+  const MAX = 4000;
+  const current = (getOrderInternalNote(orderId)?.body || '').replace(/\s+$/, '');
+  let body = current ? `${current}\n${add}` : add;
+  if (body.length > MAX) {
+    body = body.slice(body.length - MAX);
+    const nl = body.indexOf('\n');                       // start on a line boundary, not mid-line
+    if (nl !== -1 && nl < body.length - 1) body = body.slice(nl + 1);
+  }
+  setOrderInternalNote(orderId, body, email);
+  return 1;
+}
+
 export function getDropshipCache(customerId) {
   return db.prepare('SELECT * FROM dropship_config_cache WHERE customer_id = ?').get(customerId) || null;
 }
@@ -1628,6 +1649,24 @@ export function upsertOrderCache(o) {
     o.current_subtotal != null ? o.current_subtotal : null,
     Date.now()
   );
+}
+
+// WHAT: write-through of ONE field pair — financial_status + display_financial_status — onto an order whose status we
+// have just changed in Shopify (staff Mark Paid, POST /orders/bulk). The Orders list is served from orders_cache and
+// the Shopify orders/updated webhook only lands 2-3 s after the mutation, while the route redirects at once: without
+// this the page that says "marked as paid" paints the same order as PENDING (2026-10-27, #39748).
+// CHANGE-GUARD: deliberately NOT upsertOrderCache — that REPLACES the whole row and would blank every column the caller
+// does not have. This UPDATEs two columns and leaves synced_at and updated_at alone: synced_at feeds the "Synced just
+// now" badge, which must keep meaning "the cache was last refreshed FROM Shopify", and updated_at is Shopify's value.
+// INVARIANT(S): the webhook / poller still own the row — they upsert it whole, so anything written here is overwritten by
+// Shopify's truth on the next sync (a wrong guess self-heals). An order absent from the cache is a no-op (returns 0): this
+// never invents a row. Status is stored UPPERCASE, matching upsertOrderCache and every reader (STATUS-CASE above).
+// DEPENDS: server.mjs POST /orders/bulk (the only caller; wrapped in try/catch so a cache hiccup never fails a payment).
+export function setOrderFinancialStatusInCache(shopifyId, status) {
+  const s = String(status || '').toUpperCase();
+  if (!s) return 0;
+  return db.prepare('UPDATE orders_cache SET financial_status = ?, display_financial_status = ? WHERE shopify_id = ?')
+    .run(s, s, String(shopifyId)).changes;
 }
 
 // WHAT: REPLACES the cached line items for an order — deletes every existing row for

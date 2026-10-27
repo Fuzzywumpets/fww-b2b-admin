@@ -29,7 +29,7 @@ import {
   createImpersonationNonce, consumeImpersonationNonce, gcImpersonationNonces,
   createPartialInvoice, getPartialInvoices, getNextInvoiceLetter,
   getOrderHistory,
-  upsertCustomerCache, upsertOrderCache, upsertOrderLineItemsCache, upsertProductCache,
+  upsertCustomerCache, upsertOrderCache, setOrderFinancialStatusInCache, upsertOrderLineItemsCache, upsertProductCache,
   getOrdersFromCache, getOrderFromCache, getOrderSpendFromCache, getCustomerFromCache,
   getCustomersCountInCache, getOrdersCountInCache, getProductsCountInCache,
   getSyncState, setSyncState, getAllInvoicesForList, getPartialInvoicesAll,
@@ -41,7 +41,7 @@ import {
   getTopCustomersAllTime,
   listImpersonationsForCustomer,
   getOrderByName,
-  getOrderInternalNote, setOrderInternalNote,
+  getOrderInternalNote, setOrderInternalNote, appendOrderInternalNote,
   getHelcimInvoiceMap, upsertHelcimInvoiceMap, setHelcimInvoiceDelivery,
 } from './db.mjs';
 import {
@@ -67,6 +67,7 @@ import { drainDashboardOrders, drainLowStockItems, drainCustomerSpendOrders } fr
 import { renderLabelSheet, expandItems, TEMPLATES as LABEL_TEMPLATES, DEFAULT_FIELDS } from './labels.mjs';
 import { isInsider, resolveXeroContact, syncCustomerToXero, getXeroSyncStatus } from './lib/xero-customer-sync.mjs';
 import { parseLinePrices, applyLinePriceChanges, bulkMarkOrdersPaid, addLineDiscountsConcurrent } from './lib/order-money.mjs';
+import { buildPaidNoteLine } from './lib/paid-note.mjs';
 import { resolveOrderCompany, buildOrderAddresses } from './lib/order-company.mjs';
 // DEPENDS: lib/edit-mode-resume.mjs — keeps staff in edit mode across the order page's POST -> redirect -> GET
 // round trips (see its header). Mounted below with app.use('/orders', ...); the client half is in editModeScript.
@@ -1569,7 +1570,7 @@ function summarizeEditAction(action, payloadJson) {
 function summarizeAudit(action, afterJson) {
   const after = safeJsonParse(afterJson) || {};
   switch (action) {
-    case 'mark_paid':              return 'marked the order paid';
+    case 'mark_paid':              return 'marked the order paid manually';
     case 'record_manual_payment': {
       const amt = after.amount && after.amount !== 'full_outstanding' ? fmtMoney(after.amount) : 'the full balance';
       const method = after.paymentMethod ? ` via ${after.paymentMethod}` : '';
@@ -2192,8 +2193,14 @@ function renderOrdersList(session, data, filters) {
 
   // DEPENDS: GET /orders puts `error`/`msg` on `filters`. mark_paid_partial must NEVER render as a
   // success banner — some of the selected orders are still unpaid.
+  // DEPENDS: POST /orders/bulk redirects with exactly these codes: error=mark_paid_partial | mark_paid_none |
+  // bulk_unknown_action, or success=marked_paid. An unrecognised `error` value renders nothing (never user text).
   const flash = filters.error === 'mark_paid_partial'
     ? `<div class="alert alert-error">Some orders could not be marked as paid.${filters.msg ? ` ${h(filters.msg)}` : ''}</div>`
+    : filters.error === 'mark_paid_none'
+      ? `<div class="alert alert-warning">No orders selected — tick at least one order, then click Mark Paid. Nothing was changed.</div>`
+    : filters.error === 'bulk_unknown_action'
+      ? `<div class="alert alert-error">That bulk action was not recognised, so nothing was changed.</div>`
     : filters.success === 'marked_paid' ? `<div class="alert alert-success">Order(s) marked as paid.</div>` : '';
 
   // Source filter removed — all orders shown are B2B (filtered via customers_cache.is_b2b)
@@ -6375,42 +6382,76 @@ app.post('/orders/new', requireAuth, async (req, res) => {
   res.redirect(`/orders/${result.orderId}?success=created`);
 });
 
+// WHAT: after a Mark Paid that Shopify accepted, leave "Marked paid manually by <who>" in the Admin-only order note
+//   (the "B2B Admin-only note" card), so the order itself says how it came to be paid, not just the audit log.
+// CHANGE-GUARD: call it ONLY for an order Shopify really marked paid (the same rule as the 'mark_paid' audit row), never
+//   for a refused one. It writes the Admin-only note, NOT the Shopify order note: that one holds customer instructions and
+//   reaches packing slips and the CSV export. FAIL-OPEN: a note hiccup is logged and swallowed, because the payment already
+//   happened in Shopify and must not turn into an error banner.
+// DEPENDS: lib/paid-note.mjs buildPaidNoteLine (wording; never put the Helcim token or pay URL in it), db.mjs
+//   appendOrderInternalNote (append, never replace), and the order page rendering order_internal_notes. The matching
+//   audit wording is summarizeAudit('mark_paid') = "marked the order paid manually". The Helcim-confirmed form (transaction id)
+//   is a source:'helcim' line for the Helcim paid-sync to write; this manual path only NAMES a linked invoice.
+function notePaidManually(numId, email) {
+  try {
+    const row = getHelcimInvoiceMap(shopifyOrderGid(numId));
+    const helcim = row ? { invoiceNumber: row.invoice_number } : null;
+    appendOrderInternalNote(numId, buildPaidNoteLine({ source: 'manual', actor: email, helcim }), email);
+  } catch (err) {
+    console.error('[mark-paid] paid note failed (non-fatal):', numId, err.message);
+  }
+}
+
 // WHAT: Bulk order action from the list — currently only 'mark-paid'; iterates selected ids and calls orderMarkAsPaid per order (or mocks the status).
-// CHANGE-GUARD: must precede /orders/:id. Per-order orderMarkAsPaid userErrors ARE read (via lib/order-money.mjs bulkMarkOrdersPaid) — an order Shopify refused is never audit-logged as paid, and a partial failure redirects to ?error=mark_paid_partial naming the failed ids. If you add actions, branch on `action` and keep the empty-ids early-return.
+// CHANGE-GUARD: must precede /orders/:id. Per-order orderMarkAsPaid userErrors ARE read (via lib/order-money.mjs bulkMarkOrdersPaid) — an order Shopify refused is never audit-logged as paid, and a partial failure redirects to ?error=mark_paid_partial naming the failed ids. The two early returns (no ids -> ?error=mark_paid_none, action !== 'mark-paid' -> ?error=bulk_unknown_action) are what keep the success banner honest: if you add an action, extend the `action` guard, never let an unrecognised action reach the success redirect. After a mark-paid the new status is written through to orders_cache (setOrderFinancialStatusInCache) because the list is served from that cache and the webhook lags 2-3 s. Each order it paid also gets a "Marked paid manually" line in the Admin-only note (notePaidManually), never an order it failed.
 // INVARIANT(S): ids may arrive as a single value or array — normalized via Array.isArray(ids) ? ids : [ids]. Unlike the single mark-paid route, this bulk path does NOT trigger Xero payment recording — a known asymmetry, which is exactly why an unread userError here would have no second system to catch it.
 app.post('/orders/bulk', requireAuth, async (req, res) => {
   const { action, ids } = req.body;
   const idList = Array.isArray(ids) ? ids : (ids ? [ids] : []);
-  if (!idList.length) return res.redirect('/orders');
+  // INVARIANT(S): the success banner is reachable ONLY after a mark-paid that moved at least one order. An empty
+  // selection used to redirect silently and an unknown action used to fall through to ?success=marked_paid — both
+  // now say so and change nothing. renderOrdersList renders the three codes below; keep them in step.
+  if (!idList.length) return res.redirect('/orders?error=mark_paid_none');
+  if (action !== 'mark-paid') return res.redirect('/orders?error=bulk_unknown_action');
 
-  if (action === 'mark-paid') {
-    let paid = [], failed = [];
-    if (MOCK) {
-      for (const numId of idList) {
-        const prev = mockOrderOverrides.get(numId) || {};
-        // MOCK FIDELITY: mirror the real refusal — Shopify rejects orderMarkAsPaid on an order that
-        // is already PAID/REFUNDED, so the mock must too or the partial-failure path is untested.
-        if (['PAID', 'REFUNDED'].includes(prev.displayFinancialStatus || getMockOrder(numId)?.displayFinancialStatus)) {
-          failed.push({ id: String(numId), message: 'Order cannot be marked as paid.' });
-          continue;
-        }
-        mockOrderOverrides.set(numId, { ...prev, displayFinancialStatus: 'PAID' });
-        paid.push(String(numId));
+  let paid = [], failed = [], statuses = {};
+  if (MOCK) {
+    for (const numId of idList) {
+      const prev = mockOrderOverrides.get(numId) || {};
+      // MOCK FIDELITY: mirror the real refusal — Shopify rejects orderMarkAsPaid on an order that
+      // is already PAID/REFUNDED, so the mock must too or the partial-failure path is untested.
+      if (['PAID', 'REFUNDED'].includes(prev.displayFinancialStatus || getMockOrder(numId)?.displayFinancialStatus)) {
+        failed.push({ id: String(numId), message: 'Order cannot be marked as paid.' });
+        continue;
       }
-    } else {
-      ({ paid, failed } = await bulkMarkOrdersPaid({
-        shopifyFetch, ids: idList, toGid: shopifyOrderGid,
-        log: (...args) => console.error(...args),
-      }));
+      mockOrderOverrides.set(numId, { ...prev, displayFinancialStatus: 'PAID' });
+      paid.push(String(numId));
     }
-    // DEPENDS: audit rows are the only record that this path ran — only log the orders that really
-    // moved to PAID, or the audit trail asserts payment for orders that stayed unpaid.
-    for (const numId of paid) auditLog(req.adminSession.email, 'mark_paid', shopifyOrderGid(numId), null, null);
-    if (failed.length) {
-      const msg = `${failed.length} of ${idList.length} order(s) could NOT be marked paid: ${failed.map(f => `#${f.id} (${f.message})`).join('; ')}`;
-      console.error('[orders/bulk] mark-paid partial failure:', msg);
-      return res.redirect(`/orders?error=mark_paid_partial&msg=${encodeURIComponent(msg.slice(0, 300))}`);
+  } else {
+    ({ paid, failed, statuses } = await bulkMarkOrdersPaid({
+      shopifyFetch, ids: idList, toGid: shopifyOrderGid,
+      log: (...args) => console.error(...args),
+    }));
+  }
+  // DEPENDS: audit rows are the only record that this path ran — only log the orders that really
+  // moved to PAID, or the audit trail asserts payment for orders that stayed unpaid.
+  for (const numId of paid) auditLog(req.adminSession.email, 'mark_paid', shopifyOrderGid(numId), null, null);
+  for (const numId of paid) notePaidManually(numId, req.adminSession.email);
+  // DEPENDS: GET /orders is served from orders_cache (getOrdersData) and the Shopify orders/updated webhook only
+  // refreshes it 2-3 s after the mutation, but the redirect below is immediate — so write the new status through
+  // now, or the page that says "marked as paid" shows the same order PENDING (2026-10-27, #39748). Fail-open: a
+  // cache hiccup must never turn a payment Shopify already accepted into an error; the webhook/poller repair it.
+  // MOCK has no cache (the list reads mockOrderOverrides, set above).
+  if (!MOCK) {
+    for (const numId of paid) {
+      try { setOrderFinancialStatusInCache(numId, statuses[numId] || 'PAID'); }
+      catch (err) { console.error('[orders/bulk] orders_cache write-through failed:', numId, err.message); }
     }
+  }
+  if (failed.length) {
+    const msg = `${failed.length} of ${idList.length} order(s) could NOT be marked paid: ${failed.map(f => `#${f.id} (${f.message})`).join('; ')}`;
+    console.error('[orders/bulk] mark-paid partial failure:', msg);
+    return res.redirect(`/orders?error=mark_paid_partial&msg=${encodeURIComponent(msg.slice(0, 300))}`);
   }
   res.redirect('/orders?success=marked_paid');
 });
@@ -6514,6 +6555,7 @@ app.post('/orders/:id/mark-paid', requireAuth, async (req, res) => {
     }
   }
   auditLog(req.adminSession.email, 'mark_paid', shopifyOrderGid(numId), null, null);
+  notePaidManually(numId, req.adminSession.email);
 
   // Trigger Xero payment recording (non-blocking — queue on failure)
   (async () => {

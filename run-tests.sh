@@ -311,6 +311,23 @@ if [ -f test/backorder-roundtrips.test.mjs ]; then
   node test/backorder-roundtrips.test.mjs || UNIT_FAIL=$?
 fi
 
+# "Marked paid manually" / Helcim-transaction note line (lib/paid-note.mjs) + db appendOrderInternalNote (append, 4000-char cap).
+# Pure unit test on the in-memory MOCK db - no server. The HTTP side is in api.test.mjs and orders-bulk-markpaid.test.mjs.
+if [ -f test/paid-note.test.mjs ]; then
+  echo ""
+  node test/paid-note.test.mjs || UNIT_FAIL=$?
+fi
+
+# Orders list: tick + Mark Paid (POST /orders/bulk). 2026-10-27 report: the page said "Order(s) marked as paid." while the order
+# still read PENDING, because GET /orders is served from orders_cache and the Shopify webhook refreshes it 2-3 s AFTER the redirect.
+# Standalone and SELF-CONTAINED: boots the REAL (non-MOCK) server on a free port with a throwaway B2B_ADMIN_DATA_DIR and
+# test/fixtures/fake-shopify-markpaid.mjs preloaded, seeds orders_cache, and drives a real Chromium through the real form.
+# MOCK cannot: it never calls Shopify and never reads the cache. Needs Playwright's Chromium, like ui.test.mjs.
+if [ -f test/orders-bulk-markpaid.test.mjs ]; then
+  echo ""
+  node test/orders-bulk-markpaid.test.mjs || UNIT_FAIL=$?
+fi
+
 echo ""
 echo "======================================================"
 if [ $API_FAIL -eq 0 ] && [ $UI_FAIL -eq 0 ] && [ $UNIT_FAIL -eq 0 ] && [ $AUTH_FAIL -eq 0 ]; then

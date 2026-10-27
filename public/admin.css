@@ -529,6 +529,11 @@ body {
   font-weight: 500;
   color: #1E40AF;
 }
+/* The Orders list ships its bar as <div class="bulk-bar" hidden> and its inline script toggles that attribute.
+   `.bulk-bar{display:flex}` (here and in the Catalog block below) outranks the browser's own [hidden]{display:none},
+   so without this rule the bar - "0 selected" plus a live Mark Paid button - was always on screen (2026-10-27).
+   DEPENDS: server.mjs renderOrdersList (#bulk-bar + upd()); test/orders-bulk-markpaid.test.mjs pins it. */
+.bulk-bar[hidden] { display: none; }
 
 /* ── Data tables ── */
 .table-wrap {

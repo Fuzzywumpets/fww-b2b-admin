@@ -243,6 +243,19 @@ await test('POST /orders/1001/mark-paid redirects to order detail', async () => 
   assert.ok(res.headers.get('location')?.includes('/orders/1001'));
 });
 
+// ALEX 2026-10-27: Mark Paid must leave a visible "marked paid manually" trail. It goes in the Admin-only note
+// (never the Shopify note, which holds customer instructions) and the order history reads "manually" too.
+await test('POST /orders/1001/mark-paid leaves a "Marked paid manually by <who>" line in the Admin-only note and says so in the history', async () => {
+  const cookie = await seedSession();
+  const html = await (await fetch(`${BASE}/orders/1001`, { headers: { Cookie: cookie } })).text();
+  assert.match(html, /Marked paid manually by alex@fuzzywumpets\.com/, 'Admin-only note line missing');
+  const internal = html.match(/aria-label="B2B Admin-only note">([\s\S]*?)<\/textarea>/)?.[1] || '';
+  assert.ok(internal.includes('Marked paid manually by'), 'the line must be in the Admin-only note box, not elsewhere: ' + internal.slice(0, 200));
+  const shopifyNote = html.match(/aria-label="Shopify order note">([\s\S]*?)<\/textarea>/)?.[1] || '';
+  assert.ok(!/Marked paid manually/.test(shopifyNote), 'the Shopify (customer-instruction) note must not be touched');
+  assert.ok(html.includes('marked the order paid manually'), 'order history should say "manually"');
+});
+
 await test('POST /orders/1001/note saves note and redirects', async () => {
   const cookie = await seedSession();
   const res = await fetch(`${BASE}/orders/1001/note`, {
@@ -455,6 +468,13 @@ await test('POST /orders/bulk mark-paid redirects to /orders', async () => {
   assert.ok(res.headers.get('location')?.includes('/orders'));
 });
 
+await test('POST /orders/bulk mark-paid leaves the "Marked paid manually" line on each order it paid', async () => {
+  const cookie = await seedSession();
+  const html = await (await fetch(`${BASE}/orders/1002`, { headers: { Cookie: cookie } })).text();
+  const internal = html.match(/aria-label="B2B Admin-only note">([\s\S]*?)<\/textarea>/)?.[1] || '';
+  assert.match(internal, /Marked paid manually by alex@fuzzywumpets\.com/, internal.slice(0, 200));
+});
+
 // REGRESSION: the bulk path used to discard the orderMarkAsPaid response entirely — a refused order
 // was still audit-logged 'mark_paid' and the batch reported success=marked_paid. #1003 is already
 // PAID in the fixtures, so Shopify (and now the mock) refuses it. Only #1003 is submitted here on
@@ -472,6 +492,37 @@ await test('POST /orders/bulk mark-paid reports a refused order instead of a bla
   assert.ok(loc.includes('error=mark_paid_partial'), 'expected error=mark_paid_partial, got ' + loc);
   assert.ok(!loc.includes('success=marked_paid'), 'must NOT claim success: ' + loc);
   assert.ok(decodeURIComponent(loc).includes('#1003'), 'failed order id must be named: ' + loc);
+  // ...and an order Shopify refused was NOT marked paid, so it must not be annotated as if it had been.
+  const html = await (await fetch(`${BASE}/orders/1003`, { headers: { Cookie: cookie } })).text();
+  assert.ok(!html.includes('Marked paid manually'), 'a refused order must carry no "marked paid" note');
+});
+
+// REGRESSION (2026-10-27): a bulk POST that marked nothing still redirected with the SUCCESS banner (unknown
+// action) or silently (no ids). Neither mutates a fixture. The real-browser / orders_cache end-to-end version of
+// this lives in test/orders-bulk-markpaid.test.mjs.
+await test('POST /orders/bulk with no ids says nothing was selected, never success', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(BASE + '/orders/bulk', {
+    method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' }, body: 'action=mark-paid', redirect: 'manual',
+  });
+  assert.equal(res.status, 302);
+  const loc = res.headers.get('location') || '';
+  assert.ok(loc.includes('error=mark_paid_none') && !loc.includes('success='), loc);
+  const html = await (await fetch(BASE + loc, { headers: { Cookie: cookie } })).text();
+  assert.ok(html.includes('No orders selected'), 'banner must explain why nothing happened');
+  assert.ok(!html.includes('Order(s) marked as paid.'));
+});
+
+await test('POST /orders/bulk with an unknown action never claims success', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(BASE + '/orders/bulk', {
+    method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' }, body: 'ids=1002&action=frobnicate', redirect: 'manual',
+  });
+  assert.equal(res.status, 302);
+  const loc = res.headers.get('location') || '';
+  assert.ok(loc.includes('error=bulk_unknown_action') && !loc.includes('success='), loc);
+  const html = await (await fetch(BASE + loc, { headers: { Cookie: cookie } })).text();
+  assert.ok(html.includes('alert-error') && !html.includes('Order(s) marked as paid.'));
 });
 
 await test('GET /orders?error=mark_paid_partial renders an ERROR banner, not the success one', async () => {
