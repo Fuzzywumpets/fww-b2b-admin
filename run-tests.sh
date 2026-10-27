@@ -107,6 +107,23 @@ if [ -f test/helcim-note.test.mjs ]; then
   node test/helcim-note.test.mjs || UNIT_FAIL=$?
 fi
 
+# Helcim -> Shopify paid sync. Two standalone runs (neither is reachable through the mock HTTP server):
+#  - helcim-reconcile: the money rules (assessInvoice / assessOrder / syncHelcimPayment / sweep / Shopify wiring) against fakes.
+#  - helcim-paid-migration: DB-level. Builds a throwaway admin.db with the OLD helcim_invoice_map (B2B_ADMIN_DATA_DIR, deliberately NOT
+#    B2B_ADMIN_MOCK), proves the old row survives, the migration is a no-op the second time, the previous release's SQL still runs, and
+#    the claim / state / poll-list SQL behaves.
+# The route + order-page strip + audit trail are covered over HTTP at the end of test/api.test.mjs (MOCK, via POST /__test__/helcim-paid/:id).
+if [ -f test/helcim-reconcile.test.mjs ]; then
+  echo ""
+  echo "── Unit: Helcim paid sync rules (standalone, no server) ──"
+  node test/helcim-reconcile.test.mjs || UNIT_FAIL=$?
+fi
+if [ -f test/helcim-paid-migration.test.mjs ]; then
+  echo ""
+  echo "── Unit: Helcim paid sync ledger + migration (standalone, throwaway DB) ──"
+  node test/helcim-paid-migration.test.mjs || UNIT_FAIL=$?
+fi
+
 # Order-edit userErrors: the batch /edit handler returns from its MOCK branch before any Shopify
 # mutation, so this path can ONLY be covered standalone.
 if [ -f test/order-edit-user-errors.test.mjs ]; then

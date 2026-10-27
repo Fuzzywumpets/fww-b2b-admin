@@ -4076,4 +4076,94 @@ console.log('\nAPI tests — Task 48 (Revenue chart + outstanding balance):');
   console.log('  ✓ Customer detail: B2B Customer Settings card with outstanding balance section');
 }
 
+// ── Helcim → Shopify paid sync (MOCK world: Helcim invoice is DUE until POST /__test__/helcim-paid/:id) ──────
+// Uses mock order #1011 (PENDING, explicit $80.99 outstanding, referenced by no other suite on this shared server): the paid path flips it to PAID.
+// The money rules themselves are unit-tested in test/helcim-reconcile.test.mjs; this block proves the route, flashes, order-page strip and audit trail.
+console.log('\nAPI tests — Helcim payment sync:');
+
+const helcimSyncPost = (cookie, id, json = false) => fetch(`${BASE}/orders/${id}/sync-helcim-payment`, {
+  method: 'POST', redirect: 'manual',
+  headers: { Cookie: cookie, ...(json ? { 'Content-Type': 'application/json' } : {}) },
+});
+const countOf = (html, needle) => html.split(needle).length - 1;
+
+await test('Helcim sync: an order with no Helcim ledger row shows no status strip', async () => {
+  const cookie = await seedSession();
+  const html = await (await fetch(`${BASE}/orders/1011`, { headers: { Cookie: cookie } })).text();
+  assert.ok(!html.includes('id="helcim-payment-status"'));
+});
+
+await test('Helcim sync: POST on an order with no invoice → "no invoice" flash (form) / 404 (JSON)', async () => {
+  const cookie = await seedSession();
+  const form = await helcimSyncPost(cookie, 1011);
+  assert.equal(form.status, 302);
+  assert.ok(form.headers.get('location').includes('error=helcim_payment_none'), form.headers.get('location'));
+  const json = await helcimSyncPost(cookie, 1011, true);
+  assert.equal(json.status, 404);
+  assert.deepEqual(await json.json(), { ok: false, outcome: 'no_invoice' });
+});
+
+await test('Helcim sync: requires auth, and a non-numeric order id is a 404', async () => {
+  const anon = await fetch(`${BASE}/orders/1011/sync-helcim-payment`, { method: 'POST', redirect: 'manual' });
+  assert.equal(anon.status, 302);
+  assert.ok(anon.headers.get('location')?.includes('/login'));
+  const cookie = await seedSession();
+  assert.equal((await helcimSyncPost(cookie, 'abc')).status, 404);
+  assert.equal((await helcimSyncPost(cookie, '1011%20OR%201')).status, 404);
+});
+
+await test('Helcim sync: after the invoice is sent the order page shows an awaiting-payment strip with a Check button', async () => {
+  const cookie = await seedSession();
+  const sent = await fetch(`${BASE}/orders/1011/send-credit-card-invoice`, { method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' } });
+  assert.equal(sent.status, 200);
+  const html = await (await fetch(`${BASE}/orders/1011`, { headers: { Cookie: cookie } })).text();
+  assert.ok(html.includes('id="helcim-payment-status"'));
+  assert.ok(html.includes('Helcim invoice MOCK-1011'));
+  assert.ok(html.includes('/orders/1011/sync-helcim-payment'));
+  assert.ok(html.includes('Check Helcim payment'));
+  assert.ok(!html.includes('mock-token-1011'), 'the pay token must never reach the page strip');
+});
+
+await test('Helcim sync: invoice still DUE → "not paid yet" flash, order untouched, nothing audited', async () => {
+  const cookie = await seedSession();
+  const r = await helcimSyncPost(cookie, 1011);
+  assert.equal(r.status, 302);
+  const loc = r.headers.get('location');
+  assert.ok(loc.includes('success=helcim_payment_unpaid') && loc.includes('msg=DUE'), loc);
+  const html = await (await fetch(`${BASE}${loc}`, { headers: { Cookie: cookie } })).text();
+  assert.ok(html.includes('does not show this invoice as paid yet (status DUE)'));
+  assert.ok(html.includes('/orders/1011/mark-paid'), 'order must still be unpaid (Mark Paid still offered)');
+  assert.ok(!html.includes('marked the order paid: Helcim'));
+  assert.ok(html.includes('Helcim shows it as due'), 'strip records the last seen Helcim status');
+});
+
+await test('Helcim sync: Helcim says PAID → the order is marked paid, audited under the staff email, and the pay URL never leaks', async () => {
+  const cookie = await seedSession();
+  assert.equal((await fetch(`${BASE}/__test__/helcim-paid/1011`, { method: 'POST' })).status, 200);
+  const r = await helcimSyncPost(cookie, 1011, true);
+  assert.equal(r.status, 200);
+  const raw = await r.text();
+  const body = JSON.parse(raw);
+  assert.equal(body.ok, true);
+  assert.equal(body.outcome, 'synced');
+  assert.ok(!/token|myhelcim|http/i.test(raw), `response must not carry the invoice token or URL: ${raw}`);
+
+  const html = await (await fetch(`${BASE}/orders/1011`, { headers: { Cookie: cookie } })).text();
+  assert.ok(!html.includes('/orders/1011/mark-paid'), 'order is now PAID (Mark Paid no longer offered)');
+  assert.ok(html.includes('was paid and the order was marked paid'), 'strip shows the finished state');
+  assert.ok(!html.includes('Check Helcim payment'), 'no Check button once the payment is recorded');
+  assert.equal(countOf(html, 'marked the order paid: Helcim invoice MOCK-1011'), 1, 'exactly one history entry');
+  assert.ok(html.includes('alex@fuzzywumpets.com'), 'history credits the staff member');
+});
+
+await test('Helcim sync: a second check is idempotent — "already recorded", no second history row', async () => {
+  const cookie = await seedSession();
+  const j = await (await helcimSyncPost(cookie, 1011, true)).json();
+  assert.equal(j.outcome, 'done');
+  const form = await helcimSyncPost(cookie, 1011);
+  assert.ok(form.headers.get('location').includes('success=helcim_payment_done'));
+  const html = await (await fetch(`${BASE}/orders/1011`, { headers: { Cookie: cookie } })).text();
+  assert.equal(countOf(html, 'marked the order paid: Helcim invoice MOCK-1011'), 1);
+});
+
 if (failed > 0) process.exit(1);

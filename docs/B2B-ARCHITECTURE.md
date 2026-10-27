@@ -163,6 +163,37 @@ creditCardInvoice: { orderName, amount, currency, payUrl, staffNote }
   Admin with a new Portal is safe. A new Admin with an old Portal sends the legacy Re:amaze email
   with the staff note unescaped, so **deploy the Portal first**.
 
+### Helcim card invoice → paid sync
+
+**Send:** `POST /orders/:id/send-credit-card-invoice` creates a Helcim invoice for the order's exact
+outstanding balance and records it in `helcim_invoice_map` (one row per order, written *before* the email
+so a retry reuses it); the email itself is described above.
+
+**Paid sync:** the customer pays *Helcim*, so Shopify would stay "pending". `lib/helcim-reconcile.mjs`
+closes the loop: it reads the invoice from Helcim (`helcim.mjs getInvoice`, read-only, returns only
+status/amount/currency) and, **only when every check agrees**, calls `orderMarkAsPaid` on the Shopify
+order. The rule: Helcim says `PAID` for exactly the recorded amount and currency with nothing due, **and**
+the Shopify order is open and still owes exactly that amount (read twice, again just before the write).
+Anything else — partial payment, a different amount (invoice or order edited), cancelled/refunded order,
+currency mismatch, Shopify already showing paid (possible duplicate payment) — is **not** written; it is
+recorded as `needs_review` / `already_paid` on the ledger row and in the order history for a person.
+State lives in the ledger row's `paid_*` columns (`paid_state`: NULL · `syncing` · `paid_synced` ·
+`already_paid` · `needs_review` · `error`); a `syncing` claim is atomic, so the button and the poller
+cannot both write Shopify, and an interrupted claim expires after 10 minutes.
+
+Two triggers share the one code path: the **Check Helcim payment** button on the order page
+(`POST /orders/:id/sync-helcim-payment`), and a background poller that is **off unless
+`HELCIM_PAYMENT_SYNC=1`** is in the service environment (every 5 min, ≤10 invoices per sweep; polls
+fresh invoices every 4 min, invoices older than 3 days hourly, none older than 90 days; never retries
+`needs_review`). Audit verbs: `helcim_payment_synced`, `helcim_payment_needs_review`,
+`helcim_payment_sync_failed` (actor = the staff email, or `system:helcim-sync` for the poller).
+
+**Not done (open decisions):** the sync does **not** post the payment to Xero (unlike
+`POST /orders/:id/mark-paid`) — Helcim card deposits need an agreed Xero bank/clearing account first;
+partial payments are only flagged; a Helcim refund is not reflected back into Shopify.
+**Rollback:** unset `HELCIM_PAYMENT_SYNC` (the button keeps working) or redeploy the previous release —
+the `paid_*` columns are additive and nullable, and the previous release never reads or writes them.
+
 ---
 
 ## 6. Settled decisions — do not re-litigate
