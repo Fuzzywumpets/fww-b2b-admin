@@ -75,8 +75,9 @@ import { assertNoUserErrors } from './lib/shopify-user-errors.mjs';
 import { currentShippingAmount, findShippingInvoice, parseShippingAmount, stageShippingReplacement } from './lib/order-shipping.mjs';
 import { createCreditCardInvoice } from './helcim.mjs';
 // DEPENDS: lib/helcim-note.mjs is the text contract for the CC invoice email (subject keeps the
-//   #NNNNN token; quoteForMarkdown escapes the note for Portal's Markdown renderer).
-import { normalizeStaffNote, buildLegacyInvoiceEmail } from './lib/helcim-note.mjs';
+//   #NNNNN token; the stored note body is plain text) and builds the Portal visible-note payload,
+//   including the structured `creditCardInvoice` object the Portal's Gmail sender consumes.
+import { normalizeStaffNote, buildCreditCardInvoicePayload } from './lib/helcim-note.mjs';
 // SYNC: same module db.mjs uses for the SQL LIMIT — the banner/footer copy and the query page size
 // must agree, otherwise the list lies about how much it is showing.
 import { ORDERS_LIST_LIMIT, CUSTOMERS_LIST_LIMIT, LEADS_LIST_LIMIT, listCountLabel, truncationNoticeHtml } from './lib/list-truncation.mjs';
@@ -6665,10 +6666,10 @@ app.post('/orders/:id/shipping-address', requireAuth, async (req, res) => {
   res.redirect(`/orders/${numId}?success=address_saved`);
 });
 
-// WHAT: creates (or reuses) a DUE Helcim invoice for the order's exact outstanding balance, then asks the Portal's Re:amaze bridge to email its secure online-payment link.
+// WHAT: creates (or reuses) a DUE Helcim invoice for the order's exact outstanding balance, then asks the Portal to email its secure online-payment link — via Gmail as wholesale@fuzzywumpets.com when the Portal understands `creditCardInvoice` (no forced "Re:" subject prefix), via Re:amaze on an older Portal.
 // CHANGE-GUARD: the helcim_invoice_map write MUST happen before the email attempt; on delivery failure a retry reuses that invoice rather than creating a duplicate bill. JSON callers receive a non-2xx on every failure; form callers receive a truthful warning flash.
 // INVARIANT(S): no card data touches this app; paid/zero-balance orders and orders without customer email are rejected; audit rows never contain the invoice token or online-view URL.
-// DEPENDS: Portal /__internal__/visible-note now accepts an optional `subject` field passed here; lib/helcim-note.mjs is the shared text contract (subject keeps #NNNNN token; quoteForMarkdown renders note as literal Markdown blockquote).
+// DEPENDS: Portal /__internal__/visible-note accepts the optional `subject` and the structured `creditCardInvoice` { orderName, amount, currency, payUrl, staffNote } passed here (Portal gmail-invoice.mjs validateCreditCardInvoiceInput is the receiving contract; payUrl must be on the allow-listed fuzzywumpets.myhelcim.com host); lib/helcim-note.mjs is the shared text contract (subject keeps #NNNNN token; body is plain text, note lines prefixed "> "). Deploy order: Portal first — an older Portal ignores creditCardInvoice and falls back to the Re:amaze email.
 app.post('/orders/:id/send-credit-card-invoice', requireAuth, async (req, res) => {
   const numId = req.params.id;
   const order = await getOrderDetail(numId);
@@ -6710,27 +6711,23 @@ app.post('/orders/:id/send-credit-card-invoice', requireAuth, async (req, res) =
       invoice = upsertHelcimInvoiceMap(orderGid, created);
     }
 
-    // DEPENDS: lib/helcim-note.mjs buildLegacyInvoiceEmail — subject keeps the #NNNNN token so
-    //   Portal's getCustomerWholesaleThreads can scope the Re:amaze thread to this order.
-    const { subject, body: noteBody } = buildLegacyInvoiceEmail({
-      orderName: order.name, amountText: fmtMoney(outstanding), currency, url: invoice.url, note: staffNote,
+    // DEPENDS: lib/helcim-note.mjs buildCreditCardInvoicePayload — subject keeps the #NNNNN token so
+    //   Portal's getCustomerWholesaleThreads can scope a customer's Re:amaze reply thread to this order;
+    //   `creditCardInvoice` makes a current Portal send via Gmail (wholesale@) instead of Re:amaze.
+    //   The payload carries the Helcim pay URL: never log it or put it in an audit row.
+    const portalPayload = buildCreditCardInvoicePayload({
+      orderGid, orderName: order.name, amountText: fmtMoney(outstanding), amount: outstanding, currency,
+      url: invoice.url, note: staffNote, addedBy: req.adminSession.email,
     });
     const delivery = MOCK
       ? { ok: true, email: { sent: true, via: 'mock' } }
-      : await callPortalInternal('POST', '/__internal__/visible-note', {
-          orderId: orderGid,
-          body: noteBody,
-          subject,
-          addedBy: req.adminSession.email,
-          emailCustomer: true,
-          sendAs: 'wholesale',
-        });
+      : await callPortalInternal('POST', '/__internal__/visible-note', portalPayload);
     if (!delivery.ok || !delivery.email?.sent) {
-      const deliveryError = String(delivery.error || delivery.email?.error || 'Portal/Re:amaze did not confirm delivery');
+      const deliveryError = String(delivery.error || delivery.email?.error || 'Portal did not confirm delivery');
       setHelcimInvoiceDelivery(orderGid, 'delivery_failed', deliveryError);
       auditLog(req.adminSession.email, 'helcim_invoice_email_failed', orderGid, null, {
         invoiceId: invoice.invoice_id, invoiceNumber: invoice.invoice_number, amount: outstanding, currency,
-        hasNote: !!staffNote,
+        hasNote: !!staffNote, ...(staffNote ? { note: staffNote } : {}),
       });
       return fail(502, `Helcim invoice ${invoice.invoice_number || invoice.invoice_id} was created, but customer email delivery was not confirmed: ${deliveryError}`);
     }
