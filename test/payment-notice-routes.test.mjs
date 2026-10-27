@@ -67,6 +67,7 @@ db.upsertHelcimInvoiceMap('gid://shopify/Order/51001', { invoiceId: '55', invoic
 
 const readDb = (fn) => { const d = new Database(path.join(dataDir, 'admin.db'), { readonly: true }); try { return fn(d); } finally { d.close(); } };
 const auditIds = (action) => readDb(d => d.prepare('SELECT target FROM admin_audit_log WHERE action = ? ORDER BY id').all(action).map(r => r.target.split('/').pop()));
+const internalNote = (id) => readDb(d => d.prepare('SELECT body FROM order_internal_notes WHERE order_id = ?').get(String(id)))?.body;
 const auditRows = (action) => readDb(d => d.prepare('SELECT email, target, after_val FROM admin_audit_log WHERE action = ? ORDER BY id').all(action));
 
 // ── the fake Portal ─────────────────────────────────────────────────────────────────────────────────────────
@@ -151,6 +152,7 @@ await test('Orders list Mark Paid on 2 orders = ONE digest request: name + curre
   });
   assert.ok(!/SECRET|secure\.example|helcim|INV0010/i.test(r.raw), 'no Helcim token / pay URL / invoice number may leave Admin: ' + r.raw);
   assert.deepEqual(r.auditedAtArrival.mark_paid.sort(), ['51001', '51002'], 'the notice must go out only AFTER the audit rows exist');
+  assert.match(internalNote(51001) || '', /Marked paid manually by/, 'bulk: both fail-open side effects ran for a paid order');
 });
 
 await test('a bulk action with one refused order announces only the order Shopify really marked paid', async () => {
@@ -241,6 +243,7 @@ await test('FAIL-OPEN: a Portal 502 does not fail the payment; the failure is au
   assert.equal(after.source, 'mark_paid'); assert.deepEqual(after.orderIds, ['51007']);
   assert.match(after.error, /Gmail send failed/);
   assert.ok(auditIds('mark_paid').includes('51007'), 'the payment audit row itself is intact');
+  assert.match(internalNote(51007) || '', /Marked paid manually by tester@example\.com/, 'the OTHER fail-open side effect (Admin-only "marked paid manually" note) is unaffected by a failing notice');
 });
 
 await test('FAIL-OPEN: an older Portal without the route (404 html) is also just audited; the next payment is unaffected', async () => {
@@ -272,6 +275,7 @@ await test('FAIL-OPEN: a Portal that never answers cannot delay the payment redi
   assert.ok(ms < 5000, `redirect took ${ms} ms - the hung Portal call must not be awaited`);
   assert.ok(await waitFor(() => requests.some(r => r.body?.orders?.[0]?.orderId === '51008')), 'the request was made');
   assert.ok(auditIds('mark_paid').includes('51008'));
+  assert.match(internalNote(51008) || '', /Marked paid manually by/, 'the note is written even while the notice call is still hanging');
   mode = 'ok';
 });
 
