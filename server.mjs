@@ -73,7 +73,7 @@ import { refreshCustomerFromShopify, syncRecentCustomers } from './lib/customer-
 import { drainDashboardOrders, drainLowStockItems, drainCustomerSpendOrders } from './lib/dashboard-paging.mjs';
 import { renderLabelSheet, expandItems, TEMPLATES as LABEL_TEMPLATES, DEFAULT_FIELDS } from './labels.mjs';
 import { isInsider, resolveXeroContact, syncCustomerToXero, getXeroSyncStatus } from './lib/xero-customer-sync.mjs';
-import { parseLinePrices, applyLinePriceChanges, bulkMarkOrdersPaid, addLineDiscountsConcurrent, ORDER_MARK_AS_PAID_MUTATION } from './lib/order-money.mjs';
+import { parseLinePrices, applyLinePriceChanges, bulkMarkOrdersPaid, addLineDiscountsConcurrent, ORDER_MARK_AS_PAID_MUTATION, readOutstandingBeforePayment } from './lib/order-money.mjs';
 import { buildPaidNoteLine } from './lib/paid-note.mjs';
 import { createPaymentNotifier, orderNoticeFields } from './lib/payment-notice.mjs';
 import { resolveOrderCompany, buildOrderAddresses } from './lib/order-company.mjs';
@@ -6596,7 +6596,7 @@ app.post('/orders/bulk', requireAuth, async (req, res) => {
   if (!idList.length) return res.redirect('/orders?error=mark_paid_none');
   if (action !== 'mark-paid') return res.redirect('/orders?error=bulk_unknown_action');
 
-  let paid = [], failed = [], statuses = {}, paidOrders = {};
+  let paid = [], failed = [], statuses = {}, paidOrders = {}, clearedBalances = {};
   if (MOCK) {
     for (const numId of idList) {
       const prev = mockOrderOverrides.get(numId) || {};
@@ -6610,7 +6610,7 @@ app.post('/orders/bulk', requireAuth, async (req, res) => {
       paid.push(String(numId));
     }
   } else {
-    ({ paid, failed, statuses, orders: paidOrders } = await bulkMarkOrdersPaid({
+    ({ paid, failed, statuses, orders: paidOrders, cleared: clearedBalances } = await bulkMarkOrdersPaid({
       shopifyFetch, ids: idList, toGid: shopifyOrderGid,
       log: (...args) => console.error(...args),
     }));
@@ -6623,7 +6623,7 @@ app.post('/orders/bulk', requireAuth, async (req, res) => {
   // really marked paid, only AFTER their audit rows exist, and not awaited (fail-open; see paymentNotifier).
   void paymentNotifier.notify({
     source: 'mark_paid_bulk', actorEmail: req.adminSession.email,
-    orders: paid.map(numId => orderNoticeFields(numId, paidOrders[numId])),
+    orders: paid.map(numId => orderNoticeFields(numId, paidOrders[numId], clearedBalances[numId])),
   });
   // DEPENDS: GET /orders is served from orders_cache (getOrdersData) and the Shopify orders/updated webhook only
   // refreshes it 2-3 s after the mutation, but the redirect below is immediate — so write the new status through
@@ -6728,12 +6728,13 @@ app.get('/orders/:id', requireAuth, async (req, res) => {
 // INVARIANT(S): Shopify userErrors abort with ?error before any Xero work; isInsider(customerId) must short-circuit Xero (insiders never post to accounting); this single-order path DOES record Xero payment whereas /orders/bulk mark-paid does NOT.
 app.post('/orders/:id/mark-paid', requireAuth, async (req, res) => {
   const numId = req.params.id;
-  let paidOrder = null;
+  let paidOrder = null, clearedBalance = null;
   if (MOCK) {
     const prev = mockOrderOverrides.get(numId) || {};
     mockOrderOverrides.set(numId, { ...prev, displayFinancialStatus: 'PAID' });
   } else {
     try {
+      clearedBalance = await readOutstandingBeforePayment(shopifyFetch, shopifyOrderGid(numId));   // the balance Mark Paid clears (notice amount); fail-open
       const r = await shopifyFetch(ORDER_MARK_AS_PAID_MUTATION, { input: { id: shopifyOrderGid(numId) } });
       const ue = r.data?.orderMarkAsPaid?.userErrors || [];
       if (ue.length) return res.redirect(`/orders/${numId}?error=${encodeURIComponent(ue[0].message)}`);
@@ -6746,7 +6747,7 @@ app.post('/orders/:id/mark-paid', requireAuth, async (req, res) => {
   notePaidManually(numId, req.adminSession.email);
   // "Payment received" email to the owner: after Shopify accepted it and the audit row exists; not awaited (fail-open).
   void paymentNotifier.notify({
-    source: 'mark_paid', actorEmail: req.adminSession.email, orders: [orderNoticeFields(numId, paidOrder)],
+    source: 'mark_paid', actorEmail: req.adminSession.email, orders: [orderNoticeFields(numId, paidOrder, clearedBalance)],
   });
 
   // Trigger Xero payment recording (non-blocking — queue on failure)
@@ -8054,6 +8055,9 @@ async function runOrderEdit(orderId, idemKey, editedBy, action, payload, stageFn
       try { return { ...JSON.parse(again.result_json || '{}'), replayed: true }; }
       catch { return { replayed: true }; }
     }
+    // DEPENDS: lib/backorder-edit.mjs commitMayHaveLanded reads err.commitUncertain, set below ONLY when the orderEditCommit request itself
+    // threw (timeout / transport): Shopify may have applied the edit, so flag/undo must not release their claim on one stale read.
+    let commitInFlight = false;
     try {
       const _beginAt = Date.now();
       const beginResult = await shopifyFetch(`
@@ -8084,6 +8088,7 @@ async function runOrderEdit(orderId, idemKey, editedBy, action, payload, stageFn
       // opts.commitLines swaps in the commit mutation that also answers with the order's lines; its page size
       // is the session's line count + headroom (an undo-add grows the order by one), never above the 250 page cap.
       const _commitAt = Date.now();
+      commitInFlight = true;
       const commitRes = await shopifyFetch(opts.commitLines
         ? opts.commitLines(Math.min(LINE_PAGE_MAX, calcItems.length + 8))
         : `mutation commit($id:ID!,$notify:Boolean!,$note:String){
@@ -8091,6 +8096,7 @@ async function runOrderEdit(orderId, idemKey, editedBy, action, payload, stageFn
           order{id} userErrors{field message}}}`,
         { id: calcId, notify: false, note: payload?.staffNote || null },
         { timeoutMs: action === 'discount/order' ? 60000 : 15000 });
+      commitInFlight = false;
       _ms.commit = Date.now() - _commitAt;
       const cErrs = commitRes.data?.orderEditCommit?.userErrors || [];
       if (cErrs.length) {
@@ -8153,6 +8159,7 @@ async function runOrderEdit(orderId, idemKey, editedBy, action, payload, stageFn
       console.error(`[order-edit] FAIL action=${action} order=${orderId} idem=${idemKey} reason=${JSON.stringify(messages)}${err instanceof OrderEditError ? '' : '\n' + (err && err.stack ? err.stack : String(err))}`);
       putEditAction({ idemKey, orderId, action, payload, result: { ok: false, errors: messages }, status: 'failed', editedBy });
       const e = new OrderEditError(messages);
+      if (commitInFlight) e.commitUncertain = true;
       throw e;
     }
   });
@@ -9558,6 +9565,7 @@ function normalizeBackorderLine(node) {
     sku: node.sku || node.variant?.sku || '',
     variantId: node.variant?.id || null,
     currentQuantity: cur,
+    taxable: typeof node.taxable === 'boolean' ? node.taxable : null,   // stored on the backorders row; Undo re-adds a custom line with it
     unitPrice: lineItemTrueUnit(node),
     currency: money(node.discountedUnitPriceSet)?.currencyCode || money(node.originalUnitPriceSet)?.currencyCode || 'USD',
   };
@@ -9609,7 +9617,7 @@ async function backorderRestoreUnitsReal({ orderId, editedBy, mode, row, live, q
       const variantGid = String(row.variant_id).startsWith('gid://') ? row.variant_id : `gid://shopify/ProductVariant/${row.variant_id}`;
       await stageAddVariantAtPrice({ shopifyFetch, calcId, variantGid, quantity, unitPrice });
     } else {
-      await stageAddCustomAtPrice({ shopifyFetch, calcId, title: row.line_item_title, quantity, unitPrice, currency: row.currency });
+      await stageAddCustomAtPrice({ shopifyFetch, calcId, title: row.line_item_title, quantity, unitPrice, currency: row.currency, taxable: row.taxable === 1 });
     }
   }, undefined, backorderEditOpts());
   return { warnings: [], ...committedLinesOf(r) };

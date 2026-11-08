@@ -67,7 +67,7 @@ function world(lineSpecs, { orderId } = {}) {
       const priorLines = w.lines.map(x => ({ ...x }));
       w.startLag(priorLines);
       l.currentQuantity -= quantity;
-      if (w.throwAfterApply) throw new Error('orderEditCommit timed out');
+      if (w.throwAfterApply) throw Object.assign(new Error('orderEditCommit timed out'), { commitUncertain: true });   // mirrors server.mjs runOrderEdit
       w.ledger.set(idemKey, { status: 'committed', action: 'backorder/flag', payload_json: JSON.stringify(payload) });
       return w.commitAnswer(priorLines);
     },
@@ -78,7 +78,7 @@ function world(lineSpecs, { orderId } = {}) {
       w.startLag(priorLines);
       if (mode === 'raise') w.lines.find(x => x.liId === live.liId).currentQuantity += quantity;
       else w.lines.push({ liId: `gid://shopify/LineItem/${++w.nextId}`, title: row.line_item_title, variantTitle: row.variant_title || '', sku: row.sku || '', variantId: row.variant_id, currentQuantity: quantity, unitPrice: w.restoredPrice ?? unitPrice, currency: row.currency });
-      if (w.throwAfterApply) throw new Error('orderEditCommit timed out');
+      if (w.throwAfterApply) throw Object.assign(new Error('orderEditCommit timed out'), { commitUncertain: true });   // mirrors server.mjs runOrderEdit
       return { warnings: [], ...w.commitAnswer(priorLines) };
     },
     now: () => w.clock,
@@ -177,6 +177,15 @@ await test('a custom (no-variant) line is re-added at the exact stored price and
   const f = fetchFake((n) => ({ data: { [n]: okPayload() } }));
   await stageAddCustomAtPrice({ shopifyFetch: f, calcId: 'c', title: 'Rush fee', quantity: 1, unitPrice: 9.99, currency: 'CAD' });
   assert.deepEqual(f.calls[0].vars.price, { amount: '9.99', currencyCode: 'CAD' });
+});
+
+await test('REVIEW #73 F1: a TAXABLE custom line is re-added taxable, a non-taxable (or legacy/unknown) one stays non-taxable', async () => {
+  const f = fetchFake((n) => ({ data: { [n]: okPayload() } }));
+  await stageAddCustomAtPrice({ shopifyFetch: f, calcId: 'c', title: 'Setup fee', quantity: 1, unitPrice: 9.99, currency: 'USD', taxable: true });
+  await stageAddCustomAtPrice({ shopifyFetch: f, calcId: 'c', title: 'Setup fee', quantity: 1, unitPrice: 9.99, currency: 'USD', taxable: false });
+  await stageAddCustomAtPrice({ shopifyFetch: f, calcId: 'c', title: 'Setup fee', quantity: 1, unitPrice: 9.99, currency: 'USD' });
+  assert.deepEqual(f.calls.map(c => c.vars.tax), [true, false, false]);
+  assert.match(f.calls[0].query, /taxable:\$tax/);
 });
 
 console.log('\n  flagBackorder');
@@ -661,6 +670,72 @@ await test('UNDO: a commit answer that positively confirms needs no settling rea
   assert.equal(w.settled, 0);
   assert.deepEqual(w.sleeps, []);
   assert.equal(w.readCount, 1);
+});
+
+await test('REVIEW #73 F1: flag snapshots the line\'s taxable flag and Undo hands it to the restore (taxable custom item stays taxable)', async () => {
+  const w = world([{ currentQuantity: 3, variantId: null, title: 'Setup fee', taxable: true }, { currentQuantity: 3, variantId: null, title: 'Plain fee', taxable: false }, { currentQuantity: 3, variantId: null, title: 'Old fee' }]);
+  let seen = [];
+  const real = w.deps.restoreUnits;
+  w.deps.restoreUnits = async (a) => { seen.push([a.row.line_item_title, a.row.taxable]); return real(a); };
+  for (const l of [...w.lines]) { const r = await flagBackorder(w.deps, { orderId: w.orderId, lineItemId: l.liId, quantity: 3, email: 'a@fww', idemKey: null }); assert.equal(r.ok, true, r.message); }
+  assert.deepEqual(w.lines.map(l => row(w, l.liId).taxable), [1, 0, null], 'taxable true/false recorded; an unknown flag stays null');
+  for (const l of [...w.lines]) { const r = await undoBackorder(w.deps, { orderId: w.orderId, lineItemId: l.liId, email: 'a@fww' }); assert.equal(r.ok, true, r.message); }
+  assert.deepEqual(seen, [['Setup fee', 1], ['Plain fee', 0], ['Old fee', null]]);
+});
+await test('REVIEW #73 F1: BACKORDER_LINE_FIELDS selects taxable (the flag must be read from Shopify to be stored)', () => {
+  assert.match(BACKORDER_LINE_FIELDS, /\btaxable\b/);
+});
+console.log('\n  an ambiguous edit ERROR (commit timeout) + stale read must not abandon the claim (DeepReview of #73, finding 3)');
+await test('REVIEW #73 F3 FLAG: commit TIMED OUT after applying + the immediate read is STALE -> settled and retried, ends pending (never abandoned)', async () => {
+  const w = world([{ currentQuantity: 10 }]);
+  w.throwAfterApply = true;
+  w.lagReads = 1;
+  const r = await flag(w, { quantity: 4 });
+  assert.equal(r.ok, true, r.message);
+  assert.equal(row(w)?.status, 'pending', 'the claim must survive');
+  assert.equal(row(w).shopify_removed_qty, 4);
+  assert.equal(dbm.getBackorderedLinesForOrder(w.orderId)[0].quantity, 4);
+});
+await test('REVIEW #73 F3 FLAG: commit timed out + the read never shows a change inside the retry budget -> row LEFT applying for reconcile, not deleted', async () => {
+  const w = world([{ currentQuantity: 10 }]);
+  w.throwAfterApply = true;
+  w.lagReads = 99;
+  const r = await flag(w, { quantity: 4 });
+  assert.equal(r.ok, false);
+  assert.equal(r.state, 'unconfirmed');
+  assert.equal(row(w)?.status, 'applying');
+  assert.equal(row(w).claim_prior_qty, 10);
+  w.lagLeft = 0; w.clock += 1_000;
+  const again = await flag(w, { quantity: 4 });
+  assert.deepEqual([again.ok, again.duplicate], [true, true], 'next flag reconciles it as the same request');
+});
+await test('REVIEW #73 F3 UNDO: restore commit timed out after applying + stale read -> restored, never returned to pending', async () => {
+  const w = world([{ currentQuantity: 4 }]);
+  await flag(w, { quantity: 4 });
+  w.throwAfterApply = true;
+  w.lagReads = 1;
+  const r = await undo(w);
+  assert.equal(r.ok, true, r.message);
+  assert.equal(row(w).status, 'restored');
+  assert.equal(w.calls.filter(c => c.kind === 'restore').length, 1);
+});
+await test('REVIEW #73 F3 UNDO: restore commit timed out + no change visible in the retry budget -> row LEFT restoring (not reverted)', async () => {
+  const w = world([{ currentQuantity: 4 }]);
+  await flag(w, { quantity: 4 });
+  w.throwAfterApply = true;
+  w.lagReads = 99;
+  const r = await undo(w);
+  assert.equal(r.state, 'unconfirmed');
+  assert.equal(row(w).status, 'restoring');
+});
+await test('REVIEW #73 F3 control: a DEFINITE rejection (not commit-uncertain) still releases the claim after ONE read, no retries', async () => {
+  const w = world([{ currentQuantity: 5 }]);
+  w.deps.removeUnits = async () => { throw Object.assign(new Error('Line item cannot be removed'), { userMessages: ['Line item cannot be removed'] }); };
+  const r = await flag(w, { quantity: 2 });
+  assert.equal(r.state, 'not_applied');
+  assert.equal(row(w), null);
+  assert.deepEqual(w.sleeps, []);
+  assert.equal(w.settled, 0);
 });
 
 await test('completeCommitNodes returns the nodes ONLY for a provably complete page (the overflow check for the single-page selection)', () => {

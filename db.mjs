@@ -467,6 +467,7 @@ const BACKORDER_ADDED_COLUMNS = [
   ['shopify_removed_qty', 'INTEGER NOT NULL DEFAULT 0'], // 0 = legacy flag-only row: nothing was removed from Shopify
   ['restored_at', 'INTEGER'],
   ['claim_prior_qty', 'INTEGER'],
+  ['taxable', 'INTEGER'],                              // the line's Shopify taxable flag at flag time (1/0); NULL = unknown/legacy -> Undo re-adds a custom line non-taxable
 ];
 export function migrateBackordersSchema(database) {
   const cols = new Set(database.prepare(`PRAGMA table_info(backorders)`).all().map(c => c.name));
@@ -1293,20 +1294,21 @@ export function claimBackorderRemoval(c) {
     }
     db.prepare(`
       INSERT INTO backorders (order_id, line_item_id, line_item_title, quantity, eta_date, status, created_at, created_by, notified,
-                              variant_id, sku, variant_title, unit_price, currency, shopify_removed_qty, restored_at, claim_prior_qty)
+                              variant_id, sku, variant_title, unit_price, currency, shopify_removed_qty, restored_at, claim_prior_qty, taxable)
       VALUES (@orderId, @lineItemId, @title, @quantity, NULL, 'applying', @now, @createdBy, 0,
-              @variantId, @sku, @variantTitle, @unitPrice, @currency, 0, NULL, @priorQty)
+              @variantId, @sku, @variantTitle, @unitPrice, @currency, 0, NULL, @priorQty, @taxable)
       ON CONFLICT(order_id, line_item_id) DO UPDATE SET
         line_item_title = excluded.line_item_title, quantity = excluded.quantity, eta_date = NULL,
         status = 'applying', created_at = excluded.created_at, created_by = excluded.created_by, notified = 0,
         variant_id = excluded.variant_id, sku = excluded.sku, variant_title = excluded.variant_title,
         unit_price = excluded.unit_price, currency = excluded.currency, shopify_removed_qty = 0,
-        restored_at = NULL, claim_prior_qty = excluded.claim_prior_qty
+        restored_at = NULL, claim_prior_qty = excluded.claim_prior_qty, taxable = excluded.taxable
     `).run({
       orderId: c.orderId, lineItemId: c.lineItemId, title: c.title || '', quantity: c.quantity,
       now: c.now ?? Date.now(), createdBy: c.createdBy || null,
       variantId: c.variantId || null, sku: c.sku || null, variantTitle: c.variantTitle || null,
       unitPrice: c.unitPrice, currency: c.currency || 'USD', priorQty: c.priorQty ?? null,
+      taxable: c.taxable == null ? null : (c.taxable ? 1 : 0),
     });
     return { ok: true, prev };
   })();
@@ -1335,7 +1337,7 @@ export function abandonBackorderClaim(orderId, lineItemId, prev) {
         status = @status, created_at = @created_at, created_by = @created_by, notified = @notified,
         variant_id = @variant_id, sku = @sku, variant_title = @variant_title, unit_price = @unit_price,
         currency = @currency, shopify_removed_qty = @shopify_removed_qty, restored_at = @restored_at,
-        claim_prior_qty = @claim_prior_qty
+        claim_prior_qty = @claim_prior_qty, taxable = @taxable
       WHERE order_id = @order_id AND line_item_id = @line_item_id AND status = 'applying'
     `).run(prev).changes > 0;
   })();

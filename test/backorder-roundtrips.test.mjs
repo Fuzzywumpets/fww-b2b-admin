@@ -271,6 +271,15 @@ await test('FAIL CLOSED: commit applied but the answer was a gateway timeout -> 
   sequence('flag, commit timed out after applying', ops, FLAG_FALLBACK);
 });
 
+await test('REVIEW #73 F3 (real server): commit TIMED OUT after applying + the first read-back is STALE -> server.mjs marks the error commit-uncertain, the claim survives and the row ends pending', async () => {
+  srv.control({ commitThrows: true, readLag: 1 });
+  const { result } = await srv.call(() => flag(srv, 5030, 3, 'tok-flag-5030'));
+  srv.control({});
+  assert.match(flash(result), /success=backorder_flagged/);
+  assert.equal(srv.state()[5030].cq, 7);
+  assert.deepEqual(srv.row(5030), { status: 'pending', quantity: 3, shopify_removed_qty: 3 });
+});
+
 await test('FAIL CLOSED: Shopify rejects the staged quantity -> nothing committed, error shown, no row, session abandoned', async () => {
   srv.control({ failSetQty: 'Line item has been fulfilled' });
   const { result, ops } = await srv.call(() => flag(srv, 5007, 3, 'tok-flag-5007'));

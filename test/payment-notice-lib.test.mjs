@@ -225,6 +225,19 @@ await test('missing / malformed money yields amount NaN-free null so the notifie
   assert.equal(orderNoticeFields('1', { currentTotalPriceSet: { presentmentMoney: { amount: '5', currencyCode: 'USD' } } }).orderName, '#1', 'name falls back to #id');
 });
 
+await test('REVIEW #73 F2: a CLEARED balance (what Mark Paid really paid) replaces the order total as the amount; without one the total is used', () => {
+  const order = { name: '#7', currentTotalPriceSet: { presentmentMoney: { amount: '100.00', currencyCode: 'USD' } } };
+  assert.equal(orderNoticeFields('7', order, { amount: '40.00', currencyCode: 'USD' }).amount, 40);
+  assert.equal(orderNoticeFields('7', order, null).amount, 100);
+  assert.equal(orderNoticeFields('7', order, { amount: '0.00', currencyCode: 'USD' }).amount, 100, 'a zero/garbage pre-read is not announced as $0.00');
+  assert.equal(orderNoticeFields('7', order, { amount: 'x', currencyCode: 'USD' }).amount, 100);
+  // DeepReview of the fix: the pre-read balance is only an AMOUNT. Shopify's payload (the order object) is the confirmation that
+  // payment happened; a missing payload must never become a payment-received notice.
+  assert.equal(orderNoticeFields('7', null, { amount: '40.00', currencyCode: 'USD' }).amount, null, 'no payload = no confirmed payment = nothing to announce');
+  assert.equal(orderNoticeFields('7', undefined, { amount: '40.00', currencyCode: 'USD' }).amount, null);
+  assert.equal(orderNoticeFields('7', { name: '#7' }, { amount: '40.00', currencyCode: 'USD' }).amount, 40, 'a payload without money still uses the cleared balance');
+});
+
 await test('paymentNoticeKey: order + source + amount in cents', () => {
   assert.equal(paymentNoticeKey({ source: 'mark_paid', orderId: '7', amount: 10.005 }), paymentNoticeKey({ source: 'mark_paid', orderId: '7', amount: 10.005 }));
   assert.notEqual(paymentNoticeKey({ source: 'mark_paid', orderId: '7', amount: 10 }), paymentNoticeKey({ source: 'record_payment', orderId: '7', amount: 10 }));

@@ -206,7 +206,9 @@ here; do NOT email from the paid-sync path, it would double-notify). **Payments 
   `POST /__internal__/payment-notice` (Portal `payment-notice.mjs` + `docs/PAYMENT-NOTICE.md`; the Portal owns the Gmail broker env).
   Mark Paid reads `name` + `currentTotalPriceSet` (post-edit total) from the `orderMarkAsPaid` payload
   (`ORDER_MARK_AS_PAID_MUTATION` in `lib/order-money.mjs`, shared by both Mark Paid paths), so there is no extra Shopify read.
-  For Mark Paid the amount is the order's current total (equal to the payment unless it was part-paid before).
+  For Mark Paid the amount is the outstanding balance Shopify just cleared (`totalOutstandingSet`, read right before each `orderMarkAsPaid` by
+  `readOutstandingBeforePayment`; the payload alone cannot show it), so a part-paid order does not count its earlier payments again. If that
+  read fails or is zero, the order's current total is used instead (the old behaviour).
 - **Recipient is the Portal's, never the request's**: env `PAYMENT_NOTICE_TO`, default `alex@fuzzywumpets.com`. Admin sends no
   recipient, subject, sender or link. **When the staff member's login email equals the recipient the Portal sends nothing**
   (`email.skipped = 'actor_is_recipient'`, not a failure), so Alex's own clicks do not email him.
