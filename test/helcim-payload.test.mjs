@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import {
   buildHelcimInvoicePayload,
+  itemizedInvoicesEnabledFor,
   planHelcimInvoice,
   HelcimInvoiceValidationError,
   sanitizeHelcimText,
@@ -171,6 +172,34 @@ test('planHelcimInvoice reports nothing owed as 0 cents (the route refuses it) a
   assert.equal(planHelcimInvoice({ order: order(), expectedAmount: '0' }).amountCents, 0);
   assert.equal(planHelcimInvoice({ order: order(), expectedAmount: '-3' }).amountCents, 0);
   assert.throws(() => planHelcimInvoice({ order: { get lineItems() { throw new RangeError('boom'); }, currentTotalPriceSet: money('1.00') }, expectedAmount: '1.00', itemized: true }), RangeError);
+});
+
+// Per-order opt-in (2026-11-08): one real itemized test invoice without switching HELCIM_ITEMIZED_INVOICES on for everyone.
+test('itemizedInvoicesEnabledFor is off by default and on for every order when HELCIM_ITEMIZED_INVOICES=1', () => {
+  assert.equal(itemizedInvoicesEnabledFor('40500', {}), false);
+  assert.equal(itemizedInvoicesEnabledFor('40500', { HELCIM_ITEMIZED_INVOICES: '0' }), false);
+  assert.equal(itemizedInvoicesEnabledFor('40500', { HELCIM_ITEMIZED_INVOICES: '1' }), true);
+  assert.equal(itemizedInvoicesEnabledFor('40500', { HELCIM_ITEMIZED_INVOICES: 'true' }), false, 'only the exact value 1 turns it on');
+});
+
+test('itemizedInvoicesEnabledFor honours HELCIM_ITEMIZED_ORDER_IDS for exactly the listed numeric order ids', () => {
+  const env = { HELCIM_ITEMIZED_ORDER_IDS: ' 6200000000001 , 6200000000002 ' };
+  assert.equal(itemizedInvoicesEnabledFor('6200000000001', env), true);
+  assert.equal(itemizedInvoicesEnabledFor(6200000000002, env), true, 'a number id matches too');
+  assert.equal(itemizedInvoicesEnabledFor('6200000000003', env), false);
+  assert.equal(itemizedInvoicesEnabledFor('620000000000', env), false, 'no prefix match');
+  assert.equal(itemizedInvoicesEnabledFor('gid://shopify/Order/6200000000001', env), false, 'numeric ids only');
+  assert.equal(itemizedInvoicesEnabledFor('1', { HELCIM_ITEMIZED_ORDER_IDS: '1,abc,,2 OR 1' }), true, 'malformed entries are ignored');
+  assert.equal(itemizedInvoicesEnabledFor('abc', { HELCIM_ITEMIZED_ORDER_IDS: 'abc' }), false);
+  assert.equal(itemizedInvoicesEnabledFor('', { HELCIM_ITEMIZED_ORDER_IDS: '' }), false);
+});
+
+test('send-credit-card-invoice asks itemizedInvoicesEnabledFor(numId), not the global flag alone', async () => {
+  // The API suite runs with HELCIM_ITEMIZED_INVOICES=1, so it cannot see the per-order list; this pins the call site instead.
+  const { readFileSync } = await import('node:fs');
+  const src = readFileSync(new URL('../server.mjs', import.meta.url), 'utf8');
+  assert.match(src, /planHelcimInvoice\(\{ order, expectedAmount, itemized: itemizedInvoicesEnabledFor\(numId\) \}\)/);
+  assert.ok(!/itemized: process\.env\.HELCIM_ITEMIZED_INVOICES === '1'/.test(src), 'the route no longer reads the flag directly');
 });
 
 let failed = 0;
