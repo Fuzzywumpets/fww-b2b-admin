@@ -15,6 +15,10 @@
 //   only the `unit` scenarios whose line titles are not already in pick order changed — dense-multipage-with-note
 //   and partial-invoice-opts (their 38 "Long descriptive wholesale product N" lines now sort as text: 1, 10, 11…2).
 //   The other four `unit` goldens and both `http` goldens (#1001, #1002) are byte-for-byte the pre-feature hashes.
+//   RECONCILE RE-PIN (2026-11-08, production merged into main): ONLY the two `http` viewer-html hashes changed, re-generated from
+//   a pristine origin/main mock server (main's page chrome: aria-labelled nav, mobile menu, favicon, Sign out as a button). The
+//   merged #1001/#1002 viewer pages are byte-identical to main's, and both `http` PDF hashes still equal production's pre-feature
+//   PDFs, so the customer-facing invoice is unchanged by the merge.
 //
 // Set INVOICE_SHOT_DIR=<dir> to also save the section-6 screenshots (390 / 768 / 1280 px) and the section-5 PDF.
 

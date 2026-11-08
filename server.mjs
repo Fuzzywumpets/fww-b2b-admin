@@ -6911,9 +6911,11 @@ app.post('/orders/:id/send-credit-card-invoice', requireAuth, async (req, res) =
             token: `mock-token-${numId}`, url: `https://fuzzywumpets.myhelcim.com/order/?token=mock-token-${numId}`,
             amount: outstanding, currency, billingIncluded: !!billingAddress,
           }
-        : await createCreditCardInvoice(plan.mode === 'itemized'
-          ? { payload: plan.payload, amountCents, currency, billingAddress, companyName: order.customer?.company }
-          : { orderName: order.name, amount: outstanding, currency, billingAddress, companyName: order.customer?.company });
+        : await createCreditCardInvoice({
+            currency, billingAddress, companyName: order.customer?.company,
+            // helcim.mjs takes the itemized shape when `payload` is present, else the balance-due shape.
+            ...(plan.mode === 'itemized' ? { payload: plan.payload, amountCents } : { orderName: order.name, amount: outstanding }),
+          });
       remoteInvoiceCreated = true;
       billingIncluded = created.billingIncluded === true;
       // SYNC: db.mjs upsertHelcimInvoiceMap atomically consumes helcim_invoice_claims and writes the
@@ -11457,12 +11459,15 @@ async function getProductsForLabels(ids, searchText = '') {
   // SYNC: product node shape here must match the ids-path query below (both feed /labels and handleLabelsPdf).
   if (!ids || !ids.length) {
     const term = String(searchText || '').replace(/[^\p{L}\p{N} _-]/gu, ' ').trim();
+    // BOUNDED: the search tab lists the top 50 Shopify matches by design (CHANGE-GUARD above); each match's variants ARE completed.
     const found = await shopifyFetch(`
       query($q:String){products(first:50, query:$q){nodes{
         id handle title vendor productType tags
-        variants(first:30){edges{node{id title sku price compareAtPrice barcode inventoryQuantity}}}
+        variants(first:30){pageInfo{hasNextPage endCursor} edges{node{id title sku price compareAtPrice barcode inventoryQuantity}}}
       }}}`, { q: term || null });
-    return (found.data?.products?.nodes || []).filter(Boolean);
+    // Reconcile 2026-11-08: production's pagination guard caught main's search path dropping variants 31+; it now completes them
+    // exactly like the ids path below. SYNC: field list == the variants selection above == the ids-path query.
+    return completeProductVariants((found.data?.products?.nodes || []).filter(Boolean), 'id title sku price compareAtPrice barcode inventoryQuantity', 'labels');
   }
   const gids = ids.map(id => `gid://shopify/Product/${id}`);
   const result = await shopifyFetch(`
@@ -11502,6 +11507,7 @@ async function getOrderForLabels(numericId) {
   // numeric id is 13+ digits. Resolve "#1001"/"1001" by name first.
   const typed = String(numericId).trim();
   if (/^#?\d{1,9}$/.test(typed)) {
+    // BOUNDED: exact order-name lookup (name:#N) - Shopify order names are unique, so one result is complete by design.
     const byName = await shopifyFetch(`query($q:String!){orders(first:1,query:$q){nodes{id}}}`, { q: `name:#${typed.replace('#', '')}` });
     const gid = byName.data?.orders?.nodes?.[0]?.id;
     if (!gid) return null;
