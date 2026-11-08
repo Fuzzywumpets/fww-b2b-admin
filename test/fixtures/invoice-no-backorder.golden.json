@@ -1,0 +1,39 @@
+{
+  "unit": {
+    "single-page-unpaid": [
+      "f9278abde50689ccbb42eb99d49957b2287d31e383d0cd5cca9c33577ba9f917"
+    ],
+    "paid-note-terms-discounts": [
+      "08ded8de8e4c38cec377ec0e9b6c032753928f228e72bd1119e2d56408a2a5d4"
+    ],
+    "dense-multipage-with-note": [
+      "798b1224c3ef46d307042dbfd05711f38df983c2299a12917a60068aaeb464f7",
+      "d61fcfdde8f9de40938571c13a1c978899462b0abd6285af203146ba5928b852",
+      "befbc3ca0a4e0fb87697278714117e8e9b64c74d606e28baa0e1acbaf546fb50",
+      "6aa17c821133917856048dcb373a2521582643e31d22d90cbbfaf0adaba6e092",
+      "dcb6c3ccec7360597b157bf67bfc758eb6b053af4a047725a6383b84a45574dd"
+    ],
+    "partial-invoice-opts": [
+      "bd99250dc61ba7983f8e335d67390cda2fca3a33218bd9fcfdc4512893e760ec",
+      "4bd7a9278476659a9fe7a6b8caddb1ed50c70a220be3640b4c5269bb67537920",
+      "1ea8b3d8daebb922bf2592ec2bb9523baaab31d8ea4e490bde195c43deec4cc8",
+      "e0e260daffb31f1354e541604dfdc1d61798ece4c6d252a4682bf606f6f2d1fc"
+    ],
+    "all-lines-removed": [
+      "9266dec7c1f1a33826b367a1e650224bc68513b505328a9b824e38a9ef4ecaad"
+    ],
+    "company-and-canada": [
+      "9ae1bcc062d35a438b9a5b7c95f1427532002e49c18f76292c2f84e35d930ea8"
+    ]
+  },
+  "http": {
+    "viewer-html-1001": "b101e823d1bffd696726381acc64dac398c39a7439e4aee91072a69918af84ad",
+    "pdf-1001": [
+      "a977af185867eae21d292d5b0d79b0b44b33a26e9f108d7e424d6621c3f8b183"
+    ],
+    "viewer-html-1002": "182e16b2796922e08eb47c44027cb189db9c1e845f4e40e1abb118af33734db6",
+    "pdf-1002": [
+      "0212cb0676c1b5e87a86fde27a716d736a967076f3ff8956d724d8a8cd3452f3"
+    ]
+  }
+}

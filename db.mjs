@@ -6,6 +6,9 @@ import { reportEvent } from './fww-logsink.mjs';
 // SYNC: page-size constants live in lib/list-truncation.mjs so the SQL LIMIT here and the number
 // printed in the /orders + /customers footers (server.mjs) cannot drift apart.
 import { ORDERS_LIST_LIMIT, CUSTOMERS_LIST_LIMIT, LEADS_LIST_LIMIT } from './lib/list-truncation.mjs';
+// Pure module (no imports, no db): the boot backfill below reuses its legacy-fallback rule + serializer verbatim so the
+// frozen copy it writes is exactly what the live-row fallback would have rendered.
+import { serializeBackorderedLines, backorderedLinesForPartialInvoice } from './lib/partial-invoice-backorder.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const MOCK = process.env.B2B_ADMIN_MOCK === '1';
@@ -77,6 +80,8 @@ db.exec(`
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
   );
+  -- ^ helcim_invoice_map: the paid_* columns (Helcim -> Shopify paid sync) are NOT declared here; migrateHelcimInvoiceMapSchema()
+  --   below adds them to fresh and existing DBs alike so the two always end up identical.
 
   -- DEPENDS: server.mjs acquires this before the non-idempotent Helcim Invoice API POST.
   -- A row is retained when the remote outcome is uncertain so retries cannot create a second bill.
@@ -441,6 +446,127 @@ db.exec(`
   }
 }
 
+// MIGRATION (2026-10-26, backorder hot-fix): backorders used to be a LOCAL flag only (nothing touched
+// Shopify). They now carry the snapshot an invoice needs to show units that were REMOVED from the
+// Shopify order, plus the bookkeeping to undo that removal. ADDITIVE ONLY, so a rollback to the
+// previous code is safe: that code names its INSERT columns explicitly (upsertBackorder), and every
+// column added here is nullable or defaulted, so its INSERT/UPDATE statements keep working unchanged.
+// Idempotent: PRAGMA reveals the existing columns and ALTER only runs for missing ones.
+// DEPENDS: getBackorderedLinesForOrder / claimBackorderRemoval / restoreBackorder below read and write
+//   exactly these names; test/backorder-migration.test.mjs asserts the set. Do NOT also add them to the
+//   CREATE TABLE above — one source of truth (this list) keeps a fresh DB and a migrated DB identical.
+// claim_prior_qty is the one column beyond the agreed contract: the Shopify quantity observed
+//   immediately before an in-flight 'applying'/'restoring' write, so an interrupted write (process death
+//   between the Shopify commit and our status flip) can be reconciled against Shopify instead of guessed.
+const BACKORDER_ADDED_COLUMNS = [
+  ['variant_id', 'TEXT'],
+  ['sku', 'TEXT'],
+  ['variant_title', 'TEXT'],
+  ['unit_price', 'TEXT'],                              // decimal string, e.g. '14.00' — B2B price actually on the line
+  ['currency', 'TEXT'],
+  ['shopify_removed_qty', 'INTEGER NOT NULL DEFAULT 0'], // 0 = legacy flag-only row: nothing was removed from Shopify
+  ['restored_at', 'INTEGER'],
+  ['claim_prior_qty', 'INTEGER'],
+];
+export function migrateBackordersSchema(database) {
+  const cols = new Set(database.prepare(`PRAGMA table_info(backorders)`).all().map(c => c.name));
+  for (const [name, ddl] of BACKORDER_ADDED_COLUMNS) {
+    if (!cols.has(name)) database.exec(`ALTER TABLE backorders ADD COLUMN ${name} ${ddl}`);
+  }
+}
+migrateBackordersSchema(db);
+
+// MIGRATION (2026-10-27, Helcim -> Shopify paid sync): the payment-sync state lives on the existing helcim_invoice_map ledger row,
+// one row per order, so it cannot drift from the invoice it describes. ADDITIVE ONLY and every column nullable, so a rollback to the
+// previous release is safe: its explicit-column INSERT/UPDATE statements never name these, and it never reads them.
+// Idempotent: PRAGMA reveals the existing columns and ALTER only runs for missing ones.
+// DEPENDS: claimHelcimPaymentSync / setHelcimPaymentState / listHelcimInvoicesForPaymentSync below and lib/helcim-reconcile.mjs read and
+//   write exactly these names; test/helcim-paid-migration.test.mjs asserts the set. Do NOT also add them to the CREATE TABLE above.
+//   paid_state is NULL (never confirmed paid) | 'syncing' (claimed by a running sync) | 'paid_synced' | 'already_paid' |
+//   'needs_review' | 'error' — HELCIM_PAYMENT_STATES below is the one allow-list.
+const HELCIM_PAID_ADDED_COLUMNS = [
+  ['paid_state', 'TEXT'],
+  ['paid_amount', 'REAL'],        // what Helcim says was collected, set when the payment is recorded
+  ['helcim_status', 'TEXT'],      // last Helcim invoice status seen (DUE / PAID / ...), informational
+  ['paid_checked_at', 'INTEGER'], // epoch ms of the last check; doubles as the claim timestamp while paid_state = 'syncing'
+  ['paid_synced_at', 'INTEGER'],  // epoch ms the order was marked paid (or found already paid)
+  ['paid_note', 'TEXT'],          // needs_review / error / already_paid reason shown to staff (never a URL or token)
+];
+export function migrateHelcimInvoiceMapSchema(database) {
+  const cols = new Set(database.prepare(`PRAGMA table_info(helcim_invoice_map)`).all().map(c => c.name));
+  for (const [name, ddl] of HELCIM_PAID_ADDED_COLUMNS) {
+    if (!cols.has(name)) database.exec(`ALTER TABLE helcim_invoice_map ADD COLUMN ${name} ${ddl}`);
+  }
+}
+migrateHelcimInvoiceMapSchema(db);
+
+// MIGRATION (2026-10-26, lettered-invoice backorders hot-fix): a lettered partial invoice is a frozen
+// snapshot (partial_invoices.line_items_json), so the backordered units it must show — units REMOVED from the
+// Shopify order, parked in `backorders` — are frozen with it, in this one new column. ADDITIVE ONLY and
+// nullable, so a rollback to the previous release is safe: that code names its INSERT columns explicitly
+// (createPartialInvoice) and never reads the column, and a row it writes simply leaves it NULL.
+//   NULL     = LEGACY snapshot (issued before this column existed, or by a rolled-back previous release). Every NULL
+//              row is FROZEN at boot by backfillPartialInvoiceBackordered below, so after the first start of this
+//              release NULL only exists transiently (a rolled-back release writing letters). The renderers' fallback
+//              to the live pending rows (lib/partial-invoice-backorder.mjs) is therefore a DEFENSIVE path only.
+//   '[]'     = a snapshot with nothing backordered at its creation. It is NOT the same as NULL: it freezes
+//              "none", so a unit backordered LATER can never appear on an invoice already issued.
+//   '[{..}]' = the snapshot's backordered lines, as written by serializeBackorderedLines().
+// Idempotent: PRAGMA reveals the existing columns and ALTER only runs when the column is missing; the backfill only
+// ever touches rows that are still NULL.
+// DEPENDS: createPartialInvoice below writes it; server.mjs (POST/GET /orders/:id/partial-invoice*, GET
+//   /orders/:id/invoice?letter=) reads it through lib/partial-invoice-backorder.mjs. Not added to the CREATE
+//   TABLE above on purpose — one source of truth (this list) keeps a fresh DB and a migrated DB identical;
+//   test/partial-invoice-migration.test.mjs asserts it.
+export function migratePartialInvoicesSchema(database) {
+  const cols = new Set(database.prepare(`PRAGMA table_info(partial_invoices)`).all().map(c => c.name));
+  if (!cols.has('backordered_json')) database.exec(`ALTER TABLE partial_invoices ADD COLUMN backordered_json TEXT`);
+  // The backfill is DATA, the ALTER above is SCHEMA: a failure here must not take the whole staff app down at boot. It
+  // rolls back as one unit (rows stay NULL, the defensive live-row fallback keeps rendering them as before) and is
+  // retried on the next start; the error is loud so it is never silent.
+  try {
+    const n = backfillPartialInvoiceBackordered(database);
+    if (n) console.log(`[migrate] partial_invoices.backordered_json: froze the backordered lines of ${n} already-issued lettered invoice(s)`);
+  } catch (e) {
+    console.error(`[migrate] partial_invoices.backordered_json BACKFILL FAILED (rolled back, retried next start; issued letters fall back to live backorder rows meanwhile): ${e && e.stack ? e.stack : e}`);
+  }
+}
+
+// WHAT: freezes the backordered lines of every ALREADY-ISSUED lettered invoice that has no stored copy yet
+//   (backordered_json IS NULL), by computing exactly what the legacy fallback would render for it TODAY and storing
+//   that. Returns the number of rows written.
+// WHY: until this ran, a letter issued before the column existed (e.g. order #39875's letter B, created after three
+//   backorders) was rebuilt from the LIVE backorders table on every render, so a later Undo, fulfil or re-flag would
+//   change or remove an issued invoice's struck rows. An issued invoice must not change after the fact.
+// CHANGE-GUARD: the rows come from backorderedLinesForPartialInvoice (the SAME rule the renderers use for NULL: the
+//   pending, shopify_removed_qty > 0 rows with created_at <= the snapshot's created_at; unplaceable ones omitted) and
+//   are stored with serializeBackorderedLines (the SAME shape the create route stores). '[]' is stored when there are
+//   none, so a snapshot is never recomputed. Do not re-derive either rule here.
+// INVARIANT(S): ONE transaction (all rows or none). Idempotent: the SELECT and the UPDATE both require
+//   backordered_json IS NULL, so a second run finds nothing and a stored copy is never overwritten. A run after a
+//   rollback to the previous release only freezes the letters that release wrote (they are NULL again).
+// DEPENDS: selectBackorderedLines (below) — the one reader of the backorders table, shared with
+//   getBackorderedLinesForOrder; the backorders columns it reads are added by migrateBackordersSchema, which runs first.
+export function backfillPartialInvoiceBackordered(database) {
+  return database.transaction(() => {
+    const legacy = database.prepare('SELECT id, order_id, created_at FROM partial_invoices WHERE backordered_json IS NULL ORDER BY id').all();
+    if (!legacy.length) return 0;
+    // No backorders table / no removed-units column (a schema older than the backorder hot-fix) = nothing was ever removed.
+    const bcols = new Set(database.prepare(`PRAGMA table_info(backorders)`).all().map(c => c.name));
+    const canRead = bcols.has('shopify_removed_qty') && bcols.has('status');
+    const liveByOrder = new Map();
+    const set = database.prepare('UPDATE partial_invoices SET backordered_json = ? WHERE id = ? AND backordered_json IS NULL');
+    let written = 0;
+    for (const inv of legacy) {
+      if (!liveByOrder.has(inv.order_id)) liveByOrder.set(inv.order_id, canRead ? selectBackorderedLines(database, inv.order_id) : []);
+      const rows = backorderedLinesForPartialInvoice(inv, () => liveByOrder.get(inv.order_id));
+      written += set.run(serializeBackorderedLines(rows), inv.id).changes;
+    }
+    return written;
+  })();
+}
+migratePartialInvoicesSchema(db);
+
 export default db;
 
 export function createSession(sid, email, displayName, picture) {
@@ -529,6 +655,8 @@ export function releaseHelcimInvoiceClaim(orderId) {
 
 // WHAT: persists a newly created Helcim invoice before attempting customer-email delivery, allowing a failed delivery to be retried without creating another invoice.
 // CHANGE-GUARD: order_id is the conflict key; updates preserve created_at and replace only the current Helcim invoice metadata.
+//   Replacing the invoice also CLEARS the paid_* sync state: a paid/synced verdict belongs to one invoice and must never carry over to
+//   a different one (today's route only inserts when no row exists, so this is a guard for a future caller).
 // INVARIANT(S): caller supplies a validated Helcim invoiceId, token, URL, positive amount, and USD/CAD currency.
 export function upsertHelcimInvoiceMap(orderId, invoice) {
   const now = Date.now();
@@ -540,11 +668,13 @@ export function upsertHelcimInvoiceMap(orderId, invoice) {
       ON CONFLICT(order_id) DO UPDATE SET
         invoice_id=excluded.invoice_id, invoice_number=excluded.invoice_number, token=excluded.token,
         url=excluded.url, amount=excluded.amount, currency=excluded.currency,
-        delivery_status='created', delivery_error=NULL, updated_at=excluded.updated_at
+        delivery_status='created', delivery_error=NULL, updated_at=excluded.updated_at,
+        paid_state=NULL, paid_amount=NULL, helcim_status=NULL, paid_checked_at=NULL, paid_synced_at=NULL, paid_note=NULL
     `).run(String(orderId), String(invoice.invoiceId), invoice.invoiceNumber || null, String(invoice.token),
       String(invoice.url), Number(invoice.amount), String(invoice.currency), now, now);
     // SYNC: helcim_invoice_claims is consumed atomically with the retry-ledger write so there is no
     // window where a successful remote create can be followed by a second local winner.
+    // (reconcile 2026-11-08: main's claim transaction + production's paid_* reset for a replaced invoice.)
     db.prepare('DELETE FROM helcim_invoice_claims WHERE order_id = ?').run(String(orderId));
   })();
   return getHelcimInvoiceMap(orderId);
@@ -558,6 +688,83 @@ export function setHelcimInvoiceDelivery(orderId, status, error = null) {
   db.prepare('UPDATE helcim_invoice_map SET delivery_status = ?, delivery_error = ?, updated_at = ? WHERE order_id = ?')
     .run(status, error ? String(error).slice(0, 500) : null, Date.now(), String(orderId));
   return getHelcimInvoiceMap(orderId);
+}
+
+// ── Helcim -> Shopify paid sync ledger (see lib/helcim-reconcile.mjs) ─────────────────────────────────────────
+// SYNC: HELCIM_PAYMENT_STATES — lib/helcim-reconcile.mjs writes exactly these via setHelcimPaymentState; server.mjs renders them
+//   on the order page (helcimPaymentStatusLine); test/helcim-paid-migration.test.mjs pins the set.
+export const HELCIM_PAYMENT_STATES = ['syncing', 'paid_synced', 'already_paid', 'needs_review', 'error'];
+const HELCIM_PAYMENT_PATCH_COLUMNS = ['paid_state', 'paid_amount', 'helcim_status', 'paid_checked_at', 'paid_synced_at', 'paid_note'];
+
+// WHAT: atomically takes the right to run ONE payment sync for an order: NULL / needs_review / error -> 'syncing', or a 'syncing'
+//   claim older than staleMs (an interrupted sync) is taken over. Returns true only for the single caller that won.
+// CHANGE-GUARD: one UPDATE ... WHERE is the whole lock (SQLite serialises writers), so the poller and a staff click can never both
+//   mutate Shopify for the same order. paid_synced / already_paid rows are never claimable: they are finished.
+// INVARIANT(S): the claim stamps paid_checked_at = nowMs, which is also how staleness is measured; never throws on a missing row (false).
+export function claimHelcimPaymentSync(orderId, nowMs, staleMs) {
+  const result = db.prepare(`
+    UPDATE helcim_invoice_map SET paid_state = 'syncing', paid_checked_at = ?
+    WHERE order_id = ? AND (
+      paid_state IS NULL OR paid_state IN ('needs_review', 'error')
+      OR (paid_state = 'syncing' AND (paid_checked_at IS NULL OR paid_checked_at < ?))
+    )
+  `).run(Number(nowMs), String(orderId), Number(nowMs) - Number(staleMs));
+  return result.changes === 1;
+}
+
+// WHAT: records the outcome of a payment sync on the ledger row. Only the six paid_* columns can be written, and paid_state must be
+//   null or one of HELCIM_PAYMENT_STATES.
+// CHANGE-GUARD: the column names interpolated into the SQL come ONLY from HELCIM_PAYMENT_PATCH_COLUMNS (never from the patch keys);
+//   an unknown key throws instead of being ignored, so a typo cannot silently skip a state write. Invoice identity, amount, token and
+//   URL are unreachable from here. paid_note is capped at 500 chars.
+// INVARIANT(S): does not touch updated_at/delivery_*: those describe the invoice email, not the payment.
+export function setHelcimPaymentState(orderId, patch) {
+  const keys = Object.keys(patch || {});
+  if (!keys.length) throw new TypeError('Empty Helcim payment state patch');
+  for (const key of keys) {
+    if (!HELCIM_PAYMENT_PATCH_COLUMNS.includes(key)) throw new TypeError(`Unknown Helcim payment column: ${key}`);
+  }
+  if ('paid_state' in patch && patch.paid_state !== null && !HELCIM_PAYMENT_STATES.includes(patch.paid_state)) {
+    throw new TypeError(`Invalid Helcim payment state: ${patch.paid_state}`);
+  }
+  const values = keys.map((key) => {
+    const v = patch[key];
+    if (v === null || v === undefined) return null;
+    if (key === 'paid_note') return String(v).slice(0, 500);
+    if (key === 'helcim_status' || key === 'paid_state') return String(v);
+    return Number(v);
+  });
+  db.prepare(`UPDATE helcim_invoice_map SET ${keys.map((k) => `${k} = ?`).join(', ')} WHERE order_id = ?`)
+    .run(...values, String(orderId));
+  return getHelcimInvoiceMap(orderId);
+}
+
+// How far back, and how often, the BACKGROUND poller re-checks an unpaid invoice. A manual "Check Helcim payment" click ignores both.
+// A fresh invoice is the likely-to-be-paid one, so it is polled often; an older one hourly; one older than the horizon is left to staff.
+export const HELCIM_POLL_FRESH_MS = 4 * 60 * 1000;
+export const HELCIM_POLL_AGED_MS = 60 * 60 * 1000;
+export const HELCIM_POLL_AGED_AFTER_MS = 3 * 24 * 60 * 60 * 1000;
+export const HELCIM_POLL_HORIZON_MS = 90 * 24 * 60 * 60 * 1000;
+
+// WHAT: the ledger rows the poller should check now, least-recently-checked first (never-checked rows first), at most `limit`.
+// CHANGE-GUARD: only paid_state NULL / 'error' / an expired 'syncing' claim are polled. needs_review is deliberately NOT polled: it
+//   needs a human, and re-polling it forever would just re-flag it; staff re-check it from the order page after fixing the cause.
+//   paid_synced / already_paid are finished. delivery_status is not filtered: a delivery_failed email may still have reached the
+//   customer, so the invoice can be paid anyway.
+// INVARIANT(S): read-only; returns plain rows (order_id first) for syncAllHelcimPayments, which re-claims each one atomically.
+export function listHelcimInvoicesForPaymentSync({ limit = 20, nowMs = Date.now(), staleMs = 10 * 60 * 1000 } = {}) {
+  return db.prepare(`
+    SELECT order_id, invoice_id, paid_state, paid_checked_at, created_at FROM helcim_invoice_map
+    WHERE created_at >= @horizon
+      AND (paid_state IS NULL OR paid_state = 'error' OR (paid_state = 'syncing' AND (paid_checked_at IS NULL OR paid_checked_at < @stale)))
+      AND (paid_checked_at IS NULL OR paid_checked_at <= @now - (CASE WHEN created_at < @agedBefore THEN @agedGap ELSE @freshGap END))
+    ORDER BY COALESCE(paid_checked_at, 0) ASC, created_at ASC
+    LIMIT @limit
+  `).all({
+    now: nowMs, stale: nowMs - staleMs, horizon: nowMs - HELCIM_POLL_HORIZON_MS,
+    agedBefore: nowMs - HELCIM_POLL_AGED_AFTER_MS, agedGap: HELCIM_POLL_AGED_MS, freshGap: HELCIM_POLL_FRESH_MS,
+    limit: Math.max(1, Math.min(100, Math.floor(Number(limit)) || 20)),
+  });
 }
 
 export function getCustomerNotes(customerId) {
@@ -580,6 +787,27 @@ export function setOrderInternalNote(orderId, body, email) {
     INSERT OR REPLACE INTO order_internal_notes (order_id, body, updated_at, updated_by)
     VALUES (?, ?, ?, ?)
   `).run(String(orderId), String(body).slice(0, 4000), Date.now(), email || '');
+}
+
+// WHAT: add ONE line under whatever staff already wrote in the Admin-only order note (used by Mark Paid to leave its
+//   "marked paid manually" breadcrumb). Returns 1 when a line was written, 0 for a blank line.
+// CHANGE-GUARD: setOrderInternalNote cuts at 4000 chars FROM THE END, which would silently drop the newest line, so
+//   when the note would pass the cap the OLDEST whole lines are dropped instead and the new line always survives.
+// INVARIANT(S): never replaces existing text; read + write happen in one synchronous tick (better-sqlite3), so two
+//   appends cannot interleave; updated_by becomes the appender (the same as any other edit of the note).
+export function appendOrderInternalNote(orderId, line, email) {
+  const add = String(line ?? '').trim();
+  if (!add) return 0;
+  const MAX = 4000;
+  const current = (getOrderInternalNote(orderId)?.body || '').replace(/\s+$/, '');
+  let body = current ? `${current}\n${add}` : add;
+  if (body.length > MAX) {
+    body = body.slice(body.length - MAX);
+    const nl = body.indexOf('\n');                       // start on a line boundary, not mid-line
+    if (nl !== -1 && nl < body.length - 1) body = body.slice(nl + 1);
+  }
+  setOrderInternalNote(orderId, body, email);
+  return 1;
 }
 
 export function getDropshipCache(customerId) {
@@ -907,6 +1135,14 @@ export function getLeadStatusHistory(leadId) {
 
 // ── Backorders ────────────────────────────────────────────────────────────────
 
+// WHAT: LEGACY flag-only writer — records "this line is backordered" locally and touches nothing else.
+// CHANGE-GUARD: POST /orders/:id/backorder no longer calls this (it removes the units from Shopify and
+//   goes through claimBackorderRemoval). It stays exported because a rollback to the old route code
+//   still uses this exact signature, and the DB unit test uses it to seed old-style rows.
+// INVARIANT(S): never overwrites a row that already represents units REMOVED from Shopify
+//   (shopify_removed_qty > 0) or an in-flight write — the WHERE on the conflict branch makes a legacy
+//   re-flag a silent no-op there, because flipping such a row's quantity/status without Shopify would
+//   desynchronise the invoice from the order.
 export function upsertBackorder(orderId, lineItemId, lineItemTitle, quantity, etaDate, createdBy) {
   db.prepare(`
     INSERT INTO backorders (order_id, line_item_id, line_item_title, quantity, eta_date, status, created_at, created_by, notified)
@@ -914,6 +1150,7 @@ export function upsertBackorder(orderId, lineItemId, lineItemTitle, quantity, et
     ON CONFLICT(order_id, line_item_id) DO UPDATE SET
       eta_date = excluded.eta_date, quantity = excluded.quantity, status = 'pending',
       created_at = excluded.created_at, created_by = excluded.created_by
+    WHERE backorders.shopify_removed_qty = 0 AND backorders.status NOT IN ('applying', 'restoring')
   `).run(orderId, lineItemId, lineItemTitle, quantity, etaDate || null, Date.now(), createdBy);
 }
 
@@ -940,9 +1177,179 @@ export function getOpenBackorders() {
     .all('pending');
 }
 
+// WHAT: clears a LEGACY flag-only backorder when its line ships in full (called by POST /orders/:id/fulfill).
+// CHANGE-GUARD: scoped to shopify_removed_qty = 0 AND status = 'pending' on purpose. A row with
+//   shopify_removed_qty > 0 describes units that are NOT on the Shopify order any more, so shipping the
+//   line's remaining units says nothing about them — flipping it to 'fulfilled' would make
+//   getBackorderedLinesForOrder drop units that were never shipped (they would vanish from the invoice
+//   and the queue). Those rows only leave 'pending' through restoreBackorder (the Undo route).
+//   In-flight 'applying'/'restoring' rows are likewise left alone.
 export function fulfillBackorder(orderId, lineItemId) {
-  db.prepare("UPDATE backorders SET status = 'fulfilled' WHERE order_id = ? AND line_item_id = ?")
+  db.prepare("UPDATE backorders SET status = 'fulfilled' WHERE order_id = ? AND line_item_id = ? AND status = 'pending' AND shopify_removed_qty = 0")
     .run(orderId, lineItemId);
+}
+
+// ── Backorders that REMOVE units from the Shopify order (2026-10-26 hot-fix) ─────────────────────
+// Row lifecycle:   (none) ─claim→ 'applying' ─finalize→ 'pending' ─begin→ 'restoring' ─restore→ 'restored'
+//                              └abandon→ (previous row, or none)      └revert→ 'pending'
+// 'applying'/'restoring' are TRANSIENT: they exist only while a Shopify edit is in flight (or after a
+// process death mid-edit). They are invisible to getOpenBackorders/getBackordersForOrder/
+// getBackorderedLinesForOrder, which all read status = 'pending' only, and are listed by
+// getTransientBackorders so an interrupted write can be reconciled rather than lost.
+// SYNC: the status strings here are mirrored by lib/backorder-edit.mjs (BACKORDER_STATUS) — change both.
+
+// WHAT: the raw backorders row for one order line (any status), or null.
+export function getBackorderRow(orderId, lineItemId) {
+  return db.prepare('SELECT * FROM backorders WHERE order_id = ? AND line_item_id = ?').get(orderId, lineItemId) || null;
+}
+
+// WHAT: rows stuck mid-write ('applying'/'restoring'), oldest first — for startup logging and reconcile.
+export function getTransientBackorders() {
+  return db.prepare("SELECT * FROM backorders WHERE status IN ('applying', 'restoring') ORDER BY created_at ASC").all();
+}
+
+// WHAT: units currently REMOVED from the Shopify order for one order, in the shape the invoice needs.
+// Returns [{ lineItemId, variantId, sku, title, variantTitle, quantity, unitPrice (Number), currency,
+//   lineTotal (Number, 2dp), createdAt (ms), createdBy }], oldest first. (No ETA: removed by owner decision.)
+// CHANGE-GUARD: public contract for the invoice/PDF/order-page renderers (built in parallel with this
+//   change). status = 'pending' AND shopify_removed_qty > 0 is the WHOLE definition: legacy flag-only
+//   rows (shopify_removed_qty = 0) are deliberately excluded — they never removed anything, so showing
+//   them as struck-through invoice lines would invent lines the order never lost. 'restored', 'fulfilled'
+//   and the transient statuses are excluded too.
+// INVARIANT(S): lineItemId is the id the line had when it was flagged; after a FULL removal that id no
+//   longer names a live line (Shopify cannot un-remove it), and Undo re-adds the units under a NEW id.
+export function getBackorderedLinesForOrder(orderGid) {
+  return selectBackorderedLines(db, orderGid);
+}
+// The one reader behind the function above, parameterised on the handle so the boot backfill
+// (backfillPartialInvoiceBackordered, which runs during module init with the handle it is given) reads the
+// backorders table through the SAME definition and row shape instead of a copy that could drift.
+// SYNC: backfillPartialInvoiceBackordered stores these rows (via serializeBackorderedLines) into already-issued
+//   invoices — a change to this definition or shape changes what gets frozen there.
+function selectBackorderedLines(database, orderGid) {
+  const rows = database.prepare(`
+    SELECT * FROM backorders
+    WHERE order_id = ? AND status = 'pending' AND shopify_removed_qty > 0
+    ORDER BY created_at ASC, id ASC
+  `).all(orderGid);
+  return rows.map(r => {
+    const unitPrice = Number(r.unit_price);
+    const unit = Number.isFinite(unitPrice) ? unitPrice : 0;
+    return {
+      lineItemId: r.line_item_id,
+      variantId: r.variant_id || null,
+      sku: r.sku || '',
+      title: r.line_item_title || '',
+      variantTitle: r.variant_title || '',
+      quantity: r.shopify_removed_qty,
+      unitPrice: unit,
+      currency: r.currency || 'USD',
+      lineTotal: Math.round(unit * r.shopify_removed_qty * 100) / 100,
+      createdAt: r.created_at,
+      createdBy: r.created_by || null,
+    };
+  });
+}
+
+// WHAT: phase 1 of a flag — reserves the (order, line) row as 'applying' BEFORE Shopify is touched, with
+// the complete invoice snapshot, so a removal that succeeds on Shopify can never be unrecorded.
+// c: { orderId, lineItemId, title, variantId, sku, variantTitle, unitPrice (decimal string), currency,
+//      quantity, priorQty, createdBy, now }
+// Returns { ok:true, prev } (prev = the row this claim overwrote, or null — hand it back to
+// abandonBackorderClaim) or { ok:false, reason:'already_backordered'|'in_progress', row }.
+// CHANGE-GUARD: only a 'restored'/'fulfilled' row or a LEGACY flag-only pending row (shopify_removed_qty
+//   = 0) may be overwritten. A live removed row (pending, shopify_removed_qty > 0) is REFUSED rather than
+//   accumulated: accumulating would need a second "confirmed vs intended" quantity to stay reconcilable
+//   after a crash, and the Undo-then-reflag path covers the use case.
+// INVARIANT(S): a single SQLite transaction; shopify_removed_qty stays 0 until finalizeBackorderRemoval,
+//   so nothing reads the row as "units removed" until Shopify has confirmed it.
+//   eta_date is always written NULL (the expected-ship-date feature was removed by owner decision); the
+//   column itself stays so the schema is additive-only and an older release's inserts/reads keep working,
+//   and a claim over a restored/legacy row clears any ETA it carried.
+export function claimBackorderRemoval(c) {
+  return db.transaction(() => {
+    const prev = getBackorderRow(c.orderId, c.lineItemId);
+    if (prev) {
+      const reusable = prev.status === 'restored' || prev.status === 'fulfilled'
+        || (prev.status === 'pending' && prev.shopify_removed_qty === 0);
+      if (!reusable) return { ok: false, reason: prev.status === 'pending' ? 'already_backordered' : 'in_progress', row: prev };
+    }
+    db.prepare(`
+      INSERT INTO backorders (order_id, line_item_id, line_item_title, quantity, eta_date, status, created_at, created_by, notified,
+                              variant_id, sku, variant_title, unit_price, currency, shopify_removed_qty, restored_at, claim_prior_qty)
+      VALUES (@orderId, @lineItemId, @title, @quantity, NULL, 'applying', @now, @createdBy, 0,
+              @variantId, @sku, @variantTitle, @unitPrice, @currency, 0, NULL, @priorQty)
+      ON CONFLICT(order_id, line_item_id) DO UPDATE SET
+        line_item_title = excluded.line_item_title, quantity = excluded.quantity, eta_date = NULL,
+        status = 'applying', created_at = excluded.created_at, created_by = excluded.created_by, notified = 0,
+        variant_id = excluded.variant_id, sku = excluded.sku, variant_title = excluded.variant_title,
+        unit_price = excluded.unit_price, currency = excluded.currency, shopify_removed_qty = 0,
+        restored_at = NULL, claim_prior_qty = excluded.claim_prior_qty
+    `).run({
+      orderId: c.orderId, lineItemId: c.lineItemId, title: c.title || '', quantity: c.quantity,
+      now: c.now ?? Date.now(), createdBy: c.createdBy || null,
+      variantId: c.variantId || null, sku: c.sku || null, variantTitle: c.variantTitle || null,
+      unitPrice: c.unitPrice, currency: c.currency || 'USD', priorQty: c.priorQty ?? null,
+    });
+    return { ok: true, prev };
+  })();
+}
+
+// WHAT: phase 2 (success) — Shopify confirmed the removal: 'applying' → 'pending' with the units counted.
+// Returns true when a row transitioned.
+export function finalizeBackorderRemoval(orderId, lineItemId) {
+  return db.prepare(`
+    UPDATE backorders SET status = 'pending', shopify_removed_qty = quantity
+    WHERE order_id = ? AND line_item_id = ? AND status = 'applying'
+  `).run(orderId, lineItemId).changes > 0;
+}
+
+// WHAT: phase 2 (definite failure) — Shopify did NOT remove the units: undo the claim so no record claims
+// the line is backordered. Puts the overwritten row (`prev`, from claimBackorderRemoval) back verbatim, or
+// deletes the row when the claim created it. Only ever touches a row still in 'applying'.
+export function abandonBackorderClaim(orderId, lineItemId, prev) {
+  return db.transaction(() => {
+    if (!prev) {
+      return db.prepare("DELETE FROM backorders WHERE order_id = ? AND line_item_id = ? AND status = 'applying'")
+        .run(orderId, lineItemId).changes > 0;
+    }
+    return db.prepare(`
+      UPDATE backorders SET line_item_title = @line_item_title, quantity = @quantity, eta_date = @eta_date,
+        status = @status, created_at = @created_at, created_by = @created_by, notified = @notified,
+        variant_id = @variant_id, sku = @sku, variant_title = @variant_title, unit_price = @unit_price,
+        currency = @currency, shopify_removed_qty = @shopify_removed_qty, restored_at = @restored_at,
+        claim_prior_qty = @claim_prior_qty
+      WHERE order_id = @order_id AND line_item_id = @line_item_id AND status = 'applying'
+    `).run(prev).changes > 0;
+  })();
+}
+
+// WHAT: undo phase 1 — 'pending' (units removed) → 'restoring', recording the matching-line quantity seen
+// on Shopify beforehand. Returns false when the row is not a live removed-units row (already restored,
+// still applying, or a legacy flag-only row — those never reach Shopify).
+export function beginBackorderRestore(orderId, lineItemId, priorQty) {
+  return db.prepare(`
+    UPDATE backorders SET status = 'restoring', claim_prior_qty = ?
+    WHERE order_id = ? AND line_item_id = ? AND status = 'pending' AND shopify_removed_qty > 0
+  `).run(priorQty ?? null, orderId, lineItemId).changes > 0;
+}
+
+// WHAT: undo phase 2 (definite failure) — Shopify did NOT take the units back: 'restoring' → 'pending'.
+export function revertBackorderRestore(orderId, lineItemId) {
+  return db.prepare("UPDATE backorders SET status = 'pending' WHERE order_id = ? AND line_item_id = ? AND status = 'restoring'")
+    .run(orderId, lineItemId).changes > 0;
+}
+
+// WHAT: undo phase 2 (success) — the units are back on the order: row → 'restored' (+ restored_at). The
+// restore function the Undo route uses. Also accepts a plain 'pending' row, which is how a LEGACY
+// flag-only row is cleared (it has nothing on Shopify to put back). Returns true when a row transitioned.
+// INVARIANT(S): shopify_removed_qty is kept as history; every reader that means "currently removed"
+//   filters on status = 'pending', never on the quantity alone.
+export function restoreBackorder(orderId, lineItemId, now = Date.now()) {
+  return db.prepare(`
+    UPDATE backorders SET status = 'restored', restored_at = ?
+    WHERE order_id = ? AND line_item_id = ? AND status IN ('pending', 'restoring')
+  `).run(now, orderId, lineItemId).changes > 0;
 }
 
 export function logOrderEdit(orderId, editedBy, staffNote, changesJson) {
@@ -1055,11 +1462,19 @@ export function getNextInvoiceLetter(orderId) {
   return 'Z';
 }
 
-export function createPartialInvoice({ orderId, invoiceLetter, invoiceType, total, shipping, tax, lineItemsJson, createdBy }) {
+// WHAT: stores a lettered-invoice snapshot. backorderedJson is the backordered lines frozen WITH the snapshot
+//   (lib/partial-invoice-backorder.mjs serializeBackorderedLines); omit it (undefined) only to write a LEGACY-shaped
+//   row (NULL, frozen at the next boot by backfillPartialInvoiceBackordered) — every real issuing path must pass a
+//   string, '[]' when nothing was backordered (POST /orders/:id/partial-invoice does: serializeBackorderedLines
+//   always returns a string, so a NEW letter is never treated as legacy).
+// CHANGE-GUARD: the INSERT names its columns explicitly; keep it that way (an older release's INSERT does too,
+//   which is what makes the additive backordered_json column rollback-safe).
+export function createPartialInvoice({ orderId, invoiceLetter, invoiceType, total, shipping, tax, lineItemsJson, backorderedJson, createdBy }) {
   return db.prepare(`
-    INSERT INTO partial_invoices (order_id, invoice_letter, invoice_type, total, shipping, tax, line_items_json, created_at, created_by)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(orderId, invoiceLetter, invoiceType || 'fulfilled_only', total, shipping || 0, tax || 0, lineItemsJson || '[]', Date.now(), createdBy).lastInsertRowid;
+    INSERT INTO partial_invoices (order_id, invoice_letter, invoice_type, total, shipping, tax, line_items_json, backordered_json, created_at, created_by)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(orderId, invoiceLetter, invoiceType || 'fulfilled_only', total, shipping || 0, tax || 0, lineItemsJson || '[]',
+    backorderedJson == null ? null : String(backorderedJson), Date.now(), createdBy).lastInsertRowid;
 }
 
 export function getPartialInvoices(orderId) {
@@ -1380,6 +1795,24 @@ export function upsertOrderCache(o) {
     o.current_subtotal != null ? o.current_subtotal : null,
     Date.now()
   );
+}
+
+// WHAT: write-through of ONE field pair — financial_status + display_financial_status — onto an order whose status we
+// have just changed in Shopify (staff Mark Paid, POST /orders/bulk). The Orders list is served from orders_cache and
+// the Shopify orders/updated webhook only lands 2-3 s after the mutation, while the route redirects at once: without
+// this the page that says "marked as paid" paints the same order as PENDING (2026-10-27, #39748).
+// CHANGE-GUARD: deliberately NOT upsertOrderCache — that REPLACES the whole row and would blank every column the caller
+// does not have. This UPDATEs two columns and leaves synced_at and updated_at alone: synced_at feeds the "Synced just
+// now" badge, which must keep meaning "the cache was last refreshed FROM Shopify", and updated_at is Shopify's value.
+// INVARIANT(S): the webhook / poller still own the row — they upsert it whole, so anything written here is overwritten by
+// Shopify's truth on the next sync (a wrong guess self-heals). An order absent from the cache is a no-op (returns 0): this
+// never invents a row. Status is stored UPPERCASE, matching upsertOrderCache and every reader (STATUS-CASE above).
+// DEPENDS: server.mjs POST /orders/bulk (the only caller; wrapped in try/catch so a cache hiccup never fails a payment).
+export function setOrderFinancialStatusInCache(shopifyId, status) {
+  const s = String(status || '').toUpperCase();
+  if (!s) return 0;
+  return db.prepare('UPDATE orders_cache SET financial_status = ?, display_financial_status = ? WHERE shopify_id = ?')
+    .run(s, s, String(shopifyId)).changes;
 }
 
 // WHAT: REPLACES the cached line items for an order — deletes every existing row for

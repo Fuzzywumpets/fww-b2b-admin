@@ -295,6 +295,19 @@ await test('POST /orders/1001/mark-paid redirects to order detail', async () => 
   assert.ok(res.headers.get('location')?.includes('/orders/1001'));
 });
 
+// ALEX 2026-10-27: Mark Paid must leave a visible "marked paid manually" trail. It goes in the Admin-only note
+// (never the Shopify note, which holds customer instructions) and the order history reads "manually" too.
+await test('POST /orders/1001/mark-paid leaves a "Marked paid manually by <who>" line in the Admin-only note and says so in the history', async () => {
+  const cookie = await seedSession();
+  const html = await (await fetch(`${BASE}/orders/1001`, { headers: { Cookie: cookie } })).text();
+  assert.match(html, /Marked paid manually by alex@fuzzywumpets\.com/, 'Admin-only note line missing');
+  const internal = html.match(/aria-label="B2B Admin-only note">([\s\S]*?)<\/textarea>/)?.[1] || '';
+  assert.ok(internal.includes('Marked paid manually by'), 'the line must be in the Admin-only note box, not elsewhere: ' + internal.slice(0, 200));
+  const shopifyNote = html.match(/aria-label="Shopify order note">([\s\S]*?)<\/textarea>/)?.[1] || '';
+  assert.ok(!/Marked paid manually/.test(shopifyNote), 'the Shopify (customer-instruction) note must not be touched');
+  assert.ok(html.includes('marked the order paid manually'), 'order history should say "manually"');
+});
+
 await test('POST /orders/1001/note saves note and redirects', async () => {
   const cookie = await seedSession();
   const res = await fetch(`${BASE}/orders/1001/note`, {
@@ -507,6 +520,13 @@ await test('POST /orders/bulk mark-paid redirects to /orders', async () => {
   assert.ok(res.headers.get('location')?.includes('/orders'));
 });
 
+await test('POST /orders/bulk mark-paid leaves the "Marked paid manually" line on each order it paid', async () => {
+  const cookie = await seedSession();
+  const html = await (await fetch(`${BASE}/orders/1002`, { headers: { Cookie: cookie } })).text();
+  const internal = html.match(/aria-label="B2B Admin-only note">([\s\S]*?)<\/textarea>/)?.[1] || '';
+  assert.match(internal, /Marked paid manually by alex@fuzzywumpets\.com/, internal.slice(0, 200));
+});
+
 // REGRESSION: the bulk path used to discard the orderMarkAsPaid response entirely — a refused order
 // was still audit-logged 'mark_paid' and the batch reported success=marked_paid. #1003 is already
 // PAID in the fixtures, so Shopify (and now the mock) refuses it. Only #1003 is submitted here on
@@ -524,6 +544,37 @@ await test('POST /orders/bulk mark-paid reports a refused order instead of a bla
   assert.ok(loc.includes('error=mark_paid_partial'), 'expected error=mark_paid_partial, got ' + loc);
   assert.ok(!loc.includes('success=marked_paid'), 'must NOT claim success: ' + loc);
   assert.ok(decodeURIComponent(loc).includes('#1003'), 'failed order id must be named: ' + loc);
+  // ...and an order Shopify refused was NOT marked paid, so it must not be annotated as if it had been.
+  const html = await (await fetch(`${BASE}/orders/1003`, { headers: { Cookie: cookie } })).text();
+  assert.ok(!html.includes('Marked paid manually'), 'a refused order must carry no "marked paid" note');
+});
+
+// REGRESSION (2026-10-27): a bulk POST that marked nothing still redirected with the SUCCESS banner (unknown
+// action) or silently (no ids). Neither mutates a fixture. The real-browser / orders_cache end-to-end version of
+// this lives in test/orders-bulk-markpaid.test.mjs.
+await test('POST /orders/bulk with no ids says nothing was selected, never success', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(BASE + '/orders/bulk', {
+    method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' }, body: 'action=mark-paid', redirect: 'manual',
+  });
+  assert.equal(res.status, 302);
+  const loc = res.headers.get('location') || '';
+  assert.ok(loc.includes('error=mark_paid_none') && !loc.includes('success='), loc);
+  const html = await (await fetch(BASE + loc, { headers: { Cookie: cookie } })).text();
+  assert.ok(html.includes('No orders selected'), 'banner must explain why nothing happened');
+  assert.ok(!html.includes('Order(s) marked as paid.'));
+});
+
+await test('POST /orders/bulk with an unknown action never claims success', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(BASE + '/orders/bulk', {
+    method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' }, body: 'ids=1002&action=frobnicate', redirect: 'manual',
+  });
+  assert.equal(res.status, 302);
+  const loc = res.headers.get('location') || '';
+  assert.ok(loc.includes('error=bulk_unknown_action') && !loc.includes('success='), loc);
+  const html = await (await fetch(BASE + loc, { headers: { Cookie: cookie } })).text();
+  assert.ok(html.includes('alert-error') && !html.includes('Order(s) marked as paid.'));
 });
 
 await test('GET /orders?error=mark_paid_partial renders an ERROR banner, not the success one', async () => {
@@ -2037,6 +2088,21 @@ await test('order detail offers Send Credit Card Invoice and no Chase stub', asy
   assert.ok(!html.includes('Send Chase Invoice'));
 });
 
+await test('order detail CC invoice button opens a modal with a note textarea (name="note")', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/orders/1001`, { headers: { Cookie: cookie } });
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  // The button opens a modal, not a bare form-submit.
+  assert.ok(html.includes('toggleCcInvoiceModal'), 'toggleCcInvoiceModal JS missing');
+  assert.ok(html.includes('id="cc-invoice-modal"'), 'cc-invoice-modal div missing');
+  assert.ok(html.includes('name="note"'), 'note textarea missing');
+  // maxlength cap must be 500.
+  assert.ok(html.includes('maxlength="500"'), 'maxlength=500 missing on note textarea');
+});
+
+// Reconcile 2026-11-08: the API server runs with HELCIM_ITEMIZED_INVOICES=1 (run-tests.sh), so #1010 (reconciles to the cent)
+// takes main's itemized body while the edited #1001 falls back to production's balance-due line; both must send.
 await test('POST /orders/1010/send-credit-card-invoice (JSON) → creates and emails an itemized taxed Helcim invoice', async () => {
   const cookie = await seedSession();
   const res = await fetch(`${BASE}/orders/1010/send-credit-card-invoice`, {
@@ -2051,6 +2117,80 @@ await test('POST /orders/1010/send-credit-card-invoice (JSON) → creates and em
   assert.equal(j.invoice.amount, 118);
   assert.equal(j.invoice.currency, 'USD');
   assert.deepEqual(j.email, { sent: true, to: 'buyer@acme.com' });
+});
+
+await test('POST /orders/1001/send-credit-card-invoice (JSON) → creates and emails Helcim invoice', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/orders/1001/send-credit-card-invoice`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+  });
+  assert.equal(res.status, 200);
+  const j = await res.json();
+  assert.equal(j.ok, true);
+  assert.equal(j.status, 'sent');
+  assert.equal(j.invoice.invoiceId, 'mock-helcim-1001');
+  // Earlier edit-route tests intentionally mutate mock #1001; invoice the resulting CURRENT
+  // outstanding balance rather than asserting its frozen $450 fixture total.
+  assert.ok(j.invoice.amount > 0);
+  assert.equal(j.invoice.currency, 'USD');
+  assert.deepEqual(j.email, { sent: true, to: 'buyer@acme.com' });
+  // Mock #1001 has a full billing address, so the route must have built one for the Helcim invoice (the real
+  // request body is pinned in test/helcim.test.mjs; this pins that the route derives it from the order).
+  assert.equal(j.invoice.billingIncluded, true);
+});
+
+await test('POST /orders/1001/send-credit-card-invoice with form-encoded note → 302 success', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/orders/1001/send-credit-card-invoice`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ note: 'Please review your order carefully.' }),
+    redirect: 'manual',
+  });
+  assert.equal(res.status, 302);
+  assert.ok(res.headers.get('location')?.includes('credit_card_invoice_sent'),
+    `expected credit_card_invoice_sent redirect, got: ${res.headers.get('location')}`);
+});
+
+await test('POST /orders/1001/send-credit-card-invoice with JSON note → 200 ok', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/orders/1001/send-credit-card-invoice`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ note: 'Spring restock *discount* applies.' }),
+  });
+  assert.equal(res.status, 200);
+  const j = await res.json();
+  assert.equal(j.ok, true);
+  // A resend reuses the stored invoice; nothing was sent to Helcim this time, so there is nothing to report.
+  assert.equal(j.status, 'resent');
+  assert.equal(j.invoice.billingIncluded, null);
+});
+
+await test('POST /orders/1001/send-credit-card-invoice with over-long note → truncated, not rejected', async () => {
+  const cookie = await seedSession();
+  const longNote = 'x'.repeat(600);
+  const res = await fetch(`${BASE}/orders/1001/send-credit-card-invoice`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ note: longNote }),
+  });
+  // Must succeed (note is truncated to 500, not rejected).
+  assert.equal(res.status, 200);
+  const j = await res.json();
+  assert.equal(j.ok, true);
+});
+
+await test('POST /orders/1001/send-credit-card-invoice retry reuses the invoice and redirects with success', async () => {
+  const cookie = await seedSession();
+  const res = await fetch(`${BASE}/orders/1001/send-credit-card-invoice`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    redirect: 'manual',
+  });
+  assert.equal(res.status, 302);
+  assert.ok(res.headers.get('location')?.includes('credit_card_invoice_sent'));
 });
 
 await test('POST /orders/1010/send-credit-card-invoice retry reuses the invoice and redirects with success', async () => {
@@ -2943,9 +3083,24 @@ await test('manual fulfillment source bounds nested query cost and rejects stuck
   assert.match(source, /if \(!next \|\| next === previous\) throw new Error/u, 'pagination must reject missing or repeated cursors');
 });
 
+// Backorder removes units from the Shopify order, and shipped units cannot be removed. #1004 li5 is 15 on the
+// order with only 5 still unfulfilled (10 already shipped), so asking to backorder 6 must be refused by
+// Shopify -> error flash, line untouched, and NO row claiming it is backordered. (Runs before the fulfill
+// tests below on purpose: it needs li5 untouched at 5 unfulfilled.)
+await test('backorder of more units than are still unfulfilled is refused and leaves no row (#1004 li5: 10 shipped)', async () => {
+  const cookie = await seedSession();
+  const res = await postForm('/orders/1004/backorder', cookie, { lineItemId: 'li5', quantity: '6' });
+  const loc = res.headers.get('location') || '';
+  assert.ok(loc.includes('error=backorder_shopify_failed'), loc);
+  assert.ok(decodeURIComponent(loc).includes('unfulfilled'), `message should say why: ${loc}`);
+  const rows = await fetch(`${BASE}/api/orders/1004/backorders`, { headers: { Cookie: cookie } }).then(r => r.json());
+  assert.ok(!rows.backorders.some(b => b.line_item_id === 'li5'), 'a refused removal must not leave a backorder row');
+  const html = await fetch(`${BASE}/orders/1004`, { headers: { Cookie: cookie } }).then(r => r.text());
+  assert.ok(html.includes('10 items remaining'), 'the order must be untouched');
+});
+
 await test('POST /orders/1004/fulfill → records only the selected remaining quantity', async () => {
   const cookie = await seedSession();
-  await postForm('/orders/1004/backorder', cookie, { lineItemId: 'li5', lineItemTitle: 'Everyday Collar', quantity: '5' });
   const body = new URLSearchParams({
     'lineItems[li5]': '2',
     trackingCompany: 'USPS',
@@ -2961,42 +3116,337 @@ await test('POST /orders/1004/fulfill → records only the selected remaining qu
   const html = await detail.text();
   assert.ok(html.includes('8 items remaining'));
   assert.ok(html.includes('Everyday Collar') && html.includes('× 2'));
-  const partialBackorders = await fetch(`${BASE}/api/orders/1004/backorders`, { headers: { Cookie: cookie } }).then(r => r.json());
-  assert.ok(partialBackorders.backorders.some(b => b.line_item_id === 'li5' && b.status === 'pending'), 'partial shipment must keep the line backordered');
 });
 
-await test('shipping the full remaining quantity clears the matching backorder', async () => {
+await test('shipping the rest of a line completes it without error', async () => {
   const cookie = await seedSession();
   const res = await postForm('/orders/1004/fulfill', cookie, { 'lineItems[li5]': '3' });
   assert.ok(res.headers.get('location')?.includes('fulfilled'));
-  const backorders = await fetch(`${BASE}/api/orders/1004/backorders`, { headers: { Cookie: cookie } }).then(r => r.json());
-  assert.ok(!backorders.backorders.some(b => b.line_item_id === 'li5' && b.status === 'pending'), 'full remainder must clear the line backorder');
 });
 
-await test('POST /orders/1001/backorder → flags backorder in SQLite', async () => {
+// A backorder that REMOVED units from the Shopify order is not cleared by shipping the line: the shipment
+// covers the units still on the order, the removed units are a separate promise that only Undo (or staff)
+// resolves. (Before this change fulfillBackorder cleared any pending row when the remainder shipped; that
+// would now orphan the removed units from the invoice.)
+await test('shipping a line in full does NOT clear a removed-units backorder on that line', async () => {
   const cookie = await seedSession();
-  const body = new URLSearchParams({ lineItemId: 'li1', lineItemTitle: 'Elite Collar', quantity: '3', eta: '2026-07-01' });
-  const res = await fetch(`${BASE}/orders/1001/backorder`, {
-    method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: body.toString(), redirect: 'manual',
-  });
-  assert.ok([301, 302].includes(res.status), 'Should redirect after backorder');
-  assert.ok(res.headers.get('location')?.includes('backorder_flagged'), 'Should have success flash');
+  const flagged = await postForm('/orders/1004/backorder', cookie, { lineItemId: 'li6', quantity: '2' });
+  assert.ok(flagged.headers.get('location')?.includes('success=backorder_flagged'), flagged.headers.get('location'));
+  const shipped = await postForm('/orders/1004/fulfill', cookie, { 'lineItems[li6]': '3' });   // 5 ordered - 2 removed = 3 left, all shipped
+  assert.ok(shipped.headers.get('location')?.includes('fulfilled'), shipped.headers.get('location'));
+  const rows = await fetch(`${BASE}/api/orders/1004/backorders`, { headers: { Cookie: cookie } }).then(r => r.json());
+  const row = rows.backorders.find(b => b.line_item_id === 'li6');
+  assert.ok(row, 'the removed-units backorder must survive the shipment of the remaining units');
+  assert.equal(row.status, 'pending');
+  assert.equal(row.shopify_removed_qty, 2);
+  // And it is still undoable afterwards (the line is back to 5 on the order).
+  const undone = await postForm('/orders/1004/backorder/undo', cookie, { lineItemId: 'li6' });
+  assert.ok(undone.headers.get('location')?.includes('success=backorder_restored'), undone.headers.get('location'));
+  const after = await fetch(`${BASE}/api/orders/1004/backorders`, { headers: { Cookie: cookie } }).then(r => r.json());
+  assert.ok(!after.backorders.some(b => b.line_item_id === 'li6'), 'undone row leaves the pending list');
 });
 
-await test('GET /api/orders/1001/backorders → returns backorders JSON', async () => {
+// ── Backorder = remove the units from the Shopify order; Undo = put them back at the STORED price ─────────
+// Every test below drives its own throwaway "BO ..." probe line on #1001 (added through the normal
+// /line/add route) so it never depends on, or disturbs, the fixture lines other suites assert on. A final
+// test removes whatever probe lines are left. The flag-only LEGACY row (shopify_removed_qty = 0, which
+// cannot be created over HTTP any more) is covered in test/backorder-migration.test.mjs.
+console.log('\nAPI tests — Backorder removes units from Shopify; Undo restores at the stored price:');
+
+async function boProbe(cookie, { qty = 5, price = 14, listPrice = 28, title = 'BO probe', variantId = '350', sku = 'BO-PROBE-1' } = {}) {
+  const r = await postJson('/orders/1001/line/add', cookie, { idemKey: uuid(), variantId, title, sku, qty, listPrice, price });
+  assert.equal(r.status, 200, 'probe line add');
+  return r.json.line.liId;
+}
+const boLines = async (cookie) => (await fetch(`${BASE}/api/orders/1001/line-state`, { headers: { Cookie: cookie } }).then(r => r.json())).lines;
+const boQty = async (cookie, liId) => (await boLines(cookie)).find(l => l.liId === liId)?.currentQuantity;
+const boRows = async (cookie, n = 1001) => (await fetch(`${BASE}/api/orders/${n}/backorders`, { headers: { Cookie: cookie } }).then(r => r.json())).backorders;
+const boFlag = (cookie, fields) => postForm('/orders/1001/backorder', cookie, fields);
+const boUndo = (cookie, liId) => postForm('/orders/1001/backorder/undo', cookie, { lineItemId: liId });
+const locOf = (res) => res.headers.get('location') || '';
+
+await test('POST /orders/1001/backorder and /backorder/undo require auth (redirect to /login)', async () => {
+  for (const p of ['/orders/1001/backorder', '/orders/1001/backorder/undo']) {
+    const res = await postForm(p, '', { lineItemId: 'li1', quantity: '1' });
+    assert.equal(res.status, 302, p);
+    assert.ok(locOf(res).includes('/login'), p);
+  }
+});
+
+await test('backorder of a FULL line removes it from the Shopify order and snapshots everything an invoice needs', async () => {
   const cookie = await seedSession();
-  // First create a backorder
-  const body = new URLSearchParams({ lineItemId: 'li_test', lineItemTitle: 'Test Item', quantity: '2' });
-  await fetch(`${BASE}/orders/1001/backorder`, {
-    method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: body.toString(), redirect: 'manual',
-  });
-  const res = await fetch(`${BASE}/api/orders/1001/backorders`, { headers: { Cookie: cookie } });
-  assert.equal(res.status, 200);
-  const json = await res.json();
-  assert.ok(Array.isArray(json.backorders), 'Should return backorders array');
-  assert.ok(json.backorders.some(b => b.line_item_id === 'li_test'), 'Should find the test backorder');
+  const li = await boProbe(cookie, { qty: 4, price: 14, listPrice: 28, title: 'BO full' });
+  const res = await boFlag(cookie, { lineItemId: li, quantity: '4' });
+  assert.equal(res.status, 302);
+  assert.ok(locOf(res).includes('success=backorder_flagged'), locOf(res));
+  assert.equal(await boQty(cookie, li), 0, 'the line is removed from the order (quantity 0)');
+  const row = (await boRows(cookie)).find(b => b.line_item_id === li);
+  assert.ok(row, 'a pending row exists');
+  assert.deepEqual(
+    { status: row.status, qty: row.shopify_removed_qty, quantity: row.quantity, title: row.line_item_title, variant: row.variant_id,
+      sku: row.sku, price: row.unit_price, currency: row.currency, eta: row.eta_date, by: row.created_by },
+    { status: 'pending', qty: 4, quantity: 4, title: 'BO full', variant: 'gid://shopify/ProductVariant/350',
+      sku: 'BO-PROBE-1', price: '14.00', currency: 'USD', eta: null, by: 'alex@fuzzywumpets.com' });
+});
+
+await test('backorder of a PARTIAL quantity lowers the line to current minus N and records only N', async () => {
+  const cookie = await seedSession();
+  const li = await boProbe(cookie, { qty: 10, title: 'BO partial' });
+  const res = await boFlag(cookie, { lineItemId: li, quantity: '3' });
+  assert.ok(locOf(res).includes('success=backorder_flagged'), locOf(res));
+  assert.equal(await boQty(cookie, li), 7);
+  const row = (await boRows(cookie)).find(b => b.line_item_id === li);
+  assert.equal(row.shopify_removed_qty, 3);
+  assert.equal(row.eta_date, null, 'no expected ship date is recorded');
+});
+
+await test('UNDO after a full removal re-adds the item as a NEW line at the STORED price (not the list price)', async () => {
+  const cookie = await seedSession();
+  const li = await boProbe(cookie, { qty: 4, price: 14, listPrice: 28, title: 'BO undo-full' });
+  await boFlag(cookie, { lineItemId: li, quantity: '4' });
+  const res = await boUndo(cookie, li);
+  assert.ok(locOf(res).includes('success=backorder_restored'), locOf(res));
+  const lines = await boLines(cookie);
+  assert.equal(lines.find(l => l.liId === li).currentQuantity, 0, 'the removed line stays removed - Shopify cannot revive it');
+  const back = lines.filter(l => l.title === 'BO undo-full' && l.liId !== li && l.currentQuantity > 0);
+  assert.equal(back.length, 1, 'exactly one new line');
+  assert.equal(back[0].currentQuantity, 4);
+  assert.equal(back[0].unitPrice, 14, 'stored B2B price, not the 28.00 list price');
+  assert.ok(!(await boRows(cookie)).some(b => b.line_item_id === li), 'no longer pending');
+});
+
+await test('UNDO of a partial backorder raises the same line back to its original quantity', async () => {
+  const cookie = await seedSession();
+  const li = await boProbe(cookie, { qty: 10, title: 'BO undo-partial' });
+  await boFlag(cookie, { lineItemId: li, quantity: '3' });
+  assert.equal(await boQty(cookie, li), 7);
+  const res = await boUndo(cookie, li);
+  assert.ok(locOf(res).includes('success=backorder_restored'), locOf(res));
+  assert.equal(await boQty(cookie, li), 10);
+  assert.equal((await boLines(cookie)).filter(l => l.title === 'BO undo-partial').length, 1, 'no extra line was added');
+  assert.ok(!(await boRows(cookie)).some(b => b.line_item_id === li));
+});
+
+await test('UNDO twice is idempotent; undo of a line that was never backordered is an error flash', async () => {
+  const cookie = await seedSession();
+  const li = await boProbe(cookie, { qty: 6, title: 'BO undo-twice' });
+  await boFlag(cookie, { lineItemId: li, quantity: '2' });
+  assert.ok(locOf(await boUndo(cookie, li)).includes('success=backorder_restored'));
+  const again = await boUndo(cookie, li);
+  assert.ok(locOf(again).includes('success=backorder_restored'), locOf(again));
+  assert.equal(await boQty(cookie, li), 6, 'second undo must not add units again');
+  const never = await boUndo(cookie, 'gid://shopify/LineItem/never-flagged');
+  assert.ok(locOf(never).includes('error=backorder_shopify_failed'), locOf(never));
+  const missing = await postForm('/orders/1001/backorder/undo', cookie, {});
+  assert.ok(locOf(missing).includes('error=missing_line_item'), locOf(missing));
+});
+
+await test('FAIL CLOSED: a Shopify rejection redirects with the error flash and leaves NO pending row', async () => {
+  const cookie = await seedSession();
+  const li = await boProbe(cookie, { qty: 5, title: 'BO [mock-reject-flag]' });
+  const res = await boFlag(cookie, { lineItemId: li, quantity: '2' });
+  const loc = locOf(res);
+  assert.ok(loc.includes('error=backorder_shopify_failed'), loc);
+  assert.ok(loc.includes('msg='), 'the Shopify reason is passed to the flash');
+  assert.ok(!loc.includes('success='), loc);
+  assert.equal(await boQty(cookie, li), 5, 'the order line is untouched');
+  assert.ok(!(await boRows(cookie)).some(b => b.line_item_id === li), 'no pending row for a removal that did not happen');
+  const queue = await fetch(`${BASE}/api/admin/backorders`, { headers: { Cookie: cookie } }).then(r => r.json());
+  assert.ok(!queue.backorders.some(b => b.line_item_id === li), 'and nothing in the global queue either');
+});
+
+await test('FAIL CLOSED: a Shopify rejection of the UNDO keeps the backorder pending, and a retry then succeeds', async () => {
+  const cookie = await seedSession();
+  const li = await boProbe(cookie, { qty: 3, title: 'BO [mock-fail-once-restore]' });
+  assert.ok(locOf(await boFlag(cookie, { lineItemId: li, quantity: '3' })).includes('success=backorder_flagged'));
+  const failed = await boUndo(cookie, li);
+  assert.ok(locOf(failed).includes('error=backorder_shopify_failed'), locOf(failed));
+  assert.ok((await boRows(cookie)).some(b => b.line_item_id === li && b.status === 'pending'), 'still backordered');
+  assert.equal((await boLines(cookie)).filter(l => l.title.includes('mock-fail-once-restore') && l.currentQuantity > 0).length, 0, 'nothing was added');
+  const retry = await boUndo(cookie, li);
+  assert.ok(locOf(retry).includes('success=backorder_restored'), locOf(retry));
+  assert.equal((await boLines(cookie)).filter(l => l.title.includes('mock-fail-once-restore') && l.currentQuantity > 0).length, 1);
+});
+
+await test('DOUBLE SUBMIT with the same idemKey removes the units once', async () => {
+  const cookie = await seedSession();
+  const li = await boProbe(cookie, { qty: 10, title: 'BO token' });
+  const fields = { lineItemId: li, quantity: '4', idemKey: `tok-${uuid()}` };
+  assert.ok(locOf(await boFlag(cookie, fields)).includes('success=backorder_flagged'));
+  assert.ok(locOf(await boFlag(cookie, fields)).includes('success=backorder_flagged'), 'the replay reports success');
+  assert.equal(await boQty(cookie, li), 6, 'removed once, not twice');
+  assert.equal((await boRows(cookie)).filter(b => b.line_item_id === li).length, 1);
+});
+
+await test('DOUBLE SUBMIT without a token (two identical requests at once) removes the units once', async () => {
+  const cookie = await seedSession();
+  const li = await boProbe(cookie, { qty: 10, title: 'BO concurrent' });
+  const fields = { lineItemId: li, quantity: '4' };
+  const [a, b] = await Promise.all([boFlag(cookie, fields), boFlag(cookie, fields)]);
+  assert.ok(locOf(a).includes('success=backorder_flagged') && locOf(b).includes('success=backorder_flagged'), `${locOf(a)} | ${locOf(b)}`);
+  assert.equal(await boQty(cookie, li), 6, 'removed once, not twice');
+  assert.equal((await boRows(cookie)).filter(r => r.line_item_id === li).length, 1);
+});
+
+await test('a DIFFERENT second backorder on an already-backordered line is refused until it is undone', async () => {
+  const cookie = await seedSession();
+  const li = await boProbe(cookie, { qty: 10, title: 'BO twice' });
+  await boFlag(cookie, { lineItemId: li, quantity: '4' });
+  const res = await boFlag(cookie, { lineItemId: li, quantity: '2' });
+  assert.ok(locOf(res).includes('error=backorder_shopify_failed'), locOf(res));
+  assert.ok(decodeURIComponent(locOf(res)).includes('already has 4'), locOf(res));
+  assert.equal(await boQty(cookie, li), 6, 'second request changed nothing');
+  assert.equal((await boRows(cookie)).find(b => b.line_item_id === li).shopify_removed_qty, 4);
+});
+
+await test('quantity above the line, below 1, or not a whole number is rejected with no change', async () => {
+  const cookie = await seedSession();
+  const li = await boProbe(cookie, { qty: 5, title: 'BO validate' });
+  for (const quantity of ['6', '999', '0', '-1', 'abc', '2.5', '']) {
+    const res = await boFlag(cookie, { lineItemId: li, quantity });
+    assert.ok(locOf(res).includes('error=backorder_shopify_failed'), `quantity ${JSON.stringify(quantity)} -> ${locOf(res)}`);
+  }
+  const unknown = await boFlag(cookie, { lineItemId: 'gid://shopify/LineItem/nope', quantity: '1' });
+  assert.ok(locOf(unknown).includes('error=backorder_shopify_failed'), locOf(unknown));
+  const noLine = await boFlag(cookie, { quantity: '1' });
+  assert.ok(locOf(noLine).includes('error=missing_line_item'), locOf(noLine));
+  assert.equal(await boQty(cookie, li), 5, 'nothing was removed by any rejected request');
+  assert.ok(!(await boRows(cookie)).some(b => b.line_item_id === li), 'and no row was written');
+});
+
+await test('a stale client that still posts an eta is accepted, and NO ETA is recorded (ignored, not validated)', async () => {
+  const cookie = await seedSession();
+  const li = await boProbe(cookie, { qty: 5, title: 'BO stale-eta' });
+  for (const eta of ['2026-12-24', 'not-a-date']) {            // even a malformed one must not reject the request
+    const l2 = eta === '2026-12-24' ? li : await boProbe(cookie, { qty: 5, title: 'BO stale-eta 2' });
+    const res = await boFlag(cookie, { lineItemId: l2, quantity: '2', eta });
+    assert.ok(locOf(res).includes('success=backorder_flagged'), `eta=${eta} -> ${locOf(res)}`);
+    assert.equal(await boQty(cookie, l2), 3);
+    assert.equal((await boRows(cookie)).find(b => b.line_item_id === l2).eta_date, null, 'no eta_date on a new row');
+  }
+});
+
+await test('a removed-units backorder appears in the /backorders queue and the admin API', async () => {
+  const cookie = await seedSession();
+  const li = await boProbe(cookie, { qty: 3, title: 'BO queue item' });
+  await boFlag(cookie, { lineItemId: li, quantity: '2' });
+  const page = await fetch(`${BASE}/backorders`, { headers: { Cookie: cookie } }).then(r => r.text());
+  assert.ok(page.includes('BO queue item') && page.includes('#1001'), 'queue page lists it');
+  assert.ok(!/<th>ETA<\/th>/.test(page), 'the queue has no ETA column (expected ship date was removed)');
+  assert.ok(page.includes('<th>Flagged</th>') && page.includes('<th>By</th>'), 'the other columns are intact');
+  const api = await fetch(`${BASE}/api/admin/backorders`, { headers: { Cookie: cookie } }).then(r => r.json());
+  const row = api.backorders.find(b => b.line_item_id === li);
+  assert.ok(row && row.shopify_removed_qty === 2);
+  assert.ok(locOf(await boUndo(cookie, li)).includes('success=backorder_restored'));
+  const after = await fetch(`${BASE}/api/admin/backorders`, { headers: { Cookie: cookie } }).then(r => r.json());
+  assert.ok(!after.backorders.some(b => b.line_item_id === li), 'undone rows leave the queue');
+});
+
+// ── Edit mode survives the redirect (2026-10-26 hot-fix: "takes the screen out of edit mode after every change") ──
+// The page adds editMode=1 to the form it posts WHILE editing; lib/edit-mode-resume.mjs then ends the redirect in
+// ?edit=1#line-items for success AND failure. The browser half is in test/ui.test.mjs; unit cases in
+// test/edit-mode-resume.test.mjs. Probe lines are cleaned up by the housekeeping test below.
+const EDIT_SUFFIX = /[?&]edit=1#line-items$/;
+
+await test('EDIT MODE: an opted-in backorder / undo keeps edit mode on the success redirect (flash and anchor intact)', async () => {
+  const cookie = await seedSession();
+  const li = await boProbe(cookie, { qty: 6, title: 'BO keep-edit' });
+  const flagged = await boFlag(cookie, { lineItemId: li, quantity: '2', editMode: '1' });
+  assert.equal(flagged.status, 302);
+  assert.equal(locOf(flagged), '/orders/1001?success=backorder_flagged&edit=1#line-items');
+  const undone = await postForm('/orders/1001/backorder/undo', cookie, { lineItemId: li, editMode: '1' });
+  assert.equal(locOf(undone), '/orders/1001?success=backorder_restored&edit=1#line-items');
+  assert.equal(await boQty(cookie, li), 6, 'and the actions themselves still did their work');
+});
+
+await test('EDIT MODE: a FAILED backorder / undo keeps edit mode AND its error message', async () => {
+  const cookie = await seedSession();
+  const li = await boProbe(cookie, { qty: 3, title: 'BO keep-edit-fail' });
+  const tooMany = await boFlag(cookie, { lineItemId: li, quantity: '999', editMode: '1' });
+  assert.match(locOf(tooMany), /error=backorder_shopify_failed&msg=[^#]+&edit=1#line-items$/, locOf(tooMany));
+  assert.ok(decodeURIComponent(locOf(tooMany)).includes('Quantity must be between 1 and 3'), 'the server reason survives the rewrite byte-for-byte');
+  const badQty = await boFlag(cookie, { lineItemId: li, quantity: 'abc', editMode: '1' });
+  assert.match(locOf(badQty), EDIT_SUFFIX, locOf(badQty));
+  const never = await postForm('/orders/1001/backorder/undo', cookie, { lineItemId: 'gid://shopify/LineItem/never-flagged', editMode: '1' });
+  assert.match(locOf(never), /error=backorder_shopify_failed&msg=[^#]+&edit=1#line-items$/, locOf(never));
+  const noLine = await postForm('/orders/1001/backorder', cookie, { quantity: '1', editMode: '1' });
+  assert.equal(locOf(noLine), '/orders/1001?error=missing_line_item&edit=1#line-items');
+  assert.equal(await boQty(cookie, li), 3, 'and nothing was removed by any of the refused requests');
+});
+
+await test('EDIT MODE: no opt-in (a normal view-mode submit) leaves every redirect exactly as before', async () => {
+  const cookie = await seedSession();
+  const li = await boProbe(cookie, { qty: 6, title: 'BO view-mode' });
+  const flagged = await boFlag(cookie, { lineItemId: li, quantity: '2' });
+  assert.equal(locOf(flagged), '/orders/1001?success=backorder_flagged');
+  const undone = await boUndo(cookie, li);
+  assert.equal(locOf(undone), '/orders/1001?success=backorder_restored');
+  for (const bad of ['0', 'true', 'yes', '']) {
+    const r = await boFlag(cookie, { lineItemId: li, quantity: '999', editMode: bad });
+    assert.ok(!/edit=1/.test(locOf(r)) && !locOf(r).includes('#'), `editMode=${JSON.stringify(bad)} must not opt in: ${locOf(r)}`);
+  }
+});
+
+await test('EDIT MODE: "Save changes" ends the edit session even if a client sends the field (Save is not a keep-edit action)', async () => {
+  const cookie = await seedSession();
+  const res = await postForm('/orders/1001/edit', cookie, { editMode: '1', staffNote: '' });
+  assert.equal(res.status, 302);
+  assert.ok(!/edit=1/.test(locOf(res)) && !locOf(res).includes('#'), locOf(res));
+  assert.match(locOf(res), /^\/orders\/1001\?(success=order_edited|error=edit_failed)/, locOf(res));
+});
+
+await test('EDIT MODE: the discount / note forms reachable from edit mode keep it too; Cancel does not', async () => {
+  const cookie = await seedSession();
+  const missing = await postForm('/orders/1001/discount', cookie, { type: 'pct', editMode: '1' });
+  assert.equal(locOf(missing), '/orders/1001?error=discount_missing_fields&edit=1#line-items');
+  const note = await postForm('/orders/1001/internal-note', cookie, { note: '', editMode: '1' });
+  assert.equal(locOf(note), '/orders/1001?success=local_note_saved&edit=1#line-items');
+  const plain = await postForm('/orders/1001/internal-note', cookie, { note: '' });
+  assert.equal(locOf(plain), '/orders/1001?success=local_note_saved');
+});
+
+await test('EDIT MODE: the idempotency token and double-submit protection are unchanged by the opt-in', async () => {
+  const cookie = await seedSession();
+  const li = await boProbe(cookie, { qty: 10, title: 'BO keep-edit token' });
+  const fields = { lineItemId: li, quantity: '4', idemKey: `tok-${uuid()}`, editMode: '1' };
+  assert.equal(locOf(await boFlag(cookie, fields)), '/orders/1001?success=backorder_flagged&edit=1#line-items');
+  assert.equal(locOf(await boFlag(cookie, fields)), '/orders/1001?success=backorder_flagged&edit=1#line-items', 'the replay still reports success, still in edit mode');
+  assert.equal(await boQty(cookie, li), 6, 'removed once, not twice');
+  assert.equal((await boRows(cookie)).filter(b => b.line_item_id === li).length, 1);
+  const other = await boFlag(cookie, { ...fields, quantity: '1' });
+  assert.match(decodeURIComponent(locOf(other)), /already used for a different backorder/, 'a reused token on different data is still refused');
+  assert.match(locOf(other), EDIT_SUFFIX);
+});
+
+await test('EDIT MODE: only an explicit ?edit=1 re-enters edit mode — a normal order page load never does', async () => {
+  const cookie = await seedSession();
+  const get = (q = '') => fetch(`${BASE}/orders/1001${q}`, { headers: { Cookie: cookie } }).then(r => r.text());
+  const plain = await get();
+  const flashed = await get('?success=backorder_flagged');
+  const resumed = await get('?edit=1');
+  const garbage = await get('?edit=yes');
+  const off = await get('?edit=0');
+  for (const [name, html] of [['plain', plain], ['flash', flashed], ['edit=yes', garbage], ['edit=0', off]]) {
+    assert.ok(!html.includes('function resume()'), `${name}: no resume script`);
+  }
+  assert.ok(resumed.includes('function resume()') && resumed.includes('toggleEditMode(true)'), '?edit=1 carries the resume script');
+  assert.ok(plain.includes('id="edit-mode-bar" style="display:none"'), 'edit bar is rendered hidden by default');
+  assert.ok(plain.includes('<div class="card" id="line-items">'), 'the scroll anchor exists on every load');
+});
+
+// Housekeeping: no probe line or pending probe row may outlive this section.
+await test('backorder probe lines are cleaned up and no pending backorder is left on #1001', async () => {
+  const cookie = await seedSession();
+  for (const b of await boRows(cookie)) {              // undo what the tests above left flagged (also exercises Undo in bulk)
+    assert.ok(locOf(await boUndo(cookie, b.line_item_id)).includes('success=backorder_restored'), b.line_item_title);
+  }
+  for (const l of await boLines(cookie)) {
+    if (/^BO /.test(l.title) && l.currentQuantity > 0) {
+      const r = await postJson('/orders/1001/line/remove', cookie, { idemKey: uuid(), liId: l.liId });
+      assert.equal(r.status, 200, `remove ${l.title}`);
+    }
+  }
+  assert.deepEqual((await boRows(cookie)).map(b => b.line_item_title), [], 'no pending backorder remains on #1001');
 });
 
 await test('GET /orders/1001 → shows edit order button', async () => {
@@ -3448,34 +3898,51 @@ await test('REGRESSION: type=fulfilled_only is REFUSED, not silently billed in f
   assert.ok(/full/i.test(j.error || ''), `error should explain the order can only be invoiced in full, got: ${j.error}`);
 });
 
-// REGRESSION: shipping and tax were billed IN FULL on every invoice — shipping because
-// shipping_handling came from the client (modal default 'first') with no server-side check against
-// existing invoices, tax because it had no gate at all. Two invoices on a $100+$10 ship+$8 tax order
-// billed $118 then $108 = $226 for a $118 order. Both figures were persisted.
-await test('REGRESSION: shipping and tax are billed ONCE per order, not on every invoice', async () => {
+// #39394: zero-shipping invoices must not consume the once-per-order shipping allowance.
+// Exercise shipping added later, explicit omission, inclusion, then duplicate protection.
+await test('REGRESSION: shipping added after an invoice can be included once; tax stays once per order', async () => {
   const cookie = await seedSession();
-  const post = () => fetch(`${BASE}/orders/1010/partial-invoice`, {
+  const post = (shipping_handling = 'first') => fetch(`${BASE}/orders/1010/partial-invoice`, {
     method: 'POST',
     headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({ type: 'full', shipping_handling: 'first' }).toString(),
+    body: new URLSearchParams({ type: 'full', shipping_handling }).toString(),
   });
-  assert.equal((await post()).status, 200, 'first invoice should succeed');
-  assert.equal((await post()).status, 200, 'second invoice should succeed');
+  const setShipping = async (expectedAmount, amount) => {
+    const res = await fetch(`${BASE}/orders/1010/shipping-charge`, {
+      method: 'POST', redirect: 'manual',
+      headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ expectedAmount, amount, title: 'UPS', idemKey: crypto.randomUUID() }),
+    });
+    assert.match(res.headers.get('location'), /success=shipping_saved/);
+  };
+  await setShipping('10.00', '0.00');
+  assert.equal((await post()).status, 200, 'invoice before shipping is added should succeed');
+  await setShipping('0.00', '35.00');
+  assert.equal((await post('none')).status, 200, 'explicit no-shipping invoice should succeed');
+  assert.equal((await post()).status, 200, 'later invoice should include the new shipping');
+  assert.equal((await post()).status, 200, 'another invoice should not duplicate shipping');
 
   const list = await (await fetch(`${BASE}/api/admin/orders/1010/partial-invoices`, { headers: { Cookie: cookie } })).json();
   const invs = list.invoices || list;
-  assert.ok(invs.length >= 2, `expected at least 2 invoices, got ${invs.length}`);
-  const [a, b] = invs.slice(0, 2).sort((x, y) => String(x.invoice_letter).localeCompare(String(y.invoice_letter)));
-
-  assert.equal(Number(a.shipping), 10, 'the FIRST invoice carries the shipping');
+  assert.equal(invs.length, 4);
+  const [a, b, c, d] = invs.slice().sort((x, y) => String(x.invoice_letter).localeCompare(String(y.invoice_letter)));
+  assert.equal(Number(a.shipping), 0, 'current zero must override historical shipping');
+  assert.equal(Number(b.shipping), 0, 'No shipping must be honored');
+  assert.equal(Number(c.shipping), 35, 'Include shipping must work after zero-shipping invoices');
+  assert.equal(Number(c.total), 135, 'stored total must include the new shipping');
+  assert.equal(Number(d.shipping), 0, 'already invoiced shipping must not be billed again');
   assert.equal(Number(a.tax), 8, 'the FIRST invoice carries the tax');
-  assert.equal(Number(b.shipping), 0, 'the SECOND invoice must NOT re-bill shipping');
-  assert.equal(Number(b.tax), 0, 'the SECOND invoice must NOT re-bill tax');
-  // The order is $118 all-in; the extras must appear exactly once across all invoices.
+  assert.deepEqual([b.tax, c.tax, d.tax].map(Number), [0, 0, 0]);
   const totalShipping = invs.reduce((s, i) => s + Number(i.shipping || 0), 0);
   const totalTax      = invs.reduce((s, i) => s + Number(i.tax || 0), 0);
-  assert.equal(totalShipping, 10, `shipping billed ${totalShipping} across invoices, expected 10`);
+  assert.equal(totalShipping, 35, `shipping billed ${totalShipping} across invoices, expected 35`);
   assert.equal(totalTax, 8, `tax billed ${totalTax} across invoices, expected 8`);
+  const page = await (await fetch(`${BASE}/orders/1010`, { headers: { Cookie: cookie } })).text();
+  assert.match(page, /Shipping was already included on/);
+  assert.ok(page.includes('/orders/1010/invoice?letter=C'));
+  const pdf = await fetch(`${BASE}/orders/1010/partial-invoice/C.pdf`, { headers: { Cookie: cookie } });
+  assert.equal(pdf.status, 200);
+  assert.equal(pdf.headers.get('content-type'), 'application/pdf');
 });
 
 // REGRESSION: a 100%-comped line was invoiced at FULL LIST price. liNum() ends in `|| 0`, so a
@@ -3774,5 +4241,95 @@ console.log('\nAPI tests — Task 48 (Revenue chart + outstanding balance):');
   assert.ok(html.includes('outstanding') || html.includes('Outstanding') || html.includes('card-header'), 'Customer detail: card-header present');
   console.log('  ✓ Customer detail: B2B Customer Settings card with outstanding balance section');
 }
+
+// ── Helcim → Shopify paid sync (MOCK world: Helcim invoice is DUE until POST /__test__/helcim-paid/:id) ──────
+// Uses mock order #1011 (PENDING, explicit $80.99 outstanding, referenced by no other suite on this shared server): the paid path flips it to PAID.
+// The money rules themselves are unit-tested in test/helcim-reconcile.test.mjs; this block proves the route, flashes, order-page strip and audit trail.
+console.log('\nAPI tests — Helcim payment sync:');
+
+const helcimSyncPost = (cookie, id, json = false) => fetch(`${BASE}/orders/${id}/sync-helcim-payment`, {
+  method: 'POST', redirect: 'manual',
+  headers: { Cookie: cookie, ...(json ? { 'Content-Type': 'application/json' } : {}) },
+});
+const countOf = (html, needle) => html.split(needle).length - 1;
+
+await test('Helcim sync: an order with no Helcim ledger row shows no status strip', async () => {
+  const cookie = await seedSession();
+  const html = await (await fetch(`${BASE}/orders/1011`, { headers: { Cookie: cookie } })).text();
+  assert.ok(!html.includes('id="helcim-payment-status"'));
+});
+
+await test('Helcim sync: POST on an order with no invoice → "no invoice" flash (form) / 404 (JSON)', async () => {
+  const cookie = await seedSession();
+  const form = await helcimSyncPost(cookie, 1011);
+  assert.equal(form.status, 302);
+  assert.ok(form.headers.get('location').includes('error=helcim_payment_none'), form.headers.get('location'));
+  const json = await helcimSyncPost(cookie, 1011, true);
+  assert.equal(json.status, 404);
+  assert.deepEqual(await json.json(), { ok: false, outcome: 'no_invoice' });
+});
+
+await test('Helcim sync: requires auth, and a non-numeric order id is a 404', async () => {
+  const anon = await fetch(`${BASE}/orders/1011/sync-helcim-payment`, { method: 'POST', redirect: 'manual' });
+  assert.equal(anon.status, 302);
+  assert.ok(anon.headers.get('location')?.includes('/login'));
+  const cookie = await seedSession();
+  assert.equal((await helcimSyncPost(cookie, 'abc')).status, 404);
+  assert.equal((await helcimSyncPost(cookie, '1011%20OR%201')).status, 404);
+});
+
+await test('Helcim sync: after the invoice is sent the order page shows an awaiting-payment strip with a Check button', async () => {
+  const cookie = await seedSession();
+  const sent = await fetch(`${BASE}/orders/1011/send-credit-card-invoice`, { method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' } });
+  assert.equal(sent.status, 200);
+  const html = await (await fetch(`${BASE}/orders/1011`, { headers: { Cookie: cookie } })).text();
+  assert.ok(html.includes('id="helcim-payment-status"'));
+  assert.ok(html.includes('Helcim invoice MOCK-1011'));
+  assert.ok(html.includes('/orders/1011/sync-helcim-payment'));
+  assert.ok(html.includes('Check Helcim payment'));
+  assert.ok(!html.includes('mock-token-1011'), 'the pay token must never reach the page strip');
+});
+
+await test('Helcim sync: invoice still DUE → "not paid yet" flash, order untouched, nothing audited', async () => {
+  const cookie = await seedSession();
+  const r = await helcimSyncPost(cookie, 1011);
+  assert.equal(r.status, 302);
+  const loc = r.headers.get('location');
+  assert.ok(loc.includes('success=helcim_payment_unpaid') && loc.includes('msg=DUE'), loc);
+  const html = await (await fetch(`${BASE}${loc}`, { headers: { Cookie: cookie } })).text();
+  assert.ok(html.includes('does not show this invoice as paid yet (status DUE)'));
+  assert.ok(html.includes('/orders/1011/mark-paid'), 'order must still be unpaid (Mark Paid still offered)');
+  assert.ok(!html.includes('marked the order paid: Helcim'));
+  assert.ok(html.includes('Helcim shows it as due'), 'strip records the last seen Helcim status');
+});
+
+await test('Helcim sync: Helcim says PAID → the order is marked paid, audited under the staff email, and the pay URL never leaks', async () => {
+  const cookie = await seedSession();
+  assert.equal((await fetch(`${BASE}/__test__/helcim-paid/1011`, { method: 'POST' })).status, 200);
+  const r = await helcimSyncPost(cookie, 1011, true);
+  assert.equal(r.status, 200);
+  const raw = await r.text();
+  const body = JSON.parse(raw);
+  assert.equal(body.ok, true);
+  assert.equal(body.outcome, 'synced');
+  assert.ok(!/token|myhelcim|http/i.test(raw), `response must not carry the invoice token or URL: ${raw}`);
+
+  const html = await (await fetch(`${BASE}/orders/1011`, { headers: { Cookie: cookie } })).text();
+  assert.ok(!html.includes('/orders/1011/mark-paid'), 'order is now PAID (Mark Paid no longer offered)');
+  assert.ok(html.includes('was paid and the order was marked paid'), 'strip shows the finished state');
+  assert.ok(!html.includes('Check Helcim payment'), 'no Check button once the payment is recorded');
+  assert.equal(countOf(html, 'marked the order paid: Helcim invoice MOCK-1011'), 1, 'exactly one history entry');
+  assert.ok(html.includes('alex@fuzzywumpets.com'), 'history credits the staff member');
+});
+
+await test('Helcim sync: a second check is idempotent — "already recorded", no second history row', async () => {
+  const cookie = await seedSession();
+  const j = await (await helcimSyncPost(cookie, 1011, true)).json();
+  assert.equal(j.outcome, 'done');
+  const form = await helcimSyncPost(cookie, 1011);
+  assert.ok(form.headers.get('location').includes('success=helcim_payment_done'));
+  const html = await (await fetch(`${BASE}/orders/1011`, { headers: { Cookie: cookie } })).text();
+  assert.equal(countOf(html, 'marked the order paid: Helcim invoice MOCK-1011'), 1);
+});
 
 if (failed > 0) process.exit(1);
