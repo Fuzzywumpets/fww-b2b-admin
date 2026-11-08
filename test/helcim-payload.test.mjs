@@ -86,7 +86,10 @@ test('preserves a fully comped line as a zero-price item without resurrecting li
 test('marks explicit tax-exempt orders and refuses contradictory non-zero tax', () => {
   const exempt = buildHelcimInvoicePayload({ order: order({ taxExempt: true }), expectedAmount: '10.00' });
   assert.equal(exempt.taxStatus, 'exempt');
-  assert.deepEqual(exempt.payload.tax, { amount: 0, details: 'Tax exempt' });
+  // Live Helcim 2026-11-08 (order #40352): `{"tax[amount]":"tax.amount must be a valid Positive Number"}` for tax.amount 0,
+  // so a zero-tax invoice carries no tax object at all; an exempt one says so in its notes.
+  assert.equal('tax' in exempt.payload, false, 'no tax object when the tax is zero (Helcim refuses amount 0)');
+  assert.match(exempt.payload.notes, /\(tax exempt\)$/);
   assert.throws(
     () => buildHelcimInvoicePayload({ order: order({ taxExempt: true, tax: '1.00', total: '11.00' }), expectedAmount: '11.00' }),
     /Tax-exempt Shopify order has a non-zero tax amount/,
@@ -200,6 +203,15 @@ test('send-credit-card-invoice asks itemizedInvoicesEnabledFor(numId), not the g
   const src = readFileSync(new URL('../server.mjs', import.meta.url), 'utf8');
   assert.match(src, /planHelcimInvoice\(\{ order, expectedAmount, itemized: itemizedInvoicesEnabledFor\(numId\) \}\)/);
   assert.ok(!/itemized: process\.env\.HELCIM_ITEMIZED_INVOICES === '1'/.test(src), 'the route no longer reads the flag directly');
+});
+
+test('a zero-tax, non-exempt order sends no tax object (live Helcim 400 on tax.amount 0, order #40352)', () => {
+  const zero = buildHelcimInvoicePayload({ order: order(), expectedAmount: '10.00' });
+  assert.equal(zero.taxStatus, 'zero_tax');
+  assert.equal(zero.taxCents, 0);
+  assert.equal('tax' in zero.payload, false);
+  assert.equal(zero.payload.notes.includes('tax exempt'), false);
+  assert.equal(zero.amountCents, 1000, 'the reconciled amount is unchanged');
 });
 
 let failed = 0;
