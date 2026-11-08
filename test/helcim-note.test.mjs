@@ -306,7 +306,9 @@ console.log('── send-credit-card-invoice handler (source guards) ──');
 // (`URL` is shadowed by the pay-link fixture above, so reach the global constructor explicitly.)
 const serverSrc = readFileSync(fileURLToPath(new globalThis.URL('../server.mjs', import.meta.url)), 'utf8');
 const handlerStart = serverSrc.indexOf("app.post('/orders/:id/send-credit-card-invoice'");
-const handlerEnd = serverSrc.indexOf('// ── Invoice CSV export', handlerStart);
+// DEPENDS: server.mjs places the "── Helcim -> Shopify paid sync" section header right after the send handler; ending the slice there
+//   keeps later Helcim routes (sync, claim unlock) and their own audit rows out of this handler-only guard.
+const handlerEnd = serverSrc.indexOf('// ── Helcim -> Shopify paid sync', handlerStart);
 const handlerSrc = handlerStart >= 0 && handlerEnd > handlerStart ? serverSrc.slice(handlerStart, handlerEnd) : '';
 
 test('handler source was located', () => {
