@@ -86,7 +86,7 @@ import { createCreditCardInvoice, getInvoice as getHelcimInvoice } from './helci
 import { resolveServiceConfig, assertTestEnvIsolated } from './lib/test-env.mjs';
 // DEPENDS: lib/helcim-invoice-payload.mjs planHelcimInvoice picks the Helcim invoice body for POST /orders/:id/send-credit-card-invoice
 //   (balance-due line by default; main's itemized body only with HELCIM_ITEMIZED_INVOICES=1 and an exactly reconciled order).
-import { planHelcimInvoice } from './lib/helcim-invoice-payload.mjs';
+import { planHelcimInvoice, itemizedInvoicesEnabledFor } from './lib/helcim-invoice-payload.mjs';
 import { buildHelcimBillingAddress } from './lib/helcim-billing.mjs';
 // Helcim -> Shopify paid sync (route POST /orders/:id/sync-helcim-payment + the HELCIM_PAYMENT_SYNC poller). Pure rules + injected deps.
 import { syncHelcimPayment, syncAllHelcimPayments, createHelcimSyncDeps } from './lib/helcim-reconcile.mjs';
@@ -6919,8 +6919,9 @@ app.post('/orders/:id/send-credit-card-invoice', requireAuth, async (req, res) =
   const outstandingValue = order.totalOutstandingSet?.presentmentMoney?.amount;
   const expectedAmount = outstandingValue ?? String(deriveCurrentOrderTotals(order).total);
   // Reconcile 2026-11-08: production's balance-due line is the default; main's exact itemized body is opt-in
-  // (HELCIM_ITEMIZED_INVOICES=1) and falls back to the balance line when the order does not reconcile to the cent.
-  const plan = planHelcimInvoice({ order, expectedAmount, itemized: process.env.HELCIM_ITEMIZED_INVOICES === '1' });
+  // (HELCIM_ITEMIZED_INVOICES=1, or this order's id in HELCIM_ITEMIZED_ORDER_IDS) and falls back to the balance line when the
+  // order does not reconcile to the cent.
+  const plan = planHelcimInvoice({ order, expectedAmount, itemized: itemizedInvoicesEnabledFor(numId) });
   if (!(plan.amountCents > 0)) return fail(409, 'This order has no outstanding balance.');
   const { amountCents, currency, taxExempt, taxStatus, itemCount, omittedSkuLines } = plan;
   // Claim label (helcim_invoice_claims.invoice_number is NOT NULL): the itemized FWW-<order> number, or the order name for a
