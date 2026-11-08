@@ -62,6 +62,11 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # DEPENDS: test/install-model.test.js — fails the release if package.json's per-user install model
+      #   (nsis.oneClick/perMachine, name, productName, publish) drifts from tools/provision-all-users.ps1.
+      - name: Unit tests
+        run: npm test
+
       # WHY THIS RUNS BEFORE THE PUBLISHING BUILD: `npm run dist` publishes as part of itself —
       # electron-builder uploads the installer, blockmap and latest.yml during that step — so any
       # check placed after it gates nothing; the broken artifact is already live and auto-updating.
