@@ -43,6 +43,7 @@ import {
   getOrderByName,
   getOrderInternalNote, setOrderInternalNote, appendOrderInternalNote,
   getHelcimInvoiceMap, claimHelcimInvoiceCreation, releaseHelcimInvoiceClaim,
+  getHelcimInvoiceClaim, releaseCheckedHelcimInvoiceClaim,
   upsertHelcimInvoiceMap, setHelcimInvoiceDelivery,
   claimHelcimPaymentSync, setHelcimPaymentState, listHelcimInvoicesForPaymentSync,
 } from './db.mjs';
@@ -1633,6 +1634,8 @@ function summarizeAudit(action, afterJson) {
     case 'xero:invoice_failed':    return 'Xero invoice sync failed';
     case 'helcim_invoice_sent':    return `sent a Helcim credit card invoice${after.amount != null ? ` for ${fmtMoney(after.amount)}` : ''}`;
     case 'helcim_invoice_email_failed': return 'created a Helcim invoice, but email delivery failed';
+    // DEPENDS: POST /orders/:id/release-helcim-claim writes this verb.
+    case 'helcim_invoice_claim_released': return `unlocked the Helcim invoice button after checking Helcim${after.invoiceNumber ? ` (${after.invoiceNumber} was not created)` : ''}`;
     // DEPENDS: lib/payment-notice.mjs audits this when the owner's "payment received" email could not be sent (the payment itself went through).
     case 'payment_notice_failed':  return 'recorded the payment, but the "payment received" email to the owner could not be sent';
     // SYNC: the three helcim_payment_* verbs are written by lib/helcim-reconcile.mjs syncHelcimPayment (actor = staff email, or system:helcim-sync for the poller).
@@ -2570,6 +2573,38 @@ function helcimPaymentStatusHtml(ledger, numId) {
   return `<div class="helcim-strip" id="helcim-payment-status" style="margin-bottom:12px;padding:10px 14px;border-radius:6px;font-size:13px;background:${colors}">${text}${finished ? '' : button}</div>`;
 }
 
+// A claim younger than this may belong to an invoice request that is still running: helcim.mjs allows 10 s per attempt and two
+// 429 retries (about 35 s), plus one retry without the billing address. Five minutes leaves a wide margin.
+// DEPENDS: helcim.mjs DEFAULT_TIMEOUT_MS / DEFAULT_429_DELAYS_MS; raise this if those grow.
+const HELCIM_CLAIM_UNLOCK_MIN_AGE_MS = 5 * 60 * 1000;
+
+// WHAT: the "invoice button is locked" strip on the order page when a Helcim creation claim exists without an invoice row, with the
+//   staff "I checked Helcim, unlock" form once the claim is old enough (Alex 2026-11-08, DECISIONS-P3 Q7).
+// CHANGE-GUARD: renders nothing when there is no claim or when the invoice row exists (the claim is then consumed). The form pins the
+//   claim's created_at so POST /orders/:id/release-helcim-claim can never delete a newer claim. Every dynamic value goes through h().
+// SYNC: helcim-claim-unlock - field names confirm/claimedAt and the value checked-helcim are read by POST /orders/:id/release-helcim-claim
+//   and asserted by test/api.test.mjs "Helcim unlock".
+function helcimClaimStatusHtml(claim, ledger, numId, now = Date.now()) {
+  if (!claim || ledger) return '';
+  const label = `Helcim invoice ${h(claim.invoice_number)} (${fmtMoney(Number(claim.amount_cents) / 100, claim.currency)})`;
+  const startedAt = h(fmtDateTime(claim.created_at));
+  const unlockAt = Number(claim.created_at) + HELCIM_CLAIM_UNLOCK_MIN_AGE_MS;
+  const intro = `<strong>Send Credit Card Invoice is locked for this order.</strong> Creating ${label} started ${startedAt} and did not finish, so the outcome is uncertain and a second invoice is blocked.`;
+  const form = now < unlockAt
+    ? ` <span>The request may still be running. It can be unlocked after ${h(fmtDateTime(unlockAt))}.</span>`
+    : `<div style="margin-top:8px">Look in Helcim for an invoice for this order created around ${startedAt}. <b>If Helcim has one, do not unlock</b>: use that invoice in Helcim. If Helcim has none, unlock the button here.</div>
+      <form method="POST" action="/orders/${h(numId)}/release-helcim-claim" style="margin-top:8px;display:flex;flex-wrap:wrap;gap:10px;align-items:center">
+        <input type="hidden" name="claimedAt" value="${h(String(claim.created_at))}">
+        <span style="display:inline-flex;align-items:center;gap:6px;min-height:24px">
+          <input type="checkbox" id="helcim-claim-confirm" name="confirm" value="checked-helcim" required style="width:20px;height:20px">
+          <label for="helcim-claim-confirm">I checked Helcim and it has no invoice for this order</label>
+        </span>
+        <button class="btn btn-ghost" type="submit" style="min-height:24px">I checked Helcim, unlock</button>
+      </form>`;
+  // Deliberately NOT class="alert" (the one-shot flash banner class), like helcimPaymentStatusHtml.
+  return `<div class="helcim-strip" id="helcim-claim-status" role="status" style="margin-bottom:12px;padding:10px 14px;border-radius:6px;font-size:13px;background:#fff7e0;border:1px solid #f1d48a">${intro}${form}</div>`;
+}
+
 // WHAT: the large order-detail page — status timeline, editable line items, fulfillments, transactions, address, Xero/partial-invoice state, and the modal JS (edit/discount/fulfill/backorder/invoice/cancel).
 // CHANGE-GUARD: reads several SQLite stores by gid (getXeroMap, getPartialInvoices, getBackordersForOrder, getBackorderedLinesForOrder) — those keys must match shopifyOrderGid(numId). Backordered units are NOT on the Shopify order any more, so they render as inert struck-through rows in a second <tbody class="bo-struck"> (backorderedRowsHtml) that the edit machinery must never see — see the CHANGE-GUARD there. The edit form posts qtys[]/prices[]/removes/addCustomLines to /orders/:id/edit; serializeCustomLines() must run before submit (onclick on Save). Re-test edit/fulfill/cancel modals after any markup change since the inline JS selects elements by hardcoded ids.
 // EDIT-MODE RESUME (2026-10-26): `resumeEdit` (true only for ?edit=1) emits resumeEditScript, which re-enters edit mode after an action taken while editing — see lib/edit-mode-resume.mjs; never default it to true. INVARIANT(S): flash strings map 1:1 to alert banners — adding a server flash value needs a branch here or it renders silently; line-item product links resolve via variant.product.id or the MOCK_VARIANT_PRODUCT fallback.
@@ -2865,6 +2900,19 @@ function renderOrderDetail(session, order, flash, flashMsg, { resumeEdit = false
     ? `<div class="alert alert-warning">The Helcim payment check could not finish. Nothing was marked paid. ${h(flashMsg || 'Check server logs.')}</div>`
     : flash === 'helcim_payment_none'
     ? `<div class="alert alert-warning">This order has no Helcim credit card invoice to check.</div>`
+    // SYNC: helcim-claim-unlock - codes come from POST /orders/:id/release-helcim-claim (HELCIM_CLAIM_FLASH).
+    : flash === 'helcim_claim_released'
+    ? `<div class="alert alert-success">Unlocked. Send Credit Card Invoice is available again for this order.</div>`
+    : flash === 'helcim_claim_none'
+    ? `<div class="alert alert-warning">There is no locked Helcim invoice request on this order, so nothing was unlocked.</div>`
+    : flash === 'helcim_claim_has_invoice'
+    ? `<div class="alert alert-warning">This order already has a recorded Helcim invoice, so nothing was unlocked.</div>`
+    : flash === 'helcim_claim_unconfirmed'
+    ? `<div class="alert alert-warning">Nothing was unlocked. Tick the box to confirm you checked Helcim first.</div>`
+    : flash === 'helcim_claim_changed'
+    ? `<div class="alert alert-warning">Nothing was unlocked: the locked request changed since this page loaded. Reload the order and check Helcim again.</div>`
+    : flash === 'helcim_claim_too_new'
+    ? `<div class="alert alert-warning">Nothing was unlocked: the invoice request started less than five minutes ago and may still be running. Try again later.</div>`
     : flash === 'order_edited'
     ? `<div class="alert alert-success">Order updated.${flashMsg ? ` <span style="color:#b45309">Note: ${h(flashMsg)}</span>` : ''}</div>`
     : flash === 'discount_applied'
@@ -3348,6 +3396,7 @@ function renderOrderDetail(session, order, flash, flashMsg, { resumeEdit = false
     </div>
     ${timeline}
     ${helcimPaymentStatusHtml(helcimInvoice, numId)}
+    ${helcimClaimStatusHtml(getHelcimInvoiceClaim(shopifyOrderGid(numId)), helcimInvoice, numId)}
     <div class="detail-grid">
       <div class="detail-main">
         ${/* DEPENDS: id="line-items" is the scroll anchor of lib/edit-mode-resume.mjs (EDIT_ANCHOR): the keep-edit-mode redirect
@@ -7041,6 +7090,55 @@ app.post('/__test__/helcim-paid/:id', (req, res) => {
   if (!MOCK) return res.status(404).json({ error: 'not found' });
   mockHelcimPaid.add(String(req.params.id));
   res.json({ ok: true });
+});
+
+// WHAT: MOCK-only test hook: seed a creation claim for an order, backdated by ?ageMs, as if an invoice POST had timed out.
+// CHANGE-GUARD: 404 outside MOCK, like /__test__/helcim-paid/:id; it only writes the claim table of the MOCK app's own DB.
+app.post('/__test__/helcim-claim/:id', (req, res) => {
+  if (!MOCK) return res.status(404).json({ error: 'not found' });
+  if (!/^[0-9]{1,20}$/.test(req.params.id)) return res.status(404).json({ error: 'not found' });
+  const orderGid = shopifyOrderGid(req.params.id);
+  releaseHelcimInvoiceClaim(orderGid);
+  const now = Date.now() - Math.max(0, Number(req.query.ageMs) || 0);
+  const { claim } = claimHelcimInvoiceCreation(orderGid, { invoiceNumber: `order #${req.params.id}`, amountCents: 100, currency: 'USD' }, { now });
+  res.json({ ok: true, claimedAt: claim.created_at });
+});
+
+// WHAT: staff "I checked Helcim, unlock" (Alex 2026-11-08, DECISIONS-P3 Q7): releases a Helcim creation claim that a timeout or other
+//   uncertain outcome left behind, after the staff member has checked Helcim by hand and found no invoice for the order.
+// CHANGE-GUARD: this is the only human override of the durable claim (see send-credit-card-invoice). It refuses unless ALL hold: a claim
+//   exists, no helcim_invoice_map row exists, the confirm box was ticked, the posted claimedAt equals the claim's created_at (so a newer
+//   claim is never deleted), and the claim is at least HELCIM_CLAIM_UNLOCK_MIN_AGE_MS old (a request may still be running). It never
+//   calls Helcim or Shopify. Every unlock is audited with the claim's label, amount and time; no token or URL exists on a claim.
+// SYNC: helcim-claim-unlock - helcimClaimStatusHtml (form fields), the helcim_claim_* flash banners, summarizeAudit, test/api.test.mjs.
+const HELCIM_CLAIM_FLASH = {
+  released: ['success', 'helcim_claim_released'],
+  none: ['error', 'helcim_claim_none'],
+  has_invoice: ['error', 'helcim_claim_has_invoice'],
+  unconfirmed: ['error', 'helcim_claim_unconfirmed'],
+  changed: ['error', 'helcim_claim_changed'],
+  too_new: ['error', 'helcim_claim_too_new'],
+};
+app.post('/orders/:id/release-helcim-claim', requireAuth, (req, res) => {
+  const numId = req.params.id;
+  if (!/^[0-9]{1,20}$/.test(numId)) return res.status(404).json({ error: 'Order not found' });
+  const orderGid = shopifyOrderGid(numId);
+  const done = (outcome) => {
+    const [param, code] = HELCIM_CLAIM_FLASH[outcome];
+    return res.redirect(`/orders/${numId}?${param}=${code}`);
+  };
+  const claim = getHelcimInvoiceClaim(orderGid);
+  if (!claim) return done('none');
+  if (getHelcimInvoiceMap(orderGid)) return done('has_invoice');
+  if (req.body?.confirm !== 'checked-helcim') return done('unconfirmed');
+  if (String(req.body?.claimedAt ?? '') !== String(claim.created_at)) return done('changed');
+  if (Date.now() - Number(claim.created_at) < HELCIM_CLAIM_UNLOCK_MIN_AGE_MS) return done('too_new');
+  if (!releaseCheckedHelcimInvoiceClaim(orderGid, claim.created_at)) return done('changed');
+  auditLog(req.adminSession.email, 'helcim_invoice_claim_released', orderGid, {
+    invoiceNumber: claim.invoice_number, amountCents: claim.amount_cents, currency: claim.currency,
+    claimedAt: new Date(Number(claim.created_at)).toISOString(),
+  }, { invoiceNumber: claim.invoice_number, checkedHelcim: true });
+  return done('released');
 });
 
 // outcome -> [?success= | ?error=, flash code]. Informational results use success; anything a person should look at uses error (rendered as a warning).

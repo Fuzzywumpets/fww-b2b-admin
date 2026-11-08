@@ -4332,4 +4332,85 @@ await test('Helcim sync: a second check is idempotent — "already recorded", no
   assert.equal(countOf(html, 'marked the order paid: Helcim invoice MOCK-1011'), 1);
 });
 
+// ── Helcim creation claim: staff unlock ("I checked Helcim, unlock", Alex 2026-11-08 Q7) ──────────────────
+// #1009 is used because no other suite sends it a Helcim invoice; every test below leaves it unclaimed again.
+console.log('\nAPI tests — Helcim creation claim unlock:');
+
+const claimHook = (id, ageMs) => fetch(`${BASE}/__test__/helcim-claim/${id}?ageMs=${ageMs}`, { method: 'POST' });
+const unlockPost = (cookie, id, fields) => fetch(`${BASE}/orders/${id}/release-helcim-claim`, {
+  method: 'POST', redirect: 'manual',
+  headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+  body: new URLSearchParams(fields).toString(),
+});
+
+await test('Helcim unlock: requires auth, and a non-numeric order id is a 404', async () => {
+  const anon = await fetch(`${BASE}/orders/1009/release-helcim-claim`, { method: 'POST', redirect: 'manual' });
+  assert.equal(anon.status, 302);
+  assert.ok(anon.headers.get('location')?.includes('/login'));
+  const cookie = await seedSession();
+  assert.equal((await unlockPost(cookie, 'abc', {})).status, 404);
+});
+
+await test('Helcim unlock: an order with no stuck claim shows no lock strip and the unlock says "nothing to unlock"', async () => {
+  const cookie = await seedSession();
+  const html = await (await fetch(`${BASE}/orders/1009`, { headers: { Cookie: cookie } })).text();
+  assert.ok(!html.includes('id="helcim-claim-status"'));
+  const r = await unlockPost(cookie, 1009, { confirm: 'checked-helcim', claimedAt: '1' });
+  assert.equal(r.status, 302);
+  assert.ok(r.headers.get('location').includes('error=helcim_claim_none'), r.headers.get('location'));
+});
+
+await test('Helcim unlock: a fresh claim locks the invoice button and cannot be unlocked yet (a request may still be running)', async () => {
+  const cookie = await seedSession();
+  const seeded = await claimHook(1009, 0);
+  assert.equal(seeded.status, 200);
+  const { claimedAt } = await seeded.json();
+  const html = await (await fetch(`${BASE}/orders/1009`, { headers: { Cookie: cookie } })).text();
+  assert.ok(html.includes('id="helcim-claim-status"'), 'the lock strip is shown');
+  assert.ok(html.includes('order #1009'), 'the strip names the claimed invoice label');
+  assert.ok(html.includes('can be unlocked after'), 'too new: the strip says when the unlock becomes available');
+  assert.ok(!html.includes('/orders/1009/release-helcim-claim'), 'no unlock form while the claim is fresh');
+  const send = await fetch(`${BASE}/orders/1009/send-credit-card-invoice`, { method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' } });
+  assert.equal(send.status, 409, 'the invoice button stays locked by the claim');
+  const r = await unlockPost(cookie, 1009, { confirm: 'checked-helcim', claimedAt: String(claimedAt) });
+  assert.ok(r.headers.get('location').includes('error=helcim_claim_too_new'), r.headers.get('location'));
+});
+
+await test('Helcim unlock: an old claim offers an accessible confirm-and-unlock form', async () => {
+  const cookie = await seedSession();
+  const { claimedAt } = await (await claimHook(1009, 10 * 60 * 1000)).json();
+  const html = await (await fetch(`${BASE}/orders/1009`, { headers: { Cookie: cookie } })).text();
+  assert.ok(html.includes('action="/orders/1009/release-helcim-claim"'));
+  assert.ok(/<input[^>]*type="checkbox"[^>]*id="helcim-claim-confirm"[^>]*name="confirm"[^>]*value="checked-helcim"[^>]*required/.test(html), 'required confirm checkbox');
+  assert.ok(html.includes('<label for="helcim-claim-confirm"'), 'the checkbox has a label');
+  assert.ok(html.includes(`name="claimedAt" value="${claimedAt}"`), 'the form pins the exact claim it was shown');
+  assert.ok(html.includes('I checked Helcim, unlock'));
+});
+
+await test('Helcim unlock: without the confirmation, or for a different claim, nothing is released', async () => {
+  const cookie = await seedSession();
+  const { claimedAt } = await (await claimHook(1009, 10 * 60 * 1000)).json();
+  const noConfirm = await unlockPost(cookie, 1009, { claimedAt: String(claimedAt) });
+  assert.ok(noConfirm.headers.get('location').includes('error=helcim_claim_unconfirmed'), noConfirm.headers.get('location'));
+  const stale = await unlockPost(cookie, 1009, { confirm: 'checked-helcim', claimedAt: String(claimedAt - 1) });
+  assert.ok(stale.headers.get('location').includes('error=helcim_claim_changed'), stale.headers.get('location'));
+  const html = await (await fetch(`${BASE}/orders/1009`, { headers: { Cookie: cookie } })).text();
+  assert.ok(html.includes('id="helcim-claim-status"'), 'the claim is still in place');
+});
+
+await test('Helcim unlock: confirmed unlock releases the claim, is audited in the order history, and a repeat finds nothing', async () => {
+  const cookie = await seedSession();
+  const { claimedAt } = await (await claimHook(1009, 10 * 60 * 1000)).json();
+  const r = await unlockPost(cookie, 1009, { confirm: 'checked-helcim', claimedAt: String(claimedAt) });
+  assert.equal(r.status, 302);
+  const loc = r.headers.get('location');
+  assert.ok(loc.includes('success=helcim_claim_released'), loc);
+  const html = await (await fetch(`${BASE}${loc}`, { headers: { Cookie: cookie } })).text();
+  assert.ok(!html.includes('id="helcim-claim-status"'), 'the lock strip is gone');
+  assert.ok(html.includes('Send Credit Card Invoice is available again'), 'flash confirms the unlock');
+  assert.equal(countOf(html, 'unlocked the Helcim invoice button after checking Helcim'), 1, 'exactly one audited history row');
+  const again = await unlockPost(cookie, 1009, { confirm: 'checked-helcim', claimedAt: String(claimedAt) });
+  assert.ok(again.headers.get('location').includes('error=helcim_claim_none'));
+});
+
 if (failed > 0) process.exit(1);

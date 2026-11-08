@@ -634,8 +634,8 @@ export function getHelcimInvoiceMap(orderId) {
 // CHANGE-GUARD: Invoice API creation has no documented idempotency header; never replace this with
 // an in-memory lock, and never clear a claim after a timeout/network/5xx outcome.
 // INVARIANT(S): INSERT OR IGNORE plus the primary key makes concurrent double-submit single-winner.
-export function claimHelcimInvoiceCreation(orderId, { invoiceNumber, amountCents, currency }) {
-  const now = Date.now();
+// `now` exists only so the MOCK test hook (server.mjs POST /__test__/helcim-claim/:id) can seed an old, stuck claim.
+export function claimHelcimInvoiceCreation(orderId, { invoiceNumber, amountCents, currency }, { now = Date.now() } = {}) {
   const result = db.prepare(`
     INSERT OR IGNORE INTO helcim_invoice_claims
       (order_id, invoice_number, amount_cents, currency, created_at, updated_at)
@@ -645,6 +645,23 @@ export function claimHelcimInvoiceCreation(orderId, { invoiceNumber, amountCents
     acquired: result.changes === 1,
     claim: db.prepare('SELECT * FROM helcim_invoice_claims WHERE order_id = ?').get(String(orderId)) || null,
   };
+}
+
+// WHAT: the creation claim for an order, or null. A claim with no helcim_invoice_map row means an invoice POST is running or
+//   ended with an uncertain outcome; the order page shows it as a lock strip with the staff unlock below.
+// CHANGE-GUARD: read-only; the row holds no token or URL, but callers still render only the label, amount and time.
+export function getHelcimInvoiceClaim(orderId) {
+  return db.prepare('SELECT * FROM helcim_invoice_claims WHERE order_id = ?').get(String(orderId)) || null;
+}
+
+// WHAT: staff unlock ("I checked Helcim, unlock", POST /orders/:id/release-helcim-claim): deletes the claim ONLY if it is
+//   the exact one the staff member was shown (same created_at), so a newer claim taken after the page rendered survives.
+// CHANGE-GUARD: never call this from an automatic path. It is the human override of the "never clear an ambiguous claim"
+//   rule above: the person has checked Helcim and found no invoice. Returns true only when a row was deleted.
+// DEPENDS: server.mjs POST /orders/:id/release-helcim-claim (age, confirmation and no-ledger checks happen there first).
+export function releaseCheckedHelcimInvoiceClaim(orderId, createdAt) {
+  return db.prepare('DELETE FROM helcim_invoice_claims WHERE order_id = ? AND created_at = ?')
+    .run(String(orderId), Number(createdAt)).changes === 1;
 }
 
 // WHAT: releases a creation claim only after a definitive rejection proves Helcim did not create an invoice.
