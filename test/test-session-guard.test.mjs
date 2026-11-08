@@ -35,6 +35,17 @@ const spawned = [];
 const tmpDirs = [];
 
 // Boots a real MOCK=false server on `port` with `env` merged in, waits for /healthz, returns a handle.
+// A free loopback port from the OS. The old fixed 8896/8895 are live services on fww-vps-1 (8896 = fww-crystal-patterns, whose
+// /healthz answers 200, so startServer "found" it and this suite ran against a public production app). DEPENDS: server.mjs reads PORT.
+async function freePort() {
+  const { createServer } = await import('node:net');
+  return new Promise((resolve, reject) => {
+    const s = createServer();
+    s.once('error', reject);
+    s.listen(0, '127.0.0.1', () => { const { port } = s.address(); s.close(() => resolve(port)); });
+  });
+}
+
 async function startServer(port, env) {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'b2badmin-test-'));
   tmpDirs.push(dataDir);
@@ -53,6 +64,8 @@ async function startServer(port, env) {
   spawned.push(child);
   const base = `http://127.0.0.1:${port}`;
   for (let i = 0; i < 40; i++) {
+    // Our child must still be running: if it died (EADDRINUSE) another process could be answering on this port.
+    if (child.exitCode !== null || child.signalCode !== null) throw new Error(`server on ${port} exited before it was ready`);
     try {
       const r = await fetch(`${base}/healthz`, { signal: AbortSignal.timeout(1000) });
       if (r.ok) return { base, child, dataDir };
@@ -70,7 +83,7 @@ console.log('\n/__test__/session guard tests (non-MOCK):');
 
 // ── 1. Flag unset (the production posture): the route must not exist at all. ──────────────────
 {
-  const { base } = await startServer(8896, {});
+  const { base } = await startServer(await freePort(), {});
 
   await test('flag unset → 404, no session cookie', async () => {
     const res = await fetch(`${base}/__test__/session?email=alex@fuzzywumpets.com`);
@@ -82,7 +95,7 @@ console.log('\n/__test__/session guard tests (non-MOCK):');
 // ── 2. Flag SET (the leaked-env-var scenario). The flag alone must no longer be enough. ───────
 {
   const ALLOWED = 'allowed@example.com';
-  const { base, dataDir } = await startServer(8895, {
+  const { base, dataDir } = await startServer(await freePort(), {
     B2B_ADMIN_ALLOW_TEST_SESSION: '1',
     B2B_ADMIN_ALLOWED_EMAILS: ALLOWED,
   });

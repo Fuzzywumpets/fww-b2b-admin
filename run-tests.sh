@@ -7,7 +7,10 @@ echo "======================================================"
 echo "         fww-b2b-admin test suite"
 echo "======================================================"
 
-PORT=8894
+# DEPENDS: fww-vps-1 already listens on the old fixed port 8894 (docker-proxy for the fuzzy-tavern-horde-keepalive container), so
+# the mock server could not bind it and the health probe below got the container's 404 -> "mock server did not start" (2026-11-08).
+# Ask the OS for a free loopback port unless B2B_ADMIN_TEST_PORT pins one. Every suite reads TEST_BASE, never a hardcoded port.
+PORT="${B2B_ADMIN_TEST_PORT:-$(node -e "const s=require('net').createServer();s.listen(0,'127.0.0.1',()=>{process.stdout.write(String(s.address().port));s.close();})")}"
 echo ""
 echo "Starting mock server (B2B_ADMIN_MOCK=1, port $PORT)..."
 # HELCIM_ITEMIZED_INVOICES=1: the API suite drives BOTH Helcim invoice bodies (reconcile 2026-11-08) - #1010 reconciles and goes
@@ -18,15 +21,23 @@ MOCK_PID=$!
 cleanup() { kill "$MOCK_PID" 2>/dev/null || true; }
 trap cleanup EXIT
 
+# Ready = OUR process is still alive AND /healthz answers. Checking the pid matters: if the port was taken after it was picked,
+# node exits with EADDRINUSE and whatever owns the port would otherwise answer the probe (and receive every test request).
+READY=0
 for i in $(seq 1 20); do
+  if ! kill -0 "$MOCK_PID" 2>/dev/null; then
+    echo "ERROR: mock server exited before it was ready (port $PORT already in use? set B2B_ADMIN_TEST_PORT)" >&2
+    exit 1
+  fi
   if curl -sf "http://127.0.0.1:$PORT/healthz" >/dev/null 2>&1; then
-    echo "Mock server ready (pid $MOCK_PID)"
+    READY=1
+    echo "Mock server ready (pid $MOCK_PID, port $PORT)"
     break
   fi
   sleep 0.5
 done
-if ! curl -sf "http://127.0.0.1:$PORT/healthz" >/dev/null 2>&1; then
-  echo "ERROR: mock server did not start" >&2
+if [ "$READY" -ne 1 ] || ! kill -0 "$MOCK_PID" 2>/dev/null; then
+  echo "ERROR: mock server did not start on port $PORT" >&2
   exit 1
 fi
 
