@@ -13,7 +13,9 @@ echo "======================================================"
 PORT="${B2B_ADMIN_TEST_PORT:-$(node -e "const s=require('net').createServer();s.listen(0,'127.0.0.1',()=>{process.stdout.write(String(s.address().port));s.close();})")}"
 echo ""
 echo "Starting mock server (B2B_ADMIN_MOCK=1, port $PORT)..."
-PORT=$PORT B2B_ADMIN_MOCK=1 B2B_IMPERSONATION_SECRET=test-impersonation-secret-mock SHOPIFY_WEBHOOK_SECRET=test-shopify-webhook-secret node server.mjs &
+# HELCIM_ITEMIZED_INVOICES=1: the API suite drives BOTH Helcim invoice bodies (reconcile 2026-11-08) - #1010 reconciles and goes
+# itemized, the edited #1001 does not and falls back to the balance line. Production leaves it unset (balance line only).
+PORT=$PORT B2B_ADMIN_MOCK=1 HELCIM_ITEMIZED_INVOICES=1 B2B_IMPERSONATION_SECRET=test-impersonation-secret-mock SHOPIFY_WEBHOOK_SECRET=test-shopify-webhook-secret node server.mjs &
 MOCK_PID=$!
 
 cleanup() { kill "$MOCK_PID" 2>/dev/null || true; }
@@ -99,6 +101,13 @@ if [ -f test/order-money.test.mjs ]; then
   node test/order-money.test.mjs || UNIT_FAIL=$?
 fi
 
+# Large-order discount staging is a pure Shopify batching contract. The mock server cannot expose
+# the timeout that occurred on live #39355 (286 lines), so exercise the generated aliases directly.
+if [ -f test/order-discount-batching.test.mjs ]; then
+  echo ""
+  node test/order-discount-batching.test.mjs || UNIT_FAIL=$?
+fi
+
 if [ -f test/helcim.test.mjs ]; then
   echo ""
   echo "── Unit: Helcim invoice client (standalone, no server) ──"
@@ -123,12 +132,60 @@ if [ -f test/helcim-message.test.mjs ]; then
   node test/helcim-message.test.mjs || UNIT_FAIL=$?
 fi
 
+if [ -f test/helcim-note.test.mjs ]; then
+  echo ""
+  echo "── Unit: Helcim note helpers (normalizeStaffNote / quoteForMarkdown / buildLegacyInvoiceEmail) ──"
+  node test/helcim-note.test.mjs || UNIT_FAIL=$?
+fi
+
+if [ -f test/helcim-billing.test.mjs ]; then
+  echo ""
+  echo "── Unit: Helcim invoice billing address (buildHelcimBillingAddress + query/handler source guards) ──"
+  node test/helcim-billing.test.mjs || UNIT_FAIL=$?
+fi
+
+# Helcim -> Shopify paid sync. Two standalone runs (neither is reachable through the mock HTTP server):
+#  - helcim-reconcile: the money rules (assessInvoice / assessOrder / syncHelcimPayment / sweep / Shopify wiring) against fakes.
+#  - helcim-paid-migration: DB-level. Builds a throwaway admin.db with the OLD helcim_invoice_map (B2B_ADMIN_DATA_DIR, deliberately NOT
+#    B2B_ADMIN_MOCK), proves the old row survives, the migration is a no-op the second time, the previous release's SQL still runs, and
+#    the claim / state / poll-list SQL behaves.
+# The route + order-page strip + audit trail are covered over HTTP at the end of test/api.test.mjs (MOCK, via POST /__test__/helcim-paid/:id).
+if [ -f test/helcim-reconcile.test.mjs ]; then
+  echo ""
+  echo "── Unit: Helcim paid sync rules (standalone, no server) ──"
+  node test/helcim-reconcile.test.mjs || UNIT_FAIL=$?
+fi
+if [ -f test/helcim-paid-migration.test.mjs ]; then
+  echo ""
+  echo "── Unit: Helcim paid sync ledger + migration (standalone, throwaway DB) ──"
+  node test/helcim-paid-migration.test.mjs || UNIT_FAIL=$?
+fi
+
 # Order-edit userErrors: the batch /edit handler returns from its MOCK branch before any Shopify
 # mutation, so this path can ONLY be covered standalone.
 if [ -f test/order-edit-user-errors.test.mjs ]; then
   echo ""
   node test/order-edit-user-errors.test.mjs || UNIT_FAIL=$?
 fi
+
+# Backorder flag/undo. Two standalone runs, because the dangerous paths cannot be provoked over HTTP:
+#  - backorder-migration: DB-level. Builds a throwaway admin.db with the OLD backorders DDL (B2B_ADMIN_DATA_DIR,
+#    deliberately NOT B2B_ADMIN_MOCK — the migration only matters for an existing on-disk DB), proves an old
+#    row survives, the migration is a no-op the second time, and the previous release's INSERT still works.
+#  - backorder-edit: the orchestration state machine against a fake Shopify (commit-then-error, failed
+#    read-back, crash between the Shopify write and the status flip) over the real db.mjs SQL.
+if [ -f test/backorder-migration.test.mjs ]; then
+  echo ""
+  node test/backorder-migration.test.mjs || UNIT_FAIL=$?
+fi
+if [ -f test/backorder-edit.test.mjs ]; then
+  echo ""
+  B2B_ADMIN_MOCK=1 node test/backorder-edit.test.mjs || UNIT_FAIL=$?
+fi
+
+# Shipping replacement must abort before commit if any Shopify staging mutation fails.
+node --test test/order-shipping.test.mjs || UNIT_FAIL=$?
+node test/shipping-ui.test.mjs || UI_FAIL=$?
 
 # List truncation lives here for the same reason: the cache path is gated on `if (!MOCK)`, so the
 # HTTP suite can never reach the capped query that truncates /orders and /customers.
@@ -182,6 +239,58 @@ if [ -f test/order-display-totals.test.mjs ]; then
   node test/order-display-totals.test.mjs || UNIT_FAIL=$?
 fi
 
+# Invoice rendering: archived partial invoices must retain/recover SKU and
+# variant identity, and dense tables must paginate with full readable rows.
+if [ -f test/invoice-format.test.mjs ]; then
+  echo ""
+  node test/invoice-format.test.mjs || UNIT_FAIL=$?
+fi
+
+# Backordered lines on the ORDER invoice (struck rows + footnote; lib/invoice-backorder.mjs, pdf.mjs,
+# GET /orders/:id/invoice[.pdf]). Standalone and SELF-CONTAINED: it boots its own mock server on a free port
+# (so it never shares state or a port with the suite above) and drives POST /orders/1001/backorder through the
+# real flow; it also pins "no backordered lines => byte-identical invoice" against goldens generated from the
+# pre-feature commit. Needs Playwright's Chromium for the 390/768/1280 on-screen checks, like ui.test.mjs.
+if [ -f test/invoice-backorder.test.mjs ]; then
+  echo ""
+  node test/invoice-backorder.test.mjs || UNIT_FAIL=$?
+fi
+
+# Wholesale-priced added lines on invoices (partial invoice #39875-A: SKU 04622 printed at list price plus a
+# "Discount -$9.00" row although Shopify's net was the wholesale price). Standalone and SELF-CONTAINED: it boots its
+# own mock server on a free port (seeding two legacy partial-invoice snapshots through a --import module) so it never
+# shares state or a port with the suite above, and it reads back what the PDFs actually draw.
+if [ -f test/invoice-wholesale-lines.test.mjs ]; then
+  echo ""
+  node test/invoice-wholesale-lines.test.mjs || UNIT_FAIL=$?
+fi
+
+# Backordered lines on LETTERED partial invoices (order #39875: letter B, issued after three units were backordered,
+# printed no struck rows and no footnote). Standalone and SELF-CONTAINED like the two suites above: it boots its own mock
+# server on a free port, seeds the incident (legacy snapshots A and B + the three backorders, with their prod timestamps)
+# through a --import module, and reads back what the PDFs actually draw. Sections 1-2 are pure (lib/partial-invoice-backorder.mjs).
+if [ -f test/invoice-partial-backorder.test.mjs ]; then
+  echo ""
+  node test/invoice-partial-backorder.test.mjs || UNIT_FAIL=$?
+fi
+
+# Invoice line ORDER = warehouse pick-list order (pdf.mjs invoiceSortKey, a port of fww-shipping-bridge pickAggregate). Standalone and
+# SELF-CONTAINED: sections 1-3 are pure and use the real lines of order #39875 plus the sequence the bridge's own code produced for
+# them (test/fixtures/order-39875-pick-list.json); section 4 boots its own mock server on a free port and checks the full invoice,
+# a new lettered invoice and a re-downloaded legacy letter.
+if [ -f test/invoice-pick-order.test.mjs ]; then
+  echo ""
+  node test/invoice-pick-order.test.mjs || UNIT_FAIL=$?
+fi
+
+# partial_invoices.backordered_json — the additive column that freezes a lettered invoice's backordered lines. DB-level and
+# standalone: it needs an existing OLD-schema file (the mock server's fresh in-memory DB can never prove an issued invoice
+# survives the migration or that the previous release's INSERT still runs after it). Throwaway dir via B2B_ADMIN_DATA_DIR.
+if [ -f test/partial-invoice-migration.test.mjs ]; then
+  echo ""
+  node test/partial-invoice-migration.test.mjs || UNIT_FAIL=$?
+fi
+
 # The #38953 lock-up: a permanently-failing line edit armed a beforeunload guard, and the Electron
 # shell cancels a prevented unload SILENTLY — every link, the back button, "Generate PDF" and Quit
 # died at once. Standalone: it spans desktop shell code (never loaded by the server) and source-level
@@ -205,6 +314,19 @@ fi
 if [ -f test/fulfillment-order-paging.test.mjs ]; then
   echo ""
   node test/fulfillment-order-paging.test.mjs || UNIT_FAIL=$?
+fi
+
+if [ -f test/paginate-connection.test.mjs ]; then
+  echo ""
+  node test/paginate-connection.test.mjs || UNIT_FAIL=$?
+fi
+
+# Pagination guard (vendored from ~/.claude/scripts/pagination_guard.py): any new unbounded list fetch fails the suite.
+if [ -f scripts/pagination_guard.py ]; then
+  echo ""
+  # DeepReview 2026-10-14: choose the interpreter, then run the guard ONCE so its exit status is never masked.
+  PY=$(command -v python3 || command -v python || true)
+  if [ -z "$PY" ]; then echo "pagination_guard: no python interpreter"; UNIT_FAIL=1; else "$PY" scripts/pagination_guard.py . || UNIT_FAIL=$?; fi
 fi
 if [ -f test/dashboard-paging.test.mjs ]; then
   echo ""
@@ -238,6 +360,56 @@ fi
 if [ -f test/admin-allowlist.test.mjs ]; then
   echo ""
   node test/admin-allowlist.test.mjs || UNIT_FAIL=$?
+fi
+
+# Edit mode survives the order page's POST -> 302 -> GET actions (2026-10-26 hot-fix: Mark backordered / Undo used to
+# bounce staff out of edit mode). The redirect rewrite is a pure function + one middleware, so its cases (including
+# "never an open redirect" and "Save changes is not a keep-edit action") and the server wiring guards run standalone;
+# the browser half is in test/ui.test.mjs and the real routes' Location headers are in test/api.test.mjs.
+if [ -f test/edit-mode-resume.test.mjs ]; then
+  echo ""
+  node test/edit-mode-resume.test.mjs || UNIT_FAIL=$?
+fi
+
+# Sequential Shopify round trips behind a backorder / undo / autosave edit, and that the shortcuts taken to cut them
+# (2026-10-26 "seems slow": 7 calls per Mark backordered, four of them whole-order reads) left every fail-closed
+# rule intact. Standalone and SELF-CONTAINED: boots the REAL (non-MOCK) server on a free port with a throwaway
+# B2B_ADMIN_DATA_DIR and test/fixtures/fake-shopify-bridge.mjs preloaded (no network, never the live admin.db), so it
+# counts and schema-validates every GraphQL document. MOCK cannot do this: it never calls Shopify.
+if [ -f test/backorder-roundtrips.test.mjs ]; then
+  echo ""
+  node test/backorder-roundtrips.test.mjs || UNIT_FAIL=$?
+fi
+
+# "Marked paid manually" / Helcim-transaction note line (lib/paid-note.mjs) + db appendOrderInternalNote (append, 4000-char cap).
+# Pure unit test on the in-memory MOCK db - no server. The HTTP side is in api.test.mjs and orders-bulk-markpaid.test.mjs.
+if [ -f test/paid-note.test.mjs ]; then
+  echo ""
+  node test/paid-note.test.mjs || UNIT_FAIL=$?
+fi
+
+# Orders list: tick + Mark Paid (POST /orders/bulk). 2026-10-27 report: the page said "Order(s) marked as paid." while the order
+# still read PENDING, because GET /orders is served from orders_cache and the Shopify webhook refreshes it 2-3 s AFTER the redirect.
+# Standalone and SELF-CONTAINED: boots the REAL (non-MOCK) server on a free port with a throwaway B2B_ADMIN_DATA_DIR and
+# test/fixtures/fake-shopify-markpaid.mjs preloaded, seeds orders_cache, and drives a real Chromium through the real form.
+# MOCK cannot: it never calls Shopify and never reads the cache. Needs Playwright's Chromium, like ui.test.mjs.
+if [ -f test/orders-bulk-markpaid.test.mjs ]; then
+  echo ""
+  node test/orders-bulk-markpaid.test.mjs || UNIT_FAIL=$?
+fi
+
+# "Payment received" email to the owner for STAFF-recorded payments (Mark Paid bulk / order page, Record payment), 2026-10-27.
+# lib/payment-notice.mjs is pure and injected (no server). The routes test boots the REAL (non-MOCK) server with the fake Shopify
+# above AND an in-process fake Portal, and pins: one digest per bulk action, sent only after the audit row, double-submit = one
+# mail, fail-open (Portal 502/404/hang never fails or delays a payment, audited as payment_notice_failed). MOCK cannot: it calls
+# neither Shopify nor the Portal. Needs the Portal route (fww-b2b-portal docs/PAYMENT-NOTICE.md) only in production, not here.
+if [ -f test/payment-notice-lib.test.mjs ]; then
+  echo ""
+  node test/payment-notice-lib.test.mjs || UNIT_FAIL=$?
+fi
+if [ -f test/payment-notice-routes.test.mjs ]; then
+  echo ""
+  node test/payment-notice-routes.test.mjs || UNIT_FAIL=$?
 fi
 
 echo ""

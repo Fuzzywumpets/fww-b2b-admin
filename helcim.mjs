@@ -1,3 +1,5 @@
+import { HELCIM_BILLING_KEYS, cleanBillingText } from './lib/helcim-billing.mjs';
+
 const HELCIM_API_BASE_URL = 'https://api.helcim.com/v2/';
 const DEFAULT_TIMEOUT_MS = 10_000;
 const DEFAULT_429_DELAYS_MS = [1_000, 2_000];
@@ -110,25 +112,127 @@ export async function helcimRequest(path, {
   }
 }
 
-// WHAT: creates one pre-validated, itemized DUE invoice and returns its customer-payable online view.
-// CHANGE-GUARD: Invoice API POSTs have no documented idempotency-key support. Only explicit 429
-// responses are retried; timeouts, network errors, malformed successes, and 5xx responses are
-// outcome-unknown and must stay blocked by the caller's durable creation claim.
-// INVARIANT(S): payload reconciliation happens before this function; a response without
-// invoiceId+token fails closed before any email is sent and never leaks the response body.
-export async function createCreditCardInvoice({ payload, amountCents, currency }, options = {}) {
-  if (!payload || typeof payload !== 'object') throw new TypeError('Validated invoice payload is required');
-  if (!Number.isSafeInteger(amountCents) || amountCents <= 0) throw new TypeError('Invoice amount must be greater than zero');
+// WHAT: read-only lookup of ONE Helcim invoice's payment status, reduced to the fields the paid-sync needs.
+// CHANGE-GUARD: returns ONLY { invoiceId, invoiceNumber, status, amount, amountPaid, amountDue, currency, datePaid } — never the
+// online-view token, billing address, notes or customer id, so a caller can log/audit the result without leaking payment data.
+// A response it cannot fully trust throws (fails closed): this feeds a decision to mark a Shopify order PAID, so a missing or
+// non-numeric field must never be read as "paid". datePaid is Helcim's naive account-local timestamp, informational only.
+// INVARIANT(S): invoiceId must be a plain non-negative integer (checked before any request, so it can never alter the URL path);
+// the id Helcim echoes back must equal the id requested; status/currency are upper-cased; '0000-00-00 00:00:00' => null.
+// DEPENDS: lib/helcim-reconcile.mjs assessInvoice() consumes exactly this shape.
+export async function getInvoice(invoiceId, options = {}) {
+  const id = typeof invoiceId === 'number' ? (Number.isSafeInteger(invoiceId) && invoiceId >= 0 ? String(invoiceId) : '') : String(invoiceId ?? '');
+  if (!/^[0-9]{1,20}$/.test(id)) throw new TypeError('Helcim invoice id must be a plain numeric id');
+
+  const response = await helcimRequest(`/invoices/${id}`, { ...options, method: 'GET', body: undefined });
+  const invoice = response.data?.invoice || response.data;
+  if (!invoice || typeof invoice !== 'object') throw new HelcimApiError('Helcim invoice response was not an invoice');
+  if (invoice.invoiceId !== undefined && String(invoice.invoiceId) !== id) throw new HelcimApiError('Helcim invoice response was for a different invoice');
+
+  const status = typeof invoice.status === 'string' ? invoice.status.trim().toUpperCase() : '';
+  const currency = typeof invoice.currency === 'string' ? invoice.currency.trim().toUpperCase() : '';
+  const money = (value) => (typeof value === 'number' && Number.isFinite(value) ? value : NaN);
+  const amount = money(invoice.amount), amountPaid = money(invoice.amountPaid), amountDue = money(invoice.amountDue);
+  if (!status) throw new HelcimApiError('Helcim invoice response was missing a status');
+  if (![amount, amountPaid, amountDue].every(Number.isFinite)) throw new HelcimApiError('Helcim invoice response had a missing or non-numeric amount');
+  if (!['USD', 'CAD'].includes(currency)) throw new HelcimApiError('Helcim invoice response had an unsupported currency');
+
+  const paidOn = typeof invoice.datePaid === 'string' ? invoice.datePaid.trim() : '';
+  return {
+    invoiceId: id,
+    invoiceNumber: invoice.invoiceNumber ? String(invoice.invoiceNumber) : null,
+    status, amount, amountPaid, amountDue, currency,
+    datePaid: paidOn && !paidOn.startsWith('0000-00-00') ? paidOn : null,
+  };
+}
+
+
+// WHAT: creates one DUE Helcim invoice and returns its customer-payable online view. Reconciled 2026-11-08 from two lineages,
+//   so it accepts two body shapes:
+//   - BALANCE DUE (production since 2026-10-26, the default): `{ orderName, amount, currency }` -> one "Balance due" line for the
+//     exact outstanding amount, so partially paid and edited orders bill only what is still owed.
+//   - ITEMIZED (main PR #38, opt-in): `{ payload, amountCents, currency }` where `payload` is the pre-validated, exactly reconciled
+//     body from lib/helcim-invoice-payload.mjs buildHelcimInvoicePayload. The route only takes this path when
+//     HELCIM_ITEMIZED_INVOICES=1 AND the order reconciles; it is the shape main shipped and has never run against live Helcim.
+// CHANGE-GUARD: Invoice API POSTs have no documented idempotency-key support. Only explicit 429 responses are retried (both shapes);
+//   timeouts, network errors, malformed successes, and 5xx responses are outcome-unknown and must stay blocked by the caller's
+//   durable creation claim (db.mjs helcim_invoice_claims).
+// BILLING: an optional `billingAddress` (lib/helcim-billing.mjs buildHelcimBillingAddress) puts the customer's name, address and
+//   email on the invoice; on the itemized shape it REPLACES the payload's own billingAddress (production's builder normalises
+//   province/country the way Helcim accepts). It is whitelisted to HELCIM_BILLING_KEYS and omitted unless name+street1+postalCode
+//   are present. If Helcim answers 400/422 while an address is attached, the invoice is retried ONCE without any address
+//   (billingAddress and shipping.address), because the address is cosmetic and must never stop a card invoice going out; those two
+//   statuses mean Helcim validated and refused the request, so no invoice exists to duplicate. Every other failure (401, 429 after
+//   its retries, 5xx, timeout, network) may have created the invoice and is NOT retried. Resolves with `billingIncluded`.
+// COMPANY: an optional `companyName` is also appended to the invoice notes ("Fuzzywumpets wholesale order #1234 - Acme Pet Supply"),
+//   so the company is on the invoice even when the billing address is incomplete or Helcim refuses it (Alex, 2026-10-27: "make sure
+//   that is company name, somewhere"). Nothing parses these notes (the paid-sync matches by invoice id/number), but keep the leading
+//   "Fuzzywumpets wholesale order <name>" text stable.
+// INVARIANT(S): amount is positive, currency is USD/CAD (and equals payload.currency on the itemized shape); a response without
+//   invoiceId+token, or with an amount other than the one requested, fails closed (outcomeUnknown) before any email is sent and
+//   never leaks the response body.
+// DEPENDS: server.mjs POST /orders/:id/send-credit-card-invoice picks the shape (helcimInvoiceMode) and passes `billingAddress` +
+//   `companyName` (order.customer.company, resolved by getOrderDetail); it surfaces `billingIncluded`.
+export async function createCreditCardInvoice({ payload, amountCents: itemizedCents, orderName, amount, currency, billingAddress, companyName } = {}, options = {}) {
   const normalizedCurrency = String(currency || '').toUpperCase();
-  if (!['USD', 'CAD'].includes(normalizedCurrency) || payload.currency !== normalizedCurrency) {
-    throw new TypeError('Invoice currency must be USD or CAD and match the validated payload');
+  const { warn = console.error, ...requestOptions } = options;
+  const company = cleanBillingText(companyName).slice(0, 120).trim();
+  let body;
+  let amountCents;
+  if (payload !== undefined) {
+    if (!payload || typeof payload !== 'object') throw new TypeError('Validated invoice payload is required');
+    if (!Number.isSafeInteger(itemizedCents) || itemizedCents <= 0) throw new TypeError('Invoice amount must be greater than zero');
+    if (!['USD', 'CAD'].includes(normalizedCurrency) || payload.currency !== normalizedCurrency) {
+      throw new TypeError('Invoice currency must be USD or CAD and match the validated payload');
+    }
+    amountCents = itemizedCents;
+    body = { ...payload };
+    if (company && typeof body.notes === 'string') body.notes = `${body.notes} - ${company}`;
+  } else {
+    const normalizedAmount = Math.round(Number(amount) * 100) / 100;
+    if (!Number.isFinite(normalizedAmount) || normalizedAmount <= 0) throw new TypeError('Invoice amount must be greater than zero');
+    if (!['USD', 'CAD'].includes(normalizedCurrency)) throw new TypeError('Invoice currency must be USD or CAD');
+    amountCents = Math.round(normalizedAmount * 100);
+    const orderNote = `Fuzzywumpets wholesale order ${String(orderName || '').trim()}`.trim();
+    body = {
+      currency: normalizedCurrency,
+      type: 'INVOICE',
+      status: 'DUE',
+      lineItems: [{
+        description: `Balance due for Fuzzywumpets wholesale order ${String(orderName || '').trim()}`.trim(),
+        quantity: 1,
+        price: normalizedAmount,
+      }],
+      notes: company ? `${orderNote} - ${company}` : orderNote,
+    };
   }
-  const response = await helcimRequest('/invoices', {
-    ...options,
+  const billing = pickBillingAddress(billingAddress);
+  if (billing) body.billingAddress = billing;
+  const hasAddress = !!body.billingAddress || !!body.shipping?.address;
+  const post = (requestBody) => helcimRequest('/invoices', {
+    ...requestOptions,
     method: 'POST',
-    retry429DelaysMs: options.retry429DelaysMs || DEFAULT_429_DELAYS_MS,
-    body: payload,
+    retry429DelaysMs: requestOptions.retry429DelaysMs || DEFAULT_429_DELAYS_MS,
+    body: requestBody,
   });
+
+  let response;
+  let billingIncluded = false;
+  if (hasAddress) {
+    try {
+      response = await post(body);
+      billingIncluded = !!body.billingAddress;
+    } catch (error) {
+      if (!(error instanceof HelcimApiError) || ![400, 422].includes(error.status)) throw error;
+      warn(`Helcim refused the invoice billing address (HTTP ${error.status}); creating the invoice without it`);
+      delete body.billingAddress;
+      if (body.shipping?.address) {
+        const { address: _dropped, ...shipping } = body.shipping;
+        body.shipping = shipping;
+      }
+    }
+  }
+  if (!response) response = await post(body);
   const invoice = response.data?.invoice || response.data;
   if (!invoice?.invoiceId || !invoice?.token) {
     throw new HelcimApiError('Helcim invoice response was missing invoiceId or token', { outcomeUnknown: true });
@@ -143,10 +247,22 @@ export async function createCreditCardInvoice({ payload, amountCents, currency }
     invoiceId: invoice.invoiceId,
     // DEPENDS: Portal's public HelcimPay session links the payment to this exact invoice number.
     // Helcim may omit it from a create response, so retain the validated request value.
-    invoiceNumber: invoice.invoiceNumber || payload.invoiceNumber || null,
+    invoiceNumber: invoice.invoiceNumber || body.invoiceNumber || null,
     token: String(invoice.token),
     url: url.toString(),
     amount: amountCents / 100,
     currency: normalizedCurrency,
+    billingIncluded,
   };
+}
+
+// Keeps only documented Address keys with non-empty string values and requires Helcim's three mandatory fields; anything
+// else (null, a string, a partial object) is "no address" so the request is never one Helcim would reject outright.
+function pickBillingAddress(address) {
+  if (!address || typeof address !== 'object') return null;
+  const out = {};
+  for (const key of HELCIM_BILLING_KEYS) {
+    if (typeof address[key] === 'string' && address[key].trim()) out[key] = address[key].trim();
+  }
+  return out.name && out.street1 && out.postalCode ? out : null;
 }

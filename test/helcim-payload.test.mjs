@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import {
   buildHelcimInvoicePayload,
+  planHelcimInvoice,
   HelcimInvoiceValidationError,
   sanitizeHelcimText,
 } from '../lib/helcim-invoice-payload.mjs';
@@ -137,6 +138,39 @@ test('refuses empty active orders and the documented 100-line API ceiling', () =
     () => buildHelcimInvoicePayload({ order: order({ lines: Array.from({ length: 101 }, () => line()), subtotal: '1010.00', total: '1010.00' }), expectedAmount: '1010.00' }),
     /100-line limit/,
   );
+});
+
+// ── planHelcimInvoice: which body the send route creates (reconcile 2026-11-08; DEPENDS: server.mjs send-credit-card-invoice) ──
+test('planHelcimInvoice defaults to production\'s balance-due line, even for an order that reconciles', () => {
+  const plan = planHelcimInvoice({ order: order(), expectedAmount: '10.00' });
+  assert.equal(plan.mode, 'balance');
+  assert.equal(plan.payload, null);
+  assert.equal(plan.amountCents, 1000);
+  assert.equal(plan.currency, 'USD');
+  assert.equal(plan.fallbackReason, null);
+  assert.equal(plan.invoiceNumber, null, 'a balance-line invoice is numbered by Helcim, as in production');
+});
+
+test('planHelcimInvoice takes main\'s itemized body only when switched on AND the order reconciles', () => {
+  const plan = planHelcimInvoice({ order: order(), expectedAmount: '10.00', itemized: true });
+  assert.equal(plan.mode, 'itemized');
+  assert.equal(plan.amountCents, 1000);
+  assert.equal(plan.invoiceNumber, 'FWW-1001');
+  assert.ok(plan.payload && Array.isArray(plan.payload.lineItems));
+});
+
+test('planHelcimInvoice falls back to the balance line (with the reason) when the itemized body would not reconcile', () => {
+  // A partially paid order: $4 of $10 still owed. main refused this outright; production bills the remaining balance.
+  const plan = planHelcimInvoice({ order: order(), expectedAmount: '4.00', itemized: true });
+  assert.equal(plan.mode, 'balance');
+  assert.equal(plan.amountCents, 400);
+  assert.match(plan.fallbackReason, /unreconciled/);
+});
+
+test('planHelcimInvoice reports nothing owed as 0 cents (the route refuses it) and rethrows non-validation errors', () => {
+  assert.equal(planHelcimInvoice({ order: order(), expectedAmount: '0' }).amountCents, 0);
+  assert.equal(planHelcimInvoice({ order: order(), expectedAmount: '-3' }).amountCents, 0);
+  assert.throws(() => planHelcimInvoice({ order: { get lineItems() { throw new RangeError('boom'); }, currentTotalPriceSet: money('1.00') }, expectedAmount: '1.00', itemized: true }), RangeError);
 });
 
 let failed = 0;

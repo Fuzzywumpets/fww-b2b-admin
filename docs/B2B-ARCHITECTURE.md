@@ -97,6 +97,23 @@ ledger. Portal stores only a digest of a 256-bit public payment id, emails
 the payment response with the server-only secret token. Card data stays in Helcim's iframe. See
 `docs/HELCIM-INVOICE-CONTRACT.md` for the verified API and arithmetic invariants.
 
+The Helcim invoice also carries the customer's **billing name, address and email** (`billingAddress` on
+`POST /invoices`), so the invoice in the Helcim dashboard and on the pay page says who it is for rather
+than only "Fuzzywumpets wholesale order #1234" in the notes. Source: the Shopify order's `billingAddress`
+plus `customer.email`, mapped by `lib/helcim-billing.mjs` (name = billing company, else customer company,
+else person; US/CA province must be 2 letters; country is ISO alpha-3; phone 10-15 digits). Rules worth
+knowing: if the order has no usable billing address (Helcim requires name, street and postal code) the
+invoice is created exactly as before; if Helcim answers 400/422 to the address, `helcim.mjs` retries
+**once** without it (any other failure is never retried, since it may have created the invoice); the
+address is customer PII and goes to Helcim only, never to logs or audit rows (the audit row records just
+`billingIncluded`). The `getOrderDetail` billing selection must keep `provinceCode`, `countryCodeV2` and
+`phone`; `test/helcim-billing.test.mjs` pins that. A Helcim *customer record* (`customerId`) is not created:
+that would need the Customers permission on the API token and a duplicate-handling policy.
+The company name (`order.customer.company`, the same resolved field the invoice PDF's BILL TO uses) is also
+appended to the invoice **notes** (`Fuzzywumpets wholesale order #1234 - Acme Pet Supply`), so it is on the
+invoice even when the billing address is incomplete or Helcim refuses it. Nothing parses those notes; the
+paid-sync matches invoices by id/number.
+
 ```sh
 P=$(systemctl show -p MainPID --value <unit>)
 C=$(pgrep -P $P -f node | head -1)   # MainPID is doppler/bash; the CHILD holds the env
@@ -120,7 +137,7 @@ via `callPortalInternal()` → `PORTAL_INTERNAL_URL` (default `http://127.0.0.1:
 
 Live endpoints: `visible-note`, `customer-messages`, `conversations/:slug/messages`,
 `tax-exempt/:id/{approve,reject}`, `settings`, `leads/:id/tax-doc`, `theme-feedback`,
-**`invites` (POST create + GET list)**.
+**`invites` (POST create + GET list)**, **`payment-notice`** (below).
 
 `POST /__internal__/visible-note` also carries the invoice checkout contract from Admin to Portal:
 `{invoiceNumber,amount,taxAmount,currency,paymentUrl}`. Portal validates the original allow-listed
@@ -131,6 +148,111 @@ invite path is how you email a second live token to someone who already has one)
 caller's human email so the audit trail names a person, not the tool; and note that
 `admin_audit_log.admin_customer_id` is `NOT NULL`, so internal callers pass a `system:b2badmin`
 sentinel — passing `null` throws and 500s the request.
+
+### `visible-note` and the credit-card invoice email
+
+`POST /__internal__/visible-note` stores a customer-visible order note and optionally emails it
+(`emailCustomer`, default true). Ordinary notes go out through Re:amaze (`sendAs`, optional `subject`).
+The **Send Credit Card Invoice** button (`POST /orders/:id/send-credit-card-invoice`) additionally
+passes a structured **`creditCardInvoice`** object, which switches the Portal to a direct Gmail send:
+
+```
+creditCardInvoice: { orderName, amount, currency, payUrl, staffNote }
+```
+
+- Producer: Admin `lib/helcim-note.mjs` `buildCreditCardInvoicePayload`. Receiver: Portal
+  `gmail-invoice.mjs` `validateCreditCardInvoiceInput`. The Portal validates the shape and answers
+  **400 before storing anything** (`orderName` string ≤100, `amount` finite ≥0, `currency` three
+  uppercase letters, `staffNote` ≤500 chars, `payUrl` on an allow-listed host: exactly
+  `b2b.fuzzywumpets.com/pay/<token>` or `fuzzywumpets.myhelcim.com/order/?token=<token>`).
+  Change a field name or the host rule on one side and you must change the other in the same release.
+- `staffNote` is the optional note the staffer types in the modal. It is HTML-escaped in the email
+  (rendered as a quote block, `> ` lines in the text part), so Markdown or tags in it show literally.
+- Sender identity: **From `Fuzzywumpets Wholesale <help@fuzzywumpets.com>`, Reply-To
+  `wholesale@fuzzywumpets.com`**, sent through the `fww-bill-scanner` broker (`account=alex`,
+  `gmail.send` token; Portal env `BILL_SCANNER_WORKER_URL` + `BILL_SCANNER_BRIDGE_BEARER`). The
+  Portal owns this identity; the `sendAs: 'wholesale'` Admin still sends only affects the legacy
+  Re:amaze path and is ignored on the Gmail path. `wholesale@` is a Google **Group**, not a send-as
+  alias, so it cannot be the From (Gmail silently rewrites From to `alex@`). **`help@` must stay a
+  verified send-as on `alex@`'s Gmail**, or the From reverts to `alex@` with no error.
+- The subject is built by Admin (`Your invoice from Fuzzywumpets is ready - order #NNNNN`, no
+  forced `Re:`); keep the `#NNNNN` token in it, because the Portal scopes Re:amaze threads to an
+  order by that order name (`getCustomerWholesaleThreads`).
+- Failure: a Gmail/broker error comes back as `email:{sent:false,error}` and Admin records
+  `helcim_invoice_email_failed` (with `hasNote` and `note`). There is deliberately **no fallback to
+  Re:amaze**, because that would bring the `Re:` prefix back and double-send on retry. A Gmail 401
+  drops the Portal's cached broker token, so the next staff retry recovers.
+- Gmail-sent invoices are not Re:amaze conversations, so they do not appear in the order page's
+  customer-messages box; the Portal still stores the body as a customer-visible order note.
+- Compatibility: an absent `creditCardInvoice` keeps the legacy Re:amaze path unchanged, so an old
+  Admin with a new Portal is safe. A new Admin with an old Portal sends the legacy Re:amaze email
+  with the staff note unescaped, so **deploy the Portal first**.
+
+### `payment-notice` — the "payment received" email for STAFF-recorded payments
+
+Alex (2026-10-27): "when a payment is made, I need notification sent to alex@fuzzywumpets.com". Settled split:
+**Helcim card-invoice payments** are announced by Helcim's own merchant copy (a Helcim dashboard setting, no code
+here; do NOT email from the paid-sync path, it would double-notify). **Payments staff record in this app** are announced by us:
+
+| Admin route | `source` | Notice |
+|---|---|---|
+| `POST /orders/bulk` (Orders list Mark Paid) | `mark_paid_bulk` | ONE digest listing every order Shopify really marked paid |
+| `POST /orders/:id/mark-paid` (order page) | `mark_paid` | one order |
+| `POST /orders/:id/record-payment` | `record_payment` | one order, with the staff-typed method, amount = the fresh outstanding balance it cleared |
+
+- **Flow.** After Shopify accepted the payment AND the `mark_paid` / `record_manual_payment` audit row is written, the route calls
+  `paymentNotifier.notify(...)` (`lib/payment-notice.mjs`) **without awaiting it**. It POSTs
+  `{ source, actorEmail, paymentMethod?, orders:[{ orderId, orderName, amount, currency }] }` to the Portal's
+  `POST /__internal__/payment-notice` (Portal `payment-notice.mjs` + `docs/PAYMENT-NOTICE.md`; the Portal owns the Gmail broker env).
+  Mark Paid reads `name` + `currentTotalPriceSet` (post-edit total) from the `orderMarkAsPaid` payload
+  (`ORDER_MARK_AS_PAID_MUTATION` in `lib/order-money.mjs`, shared by both Mark Paid paths), so there is no extra Shopify read.
+  For Mark Paid the amount is the order's current total (equal to the payment unless it was part-paid before).
+- **Recipient is the Portal's, never the request's**: env `PAYMENT_NOTICE_TO`, default `alex@fuzzywumpets.com`. Admin sends no
+  recipient, subject, sender or link. **When the staff member's login email equals the recipient the Portal sends nothing**
+  (`email.skipped = 'actor_is_recipient'`, not a failure), so Alex's own clicks do not email him.
+- **Fail-open.** Any problem (Portal down or older and answering 404, Gmail/broker error, a reply that does not say
+  `email.sent === true`, a throwing log/audit) is logged and audited as `payment_notice_failed` (`after` = `{source, orderIds, error}`)
+  and swallowed. A payment is never blocked, failed or delayed by it (the 20 s timeout only frees the socket). There is no retry
+  and no fallback mailer.
+- **Idempotent.** Key = `source|orderId|amount-in-cents`, taken in memory BEFORE the Portal call, so a double click or an
+  overlapping retry sends once (a failed send keeps its key: at most once, the audit row is the record). Keys expire after 15 min
+  so a genuine second payment of the same amount later is still announced; they are lost on restart (accepted).
+- **Off switches.** `PAYMENT_NOTICE_DISABLED=1` (kill switch, no code change) and MOCK mode. If `B2B_PORTAL_INTERNAL_TOKEN` is unset
+  every notice is audited as failed (`no_internal_token`).
+- **Never** a Helcim token, pay URL or card data: the request has no field for one (pinned by `test/payment-notice-routes.test.mjs`).
+- **Deploy the Portal FIRST.** A new Admin with an old Portal gets 404s (audited, payments unaffected); a new Portal with an old
+  Admin is inert. Rollback: Admin `git reset --keep <previous sha>`; Portal `git reset --keep f850ad4`. No schema change either side.
+
+### Helcim card invoice → paid sync
+
+**Send:** `POST /orders/:id/send-credit-card-invoice` creates a Helcim invoice for the order's exact
+outstanding balance and records it in `helcim_invoice_map` (one row per order, written *before* the email
+so a retry reuses it); the email itself is described above.
+
+**Paid sync:** the customer pays *Helcim*, so Shopify would stay "pending". `lib/helcim-reconcile.mjs`
+closes the loop: it reads the invoice from Helcim (`helcim.mjs getInvoice`, read-only, returns only
+status/amount/currency) and, **only when every check agrees**, calls `orderMarkAsPaid` on the Shopify
+order. The rule: Helcim says `PAID` for exactly the recorded amount and currency with nothing due, **and**
+the Shopify order is open and still owes exactly that amount (read twice, again just before the write).
+Anything else — partial payment, a different amount (invoice or order edited), cancelled/refunded order,
+currency mismatch, Shopify already showing paid (possible duplicate payment) — is **not** written; it is
+recorded as `needs_review` / `already_paid` on the ledger row and in the order history for a person.
+State lives in the ledger row's `paid_*` columns (`paid_state`: NULL · `syncing` · `paid_synced` ·
+`already_paid` · `needs_review` · `error`); a `syncing` claim is atomic, so the button and the poller
+cannot both write Shopify, and an interrupted claim expires after 10 minutes.
+
+Two triggers share the one code path: the **Check Helcim payment** button on the order page
+(`POST /orders/:id/sync-helcim-payment`), and a background poller that is **off unless
+`HELCIM_PAYMENT_SYNC=1`** is in the service environment (every 5 min, ≤10 invoices per sweep; polls
+fresh invoices every 4 min, invoices older than 3 days hourly, none older than 90 days; never retries
+`needs_review`). Audit verbs: `helcim_payment_synced`, `helcim_payment_needs_review`,
+`helcim_payment_sync_failed` (actor = the staff email, or `system:helcim-sync` for the poller).
+
+**Not done (open decisions):** the sync does **not** post the payment to Xero (unlike
+`POST /orders/:id/mark-paid`) — Helcim card deposits need an agreed Xero bank/clearing account first;
+partial payments are only flagged; a Helcim refund is not reflected back into Shopify.
+**Rollback:** unset `HELCIM_PAYMENT_SYNC` (the button keeps working) or redeploy the previous release —
+the `paid_*` columns are additive and nullable, and the previous release never reads or writes them.
 
 ---
 
@@ -151,6 +273,17 @@ sentinel — passing `null` throws and 500s the request.
   are Fuzzywumpets actions.
 - Pre-order badge: removed for good 2026-07-02, guarded by `REGRESSION:` tests. Products are In
   stock / Out of stock only.
+- **The Orders list (`GET /orders`) is served from the local `orders_cache`, not from Shopify.** The cache
+  is refreshed by the Shopify `orders/updated` webhook (lands 2–3 s after a change) and a ~3-minute poller.
+  So anything that changes an order's status and then redirects to the list must write that status through
+  itself, or the page paints the old one under a success banner (the 2026-10-27 "Mark Paid does nothing"
+  report: Shopify had marked #39748 paid, the list still said PENDING). `POST /orders/bulk` (Mark Paid)
+  does this via `setOrderFinancialStatusInCache` — two columns, fail-open, never `synced_at`; the webhook
+  and poller still own the row and overwrite it whole. The success banner (`?success=marked_paid`) is
+  reachable only after a mark-paid that moved at least one order: no ids → `?error=mark_paid_none`,
+  unknown action → `?error=bulk_unknown_action`, any refusal → `?error=mark_paid_partial`. The bulk bar is
+  hidden until a row is ticked (`.bulk-bar[hidden]` in `public/admin.css`). Pinned end to end, in a real
+  browser against the real server, by `test/orders-bulk-markpaid.test.mjs`.
 
 ---
 
@@ -183,6 +316,23 @@ Traps:
   (`getSess` omits `company_data`; `getSessWithCompany` is dead code) and a team-member session is
   bound to the company's PRIMARY `customerId`, so the endpoints cannot tell a member from the owner.
   The escalation half (granting admin) is closed.
+- Staff **Mark Paid** is two code paths with different side effects: `POST /orders/bulk` (Orders list)
+  writes the status through to `orders_cache` but does **not** record the payment in Xero;
+  `POST /orders/:id/mark-paid` (order page) records it in Xero but does not touch `orders_cache` (it
+  redirects to the order page, which reads Shopify live, so only the list is stale for the 2–3 s webhook
+  window). Both (and Record payment) now send the owner a "payment received" email, see section 5 `payment-notice`.
+  Both paths leave the same breadcrumb on the order itself: a `[date UTC] Marked paid manually by <who>`
+  line **appended** to the **Admin-only** order note (`order_internal_notes`, via `notePaidManually` →
+  `lib/paid-note.mjs`), plus the `mark_paid` audit row, which the order history shows as "marked the order
+  paid manually". It is deliberately **not** the Shopify order note (that holds customer instructions and
+  reaches packing slips and the CSV export). Only an order Shopify accepted is annotated; a note failure
+  never fails the payment. If a Helcim card invoice is linked to the order the line names its number and says
+  the click did not check it with Helcim — a manual click proves nothing about Helcim, and the customer could
+  still pay that invoice. The Helcim-confirmed form (`Paid by card via Helcim: transaction <id>…`) exists in
+  `buildPaidNoteLine({source:'helcim'})` for the Helcim paid-sync to call; nothing calls it yet, and the sync
+  does not currently read a transaction id from Helcim (`getInvoice` returns status/amount/currency only).
+  Per Helcim's Invoices docs the invoice object carries no transactions; the id comes from the card-transactions
+  endpoint filtered by `invoiceNumber`, so the sync needs that second read before it can write the Helcim form.
 - The Electron installer is unsigned; a real CA certificate is needed for it to install anywhere.
   Note `electron-updater` compares the cert subject against `win.publisherName` and refuses
   mismatched updates — so changing certs later orphans existing installs. Do it once, properly.

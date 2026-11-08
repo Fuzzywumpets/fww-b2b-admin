@@ -109,6 +109,7 @@ async function ensurePublication(gql, knownId) {
 async function deleteSeedOrders(gql) {
   let n = 0;
   for (;;) {
+    // BOUNDED: deletes 50 seeded orders per pass and re-queries until none remain (the for(;;) loop), so it is complete.
     const d = await gql(`query($q:String!){ orders(first:50,query:$q){ nodes{ id } } }`, { q: `tag:${SEED_TAG}` });
     if (!d.orders.nodes.length) return n;
     for (const o of d.orders.nodes) {
@@ -119,6 +120,7 @@ async function deleteSeedOrders(gql) {
 }
 
 async function upsertCustomer(gql, c) {
+  // BOUNDED: exact email lookup (one customer); metafields(first:20) is the small fixed b2b namespace key set the seeder writes.
   const found = await gql(`query($q:String!){ customers(first:1,query:$q){ nodes{ id addresses{ id } metafields(first:20,namespace:"b2b"){ nodes{ key } } } } }`, { q: `email:${c.email}` });
   let node = found.customers.nodes[0];
   const input = { email: c.email, firstName: c.firstName, lastName: c.lastName, tags: ['b2b', SEED_TAG], note: null };
@@ -157,6 +159,7 @@ async function upsertProduct(gql, p, locationId, publicationIds) {
       inventoryQuantities: [{ locationId, name: 'available', quantity: v.qty }],
     })),
   };
+  // BOUNDED: echoes the variants of ONE seeded product, which this script defines with far fewer than 20 variants.
   const d = await gql(`mutation($input:ProductSetInput!,$id:ProductSetIdentifiers){ productSet(input:$input,identifier:$id,synchronous:true){ product{ id variants(first:20){ nodes{ id sku price } } } userErrors{field message} } }`,
     { input, id: { handle: p.handle } });
   const product = check(d.productSet, 'productSet').product;
@@ -199,6 +202,7 @@ export async function seed({ bridgeUrl, bearer, publicationId: publicationId0, l
   assertSeedTarget(bridgeUrl);
   if (!bearer) throw new Error('SHOPIFY_BRIDGE_BEARER is not set');
   const gql = makeGql(bridgeUrl, bearer);
+  // BOUNDED: any one location is enough to stock the dev store; publications(first:50) only needs the 'Online Store' channel.
   const shop = await gql(`query{ shop{ myshopifyDomain } locations(first:1){ nodes{ id } } publications(first:50){ nodes{ id name } } }`);
   if (shop.shop.myshopifyDomain !== TEST_SHOP_DOMAIN) {
     throw new Error(`refusing to seed: bridge answered for ${shop.shop.myshopifyDomain}, expected ${TEST_SHOP_DOMAIN}`);

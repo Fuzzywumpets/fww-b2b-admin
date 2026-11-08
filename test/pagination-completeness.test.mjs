@@ -24,6 +24,7 @@ console.log('\n\u2500\u2500 Unit: order-detail line-item pagination completeness
 const src = await readFile(new URL('../server.mjs', import.meta.url), 'utf8');
 
 // The initial projection in getOrderDetail must carry pageInfo so the walker can advance.
+// BOUNDED: test title text only; no query is issued here
 await test('getOrderDetail lineItems(first:250) requests pageInfo { hasNextPage endCursor }', () => {
   const m = src.match(/getOrderDetail[\s\S]*?lineItems\(first:250\)\{pageInfo\{hasNextPage endCursor\}/);
   assert.ok(m, 'the order-detail query must request pageInfo on the lineItems connection');
@@ -35,6 +36,12 @@ await test('getOrderDetail drains line items via drainLineItems and rebuilds edg
     'getOrderDetail must call drainLineItems on the order lineItems connection');
   assert.match(src, /result\.data\.order\.lineItems = \{ edges: nodes\.map\(node => \(\{ node \}\)\) \};/,
     'getOrderDetail must reassign lineItems.edges to the FULL drained set');
+});
+
+await test('continuation pages retain partial-fulfillment quantity state', () => {
+  const region = src.slice(src.indexOf('Pagination-completeness'), src.indexOf('return result.data?.order || null;'));
+  assert.match(region, /orderLineItemsPage\([\s\S]*?currentQuantity unfulfilledQuantity/,
+    'the continuation projection must include unfulfilledQuantity for shipping and fulfillment consumers');
 });
 
 // A partial page must never be returned as success: a paging failure is surfaced (throwOnError)
@@ -54,7 +61,8 @@ await test('dashboard and spend live paths no longer use silent first-page prefi
 await test('getOrderDetail keeps #45 shipping/fulfillment fields while draining lines', () => {
   assert.match(src, /unfulfilledQuantity/);
   assert.match(src, /currentShippingPriceSet\{presentmentMoney\{amount currencyCode\}\}/);
-  assert.match(src, /fulfillmentLineItems\(first:250\)\{nodes\{quantity lineItem\{id title sku\}\}\}/);
+  // Reconcile 2026-11-08: production's 2026-10-14 sweep added pageInfo + an overflow drain to fulfillmentLineItems.
+  assert.match(src, /fulfillmentLineItems\(first:250\)\{pageInfo\{hasNextPage endCursor\} nodes\{quantity lineItem\{id title sku\}\}\}/);
 });
 
 await test('#45 fulfill path already pages fulfillment orders instead of a silent first:10 prefix', () => {

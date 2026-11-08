@@ -139,8 +139,15 @@ await test('a looping cursor is bounded, and the bound throws instead of truncat
   let calls = 0;
   await assert.rejects(
     () => drainLineItems(page(['a'], true, 'c'), 'order', async () => { calls++; return page(['b'], true, 'c'); }),
+    /cursor repeated/);
+  // 2026-10-14: a repeated cursor now fails on the second page instead of burning LINE_PAGE_LIMIT calls.
+  assert.equal(calls, 1, `a repeated cursor must stop immediately, made ${calls} calls`);
+  // A cursor that keeps advancing but never ends is still bounded by LINE_PAGE_LIMIT.
+  let n = 0, calls2 = 0;
+  await assert.rejects(
+    () => drainLineItems(page(['a'], true, 'c0'), 'order', async () => { calls2++; return page(['b'], true, 'c' + (++n)); }),
     /did not paginate to completion/);
-  assert.equal(calls, LINE_PAGE_LIMIT, `should stop after exactly ${LINE_PAGE_LIMIT} pages, made ${calls}`);
+  assert.equal(calls2, LINE_PAGE_LIMIT, `should stop after exactly ${LINE_PAGE_LIMIT} pages, made ${calls2}`);
 });
 
 await test('an absent or empty connection degrades to an empty list, not a crash', async () => {
