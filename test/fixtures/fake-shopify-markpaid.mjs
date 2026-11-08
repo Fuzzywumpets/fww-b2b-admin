@@ -39,6 +39,10 @@ const ALLOW_URL = process.env.FAKE_MARKPAID_ALLOW_URL || '';
 const totals = JSON.parse(process.env.FAKE_MARKPAID_TOTALS || '{}');
 const totalOf = (num) => ({ name: `#${num}`, amount: '10.00', currency: 'USD', ...(totals[num] || {}) });
 // FAKE_MARKPAID_ORDERS: JSON { "<numeric order id>": "<displayFinancialStatus>" } - Shopify's truth for each order.
+// FAKE_MARKPAID_PAID_BEFORE: JSON { "<id>": "<amount already received>" } - a PART-PAID order: Shopify's totalOutstandingSet is the
+// total minus this, and orderMarkAsPaid clears exactly that outstanding balance (the total stays the same).
+const paidBefore = JSON.parse(process.env.FAKE_MARKPAID_PAID_BEFORE || '{}');
+const outstandingOf = (num) => (Number(totalOf(num).amount) - Number(paidBefore[num] || 0)).toFixed(2);
 const orders = new Map(Object.entries(JSON.parse(process.env.FAKE_MARKPAID_ORDERS || '{}')));
 const writeState = () => { try { fs.writeFileSync(STATE_FILE, JSON.stringify(Object.fromEntries(orders))); } catch { /* best effort */ } };
 const log = (entry) => { try { fs.appendFileSync(LOG, JSON.stringify(entry) + '\n'); } catch { /* best effort */ } };
@@ -59,7 +63,7 @@ globalThis.fetch = async (url, init = {}) => {
     log({ op: 'outstanding', id: num });
     if (!orders.has(num)) return json({ data: { order: null } });
     const t = totalOf(num);
-    const open = ['PAID', 'REFUNDED'].includes(orders.get(num)) ? '0.00' : t.amount;
+    const open = ['PAID', 'REFUNDED'].includes(orders.get(num)) ? '0.00' : outstandingOf(num);
     return json({ data: { order: { name: t.name, displayFinancialStatus: orders.get(num), totalOutstandingSet: { presentmentMoney: { amount: open, currencyCode: t.currency } } } } });
   }
   if (!/orderMarkAsPaid/.test(query)) { log({ op: 'other', query: query.slice(0, 120) }); return json({ errors: [{ message: 'fake-shopify-markpaid: unexpected document' }] }); }

@@ -27,12 +27,15 @@ const PORTAL_TOKEN = 'test-portal-token';
 
 const SHOPIFY = {
   51001: 'PENDING', 51002: 'PENDING', 51003: 'PAID', 51004: 'PENDING', 51005: 'PENDING_STICKY', 51006: 'PENDING',
-  51007: 'PENDING', 51008: 'PENDING', 51009: 'PENDING', 51010: 'PENDING', 51012: 'PENDING', 51013: 'PENDING', 51014: 'PENDING',
+  51007: 'PENDING', 51008: 'PENDING', 51009: 'PENDING', 51010: 'PENDING', 51012: 'PENDING', 51013: 'PENDING', 51014: 'PENDING', 51015: 'PENDING', 51016: 'PENDING', 51017: 'PENDING',
 };
 const TOTALS = {
   51001: { name: '#51001', amount: '123.40' }, 51002: { name: '#51002', amount: '50.00' }, 51004: { name: '#51004', amount: '77.77' },
   51006: { name: '#51006', amount: '250.00' }, 51012: { name: '#51012', amount: '5.50' }, 51013: { name: '#51013', amount: '6.60' },
+  51015: { name: '#51015', amount: '100.00' }, 51016: { name: '#51016', amount: '80.00' }, 51017: { name: '#51017', amount: '30.00' },
 };
+// Part-paid before staff clicked Mark Paid: Shopify clears only the outstanding balance (total - already received).
+const PAID_BEFORE = { 51015: '60.00', 51016: '20.00' };
 
 let passed = 0, failed = 0;
 async function test(name, fn) {
@@ -106,7 +109,7 @@ child = spawn(process.execPath, ['--import', FAKE, 'server.mjs'], {
     B2B_ADMIN_ALLOW_TEST_SESSION: '1', B2B_ADMIN_ALLOWED_EMAILS: EMAIL,
     SHOPIFY_BRIDGE_BEARER: '',
     B2B_PORTAL_INTERNAL_URL: portalBase, B2B_PORTAL_INTERNAL_TOKEN: PORTAL_TOKEN, PAYMENT_NOTICE_DISABLED: '',
-    FAKE_MARKPAID_LOG: logFile, FAKE_MARKPAID_ORDERS: JSON.stringify(SHOPIFY), FAKE_MARKPAID_TOTALS: JSON.stringify(TOTALS),
+    FAKE_MARKPAID_LOG: logFile, FAKE_MARKPAID_ORDERS: JSON.stringify(SHOPIFY), FAKE_MARKPAID_TOTALS: JSON.stringify(TOTALS), FAKE_MARKPAID_PAID_BEFORE: JSON.stringify(PAID_BEFORE),
     FAKE_MARKPAID_ALLOW_URL: portalBase,
   },
 });
@@ -287,6 +290,24 @@ await test('a Portal "skipped" (the staff member is the recipient) is not a fail
   await sleep(500);
   assert.ok(!auditRows('payment_notice_failed').some(r => r.target.endsWith('/51009')), 'skipped is intentional, not an error');
   mode = 'ok';
+});
+
+await test('REVIEW #73 F2: Mark Paid on a PART-PAID order announces the balance Shopify just cleared, not the order total (order page)', async () => {
+  mode = 'ok';
+  const res = await form('/orders/51015/mark-paid', {});            // $100.00 order, $60.00 already received -> clears $40.00
+  assert.ok(loc(res).includes('success=marked_paid'), loc(res));
+  assert.ok(await waitFor(() => requests.some(r => r.body?.orders?.[0]?.orderId === '51015')));
+  const r = requests.find(x => x.body?.orders?.[0]?.orderId === '51015');
+  assert.deepEqual(r.body.orders, [{ orderId: '51015', orderName: '#51015', amount: 40, currency: 'USD' }]);
+});
+
+await test('REVIEW #73 F2: bulk Mark Paid digest lists each order\'s cleared balance (part-paid $80 order with $20 received = $60; unpaid order = its total)', async () => {
+  mode = 'ok';
+  const res = await form('/orders/bulk', { action: 'mark-paid', ids: ['51016', '51017'] });
+  assert.ok(loc(res).includes('success=marked_paid'), loc(res));
+  assert.ok(await waitFor(() => requests.some(r => r.body?.orders?.some(o => o.orderId === '51016'))));
+  const r = requests.find(x => x.body?.orders?.some(o => o.orderId === '51016'));
+  assert.deepEqual(r.body.orders.map(o => [o.orderId, o.amount]), [['51016', 60], ['51017', 30]]);
 });
 
 await test('the server never logged the bearer or a Helcim token while doing all of this', () => {
