@@ -11,7 +11,7 @@ import { buildClientSchema, parse, validate } from 'graphql';
 import * as dbm from '../db.mjs';
 import {
   flagBackorder, undoBackorder, parseBackorderRequest, priceAdjustment, pricesMatch, BACKORDER_LINE_FIELDS, backorderCommitMutation, completeCommitNodes,
-  stageRemoveUnits, stageRaiseUnits, stageAddVariantAtPrice, stageAddCustomAtPrice, DUPLICATE_WINDOW_MS, READBACK_RETRY_DELAYS_MS,
+  stageRemoveUnits, stageRaiseUnits, STALE_CLAIM_MS, stageAddVariantAtPrice, stageAddCustomAtPrice, DUPLICATE_WINDOW_MS, READBACK_RETRY_DELAYS_MS,
 } from '../lib/backorder-edit.mjs';
 
 let passed = 0, failed = 0;
@@ -315,6 +315,9 @@ await test('RECONCILE: an orphaned applying row whose removal DID land is finali
 await test('RECONCILE: an orphaned applying row whose removal did NOT land is discarded, then the new flag proceeds', async () => {
   const w = world([{ currentQuantity: 10 }]);
   dbm.claimBackorderRemoval({ orderId: w.orderId, lineItemId: w.lines[0].liId, title: 'Elite Collar', variantId: 'v', sku: 'EC-1', variantTitle: '', unitPrice: '18.00', currency: 'USD', quantity: 4, priorQty: 10, createdBy: 'a@fww', now: w.clock });
+  // DeepReview 0.4.2 of #73 (run 3): a FRESH claim that still reads unchanged is indistinguishable from a stale replica after a
+  // successful commit, so it is NOT discarded (that made the retry remove a second batch). It is only discarded once it is old.
+  w.clock += STALE_CLAIM_MS + 1;
   assert.equal((await flag(w, { quantity: 2 })).ok, true);
   assert.equal(w.lines[0].currentQuantity, 8);
   assert.equal(row(w).shopify_removed_qty, 2);
@@ -593,6 +596,13 @@ await test('FLAG: reported success that REALLY changed nothing is left applying 
   assert.equal((await flag(w, { quantity: 2 })).state, 'unconfirmed');
   assert.equal(row(w).status, 'applying');
   w.deps.removeUnits = real;
+  // The OLD expectation here (discard on the very next attempt) was the bug: "reported success + unchanged read" is exactly what a stale
+  // replica looks like after a real removal, and proceeding removed a second batch. A young claim now stays and says "unconfirmed".
+  const early = await flag(w, { quantity: 2 });
+  assert.equal(early.state, 'unconfirmed');
+  assert.equal(row(w).status, 'applying', 'a young unchanged claim is kept');
+  assert.equal(w.calls.filter(c => c.kind === 'remove').length, 0, 'real removeUnits not called while unconfirmed');
+  w.clock += STALE_CLAIM_MS + 1;                                  // old enough that a lagging replica is no longer a credible explanation
   const r = await flag(w, { quantity: 2 });
   assert.equal(r.ok, true, r.message);
   assert.equal(w.lines[0].currentQuantity, 3);
@@ -777,6 +787,23 @@ await test('REVIEW #73 v0.4.1 F6: retrying a COMMITTED token while the read is S
   w.lagLeft = 0;
   assert.equal((await flag(w, { quantity: 4, idemKey: 'tok-f6-bbbbbb2' })).ok, true);
   assert.equal(row(w).status, 'pending');
+});
+await test('REVIEW #73 v0.4.2 run 3: a FRESH token while the earlier flag is applying + stale read must NOT remove a second batch', async () => {
+  const w = world([{ currentQuantity: 10 }]);
+  w.lagReads = 99;                                               // token A committed; every read-back is stale
+  assert.equal((await flag(w, { quantity: 4, idemKey: 'tok-run3-aaaaaa1' })).state, 'unconfirmed');
+  w.lagLeft = 99;                                                // still stale when the modal is reopened (token B)
+  const b = await flag(w, { quantity: 4, idemKey: 'tok-run3-bbbbbb2' });
+  assert.equal(b.ok, false);
+  assert.equal(b.state, 'unconfirmed');
+  assert.equal(w.calls.filter(c => c.kind === 'remove').length, 1, 'exactly one removal was ever sent');
+  assert.equal(w.lines[0].currentQuantity, 6);
+  assert.equal(row(w).status, 'applying', 'the original claim (and its snapshot) is kept');
+  w.lagLeft = 0;                                                 // replica caught up: the next try settles it as the same request
+  const c = await flag(w, { quantity: 4, idemKey: 'tok-run3-cccccc3' });
+  assert.deepEqual([c.ok, c.duplicate], [true, true]);
+  assert.equal(row(w).status, 'pending');
+  assert.equal(w.calls.filter(x => x.kind === 'remove').length, 1);
 });
 await test('REVIEW #73 v0.4.1 F6 control: a committed token with a settled (pending) row is still a plain duplicate and reads nothing', async () => {
   const w = world([{ currentQuantity: 10 }]);
