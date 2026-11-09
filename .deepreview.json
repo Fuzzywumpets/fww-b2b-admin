@@ -1,1 +1,1 @@
-{"test_commands": ["./run-tests.sh"]}
+{"test_commands": ["./run-tests.sh"], "test_network": "allow"}

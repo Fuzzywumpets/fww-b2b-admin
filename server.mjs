@@ -2968,6 +2968,16 @@ function renderOrderDetail(session, order, flash, flashMsg, { resumeEdit = false
     // only ever fail ("...cannot be edited because it is removed"), and un-dimming it tells the
     // operator the line is back on the order when it is gone. Both were live defects.
     const liveRow = el => !el.closest('tr[data-line-removed="1"]');
+    // The Total cell follows the INPUTS while editing and the SAVED (read-only) qty x price when not, so Cancel after a failed save never
+    // shows an unsaved Total beside the saved qty/price (DeepReview 0.4.2 re-review of the finding-3 fix). The inputs keep any unsaved value.
+    // DEPENDS: paintRowTotal (edit-mode script) reads the inputs; the static spans are written only by flushLine on an accepted save.
+    document.querySelectorAll('tr[data-existing="1"]').forEach(function(tr){
+      var amt = tr.querySelector('.line-total-amt'); if (!amt) return;
+      if (enable) { if (window.paintRowTotal) window.paintRowTotal(tr); return; }
+      var qs = tr.querySelector('.edit-qty-static'), ps = tr.querySelector('.edit-price-static');
+      var q = qs ? parseInt(qs.textContent, 10) : NaN, pr = ps ? parseFloat(ps.textContent.replace(/[^0-9.\-]/g, '')) : NaN;
+      if (q >= 0 && pr >= 0) amt.textContent = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(q * pr);
+    });
     document.querySelectorAll('.edit-qty-input').forEach(el => { el.style.display = enable ? 'inline-block' : 'none'; el.disabled = !enable || !liveRow(el); });
     document.querySelectorAll('.edit-qty-static').forEach(el => { el.style.display = enable ? 'none' : 'inline'; });
     document.querySelectorAll('.edit-price-input').forEach(el => { el.style.display = enable ? 'inline-block' : 'none'; el.disabled = !enable || !liveRow(el); });

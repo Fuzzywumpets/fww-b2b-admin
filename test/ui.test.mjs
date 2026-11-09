@@ -2008,6 +2008,10 @@ await test('REVIEW #73 v0.4.1 F3: a FAILED qty/price save leaves the read-only q
   await page.locator('#edit-mode-bar button:has-text("Cancel")').click();
   assert.equal((await row.locator('.edit-qty-static').textContent()).trim(), q0, 'read-only qty must stay the SAVED quantity');
   assert.equal((await row.locator('.edit-price-static').textContent()).trim(), p0, 'read-only unit price must stay the SAVED price');
+  assert.equal((await row.locator('.line-total-amt').textContent()).trim(), usd(parseInt(q0, 10) * parseFloat(p0.replace(/[$,]/g, ''))),
+    'the line Total must agree with the saved qty x price after Cancel (v0.4.2 re-review of the F3 fix)');
+  await page.click('#edit-btn');                                  // back into edit mode: the unsaved inputs are still there, so the Total follows them again
+  assert.equal((await row.locator('.line-total-amt').textContent()).trim(), usd((parseInt(q0, 10) + 3) * 77.77), 'edit mode repaints from the inputs');
 });
 
 await test('a RETRYABLE failure still warns — and "Leave anyway" gets the operator out', async (page, ctx) => {
