@@ -2523,7 +2523,11 @@ function deriveCurrentOrderTotals(order) {
   } else {
     subtotal = lineSubtotal;                  // missing, or lagging after a rapid edit → trust the lines
   }
-  const curTotLags = hasEdit && curTot != null && Math.abs(parseFloat(curTot) - origTot) < 0.005;
+  // Shopify moves current subtotal and total together: a total equal to the frozen original is only evidence of LAG when the subtotal did not
+  // move either. An edited order can legitimately land back on its original total (lines cut, shipping raised), and the old test then
+  // replaced a correct total with subtotal + original extras (DeepReview 0.4.1 of #73, finding 4; test/order-total-coincidence.test.mjs).
+  // DEPENDS: curSubLags above; the lag fixtures in test/order-display-totals.test.mjs.
+  const curTotLags = hasEdit && curTot != null && Math.abs(parseFloat(curTot) - origTot) < 0.005 && (curSub == null || curSubLags);
   let total;
   if (curTot != null && !curTotLags) {
     total = parseFloat(curTot);               // authoritative current total
@@ -3486,9 +3490,9 @@ function renderOrderDetail(session, order, flash, flashMsg, { resumeEdit = false
               //   .ncl-qty / .ncl-price (addCustomLineRow), .cl-qty / .cl-price (addCatalogLineRow). Add a
               //   new row type and you must give it a .line-total-amt span, call wireRowTotal(tr) and
               //   paintRowTotal(tr) once, and list its input classes here.
-              //   An existing row also has static qty / unit-price spans (shown when edit mode is off). They
-              //   are mirrored from the same inputs here, otherwise leaving edit mode after a change would
-              //   show the OLD qty and price next to the NEW total: a different way of not adding up.
+              //   An existing row also has static qty / unit-price spans (shown when edit mode is off). They are NOT
+              //   written here: flushLine copies the value into them once the save is accepted, so a failed save
+              //   never shows as the order's state after Cancel (the saved total and the saved qty/price agree).
               // INVARIANT(S): display only. The server recomputes every total; nothing here is submitted.
               window.paintRowTotal = function(tr) {
                 var amt = tr && tr.querySelector('.line-total-amt'); if (!amt) return;
@@ -3497,8 +3501,6 @@ function renderOrderDetail(session, order, flash, flashMsg, { resumeEdit = false
                 var qty = q ? parseInt(q.value, 10) : NaN, price = p ? parseFloat(p.value) : NaN;
                 var usd = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' });
                 var qs = tr.querySelector('.edit-qty-static'), ps = tr.querySelector('.edit-price-static');
-                if (qs && qty >= 0) qs.textContent = String(qty);
-                if (ps && price >= 0) ps.textContent = usd.format(price);
                 if (!(qty >= 0) || !(price >= 0)) { amt.textContent = '—'; return; }
                 amt.textContent = usd.format(qty * price);
               };
@@ -4121,7 +4123,15 @@ function renderOrderDetail(session, order, flash, flashMsg, { resumeEdit = false
                   setChip(p.tr, 'saving'); inflight++; setPill();
                   post(p.path, body).then(function(res){
                     inflight--; lineInflight[key] = false;
-                    if (res.ok && res.json && res.json.ok){ setChip(p.tr, 'saved'); totals(res.json.order); }
+                    if (res.ok && res.json && res.json.ok){
+                      setChip(p.tr, 'saved'); totals(res.json.order);
+                      // The read-only qty / unit price follow only what Shopify ACCEPTED (a failed save leaves them at the saved value, so
+                      // Cancel never shows an unsaved edit as the order's state - DeepReview 0.4.1 of #73, finding 3).
+                      // DEPENDS: paintRowTotal no longer mirrors .edit-qty-static / .edit-price-static; this is the only writer after load.
+                      var qs2 = p.tr.querySelector('.edit-qty-static'), ps2 = p.tr.querySelector('.edit-price-static');
+                      if (qs2 && p.extra.qty != null) qs2.textContent = String(p.extra.qty);
+                      if (ps2 && p.extra.price != null) ps2.textContent = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(p.extra.price);
+                    }
                     else {
                       var msg = (res.json && res.json.errors) ? res.json.errors.join('; ') : 'Save failed';
                       var terminal = !!(res.json && res.json.terminal);

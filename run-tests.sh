@@ -182,6 +182,15 @@ if [ -f test/backorder-edit.test.mjs ]; then
   echo ""
   B2B_ADMIN_MOCK=1 node test/backorder-edit.test.mjs || UNIT_FAIL=$?
 fi
+# DeepReview 0.4.1 of #73: long variant titles on active invoice lines; a correct current total equal to the frozen original (own mock server).
+if [ -f test/invoice-long-variant.test.mjs ]; then
+  echo ""
+  node test/invoice-long-variant.test.mjs || UNIT_FAIL=$?
+fi
+if [ -f test/order-total-coincidence.test.mjs ]; then
+  echo ""
+  node test/order-total-coincidence.test.mjs || UNIT_FAIL=$?
+fi
 
 # Shipping replacement must abort before commit if any Shopify staging mutation fails.
 node --test test/order-shipping.test.mjs || UNIT_FAIL=$?

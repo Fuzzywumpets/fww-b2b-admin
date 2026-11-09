@@ -750,6 +750,55 @@ await test('completeCommitNodes returns the nodes ONLY for a provably complete p
   ]) assert.equal(completeCommitNodes(bad), null, JSON.stringify(bad));
 });
 
+console.log('\n  DeepReview 0.4.1 of #73: a committed idempotency token must not skip reconciliation (finding 6) + fulfilling the rest must not clear parked units (probe)');
+await test('REVIEW #73 v0.4.1 F6: retrying a COMMITTED token while the row is still applying finalizes it once the read shows the removal', async () => {
+  const w = world([{ currentQuantity: 10 }]);
+  w.lagReads = 99;                                               // the commit succeeded; every read-back is stale
+  const first = await flag(w, { quantity: 4, idemKey: 'tok-f6-aaaaaa1' });
+  assert.equal(first.state, 'unconfirmed');
+  assert.equal(row(w).status, 'applying');
+  assert.equal(dbm.getBackorderedLinesForOrder(w.orderId).length, 0, 'not on the queue / invoice yet');
+  w.lagLeft = 0;                                                 // the replica has caught up
+  const again = await flag(w, { quantity: 4, idemKey: 'tok-f6-aaaaaa1' });
+  assert.equal(again.ok, true, again.message);
+  assert.equal(row(w).status, 'pending', 'the retry must repair the applying row, not just say "duplicate"');
+  assert.equal(dbm.getBackorderedLinesForOrder(w.orderId)[0].quantity, 4, 'the removed units are on the queue and invoice');
+  assert.equal(w.calls.filter(c => c.kind === 'remove').length, 1, 'no second removal was sent');
+});
+await test('REVIEW #73 v0.4.1 F6: retrying a COMMITTED token while the read is STILL stale reports unconfirmed, never success, and keeps the row (never abandons a committed removal)', async () => {
+  const w = world([{ currentQuantity: 10 }]);
+  w.lagReads = 99;
+  await flag(w, { quantity: 4, idemKey: 'tok-f6-bbbbbb2' });
+  w.lagLeft = 99;
+  const again = await flag(w, { quantity: 4, idemKey: 'tok-f6-bbbbbb2' });
+  assert.equal(again.ok, false);
+  assert.equal(again.state, 'unconfirmed');
+  assert.equal(row(w).status, 'applying', 'the committed removal must not be discarded on a stale read');
+  w.lagLeft = 0;
+  assert.equal((await flag(w, { quantity: 4, idemKey: 'tok-f6-bbbbbb2' })).ok, true);
+  assert.equal(row(w).status, 'pending');
+});
+await test('REVIEW #73 v0.4.1 F6 control: a committed token with a settled (pending) row is still a plain duplicate and reads nothing', async () => {
+  const w = world([{ currentQuantity: 10 }]);
+  assert.equal((await flag(w, { quantity: 4, idemKey: 'tok-f6-cccccc3' })).ok, true);
+  w.readCount = 0;
+  const again = await flag(w, { quantity: 4, idemKey: 'tok-f6-cccccc3' });
+  assert.deepEqual([again.ok, again.duplicate], [true, true]);
+  assert.equal(w.readCount, 0);
+});
+await test('PROBE (#73 v0.4.1): fulfilling the REMAINING units of a partly backordered line leaves the parked units pending, on the queue and invoice, and undoable', async () => {
+  const w = world([{ currentQuantity: 10 }]);
+  assert.equal((await flag(w, { quantity: 4 })).ok, true);       // 4 of 10 parked, 6 stay on the order
+  dbm.fulfillBackorder(w.orderId, w.lines[0].liId);              // what POST /orders/:id/fulfill calls once the other 6 ship
+  assert.equal(row(w).status, 'pending');
+  assert.equal(row(w).shopify_removed_qty, 4);
+  assert.ok(dbm.getOpenBackorders().some(b => b.order_id === w.orderId), 'still on the backorder queue');
+  assert.equal(dbm.getBackorderedLinesForOrder(w.orderId)[0].quantity, 4, 'still on the invoice annotations');
+  const r = await undo(w);
+  assert.equal(r.ok, true, r.message);
+  assert.equal(row(w).status, 'restored');
+});
+
 console.log('\n  Shopify documents');
 await test('the commit mutation that carries the order lines validates against the Admin schema snapshot, at the sizes the server uses', () => {
   const snap = JSON.parse(readFileSync(new URL('./fixtures/shopify-admin-schema.json', import.meta.url), 'utf8'));

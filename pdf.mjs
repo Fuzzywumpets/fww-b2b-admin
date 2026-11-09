@@ -499,7 +499,11 @@ export async function generateInvoicePdf(order, opts = {}) {
       doc.fontSize(9.5).font('Inter').fillColor(BLACK);
       doc.text(productTitle, 56, y, { width: 210, lineGap: 1 });
       if (variantTitle) {
-        doc.fontSize(8).fillColor('#555555').text(variantTitle, 56, y + titleH + 2, { width: 210, lineBreak: false });
+        // One line, trimmed with an ellipsis to the 210pt description column: pdfkit does not clip, so an unclipped long variant
+        // title ran down through the rows below it (DeepReview 0.4.1 of #73, finding 2; test/invoice-long-variant.test.mjs).
+        // rowH above reserves exactly ONE 13pt variant line, so this must stay a single line.
+        doc.fontSize(8).fillColor('#555555');
+        doc.text(fitOneLine(doc, variantTitle, 210), 56, y + titleH + 2, { width: 210, lineBreak: false });
         doc.fontSize(9.5).fillColor(BLACK);
       }
       // SKU: full SKUs run up to 16 chars (e.g. CRSWLK0533258XS8).

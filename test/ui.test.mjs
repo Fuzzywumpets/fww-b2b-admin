@@ -1990,6 +1990,26 @@ await test('THE #38953 LOCK-UP: a TERMINAL rejection must not make the page unle
   assert.equal(await chip.evaluate(el => el.style.cursor), 'default', 'terminal chips offer no retry');
 });
 
+// DeepReview 0.4.1 of #73, finding 3: the read-only qty / unit price mirror the edit INPUTS so a SAVED edit reads right on
+// leaving edit mode - but a FAILED save left the unsaved value in them, so Cancel showed an order state Shopify never accepted.
+await test('REVIEW #73 v0.4.1 F3: a FAILED qty/price save leaves the read-only qty and price at the SAVED values after Cancel', async (page, ctx) => {
+  await page.route('**/line/qty', route => route.fulfill({ status: 422, contentType: 'application/json', body: JSON.stringify({ ok: false, errors: ['Shopify is down'] }) }));
+  await page.route('**/line/price', route => route.fulfill({ status: 422, contentType: 'application/json', body: JSON.stringify({ ok: false, errors: ['Shopify is down'] }) }));
+  const row = await openEditMode(page, ctx, 1007);
+  const qtyEl = row.locator('.edit-qty-input'), priceEl = row.locator('.edit-price-input');
+  const q0 = (await row.locator('.edit-qty-static').textContent()).trim();
+  const p0 = (await row.locator('.edit-price-static').textContent()).trim();
+  await qtyEl.fill(String(parseInt(q0, 10) + 3));
+  await page.keyboard.press('Tab');
+  await priceEl.fill('77.77');
+  await page.keyboard.press('Tab');
+  await page.waitForFunction(() => document.querySelectorAll('#edit-form tr[data-existing="1"] .row-save-chip[data-state="failed"]').length > 0, null, { timeout: 10000 });
+  await page.waitForFunction(() => document.querySelector('#autosave-pill')?.dataset.state === 'failed', null, { timeout: 10000 });
+  await page.locator('#edit-mode-bar button:has-text("Cancel")').click();
+  assert.equal((await row.locator('.edit-qty-static').textContent()).trim(), q0, 'read-only qty must stay the SAVED quantity');
+  assert.equal((await row.locator('.edit-price-static').textContent()).trim(), p0, 'read-only unit price must stay the SAVED price');
+});
+
 await test('a RETRYABLE failure still warns — and "Leave anyway" gets the operator out', async (page, ctx) => {
   await page.route('**/line/qty', route => route.fulfill({
     status: 422, contentType: 'application/json',
