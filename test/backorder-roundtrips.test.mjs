@@ -208,12 +208,16 @@ await test('FAIL CLOSED: a "successful" commit that changed nothing is NOT a bac
   assert.equal(srv.state()[5005].cq, 10, 'order untouched');
   assert.deepEqual(srv.row(5005), { status: 'applying', quantity: 3, shopify_removed_qty: 0 }, 'transient: no invoice/queue reader sees it as backordered');
   sequence('flag, commit changed nothing', ops, FLAG_UNCHANGED);
-  // The next attempt on the line reconciles it against Shopify (still 10 = the claim never landed), discards it and proceeds.
+  // The next attempt (a fresh form token) must NOT discard the claim and remove again: an unchanged read on a young claim is exactly what a
+  // lagging replica shows after a commit that succeeded (DeepReview 0.4.2 of #73, run 3). The old expectation here - discard and proceed
+  // on the very next attempt - was the double-removal bug. The claim is kept and nothing is sent to Shopify; discarding an OLD orphan is
+  // covered in test/backorder-edit.test.mjs (STALE_CLAIM_MS).
   const again = await srv.call(() => flag(srv, 5005, 3, 'tok-flag-5005-retry'));
-  assert.match(flash(again.result), /success=backorder_flagged/);
-  assert.equal(srv.state()[5005].cq, 7);
-  assert.equal(srv.row(5005).status, 'pending');
-  sequence('flag, retry after the unconfirmed one', again.ops, FLAG);
+  assert.match(flash(again.result), /error=backorder_shopify_failed/);
+  assert.match(flash(again.result), /not confirmed yet/);
+  assert.equal(srv.state()[5005].cq, 10, 'no second removal was sent');
+  assert.deepEqual(srv.row(5005), { status: 'applying', quantity: 3, shopify_removed_qty: 0 }, 'the claim is kept');
+  sequence('flag, retry after the unconfirmed one reconciles only', again.ops, ['orderLines']);
 });
 
 await test('NO SILENT ABANDON: commit OK + non-confirming answer + STALE reads (settling read AND first read-back) -> the claim survives, the retry sees the truth, row ends pending', async () => {
