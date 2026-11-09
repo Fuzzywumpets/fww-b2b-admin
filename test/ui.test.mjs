@@ -1992,6 +1992,25 @@ await test('THE #38953 LOCK-UP: a TERMINAL rejection must not make the page unle
 
 // DeepReview 0.4.1 of #73, finding 3: the read-only qty / unit price mirror the edit INPUTS so a SAVED edit reads right on
 // leaving edit mode - but a FAILED save left the unsaved value in them, so Cancel showed an order state Shopify never accepted.
+await test('REVIEW #73 v0.4.2 F3 re-review: a save that LANDS after Cancel repaints the line Total with the new qty (no stale Total beside it)', async (page, ctx) => {
+  let release; const held = new Promise(r => { release = r; });
+  await page.route('**/line/qty', async route => { await held; await route.continue(); });
+  const row = await openEditMode(page, ctx, 1007);
+  const q0 = parseInt((await row.locator('.edit-qty-static').textContent()).trim(), 10);
+  const p0 = parseFloat((await row.locator('.edit-price-static').textContent()).replace(/[$,]/g, ''));
+  await row.locator('.edit-qty-input').fill(String(q0 + 1));
+  await page.keyboard.press('Tab');
+  await page.locator('#edit-mode-bar button:has-text("Cancel")').click();
+  release();
+  await page.waitForFunction(([sel, want]) => document.querySelector(sel)?.textContent.trim() === want,
+    ['#edit-form tr[data-existing="1"] .edit-qty-static', String(q0 + 1)], { timeout: 10000 });
+  assert.equal((await row.locator('.line-total-amt').textContent()).trim(), usd((q0 + 1) * p0), 'Total follows the saved quantity');
+  // put #1007 back as found (later tests share this mock order)
+  await page.click('#edit-btn');
+  await row.locator('.edit-qty-input').fill(String(q0));
+  await page.keyboard.press('Tab');
+  await page.waitForFunction(() => document.querySelector('#autosave-pill')?.dataset.state === 'saved', null, { timeout: 10000 });
+});
 await test('REVIEW #73 v0.4.1 F3: a FAILED qty/price save leaves the read-only qty and price at the SAVED values after Cancel', async (page, ctx) => {
   await page.route('**/line/qty', route => route.fulfill({ status: 422, contentType: 'application/json', body: JSON.stringify({ ok: false, errors: ['Shopify is down'] }) }));
   await page.route('**/line/price', route => route.fulfill({ status: 422, contentType: 'application/json', body: JSON.stringify({ ok: false, errors: ['Shopify is down'] }) }));

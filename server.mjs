@@ -2956,6 +2956,15 @@ function renderOrderDetail(session, order, flash, flashMsg, { resumeEdit = false
 // CHANGE-GUARD: every function selects DOM by hardcoded element id (edit-mode-bar, edit-save-bar, discount-modal, fulfill-modal, etc.) — renaming those ids in the markup silently no-ops the buttons. toggleEditMode(false) RESETS custom lines and discount inputs; keep that cleanup if you add fields.
 // INVARIANT(S): disabled inputs are excluded from form submission (edit mode toggles .disabled), so non-edit-mode loads never POST qty/price overrides; Escape closes all modals via the keydown handler at the bottom.
   const editModeScript = `<script>
+  // WHAT: sets an existing row's Total cell to its SAVED (read-only) qty x unit price. Used on leaving edit mode and when a save lands while
+  //   edit mode is already off (Cancel is allowed mid-save), so the Total can never disagree with the qty/price beside it.
+  // DEPENDS: flushLine's success handler (autosave controller) calls this after writing the static spans.
+  function paintSavedRowTotal(tr) {
+    var amt = tr.querySelector('.line-total-amt'); if (!amt) return;
+    var qs = tr.querySelector('.edit-qty-static'), ps = tr.querySelector('.edit-price-static');
+    var q = qs ? parseInt(qs.textContent, 10) : NaN, pr = ps ? parseFloat(ps.textContent.replace(/[^0-9.\-]/g, '')) : NaN;
+    if (q >= 0 && pr >= 0) amt.textContent = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(q * pr);
+  }
   function toggleEditMode(enable) {
     document.getElementById('edit-mode-bar').style.display = enable ? 'block' : 'none';
     document.getElementById('edit-save-bar').style.display = enable ? 'block' : 'none';
@@ -2972,11 +2981,7 @@ function renderOrderDetail(session, order, flash, flashMsg, { resumeEdit = false
     // shows an unsaved Total beside the saved qty/price (DeepReview 0.4.2 re-review of the finding-3 fix). The inputs keep any unsaved value.
     // DEPENDS: paintRowTotal (edit-mode script) reads the inputs; the static spans are written only by flushLine on an accepted save.
     document.querySelectorAll('tr[data-existing="1"]').forEach(function(tr){
-      var amt = tr.querySelector('.line-total-amt'); if (!amt) return;
-      if (enable) { if (window.paintRowTotal) window.paintRowTotal(tr); return; }
-      var qs = tr.querySelector('.edit-qty-static'), ps = tr.querySelector('.edit-price-static');
-      var q = qs ? parseInt(qs.textContent, 10) : NaN, pr = ps ? parseFloat(ps.textContent.replace(/[^0-9.\-]/g, '')) : NaN;
-      if (q >= 0 && pr >= 0) amt.textContent = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(q * pr);
+      if (enable) { if (window.paintRowTotal) window.paintRowTotal(tr); } else paintSavedRowTotal(tr);
     });
     document.querySelectorAll('.edit-qty-input').forEach(el => { el.style.display = enable ? 'inline-block' : 'none'; el.disabled = !enable || !liveRow(el); });
     document.querySelectorAll('.edit-qty-static').forEach(el => { el.style.display = enable ? 'none' : 'inline'; });
@@ -4141,6 +4146,9 @@ function renderOrderDetail(session, order, flash, flashMsg, { resumeEdit = false
                       var qs2 = p.tr.querySelector('.edit-qty-static'), ps2 = p.tr.querySelector('.edit-price-static');
                       if (qs2 && p.extra.qty != null) qs2.textContent = String(p.extra.qty);
                       if (ps2 && p.extra.price != null) ps2.textContent = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(p.extra.price);
+                      // Cancel is allowed mid-save: if edit mode is already off, the Total must follow the value that just landed.
+                      var eb = document.getElementById('edit-mode-bar');
+                      if (eb && eb.style.display === 'none' && typeof paintSavedRowTotal === 'function') paintSavedRowTotal(p.tr);
                     }
                     else {
                       var msg = (res.json && res.json.errors) ? res.json.errors.join('; ') : 'Save failed';
