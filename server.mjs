@@ -425,8 +425,8 @@ async function callPortalInternal(method, path, body, { timeoutMs } = {}) {
 // (there is no Portal there) and when PAYMENT_NOTICE_DISABLED=1 (kill switch, no redeploy of code needed).
 // CHANGE-GUARD: call sites invoke `paymentNotifier.notify(...)` WITHOUT await, after the Shopify call succeeded and the
 // audit row is written - a slow Portal/Gmail (up to ~14 s) must never delay or fail the staff member's redirect. The 20 s
-// timeout only frees the socket; it does not decide delivery. Staff-recorded payments ONLY: never call it from the Helcim
-// paid-sync path (Helcim's own merchant copy covers card-invoice payments; calling it there double-notifies).
+// timeout only frees the socket; it does not decide delivery. The Helcim paid-sync path awaits its
+// separate source helcim_invoice_paid, protected by Portal's durable invoice-id claim.
 // DEPENDS: Portal POST /__internal__/payment-notice (deploy the Portal first); B2B_PORTAL_INTERNAL_TOKEN must be set (else
 // every notice is audited as payment_notice_failed with 'no_internal_token').
 const paymentNotifier = createPaymentNotifier({
@@ -6986,7 +6986,7 @@ app.post('/orders/:id/send-credit-card-invoice', requireAuth, async (req, res) =
       creationClaimAcquired = true;
       const created = MOCK
         ? {
-            invoiceId: `mock-helcim-${numId}`, invoiceNumber: `MOCK-${numId}`,
+            invoiceId: String(numId), invoiceNumber: `MOCK-${numId}`,
             token: `mock-token-${numId}`, url: `https://fuzzywumpets.myhelcim.com/order/?token=mock-token-${numId}`,
             amount: outstanding, currency, billingIncluded: !!billingAddress,
           }
@@ -7010,6 +7010,7 @@ app.post('/orders/:id/send-credit-card-invoice', requireAuth, async (req, res) =
     const portalPayload = buildCreditCardInvoicePayload({
       orderGid, orderName: order.name, amountText: fmtMoney(outstanding), amount: outstanding, currency,
       url: invoice.url, note: staffNote, addedBy: req.adminSession.email,
+      invoiceId: invoice.invoice_id, invoiceNumber: invoice.invoice_number,
     });
     const delivery = MOCK
       ? { ok: true, email: { sent: true, via: 'mock' } }
@@ -7079,6 +7080,8 @@ function getHelcimSyncDeps() {
   const real = createHelcimSyncDeps({
     shopifyFetch,
     getInvoice: getHelcimInvoice,
+    notifyOwner: (notice) => paymentNotifier.notify(notice),
+    log: (...args) => console.error(...args),
     store: { getLedger: getHelcimInvoiceMap, claim: claimHelcimPaymentSync, setState: setHelcimPaymentState, listDue: listHelcimInvoicesForPaymentSync },
     auditLog,
   });

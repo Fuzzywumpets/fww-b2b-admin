@@ -37,8 +37,8 @@ function rig({ reply = { ok: true, email: { sent: true, via: 'gmail', id: 'm1' }
 
 console.log('\n  lib/payment-notice.mjs');
 
-await test('the three staff sources are exactly the ones the Portal accepts', () => {
-  assert.deepEqual([...PAYMENT_NOTICE_SOURCES], ['mark_paid_bulk', 'mark_paid', 'record_payment']);
+await test('staff and Helcim sources match the Portal', () => {
+  assert.deepEqual([...PAYMENT_NOTICE_SOURCES], ['mark_paid_bulk', 'mark_paid', 'record_payment', 'helcim_invoice_paid']);
   assert.equal(MAX_ORDERS, 250);
 });
 

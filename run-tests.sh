@@ -415,6 +415,7 @@ fi
 if [ -f test/payment-notice-lib.test.mjs ]; then
   echo ""
   node test/payment-notice-lib.test.mjs || UNIT_FAIL=$?
+  node test/helcim-owner-notice.test.mjs || UNIT_FAIL=$?
 fi
 if [ -f test/payment-notice-routes.test.mjs ]; then
   echo ""

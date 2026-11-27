@@ -88,3 +88,16 @@ Rollback is an Admin code rollback; the additive claims table can remain. A reta
 
 No live invoice, charge, customer email, refund, cancellation, or customer mutation was performed
 while implementing or testing this contract.
+
+## Identified checkout and owner notices (2026-11-27)
+
+Admin sends the saved `invoiceId` and `invoiceNumber` together with its existing
+`payUrl` invoice contract. Portal verifies that authoritative invoice's identity,
+amount, currency, token and tax before replacing the note/email URL with `/pay`.
+Production checkout uses server-owned `B2B_HELCIM_TERMINAL_ID=116973`; no fallback.
+Tax comes from the saved invoice, including on resend, never a newly computed order tax.
+
+A confirmed fully paid invoice triggers `helcim_invoice_paid` before Shopify assessment,
+even when Shopify requires manual review. Portal sends only to Alex using its durable
+invoice-ID/digest claim. Unknown deliveries never retry. Finalized historical invoices
+are not replayed. See B2B-ARCHITECTURE.md for the full notice contract.

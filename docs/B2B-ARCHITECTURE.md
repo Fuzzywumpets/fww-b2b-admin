@@ -157,7 +157,7 @@ The **Send Credit Card Invoice** button (`POST /orders/:id/send-credit-card-invo
 passes a structured **`creditCardInvoice`** object, which switches the Portal to a direct Gmail send:
 
 ```
-creditCardInvoice: { orderName, amount, currency, payUrl, staffNote }
+creditCardInvoice: { orderName, amount, currency, payUrl, staffNote, invoiceId, invoiceNumber }
 ```
 
 - Producer: Admin `lib/helcim-note.mjs` `buildCreditCardInvoicePayload`. Receiver: Portal
@@ -188,11 +188,10 @@ creditCardInvoice: { orderName, amount, currency, payUrl, staffNote }
   Admin with a new Portal is safe. A new Admin with an old Portal sends the legacy Re:amaze email
   with the staff note unescaped, so **deploy the Portal first**.
 
-### `payment-notice` — the "payment received" email for STAFF-recorded payments
+### `payment-notice` — staff and confirmed Helcim payment emails
 
 Alex (2026-10-27): "when a payment is made, I need notification sent to alex@fuzzywumpets.com". Settled split:
-**Helcim card-invoice payments** are announced by Helcim's own merchant copy (a Helcim dashboard setting, no code
-here; do NOT email from the paid-sync path, it would double-notify). **Payments staff record in this app** are announced by us:
+**Confirmed Helcim card-invoice payments** are now announced by the paid-sync path through an Alex-only durable Portal notice (owner-authorized 2026-11-27). **Payments staff record in this app** retain the existing behavior:
 
 | Admin route | `source` | Notice |
 |---|---|---|
@@ -209,7 +208,7 @@ here; do NOT email from the paid-sync path, it would double-notify). **Payments 
   For Mark Paid the amount is the outstanding balance Shopify just cleared (`totalOutstandingSet`, read right before each `orderMarkAsPaid` by
   `readOutstandingBeforePayment`; the payload alone cannot show it), so a part-paid order does not count its earlier payments again. If that
   read fails or is zero, the order's current total is used instead (the old behaviour).
-- **Recipient is the Portal's, never the request's**: env `PAYMENT_NOTICE_TO`, default `alex@fuzzywumpets.com`. Admin sends no
+- **Staff recipient is the Portal's, never the request's**: env `PAYMENT_NOTICE_TO`, default `alex@fuzzywumpets.com`. Admin sends no
   recipient, subject, sender or link. **When the staff member's login email equals the recipient the Portal sends nothing**
   (`email.skipped = 'actor_is_recipient'`, not a failure), so Alex's own clicks do not email him.
 - **Fail-open.** Any problem (Portal down or older and answering 404, Gmail/broker error, a reply that does not say
@@ -223,7 +222,24 @@ here; do NOT email from the paid-sync path, it would double-notify). **Payments 
   every notice is audited as failed (`no_internal_token`).
 - **Never** a Helcim token, pay URL or card data: the request has no field for one (pinned by `test/payment-notice-routes.test.mjs`).
 - **Deploy the Portal FIRST.** A new Admin with an old Portal gets 404s (audited, payments unaffected); a new Portal with an old
-  Admin is inert. Rollback: Admin `git reset --keep <previous sha>`; Portal `git reset --keep f850ad4`. No schema change either side.
+  Admin is inert. Rollback: Admin `git reset --keep <previous sha>`; Portal `git reset --keep f850ad4`. Portal adds the durable `helcim_owner_notices` table; keep it on rollback to preserve duplicate protection.
+
+For `helcim_invoice_paid`, the request also carries `invoiceId`, `invoiceNumber` and
+`helcimDatePaid`, with exactly one order. Recipient is always `alex@fuzzywumpets.com`,
+regardless of `PAYMENT_NOTICE_TO` or actor. The body says paid through Helcim.
+Portal claims the invoice ID atomically before Gmail and hashes identity, order ID,
+amount, currency and paid date. Same payload repeats do not send; changed facts return
+409. Sending/unknown claims never expire or retry. Only a confirmed Gmail ID marks sent.
+No history is replayed for finalized `paid_synced`/`already_paid` ledger rows.
+Notification failure is audited independently and cannot prevent Shopify reconciliation.
+
+Identified invoice emails require `B2B_PORTAL_PAY_CHECKOUT=1` and server-owned
+`B2B_HELCIM_TERMINAL_ID=116973`. Portal GETs the saved invoice and validates ID, number,
+amount, currency, hosted-link token and saved tax before preparing a public `/pay` link.
+It replaces every exact hosted URL in the visible note before storage/audit and uses
+that same public URL in the email. Missing/invalid configuration or mismatched facts
+fail closed. No current Shopify tax is substituted on resend. Legacy unpaired callers
+retain their hosted-link behavior until Admin is deployed after Portal.
 
 ### Helcim card invoice → paid sync
 

@@ -367,7 +367,7 @@ function wiring(responses) {
 await test('fetchOrder reads financial status, cancelledAt and the OUTSTANDING (not total) with its currency', async () => {
   const w = wiring([{ data: { order: { displayFinancialStatus: 'PENDING', cancelledAt: null, totalOutstandingSet: { presentmentMoney: { amount: '1.00', currencyCode: 'USD' } } } } }]);
   const o = await w.deps.fetchOrder(GID);
-  assert.deepEqual(o, { financialStatus: 'PENDING', cancelledAt: null, outstanding: 1, currency: 'USD' });
+  assert.deepEqual(o, { name: undefined, financialStatus: 'PENDING', cancelledAt: null, outstanding: 1, currency: 'USD' });
   assert.match(w.queries[0].query, /totalOutstandingSet/);
   assert.deepEqual(w.queries[0].variables, { id: GID });
 });
