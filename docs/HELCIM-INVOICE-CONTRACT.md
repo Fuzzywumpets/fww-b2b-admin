@@ -100,4 +100,7 @@ Tax comes from the saved invoice, including on resend, never a newly computed or
 A confirmed fully paid invoice triggers `helcim_invoice_paid` before Shopify assessment,
 even when Shopify requires manual review. Portal sends only to Alex using its durable
 invoice-ID/digest claim. Unknown deliveries never retry. Finalized historical invoices
-are not replayed. See B2B-ARCHITECTURE.md for the full notice contract.
+are not replayed. Previously observed `helcim_status=PAID` rows are also suppressed,
+including historical `needs_review` rows, while their reconciliation continues.
+First-observed paid transitions still alert before Shopify assessment.
+See B2B-ARCHITECTURE.md for the full notice contract.

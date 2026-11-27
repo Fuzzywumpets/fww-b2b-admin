@@ -231,6 +231,9 @@ Portal claims the invoice ID atomically before Gmail and hashes identity, order 
 amount, currency and paid date. Same payload repeats do not send; changed facts return
 409. Sending/unknown claims never expire or retry. Only a confirmed Gmail ID marks sent.
 No history is replayed for finalized `paid_synced`/`already_paid` ledger rows.
+Rows already observed with `helcim_status=PAID` also produce no retrospective
+notice, including historical `needs_review` rows; reconciliation still assesses
+them normally. First-observed paid transitions still alert before Shopify assessment.
 Notification failure is audited independently and cannot prevent Shopify reconciliation.
 
 Identified invoice emails require `B2B_PORTAL_PAY_CHECKOUT=1` and server-owned

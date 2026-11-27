@@ -24,6 +24,13 @@ for (const invoice of [{ status: 'DUE', amountPaid: 0 }, { amount: 11 }, { curre
 for (const paid_state of ['paid_synced', 'already_paid']) {
   const f = fixture({ ledger: { paid_state } }); assert.equal((await syncHelcimPayment(gid, f.deps)).outcome, 'done'); assert.deepEqual(f.calls, []);
 }
+{
+  const f = fixture({ ledger: { paid_state: 'needs_review', helcim_status: 'PAID' }, order: { outstanding: 11 } });
+  const result = await syncHelcimPayment(gid, f.deps);
+  assert.equal(result.outcome, 'needs_review', 'historical payment still receives Shopify assessment');
+  assert.match(result.reason, /balance/);
+  assert.deepEqual(f.calls, [], 'already-observed PAID invoice must not produce a retrospective notice or payment write');
+}
 for (const options of [{}, { failNotice: true }, { order: { outstanding: 11 } }, { failOrder: true }]) {
   const f = fixture(options); const result = await syncHelcimPayment(gid, f.deps, { actor: 'alex@fuzzywumpets.com' });
   assert.equal(f.calls[0].source, 'helcim_invoice_paid'); assert.equal(f.calls[0].actorEmail, 'payments@fuzzywumpets.com');
